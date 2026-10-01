@@ -1,0 +1,38 @@
+{
+  "_comment": "Observed 2026-10-01 from a single request with an obviously fake bearer token. No real credential involved.",
+  "request": {
+    "method": "POST",
+    "url": "https://api.deepseek.com/anthropic/v1/messages",
+    "headers": {
+      "Authorization": "Bearer sk-dummy-not-a-real-key-0000",
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json"
+    },
+    "body": {
+      "model": "deepseek-v4-pro",
+      "max_tokens": 1,
+      "messages": [
+        {
+          "role": "user",
+          "content": "."
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "content-type": "application/json",
+      "x-ds-trace-id": "<varies>",
+      "via": "CloudFront"
+    },
+    "body": {
+      "error": {
+        "message": "Authentication Fails, Your api key: ****0000 is invalid (request_id: 840cab9d-5153-42ca-9e56-534e7c4f3410)",
+        "type": "authentication_error",
+        "param": null,
+        "code": "invalid_request_error"
+      }
+    }
+  }
+}

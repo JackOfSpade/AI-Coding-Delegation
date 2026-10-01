@@ -1,0 +1,327 @@
+{
+  "_comment": "Sanitized from local-mock captures of `claude -p` v2.1.284 (see docs/spikes/01-deepseek-facts.md section 7). Values truncated; tools reduced to names.",
+  "default_env_with_1m_suffix": {
+    "method": "POST",
+    "url": "/v1/messages?beta=true",
+    "headers": {
+      "accept": "application/json",
+      "authorization": "<redacted len=26 prefix=Bearer >",
+      "content-type": "application/json",
+      "user-agent": "claude-cli/2.1.284 (external, sdk-cli)",
+      "x-stainless-arch": "arm64",
+      "x-stainless-lang": "js",
+      "x-stainless-os": "MacOS",
+      "x-stainless-package-version": "0.112.1",
+      "x-stainless-retry-count": "0",
+      "x-stainless-runtime": "node",
+      "x-stainless-runtime-version": "v26.3.0",
+      "x-stainless-timeout": "600",
+      "anthropic-beta": "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24",
+      "anthropic-dangerous-direct-browser-access": "true",
+      "anthropic-version": "2023-06-01",
+      "x-app": "cli"
+    },
+    "body": {
+      "model": "deepseek-v4-pro",
+      "max_tokens": 32000,
+      "thinking": {
+        "type": "adaptive",
+        "display": "omitted"
+      },
+      "context_management": {
+        "edits": [
+          {
+            "type": "clear_thinking_20251015",
+            "keep": "all"
+          }
+        ]
+      },
+      "output_config": {
+        "effort": "max"
+      },
+      "stream": true,
+      "metadata": {
+        "user_id": "{\"device_id\":\"<redacted>\",\"account_uuid\":\"\",\"session_id\":\"<redacted>\"}"
+      },
+      "system": [
+        {
+          "text": "x-anthropic-billing-header: cc_version=2.1.284.dd4; cc_entrypoint=sdk-cli;",
+          "cache_control": null
+        },
+        {
+          "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        },
+        {
+          "text": "\nYou are an interactive agent that helps users with software engineering tasks.\n\nIMPORTANT...<5836 chars>",
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        }
+      ],
+      "tools": [
+        "Agent",
+        "Bash",
+        "CronCreate",
+        "CronDelete",
+        "CronList",
+        "DesignSync",
+        "Edit",
+        "EnterWorktree",
+        "ExitWorktree",
+        "ListAgents",
+        "NotebookEdit",
+        "Read",
+        "ReportFindings",
+        "ScheduleWakeup",
+        "SendMessage",
+        "Skill",
+        "TaskStop",
+        "WebFetch",
+        "WebSearch",
+        "Workflow",
+        "Write"
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "<system-reminder>\nAttribution for git commits and pull requests you create from here on (t...<576 chars>"
+            },
+            {
+              "type": "text",
+              "text": "Say hi"
+            }
+          ]
+        },
+        {
+          "role": "system",
+          "content": [
+            {
+              "type": "text",
+              "text": "# Environment\nYou have been invoked in the following environment: \n - Primary working dire...<7642 chars>"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "experimental_betas_disabled_with_tool_roundtrip": [
+    {
+      "method": "POST",
+      "url": "/v1/messages?beta=true",
+      "headers": {
+        "accept": "application/json",
+        "authorization": "<redacted len=26 prefix=Bearer >",
+        "content-type": "application/json",
+        "user-agent": "claude-cli/2.1.284 (external, sdk-cli)",
+        "x-stainless-arch": "arm64",
+        "x-stainless-lang": "js",
+        "x-stainless-os": "MacOS",
+        "x-stainless-package-version": "0.112.1",
+        "x-stainless-retry-count": "0",
+        "x-stainless-runtime": "node",
+        "x-stainless-runtime-version": "v26.3.0",
+        "x-stainless-timeout": "600",
+        "anthropic-beta": "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,mid-conversation-system-2026-04-07,effort-2025-11-24",
+        "anthropic-dangerous-direct-browser-access": "true",
+        "anthropic-version": "2023-06-01",
+        "x-app": "cli"
+      },
+      "body": {
+        "model": "deepseek-v4-pro",
+        "max_tokens": 32000,
+        "thinking": {
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "high"
+        },
+        "stream": true,
+        "metadata": {
+          "user_id": "{\"device_id\":\"<redacted>\",\"account_uuid\":\"\",\"session_id\":\"<redacted>\"}"
+        },
+        "system": [
+          {
+            "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "text": "\nYou are an interactive agent that helps users with software engineering tasks.\n\nIMPORTANT...<5673 chars>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "tools": [
+          "Bash",
+          "Edit",
+          "Glob",
+          "Grep",
+          "Read",
+          "Write"
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\nAttribution for git commits and pull requests you create from here on (t...<576 chars>"
+              },
+              {
+                "type": "text",
+                "text": "Run the bash command: echo mock-tool-ran"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": "# Environment\nYou have been invoked in the following environment: \n - Primary working dire...<442 chars>"
+          }
+        ]
+      }
+    },
+    {
+      "method": "POST",
+      "url": "/v1/messages?beta=true",
+      "headers": {
+        "accept": "application/json",
+        "authorization": "<redacted len=26 prefix=Bearer >",
+        "content-type": "application/json",
+        "user-agent": "claude-cli/2.1.284 (external, sdk-cli)",
+        "x-stainless-arch": "arm64",
+        "x-stainless-lang": "js",
+        "x-stainless-os": "MacOS",
+        "x-stainless-package-version": "0.112.1",
+        "x-stainless-retry-count": "0",
+        "x-stainless-runtime": "node",
+        "x-stainless-runtime-version": "v26.3.0",
+        "x-stainless-timeout": "600",
+        "anthropic-beta": "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,mid-conversation-system-2026-04-07,effort-2025-11-24",
+        "anthropic-dangerous-direct-browser-access": "true",
+        "anthropic-version": "2023-06-01",
+        "x-app": "cli"
+      },
+      "body": {
+        "model": "deepseek-v4-pro",
+        "max_tokens": 32000,
+        "thinking": {
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "high"
+        },
+        "stream": true,
+        "metadata": {
+          "user_id": "{\"device_id\":\"<redacted>\",\"account_uuid\":\"\",\"session_id\":\"<redacted>\"}"
+        },
+        "system": [
+          {
+            "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "text": "\nYou are an interactive agent that helps users with software engineering tasks.\n\nIMPORTANT...<5673 chars>",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "tools": [
+          "Bash",
+          "Edit",
+          "Glob",
+          "Grep",
+          "Read",
+          "Write"
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\nAttribution for git commits and pull requests you create from here on (t...<576 chars>"
+              },
+              {
+                "type": "text",
+                "text": "Run the bash command: echo mock-tool-ran"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": "# Environment\nYou have been invoked in the following environment: \n - Primary working dire...<442 chars>"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "mock reasoning: I should run the tool.",
+                "signature": "0188d6a3-ad7b-43df-954b-6c4c60f7699b"
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_mock1",
+                "name": "Bash"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "tool_use_id": "toolu_mock1",
+                "type": "tool_result"
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": "<total_tokens>14999970 tokens left</total_tokens>"
+          }
+        ]
+      }
+    }
+  ],
+  "env_matrix": {
+    "MAX_THINKING_TOKENS=0": {
+      "thinking": null,
+      "output_config": {
+        "effort": "max"
+      }
+    },
+    "CLAUDE_CODE_DISABLE_THINKING=1": {
+      "thinking": null,
+      "output_config": {
+        "effort": "max"
+      }
+    },
+    "CLAUDE_CODE_EFFORT_LEVEL=xhigh": {
+      "output_config": {
+        "effort": "xhigh"
+      }
+    },
+    "--bare": {
+      "ntools": 3,
+      "content_length": 4752
+    },
+    "--tools Read,Edit,Write,Bash,Glob,Grep --disable-slash-commands": {
+      "ntools": 6,
+      "content_length": 17700
+    },
+    "default (21 tools)": {
+      "content_length": 69834
+    }
+  }
+}

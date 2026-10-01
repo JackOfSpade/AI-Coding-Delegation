@@ -1,0 +1,89 @@
+{
+  "_comment": "Transcribed from https://api-docs.deepseek.com/quick_start/pricing on 2026-10-01 (curl + html strip). USD per 1M tokens. Not machine-published by DeepSeek; re-check before trusting.",
+  "fetched_at": "2026-10-01T09:42Z",
+  "sources": [
+    "https://api-docs.deepseek.com/quick_start/pricing",
+    "https://api-docs.deepseek.com/quick_start/rate_limit",
+    "https://api-docs.deepseek.com/updates"
+  ],
+  "base_urls": {
+    "openai": "https://api.deepseek.com",
+    "anthropic": "https://api.deepseek.com/anthropic"
+  },
+  "peak": {
+    "utc_windows": [
+      [
+        "01:00",
+        "04:00"
+      ],
+      [
+        "06:00",
+        "10:00"
+      ]
+    ],
+    "days": "Mon-Fri (UTC date of the window)",
+    "excludes": "Chinese public holidays",
+    "beijing_equivalent": [
+      "09:00-12:00",
+      "14:00-18:00"
+    ],
+    "off_peak_is_half_of_peak": true
+  },
+  "models": {
+    "deepseek-v4-pro": {
+      "version": "DeepSeek-V4-Pro-0813",
+      "context_tokens": 1000000,
+      "max_output_tokens": 384000,
+      "thinking_default": "enabled (effort high)",
+      "vision": false,
+      "concurrency_per_account": 500,
+      "usd_per_1m": {
+        "input_cache_hit": {
+          "off_peak": 0.022,
+          "peak": 0.044
+        },
+        "input_cache_miss": {
+          "off_peak": 0.66,
+          "peak": 1.32
+        },
+        "output": {
+          "off_peak": 1.98,
+          "peak": 3.96
+        }
+      }
+    },
+    "deepseek-flash": {
+      "version": "DeepSeek-V4.1-Flash",
+      "context_tokens": 1000000,
+      "max_output_tokens": 384000,
+      "thinking_default": "enabled (effort high)",
+      "vision": true,
+      "concurrency_per_account": 2500,
+      "usd_per_1m": {
+        "input_cache_hit": {
+          "off_peak": 0.003,
+          "peak": 0.006
+        },
+        "input_cache_miss": {
+          "off_peak": 0.15,
+          "peak": 0.3
+        },
+        "output": {
+          "off_peak": 0.6,
+          "peak": 1.2
+        }
+      }
+    }
+  },
+  "legacy_aliases": {
+    "deepseek-v4-flash": "served by deepseek-flash at Flash price",
+    "deepseek-v4-flash-vision-exp": "served by deepseek-flash at Flash price"
+  },
+  "anthropic_name_mapping": {
+    "claude-opus*": "deepseek-v4-pro",
+    "claude-sonnet*": "deepseek-flash",
+    "claude-haiku*": "deepseek-flash",
+    "unknown": "deepseek-flash"
+  },
+  "caveat": "News post 2026-09-10 says deepseek-v4-pro routes to V4.1-Flash from 2026-09-14 04:00 UTC; changelog says Pro continues. Pricing page (fetched 2026-10-01) still lists Pro separately. Unresolved without a real key: check response `model` field."
+}
