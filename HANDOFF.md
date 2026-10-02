@@ -4,7 +4,7 @@
 
 `offload` is a local CLI and stdio MCP service for delegating bounded implementation, test-writing, and debugging work to an OpenAI-compatible worker. The worker is not trusted with direct repository access; it uses bounded local tools. The orchestrator remains responsible for architecture, security choices, and final review.
 
-The durable design is in [DESIGN.md](DESIGN.md), operational safety notes are in [docs/SECURITY.md](docs/SECURITY.md), and release commands are in [docs/TESTING.md](docs/TESTING.md).
+The durable design is in [DESIGN.md](DESIGN.md), and release commands are in [docs/TESTING.md](docs/TESTING.md).
 
 ## Core invariants
 

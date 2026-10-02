@@ -67,7 +67,6 @@ test('the npm package contains the runnable product and excludes legacy or test 
       'plugins/offload/skills/offload/SKILL.md',
     ])
       assert.equal(paths.has(path), true, `${path} must ship`);
-    assert.ok(paths.has('docs/SECURITY.md'));
     assert.ok(paths.has('docs/TESTING.md'));
     assert.ok(paths.has('docs/spikes/01-deepseek-facts.md'));
     assert.ok(paths.has('docs/spikes/02-openai-surface.md'));
