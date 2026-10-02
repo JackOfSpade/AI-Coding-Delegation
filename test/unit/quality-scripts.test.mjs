@@ -15,6 +15,7 @@ import {
 } from '../../scripts/package-gate.mjs';
 import { analyzeStrictSkips, parseTapSkips } from '../run-suite.mjs';
 import { runCiTests } from '../../scripts/test-ci.mjs';
+import { coverageInvocation, runCoverage } from '../../scripts/run-coverage.mjs';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 
@@ -132,6 +133,128 @@ test('CI test launcher preserves a strict runner failure exit code', async () =>
       windowsHide: true,
     },
   });
+});
+
+function fakeCoverageChild(exitCode) {
+  return {
+    once(event, listener) {
+      if (event === 'exit') queueMicrotask(() => listener(exitCode));
+      return this;
+    },
+  };
+}
+
+test('coverage runner invokes c8 through Node with isolated cross-platform paths', () => {
+  const unix = coverageInvocation({ c8: '/deps/c8.js', cwd: '/repo', temporaryDirectory: '/tmp/offload-coverage-a', node: '/node' });
+  assert.equal(unix.command, '/node');
+  assert.deepEqual(unix.args.slice(0, 10), [
+    '/deps/c8.js',
+    '--all',
+    '--include=src/**/*.mjs',
+    '--reporter=text',
+    '--reporter=json-summary',
+    '--reports-dir=/tmp/offload-coverage-a/reports',
+    '--temp-directory=/tmp/offload-coverage-a/v8',
+    '--check-coverage',
+    '--lines=90',
+    '--functions=90',
+  ]);
+  assert.deepEqual(unix.args.slice(-2), ['/node', '/repo/scripts/test-ci.mjs']);
+  const windows = coverageInvocation({
+    c8: 'C:\\deps\\c8.js',
+    cwd: 'C:\\repo',
+    temporaryDirectory: 'C:\\Temp\\offload-coverage-a',
+    node: 'C:\\node\\node.exe',
+    platform: 'win32',
+  });
+  assert.equal(windows.command, 'C:\\node\\node.exe');
+  assert.ok(windows.args.includes('--reports-dir=C:\\Temp\\offload-coverage-a\\reports'));
+  assert.ok(windows.args.includes('--temp-directory=C:\\Temp\\offload-coverage-a\\v8'));
+  assert.deepEqual(windows.args.slice(-2), ['C:\\node\\node.exe', 'C:\\repo\\scripts\\test-ci.mjs']);
+});
+
+test('coverage runner publishes isolated reports only after a successful c8 exit and always cleans up', async () => {
+  const calls = [];
+  const code = await runCoverage({
+    cwd: '/repo',
+    environment: { PATH: '/bin' },
+    c8: '/deps/c8.js',
+    node: '/node',
+    temporaryRoot: '/tmp',
+    createTemporaryDirectory: async (prefix) => {
+      calls.push(['mkdtemp', prefix]);
+      return '/tmp/offload-coverage-fixed';
+    },
+    spawnProcess: (command, args, options) => {
+      calls.push(['spawn', command, args, options]);
+      return fakeCoverageChild(0);
+    },
+    checkAccess: async (path) => calls.push(['access', path]),
+    makeDirectory: async (path, options) => calls.push(['mkdir', path, options]),
+    copy: async (source, destination) => calls.push(['copy', source, destination]),
+    move: async (source, destination) => calls.push(['rename', source, destination]),
+    remove: async (path, options) => calls.push(['rm', path, options]),
+    unique: () => 'unique',
+    pid: 123,
+  });
+  assert.equal(code, 0);
+  assert.deepEqual(calls[0], ['mkdtemp', '/tmp/offload-coverage-']);
+  assert.deepEqual(calls[1], [
+    'spawn',
+    '/node',
+    [
+      '/deps/c8.js',
+      '--all',
+      '--include=src/**/*.mjs',
+      '--reporter=text',
+      '--reporter=json-summary',
+      '--reports-dir=/tmp/offload-coverage-fixed/reports',
+      '--temp-directory=/tmp/offload-coverage-fixed/v8',
+      '--check-coverage',
+      '--lines=90',
+      '--functions=90',
+      '--branches=72',
+      '/node',
+      '/repo/scripts/test-ci.mjs',
+    ],
+    {
+      cwd: '/repo',
+      env: { PATH: '/bin', OFFLOAD_TEST_SUMMARY_FILE: '/tmp/offload-coverage-fixed/test-summary.json' },
+      stdio: 'inherit',
+      windowsHide: true,
+    },
+  ]);
+  assert.deepEqual(
+    calls.filter(([operation]) => operation === 'access'),
+    [
+      ['access', '/tmp/offload-coverage-fixed/reports/coverage-summary.json'],
+      ['access', '/tmp/offload-coverage-fixed/test-summary.json'],
+    ],
+  );
+  assert.deepEqual(
+    calls.filter(([operation]) => operation === 'rename'),
+    [
+      ['rename', '/repo/coverage/.coverage-summary.json.123.unique.tmp', '/repo/coverage/coverage-summary.json'],
+      ['rename', '/repo/artifacts/.test-summary.json.123.unique.tmp', '/repo/artifacts/test-summary.json'],
+    ],
+  );
+  assert.deepEqual(calls.at(-1), ['rm', '/tmp/offload-coverage-fixed', { recursive: true, force: true }]);
+});
+
+test('coverage runner propagates c8 failure without reading or publishing generated artifacts', async () => {
+  const calls = [];
+  const code = await runCoverage({
+    cwd: '/repo',
+    createTemporaryDirectory: async () => '/tmp/offload-coverage-fixed',
+    spawnProcess: () => fakeCoverageChild(7),
+    checkAccess: async () => calls.push('access'),
+    makeDirectory: async () => calls.push('mkdir'),
+    copy: async () => calls.push('copy'),
+    move: async () => calls.push('rename'),
+    remove: async (path, options) => calls.push(['rm', path, options]),
+  });
+  assert.equal(code, 7);
+  assert.deepEqual(calls, [['rm', '/tmp/offload-coverage-fixed', { recursive: true, force: true }]]);
 });
 
 test('package gate keeps the two plugin manifests semantically aligned and requires JSON skill frontmatter', () => {

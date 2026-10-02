@@ -30,7 +30,7 @@
     "format:check": "prettier --check .",
     "format:write": "prettier --write .",
     "test:ci": "node scripts/test-ci.mjs",
-    "coverage": "c8 --all --include=src/**/*.mjs --reporter=text --reporter=json-summary --reports-dir=coverage --check-coverage --lines 90 --functions 90 --branches 72 npm run test:ci",
+    "coverage": "node scripts/run-coverage.mjs",
     "artifacts:clean": "node scripts/clean-artifacts.mjs",
     "package:check": "node scripts/package-gate.mjs",
     "release:check": "npm run artifacts:clean && npm run static && npm run lint && npm run format:check && npm run test:ci && npm run coverage && npm run package:check"
