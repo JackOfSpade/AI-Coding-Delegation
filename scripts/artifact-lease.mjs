@@ -8,7 +8,7 @@ import { ensurePrivateDirectory, LeaseError, LeaseManager } from '../src/lease.m
 
 export const ARTIFACT_LEASE_ENV = 'OFFLOAD_ARTIFACT_LEASE';
 export const ARTIFACT_LEASE_PATHS = Object.freeze(['artifacts/**', 'coverage/**']);
-const MARKER_VERSION = 1;
+const MARKER_VERSION = 2;
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));

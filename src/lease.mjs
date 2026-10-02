@@ -420,6 +420,8 @@ function checkedManagedDirectory(path, platform) {
 export function ensurePrivateDirectory(path, platform = process.platform) {
   // Match JobStore's race-tolerant contract without following a link. The
   // retry handles another process creating the same managed directory.
+  const parent = lstatSync(dirname(path));
+  if (!parent.isDirectory() || parent.isSymbolicLink()) throw new LeaseError('lease storage directory is invalid', 'E_LEASE_STORAGE');
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       checkedManagedDirectory(path, platform);

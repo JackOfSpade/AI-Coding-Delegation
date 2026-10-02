@@ -5,9 +5,21 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, ut
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
-import { LeaseManager, getGitDir, readLeaseJson } from '../../src/lease.mjs';
+import { ensurePrivateDirectory, LeaseManager, getGitDir, readLeaseJson } from '../../src/lease.mjs';
 import { cleanup, tempDir } from './helpers.mjs';
 const nonce = (value) => `${value}-owner-nonce`.padEnd(16, 'x');
+
+test('private directory creation rejects a symlinked namespace intermediate', () => {
+  const root = tempDir();
+  const outside = tempDir();
+  try {
+    symlinkSync(outside, join(root, 'namespace'));
+    assert.throws(() => ensurePrivateDirectory(join(root, 'namespace', 'child')), /directory is invalid|ancestry is insecure/);
+  } finally {
+    cleanup(root);
+    cleanup(outside);
+  }
+});
 
 test('leases reject overlapping live scopes and allow disjoint jobs', () => {
   const gitDir = tempDir();

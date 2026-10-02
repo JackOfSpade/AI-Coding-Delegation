@@ -399,6 +399,34 @@ test('inherited artifact marker rejects a live lease with disjoint owned paths',
   );
 });
 
+test('a marker from another workspace acquires locally without inspecting the parent lease', async () => {
+  let acquired = 0;
+  const parentWorkspace = artifactLeaseRoot({ cwd: '/parent', temporaryRoot: '/tmp', realpath: (path) => path })
+    .split('/')
+    .at(-1);
+  const marker = formatArtifactLeaseMarker({
+    jobId: 'quality-artifacts-1234567890123456',
+    ownerNonce: '1234567890123456',
+    pid: 123,
+    workspace: parentWorkspace,
+  });
+  const lease = await acquireArtifactLease({
+    cwd: '/child',
+    environment: { OFFLOAD_ARTIFACT_LEASE: marker },
+    temporaryRoot: '/tmp',
+    realpath: (path) => path,
+    ensureDirectory: () => {},
+    createId: () => '1234567890123456',
+    makeLeaseManager: () => ({
+      list: () => assert.fail('must not inspect a foreign marker'),
+      acquire: () => (acquired += 1),
+      release: () => true,
+    }),
+  });
+  assert.equal(acquired, 1);
+  assert.equal(lease.inherited, false);
+});
+
 test('coverage publishers hold the shared artifact lease across both public renames', async () => {
   const events = [];
   let tail = Promise.resolve();
