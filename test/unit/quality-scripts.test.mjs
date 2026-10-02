@@ -16,6 +16,7 @@ import {
 import { analyzeStrictSkips, parseTapSkips } from '../run-suite.mjs';
 import { runCiTests } from '../../scripts/test-ci.mjs';
 import { coverageInvocation, runCoverage } from '../../scripts/run-coverage.mjs';
+import { npmInvocation, runReleaseCheck } from '../../scripts/release-check.mjs';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 
@@ -196,6 +197,7 @@ test('coverage runner publishes isolated reports only after a successful c8 exit
     remove: async (path, options) => calls.push(['rm', path, options]),
     unique: () => 'unique',
     pid: 123,
+    acquireLease: async () => ({ release: () => calls.push(['release-lease']) }),
   });
   assert.equal(code, 0);
   assert.deepEqual(calls[0], ['mkdtemp', '/tmp/offload-coverage-']);
@@ -255,6 +257,112 @@ test('coverage runner propagates c8 failure without reading or publishing genera
   });
   assert.equal(code, 7);
   assert.deepEqual(calls, [['rm', '/tmp/offload-coverage-fixed', { recursive: true, force: true }]]);
+});
+
+test('coverage publishers hold the shared artifact lease across both public renames', async () => {
+  const events = [];
+  let tail = Promise.resolve();
+  const acquireLease = async () => {
+    const previous = tail;
+    let unlock;
+    tail = new Promise((resolve) => {
+      unlock = resolve;
+    });
+    await previous;
+    return { release: () => unlock() };
+  };
+  let temporary = 0;
+  const run = () =>
+    runCoverage({
+      cwd: '/repo',
+      createTemporaryDirectory: async () => `/tmp/run-${(temporary += 1)}`,
+      spawnProcess: () => fakeCoverageChild(0),
+      checkAccess: async () => {},
+      makeDirectory: async () => {},
+      copy: async (source) => events.push(`copy:${source}`),
+      move: async (source, destination) => events.push(`rename:${source}:${destination}`),
+      remove: async () => {},
+      unique: () => 'unique',
+      acquireLease,
+    });
+  await Promise.all([run(), run()]);
+  const renames = events.filter((event) => event.startsWith('rename:'));
+  assert.deepEqual(renames, [
+    'rename:/repo/coverage/.coverage-summary.json.' + process.pid + '.unique.tmp:/repo/coverage/coverage-summary.json',
+    'rename:/repo/artifacts/.test-summary.json.' + process.pid + '.unique.tmp:/repo/artifacts/test-summary.json',
+    'rename:/repo/coverage/.coverage-summary.json.' + process.pid + '.unique.tmp:/repo/coverage/coverage-summary.json',
+    'rename:/repo/artifacts/.test-summary.json.' + process.pid + '.unique.tmp:/repo/artifacts/test-summary.json',
+  ]);
+  assert.ok(
+    events.indexOf('copy:/tmp/run-1/reports/coverage-summary.json') < events.indexOf('copy:/tmp/run-2/reports/coverage-summary.json'),
+  );
+});
+
+test('coverage publisher releases the artifact lease if a public rename fails', async () => {
+  const events = [];
+  let failOnce = true;
+  await assert.rejects(
+    runCoverage({
+      cwd: '/repo',
+      createTemporaryDirectory: async () => '/tmp/run-failure',
+      spawnProcess: () => fakeCoverageChild(0),
+      checkAccess: async () => {},
+      makeDirectory: async () => {},
+      copy: async (source, destination) => events.push(`copy:${source}:${destination}`),
+      move: async (_source, destination) => {
+        events.push(`rename:${_source}:${destination}`);
+        if (destination === '/repo/artifacts/test-summary.json' && failOnce) {
+          failOnce = false;
+          throw new Error('simulated rename failure');
+        }
+      },
+      remove: async () => {},
+      acquireLease: async () => ({ release: () => events.push('release') }),
+      unique: () => 'unique',
+      pid: 123,
+    }),
+    /simulated rename failure/,
+  );
+  assert.deepEqual(
+    events.filter((event) => event.startsWith('rename:')),
+    [
+      'rename:/repo/coverage/.coverage-summary.json.123.unique.tmp:/repo/coverage/coverage-summary.json',
+      'rename:/repo/artifacts/.test-summary.json.123.unique.tmp:/repo/artifacts/test-summary.json',
+      'rename:/repo/coverage/.coverage-summary.json.123.unique.tmp:/repo/coverage/coverage-summary.json',
+      'rename:/repo/artifacts/.test-summary.json.123.unique.tmp:/repo/artifacts/test-summary.json',
+    ],
+  );
+  assert.equal(events.at(-1), 'release');
+});
+
+test('release gate holds one artifact lease across cleanup and passes it to its coverage child', async () => {
+  const events = [];
+  const markerValue = '{"version":1,"jobId":"quality-artifacts-1234567890123456","ownerNonce":"1234567890123456","pid":1}';
+  const code = await runReleaseCheck({
+    cwd: '/repo',
+    environment: { PATH: '/bin', npm_execpath: '/deps/npm-cli.js' },
+    node: '/node',
+    acquireLease: async (options) => {
+      events.push(['acquire', options]);
+      return { markerValue, release: () => events.push(['release']) };
+    },
+    spawnProcess: (command, args, options) => {
+      events.push(['spawn', command, args, options]);
+      return fakeCoverageChild(0);
+    },
+  });
+  assert.equal(code, 0);
+  assert.deepEqual(events[0], [
+    'acquire',
+    { cwd: '/repo', environment: { PATH: '/bin', npm_execpath: '/deps/npm-cli.js' }, platform: process.platform, allowInherited: false },
+  ]);
+  assert.equal(events.filter(([event]) => event === 'spawn').length, 7);
+  assert.equal(events[1][3].env.OFFLOAD_ARTIFACT_LEASE, markerValue);
+  assert.deepEqual(events.at(-1), ['release']);
+  assert.deepEqual(npmInvocation({ phase: 'coverage', environment: { npm_execpath: '/deps/npm-cli.js' }, node: '/node' }), {
+    command: '/node',
+    args: ['/deps/npm-cli.js', 'run', 'coverage'],
+  });
 });
 
 test('package gate keeps the two plugin manifests semantically aligned and requires JSON skill frontmatter', () => {

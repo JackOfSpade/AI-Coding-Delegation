@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { posix, resolve, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { acquireArtifactLease } from './artifact-lease.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const c8Program = fileURLToPath(new URL('../node_modules/c8/bin/c8.js', import.meta.url));
@@ -59,6 +60,16 @@ async function publishFile(source, destination, { makeDirectory, copy, move, rem
   }
 }
 
+async function preserveFile(source, backup, { copy }) {
+  try {
+    await copy(source, backup);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
 /**
  * Preserve the public CI artifact paths, but do not expose a run's generated
  * data until c8 has completed and its threshold checks have passed.
@@ -79,6 +90,7 @@ export async function runCoverage({
   remove = rm,
   unique = randomUUID,
   pid = process.pid,
+  acquireLease = acquireArtifactLease,
 } = {}) {
   const paths = platform === 'win32' ? win32 : posix;
   const temporaryDirectory = await createTemporaryDirectory(paths.join(temporaryRoot, 'offload-coverage-'));
@@ -98,24 +110,45 @@ export async function runCoverage({
     const coverageSummary = paths.join(reportsDirectory, 'coverage-summary.json');
     // Check both generated inputs before replacing either public artifact.
     await Promise.all([checkAccess(coverageSummary), checkAccess(testSummary)]);
-    await publishFile(coverageSummary, paths.join(cwd, 'coverage', 'coverage-summary.json'), {
-      makeDirectory,
-      copy,
-      move,
-      remove,
-      unique,
-      paths,
-      pid,
-    });
-    await publishFile(testSummary, paths.join(cwd, 'artifacts', 'test-summary.json'), {
-      makeDirectory,
-      copy,
-      move,
-      remove,
-      unique,
-      paths,
-      pid,
-    });
+    const lease = await acquireLease({ cwd, environment, platform });
+    try {
+      const publicCoverage = paths.join(cwd, 'coverage', 'coverage-summary.json');
+      const publicTest = paths.join(cwd, 'artifacts', 'test-summary.json');
+      // If the second replacement fails, restore the pair observed before this
+      // lease. The lease makes that rollback exclusive; a crash releases the
+      // lease by PID death, and the next release starts with artifacts:clean.
+      const coverageBackup = paths.join(temporaryDirectory, 'prior-coverage-summary.json');
+      const testBackup = paths.join(temporaryDirectory, 'prior-test-summary.json');
+      const hadCoverage = await preserveFile(publicCoverage, coverageBackup, { copy });
+      const hadTest = await preserveFile(publicTest, testBackup, { copy });
+      const publishOptions = {
+        makeDirectory,
+        copy,
+        move,
+        remove,
+        unique,
+        paths,
+        pid,
+      };
+      let coveragePublished = false;
+      try {
+        await publishFile(coverageSummary, publicCoverage, publishOptions);
+        coveragePublished = true;
+        await publishFile(testSummary, publicTest, publishOptions);
+      } catch (error) {
+        if (coveragePublished) {
+          try {
+            if (hadCoverage) await publishFile(coverageBackup, publicCoverage, publishOptions);
+            else await remove(publicCoverage, { force: true });
+            if (hadTest) await publishFile(testBackup, publicTest, publishOptions);
+            else await remove(publicTest, { force: true });
+          } catch {}
+        }
+        throw error;
+      }
+    } finally {
+      lease.release();
+    }
     return 0;
   } finally {
     await remove(temporaryDirectory, { recursive: true, force: true });
