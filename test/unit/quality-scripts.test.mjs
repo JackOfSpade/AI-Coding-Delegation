@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { delimiter, join, resolve } from 'node:path';
+import { delimiter, join, posix, resolve, win32 } from 'node:path';
 import { checkSyntaxTargets, discoverSyntaxTargets } from '../../scripts/check-syntax.mjs';
 import {
   collectPackageTargets,
@@ -117,7 +117,8 @@ test('CI test launcher preserves a strict runner failure exit code', async () =>
   };
   const code = await runCiTests({
     cwd: '/test/root',
-    environment: { PATH: '/bin', OFFLOAD_TEST_SUMMARY_FILE: join(tmpdir(), 'offload-test-summary.json') },
+    environment: { PATH: '/bin', OFFLOAD_TEST_SUMMARY_FILE: '/tmp/offload-test-summary.json' },
+    platform: 'linux',
     makeDirectory: async (directory, options) => calls.push({ directory, options }),
     spawnProcess: (command, args, options) => {
       calls.push({ command, args, options });
@@ -126,7 +127,7 @@ test('CI test launcher preserves a strict runner failure exit code', async () =>
   });
   assert.equal(code, 1);
   assert.deepEqual(calls[0], {
-    directory: tmpdir(),
+    directory: '/tmp',
     options: { recursive: true },
   });
   assert.deepEqual(calls[1], {
@@ -134,7 +135,7 @@ test('CI test launcher preserves a strict runner failure exit code', async () =>
     args: ['test/run-suite.mjs', 'all'],
     options: {
       cwd: '/test/root',
-      env: { PATH: '/bin', OFFLOAD_REQUIRE_LOOPBACK: '1', OFFLOAD_TEST_SUMMARY_FILE: join(tmpdir(), 'offload-test-summary.json') },
+      env: { PATH: '/bin', OFFLOAD_REQUIRE_LOOPBACK: '1', OFFLOAD_TEST_SUMMARY_FILE: '/tmp/offload-test-summary.json' },
       stdio: 'inherit',
       windowsHide: true,
     },
@@ -143,10 +144,14 @@ test('CI test launcher preserves a strict runner failure exit code', async () =>
 
 test('CI test launcher publishes its private diagnostic summary under a reentrant artifact lease', async () => {
   const calls = [];
+  const temporaryDirectory = '/tmp/private-summary';
+  const summaryFile = posix.resolve(temporaryDirectory, 'test-summary.json');
+  const publishedSummary = posix.join('/repo', 'artifacts', 'test-summary.json');
   const code = await runCiTests({
     cwd: '/repo',
     environment: { PATH: '/bin' },
-    createTemporaryDirectory: async () => '/tmp/private-summary',
+    platform: 'linux',
+    createTemporaryDirectory: async () => temporaryDirectory,
     makeDirectory: async () => {},
     checkAccess: async (path) => calls.push(['access', path]),
     acquireLease: async (options) => {
@@ -159,11 +164,41 @@ test('CI test launcher publishes its private diagnostic summary under a reentran
   });
   assert.equal(code, 1);
   assert.deepEqual(calls, [
-    ['access', '/tmp/private-summary/test-summary.json'],
-    ['acquire', { cwd: '/repo', environment: { PATH: '/bin' } }],
-    ['publish', { source: '/tmp/private-summary/test-summary.json', destination: '/repo/artifacts/test-summary.json' }],
+    ['access', summaryFile],
+    ['acquire', { cwd: '/repo', environment: { PATH: '/bin' }, platform: 'linux' }],
+    ['publish', { source: summaryFile, destination: publishedSummary, platform: 'linux' }],
     ['release'],
-    ['rm', '/tmp/private-summary', { recursive: true, force: true }],
+    ['rm', temporaryDirectory, { recursive: true, force: true }],
+  ]);
+});
+
+test('CI test launcher uses injected Windows paths for its private summary publication', async () => {
+  const calls = [];
+  const temporaryDirectory = 'C:\\Temp\\private-summary';
+  const summaryFile = win32.resolve(temporaryDirectory, 'test-summary.json');
+  const publishedSummary = win32.join('C:\\repo', 'artifacts', 'test-summary.json');
+  const code = await runCiTests({
+    cwd: 'C:\\repo',
+    environment: { PATH: 'C:\\Windows\\System32' },
+    platform: 'win32',
+    createTemporaryDirectory: async () => temporaryDirectory,
+    makeDirectory: async () => {},
+    checkAccess: async (path) => calls.push(['access', path]),
+    acquireLease: async (options) => {
+      calls.push(['acquire', options]);
+      return { release: () => calls.push(['release']) };
+    },
+    publishFile: async (options) => calls.push(['publish', options]),
+    remove: async (path, options) => calls.push(['rm', path, options]),
+    spawnProcess: () => fakeCoverageChild(1),
+  });
+  assert.equal(code, 1);
+  assert.deepEqual(calls, [
+    ['access', summaryFile],
+    ['acquire', { cwd: 'C:\\repo', environment: { PATH: 'C:\\Windows\\System32' }, platform: 'win32' }],
+    ['publish', { source: summaryFile, destination: publishedSummary, platform: 'win32' }],
+    ['release'],
+    ['rm', temporaryDirectory, { recursive: true, force: true }],
   ]);
 });
 
@@ -172,6 +207,7 @@ test('artifact cleanup holds the shared lease while deleting both public roots',
   await cleanArtifacts({
     cwd: '/repo',
     environment: { OFFLOAD_ARTIFACT_LEASE: 'marker' },
+    platform: 'linux',
     acquireLease: async (options) => {
       calls.push(['acquire', options]);
       return { release: () => calls.push(['release']) };
@@ -179,9 +215,29 @@ test('artifact cleanup holds the shared lease while deleting both public roots',
     remove: async (path, options) => calls.push(['rm', path, options]),
   });
   assert.deepEqual(calls, [
-    ['acquire', { cwd: '/repo', environment: { OFFLOAD_ARTIFACT_LEASE: 'marker' } }],
-    ['rm', '/repo/artifacts', { recursive: true, force: true }],
-    ['rm', '/repo/coverage', { recursive: true, force: true }],
+    ['acquire', { cwd: '/repo', environment: { OFFLOAD_ARTIFACT_LEASE: 'marker' }, platform: 'linux' }],
+    ['rm', posix.join('/repo', 'artifacts'), { recursive: true, force: true }],
+    ['rm', posix.join('/repo', 'coverage'), { recursive: true, force: true }],
+    ['release'],
+  ]);
+});
+
+test('artifact cleanup uses injected Windows path semantics', async () => {
+  const calls = [];
+  await cleanArtifacts({
+    cwd: 'C:\\repo',
+    environment: { OFFLOAD_ARTIFACT_LEASE: 'marker' },
+    platform: 'win32',
+    acquireLease: async (options) => {
+      calls.push(['acquire', options]);
+      return { release: () => calls.push(['release']) };
+    },
+    remove: async (path, options) => calls.push(['rm', path, options]),
+  });
+  assert.deepEqual(calls, [
+    ['acquire', { cwd: 'C:\\repo', environment: { OFFLOAD_ARTIFACT_LEASE: 'marker' }, platform: 'win32' }],
+    ['rm', win32.join('C:\\repo', 'artifacts'), { recursive: true, force: true }],
+    ['rm', win32.join('C:\\repo', 'coverage'), { recursive: true, force: true }],
     ['release'],
   ]);
 });
@@ -234,10 +290,10 @@ test('coverage runner publishes isolated reports only after a successful c8 exit
   const calls = [];
   const code = await runCoverage({
     cwd: '/repo',
+    platform: 'linux',
     environment: { PATH: '/bin' },
     c8: '/deps/c8.js',
     node: '/node',
-    platform: 'linux',
     temporaryRoot: '/tmp',
     createTemporaryDirectory: async (prefix) => {
       calls.push(['mkdtemp', prefix]);
@@ -304,6 +360,7 @@ test('coverage runner propagates c8 failure without reading or publishing genera
   const calls = [];
   const code = await runCoverage({
     cwd: '/repo',
+    platform: 'linux',
     createTemporaryDirectory: async () => '/tmp/offload-coverage-fixed',
     spawnProcess: () => fakeCoverageChild(7),
     checkAccess: async () => calls.push('access'),
@@ -319,11 +376,18 @@ test('coverage runner propagates c8 failure without reading or publishing genera
 test('artifact lease root is a private stable hash of the canonical workspace on each platform', () => {
   const posixRoot = artifactLeaseRoot({
     cwd: '/workspace/alias',
+    platform: 'linux',
     temporaryRoot: '/tmp',
     realpath: () => '/workspace/actual',
   });
-  assert.equal(posixRoot, artifactLeaseRoot({ cwd: '/workspace/actual', temporaryRoot: '/tmp', realpath: (path) => path }));
-  assert.notEqual(posixRoot, artifactLeaseRoot({ cwd: '/workspace/other', temporaryRoot: '/tmp', realpath: (path) => path }));
+  assert.equal(
+    posixRoot,
+    artifactLeaseRoot({ cwd: '/workspace/actual', platform: 'linux', temporaryRoot: '/tmp', realpath: (path) => path }),
+  );
+  assert.notEqual(
+    posixRoot,
+    artifactLeaseRoot({ cwd: '/workspace/other', platform: 'linux', temporaryRoot: '/tmp', realpath: (path) => path }),
+  );
   assert.ok(posixRoot.startsWith('/tmp/offload-artifact-leases/'));
   assert.equal(posixRoot.includes('workspace'), false);
   assert.notEqual(
@@ -389,6 +453,7 @@ test('artifact lease gives release a fresh retry window after acquisition conten
   };
   const lease = await acquireArtifactLease({
     cwd: '/repo',
+    platform: 'linux',
     maxWaitMs: 10,
     retryMs: 1,
     now: () => clock,
@@ -412,7 +477,7 @@ test('inherited artifact marker rejects a live lease with disjoint owned paths',
     jobId: 'quality-artifacts-1234567890123456',
     ownerNonce: '1234567890123456',
     pid: 123,
-    workspace: artifactLeaseRoot({ cwd: '/repo', temporaryRoot: '/tmp', realpath: (path) => path })
+    workspace: artifactLeaseRoot({ cwd: '/repo', platform: 'linux', temporaryRoot: '/tmp', realpath: (path) => path })
       .split('/')
       .at(-1),
   };
@@ -420,6 +485,7 @@ test('inherited artifact marker rejects a live lease with disjoint owned paths',
     acquireArtifactLease({
       cwd: '/repo',
       environment: { OFFLOAD_ARTIFACT_LEASE: formatArtifactLeaseMarker(marker) },
+      platform: 'linux',
       temporaryRoot: '/tmp',
       realpath: (path) => path,
       ensureDirectory: () => {},
@@ -431,7 +497,7 @@ test('inherited artifact marker rejects a live lease with disjoint owned paths',
 
 test('a marker from another workspace acquires locally without inspecting the parent lease', async () => {
   let acquired = 0;
-  const parentWorkspace = artifactLeaseRoot({ cwd: '/parent', temporaryRoot: '/tmp', realpath: (path) => path })
+  const parentWorkspace = artifactLeaseRoot({ cwd: '/parent', platform: 'linux', temporaryRoot: '/tmp', realpath: (path) => path })
     .split('/')
     .at(-1);
   const marker = formatArtifactLeaseMarker({
@@ -443,6 +509,7 @@ test('a marker from another workspace acquires locally without inspecting the pa
   const lease = await acquireArtifactLease({
     cwd: '/child',
     environment: { OFFLOAD_ARTIFACT_LEASE: marker },
+    platform: 'linux',
     temporaryRoot: '/tmp',
     realpath: (path) => path,
     ensureDirectory: () => {},
@@ -473,6 +540,7 @@ test('coverage publishers hold the shared artifact lease across both public rena
   const run = () =>
     runCoverage({
       cwd: '/repo',
+      platform: 'linux',
       createTemporaryDirectory: async () => `/tmp/run-${(temporary += 1)}`,
       spawnProcess: () => fakeCoverageChild(0),
       checkAccess: async () => {},
@@ -502,6 +570,7 @@ test('coverage publisher releases the artifact lease if a public rename fails', 
   await assert.rejects(
     runCoverage({
       cwd: '/repo',
+      platform: 'linux',
       createTemporaryDirectory: async () => '/tmp/run-failure',
       spawnProcess: () => fakeCoverageChild(0),
       checkAccess: async () => {},

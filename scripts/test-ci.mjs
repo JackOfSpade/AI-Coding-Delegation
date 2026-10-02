@@ -2,13 +2,14 @@
 import { access, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { posix, resolve, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { acquireArtifactLease, publishArtifactFile } from './artifact-lease.mjs';
 
 export async function runCiTests({
   cwd = process.cwd(),
   environment = process.env,
+  platform = process.platform,
   makeDirectory = mkdir,
   createTemporaryDirectory = mkdtemp,
   checkAccess = access,
@@ -17,10 +18,13 @@ export async function runCiTests({
   publishFile = publishArtifactFile,
   spawnProcess = spawn,
 } = {}) {
+  const paths = platform === 'win32' ? win32 : posix;
   const explicitSummary = typeof environment.OFFLOAD_TEST_SUMMARY_FILE === 'string' && environment.OFFLOAD_TEST_SUMMARY_FILE.length > 0;
-  const temporaryDirectory = explicitSummary ? undefined : await createTemporaryDirectory(join(tmpdir(), 'offload-test-summary-'));
-  const summaryFile = resolve(explicitSummary ? environment.OFFLOAD_TEST_SUMMARY_FILE : join(temporaryDirectory, 'test-summary.json'));
-  await makeDirectory(dirname(summaryFile), { recursive: true });
+  const temporaryDirectory = explicitSummary ? undefined : await createTemporaryDirectory(paths.join(tmpdir(), 'offload-test-summary-'));
+  const summaryFile = paths.resolve(
+    explicitSummary ? environment.OFFLOAD_TEST_SUMMARY_FILE : paths.join(temporaryDirectory, 'test-summary.json'),
+  );
+  await makeDirectory(paths.dirname(summaryFile), { recursive: true });
   const child = spawnProcess(process.execPath, ['test/run-suite.mjs', 'all'], {
     cwd,
     env: {
@@ -39,9 +43,9 @@ export async function runCiTests({
     });
     if (explicitSummary) return exitCode;
     await checkAccess(summaryFile);
-    const lease = await acquireLease({ cwd, environment });
+    const lease = await acquireLease({ cwd, environment, platform });
     try {
-      await publishFile({ source: summaryFile, destination: join(cwd, 'artifacts', 'test-summary.json') });
+      await publishFile({ source: summaryFile, destination: paths.join(cwd, 'artifacts', 'test-summary.json'), platform });
     } finally {
       await lease.release();
     }
