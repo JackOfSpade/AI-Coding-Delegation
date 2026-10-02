@@ -285,21 +285,21 @@ export class LeaseManager {
   #retireInvalidLease(file) {
     let details;
     try {
-      details = lstatSync(file);
+      details = lstatSync(file, BIGINT_STAT_OPTIONS);
     } catch {
       return false;
     }
-    if (!details.isFile() || details.isSymbolicLink() || this.now() - details.mtimeMs <= this.staleMs) return false;
+    if (!details.isFile() || details.isSymbolicLink() || BigInt(this.now()) - details.mtimeMs <= BigInt(this.staleMs)) return false;
     return retireIfSame(file, identityFor(details));
   }
   #retireInvalidMutex(file) {
     let details;
     try {
-      details = lstatSync(file);
+      details = lstatSync(file, BIGINT_STAT_OPTIONS);
     } catch {
       return false;
     }
-    if (!details.isFile() || details.isSymbolicLink() || this.now() - details.mtimeMs <= this.mutexStaleMs) return false;
+    if (!details.isFile() || details.isSymbolicLink() || BigInt(this.now()) - details.mtimeMs <= BigInt(this.mutexStaleMs)) return false;
     return retireIfSame(file, identityFor(details));
   }
   #retireMutex({ nonce }) {
@@ -580,10 +580,13 @@ function retireIfSame(file, identity, verify = () => true) {
   }
   let details;
   try {
-    details = lstatSync(tombstone);
+    details = lstatSync(tombstone, BIGINT_STAT_OPTIONS);
   } catch {
     return false;
   }
+  // The checked reader supplies bigint file identities; preserve that
+  // precision through the post-rename comparison because NTFS file indexes
+  // need not be safely representable as JavaScript numbers.
   if (!sameIdentity(details, identity) || !verify(tombstone)) {
     // `rename` would overwrite a replacement created after the absence check.
     // A hard link has no-replace semantics, so it is safe to restore only when
