@@ -67,6 +67,10 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
       'POSIX root checks require POSIX metadata',
     ],
     [
+      'a missing integrity root is never recreated over a corrupt orphan job entry',
+      'Windows stores integrity roots in Credential Locker',
+    ],
+    [
       'path policy rejects broken symlink and lexical escapes before a write can follow them',
       'Windows symlink creation requires Developer Mode or elevation',
     ],
@@ -118,6 +122,10 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
     ],
     [
       'installer refuses a symlinked package artifact before altering a client',
+      'Windows symlink creation requires Developer Mode or elevation',
+    ],
+    [
+      'installer refuses a symlinked client config without reading, backing up, or replacing its target',
       'Windows symlink creation requires Developer Mode or elevation',
     ],
   ].map(([name, reason]) => Object.freeze({ name, reason })),
