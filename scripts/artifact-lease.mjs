@@ -72,7 +72,18 @@ export function artifactLeaseRoot({
 } = {}) {
   const paths = platform === 'win32' ? win32 : posix;
   const canonicalWorkspace = realpath(paths.resolve(cwd));
-  const digest = createHash('sha256').update(canonicalWorkspace, 'utf8').digest('hex');
+  // Windows permits differently cased and slash-spelled paths to name the
+  // same workspace. Keep that identity aligned with LeaseManager's Windows
+  // path semantics so those invocations serialize through one artifact root.
+  const workspaceIdentity =
+    platform === 'win32'
+      ? canonicalWorkspace
+          .replaceAll('/', '\\')
+          .replace(/^\\\\\?\\UNC\\/i, '\\\\')
+          .replace(/^\\\\\?\\/, '')
+          .toLowerCase()
+      : canonicalWorkspace;
+  const digest = createHash('sha256').update(workspaceIdentity, 'utf8').digest('hex');
   return paths.join(temporaryRoot, 'offload-artifact-leases', digest);
 }
 
