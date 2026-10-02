@@ -435,12 +435,17 @@ function packagedPluginVersion(artifacts) {
     .map((path) => {
       const content = artifacts[path];
       if (typeof content !== 'string') throw new Error(`missing packaged plugin artifact: ${path}`);
+      // The cache version identifies semantic plugin content, not the checkout
+      // platform. Git attributes keep the shipped artifacts LF-normalized, and
+      // this defensive normalization also keeps an existing CRLF checkout from
+      // rejecting its own otherwise canonical manifests before it can refresh.
+      const canonicalContent = content.replace(/\r\n?/g, '\n');
       if (path === 'plugin.json' || path === '.codex-plugin/plugin.json') {
-        const next = content.replace(/("version"\s*:\s*)"(?:[^"\\]|\\.)*"/, '$1"<cache-version>"');
-        if (next === content) throw new Error('packaged plugin manifest lacks a normalizable version');
+        const next = canonicalContent.replace(/("version"\s*:\s*)"(?:[^"\\]|\\.)*"/, '$1"<cache-version>"');
+        if (next === canonicalContent) throw new Error('packaged plugin manifest lacks a normalizable version');
         return `${path}\0${next}\0`;
       }
-      return `${path}\0${content}\0`;
+      return `${path}\0${canonicalContent}\0`;
     })
     .join('');
   const expected = `+codex.${digest(normalized).slice(0, 16)}`;

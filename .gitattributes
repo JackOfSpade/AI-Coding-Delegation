@@ -1,0 +1,5 @@
+# Plugin cache versions are derived from canonical text. Keep these distributed
+# artifacts byte-stable on Windows checkouts as well as POSIX checkouts.
+plugins/offload/plugin.json text eol=lf
+plugins/offload/.codex-plugin/plugin.json text eol=lf
+plugins/offload/skills/offload/SKILL.md text eol=lf

@@ -720,6 +720,53 @@ test('Codex desktop plugin installs from the personal marketplace without a dupl
   assert.doesNotMatch(await readFile(join(codexHome, 'config.toml'), 'utf8'), /mcp_servers\.offload/);
   await assert.rejects(access(join(home, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md')), /ENOENT/);
 });
+test('plugin content versions remain canonical when a Windows checkout supplies CRLF artifacts', async () => {
+  const product = await mkdtemp(`${tmpdir()}/offload-crlf-product-`);
+  const home = await mkdtemp(`${tmpdir()}/offload-crlf-home-`);
+  const executable = join(home, 'bin', 'codex');
+  try {
+    for (const path of ['bin', 'plugins', 'templates']) await cp(join(process.cwd(), path), join(product, path), { recursive: true });
+    for (const path of ['install.mjs', 'config.example.json']) await cp(join(process.cwd(), path), join(product, path));
+    for (const relativePath of ['plugin.json', '.codex-plugin/plugin.json', 'skills/offload/SKILL.md']) {
+      const path = join(product, 'plugins', 'offload', relativePath);
+      await writeFile(path, (await readFile(path, 'utf8')).replace(/\n/g, '\r\n'));
+    }
+    let installed = false;
+    const result = await rawInstall({
+      root: product,
+      home,
+      configHome: join(home, 'config'),
+      clients: ['codex'],
+      env: { PATH: dirname(executable) },
+      commandExists: async (path) => path === executable,
+      runCommand: (_command, args) => {
+        if (args.includes('list'))
+          return {
+            status: 0,
+            stdout: JSON.stringify({ installed: installed ? [{ name: 'offload', marketplace: 'personal', installed: true }] : [] }),
+          };
+        if (args.includes('add')) installed = true;
+        return { status: 0, stdout: '{}' };
+      },
+    });
+    assert.equal(result.plugin.active, true, JSON.stringify(result.plugin));
+    assert.equal(await readFile(join(home, 'plugins', 'offload', 'plugin.json'), 'utf8').then((text) => text.includes('\r\n')), true);
+  } finally {
+    await rm(product, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true });
+  }
+});
+test('Git pins canonical plugin artifacts to LF for cache-version stability', async () => {
+  const attributes = await readFile(join(process.cwd(), '.gitattributes'), 'utf8');
+  for (const path of [
+    'plugins/offload/plugin.json',
+    'plugins/offload/.codex-plugin/plugin.json',
+    'plugins/offload/skills/offload/SKILL.md',
+  ]) {
+    assert.match(attributes, new RegExp(`^${path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} text eol=lf$`, 'm'));
+    assert.doesNotMatch(await readFile(join(process.cwd(), path), 'utf8'), /\r\n?/);
+  }
+});
 test('a user-owned native Codex skill prevents plugin activation', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-plugin-`);
   const native = join(home, '.codex', 'skills', 'offload', 'SKILL.md');
