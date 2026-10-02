@@ -20,10 +20,34 @@ test('runner scrubs secrets and captures timeout', async () => {
     assert.equal(scrubbed[name], undefined);
   assert.equal(scrubbed.PATH, '/bin');
   assert.equal(scrubbed.LANG, 'C');
-  const command = process.platform === 'win32' ? 'echo ok & ping -n 3 127.0.0.1 >NUL' : 'printf ok; sleep 1';
-  // Leave enough scheduling headroom for a fresh Windows command process to
-  // emit its first bytes before the intentional timeout.
-  const result = await runCommand(command, { sandbox: false, timeoutMs: 250 });
+  // A synthetic child queues output before the timeout timer is installed.
+  // Microtasks run before timers, so this proves that output delivered before
+  // termination remains available without depending on OS process startup or
+  // scheduling headroom (which made the previous shell-based test flaky).
+  const child = new EventEmitter();
+  child.pid = Number.MAX_SAFE_INTEGER;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  let terminated = false;
+  child.kill = (signal) => {
+    if (terminated) return false;
+    terminated = true;
+    queueMicrotask(() => child.emit('close', null, signal));
+    return true;
+  };
+  const result = await runCommand('ignored by the synthetic child', {
+    sandbox: false,
+    timeoutMs: 1,
+    spawnProcess() {
+      queueMicrotask(() => child.stdout.emit('data', Buffer.from('ok')));
+      return child;
+    },
+    // Keep the synthetic termination host-independent: Windows uses taskkill,
+    // while POSIX falls back to the child kill after rejecting this impossible PID.
+    taskkill() {
+      return { status: child.kill('SIGTERM') ? 0 : 1 };
+    },
+  });
   assert.equal(result.timedOut, true);
   assert.match(result.stdout, /ok/);
 });
