@@ -195,8 +195,16 @@ async function pollStoredJob(id, path, predicate, attempts = 160) {
   await store.init(path);
   let job;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    job = await store.get(id);
-    if (predicate(job)) return job;
+    try {
+      job = await store.get(id);
+    } catch (error) {
+      // A child atomically replaces its durable record. The checked store
+      // reader intentionally fails closed if this poll catches that exact
+      // lstat/open race; polling should wait for the replacement rather than
+      // turn the safe transient into a platform-specific test failure.
+      if (!/^stored file is invalid or changed while (opening|reading)$/.test(error?.message || '')) throw error;
+    }
+    if (job && predicate(job)) return job;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return job;
