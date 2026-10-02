@@ -1,10 +1,19 @@
 #!/usr/bin/env node
 import { rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { acquireArtifactLease } from './artifact-lease.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
-// These are generated, ignored directories. Keeping cleanup here (rather than
-// a shell command) makes the CI preflight portable and limits deletion to the
-// exact project-local paths that artifact upload later reads.
-await Promise.all(['artifacts', 'coverage'].map((name) => rm(join(root, name), { recursive: true, force: true })));
+// These are generated, ignored directories. The shared lease prevents a
+// standalone reporter from publishing while release cleanup removes outputs.
+export async function cleanArtifacts({ cwd = root, environment = process.env, acquireLease = acquireArtifactLease, remove = rm } = {}) {
+  const lease = await acquireLease({ cwd, environment });
+  try {
+    await Promise.all(['artifacts', 'coverage'].map((name) => remove(join(cwd, name), { recursive: true, force: true })));
+  } finally {
+    await lease.release();
+  }
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await cleanArtifacts();

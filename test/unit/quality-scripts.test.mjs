@@ -15,6 +15,7 @@ import {
 } from '../../scripts/package-gate.mjs';
 import { analyzeStrictSkips, parseTapSkips } from '../run-suite.mjs';
 import { runCiTests } from '../../scripts/test-ci.mjs';
+import { cleanArtifacts } from '../../scripts/clean-artifacts.mjs';
 import { acquireArtifactLease, formatArtifactLeaseMarker } from '../../scripts/artifact-lease.mjs';
 import { coverageInvocation, runCoverage } from '../../scripts/run-coverage.mjs';
 import { npmInvocation, runReleaseCheck } from '../../scripts/release-check.mjs';
@@ -115,9 +116,8 @@ test('CI test launcher preserves a strict runner failure exit code', async () =>
     },
   };
   const code = await runCiTests({
-    summaryFile: join(tmpdir(), 'offload-test-summary.json'),
     cwd: '/test/root',
-    environment: { PATH: '/bin' },
+    environment: { PATH: '/bin', OFFLOAD_TEST_SUMMARY_FILE: join(tmpdir(), 'offload-test-summary.json') },
     makeDirectory: async (directory, options) => calls.push({ directory, options }),
     spawnProcess: (command, args, options) => {
       calls.push({ command, args, options });
@@ -125,7 +125,10 @@ test('CI test launcher preserves a strict runner failure exit code', async () =>
     },
   });
   assert.equal(code, 1);
-  assert.deepEqual(calls[0], { directory: tmpdir(), options: { recursive: true } });
+  assert.deepEqual(calls[0], {
+    directory: tmpdir(),
+    options: { recursive: true },
+  });
   assert.deepEqual(calls[1], {
     command: process.execPath,
     args: ['test/run-suite.mjs', 'all'],
@@ -136,6 +139,51 @@ test('CI test launcher preserves a strict runner failure exit code', async () =>
       windowsHide: true,
     },
   });
+});
+
+test('CI test launcher publishes its private diagnostic summary under a reentrant artifact lease', async () => {
+  const calls = [];
+  const code = await runCiTests({
+    cwd: '/repo',
+    environment: { PATH: '/bin' },
+    createTemporaryDirectory: async () => '/tmp/private-summary',
+    makeDirectory: async () => {},
+    checkAccess: async (path) => calls.push(['access', path]),
+    acquireLease: async (options) => {
+      calls.push(['acquire', options]);
+      return { release: () => calls.push(['release']) };
+    },
+    publishFile: async (options) => calls.push(['publish', options]),
+    remove: async (path, options) => calls.push(['rm', path, options]),
+    spawnProcess: () => fakeCoverageChild(1),
+  });
+  assert.equal(code, 1);
+  assert.deepEqual(calls, [
+    ['access', '/tmp/private-summary/test-summary.json'],
+    ['acquire', { cwd: '/repo', environment: { PATH: '/bin' } }],
+    ['publish', { source: '/tmp/private-summary/test-summary.json', destination: '/repo/artifacts/test-summary.json' }],
+    ['release'],
+    ['rm', '/tmp/private-summary', { recursive: true, force: true }],
+  ]);
+});
+
+test('artifact cleanup holds the shared lease while deleting both public roots', async () => {
+  const calls = [];
+  await cleanArtifacts({
+    cwd: '/repo',
+    environment: { OFFLOAD_ARTIFACT_LEASE: 'marker' },
+    acquireLease: async (options) => {
+      calls.push(['acquire', options]);
+      return { release: () => calls.push(['release']) };
+    },
+    remove: async (path, options) => calls.push(['rm', path, options]),
+  });
+  assert.deepEqual(calls, [
+    ['acquire', { cwd: '/repo', environment: { OFFLOAD_ARTIFACT_LEASE: 'marker' } }],
+    ['rm', '/repo/artifacts', { recursive: true, force: true }],
+    ['rm', '/repo/coverage', { recursive: true, force: true }],
+    ['release'],
+  ]);
 });
 
 function fakeCoverageChild(exitCode) {

@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
+import { acquireArtifactLease, publishArtifactFile } from './artifact-lease.mjs';
 
 // These hooks can execute while a consumer installs this package or while it is packed/published.
 // Keep the published artifact declarative: this project has an explicit installer instead.
@@ -184,7 +185,10 @@ export function collectPackageTargets(value, { field, allowBarePaths = false, co
   return { targets, invalid };
 }
 
-export async function packageGate(projectRoot = process.cwd()) {
+export async function packageGate(
+  projectRoot = process.cwd(),
+  { environment = process.env, acquireLease = acquireArtifactLease, publishFile = publishArtifactFile } = {},
+) {
   const root = resolve(projectRoot);
   // Validate lifecycle hooks before asking npm to inspect the package. Older
   // npm releases can still invoke `prepare` during `pack --dry-run` despite
@@ -264,8 +268,28 @@ export async function packageGate(projectRoot = process.cwd()) {
     invalidPackageTargets,
     pluginArtifacts,
   };
-  await mkdir(join(root, 'artifacts'), { recursive: true });
-  await writeFile(join(root, 'artifacts', 'package-contents.json'), `${JSON.stringify(summary, null, 2)}\n`, { mode: 0o600 });
+  const summaryDirectory = await mkdtemp(join(tmpdir(), 'offload-package-summary-'));
+  try {
+    const summaryFile = join(summaryDirectory, 'package-contents.json');
+    await writeFile(summaryFile, `${JSON.stringify(summary, null, 2)}\n`, { mode: 0o600 });
+    let lease;
+    try {
+      lease = await acquireLease({ cwd: root, environment });
+    } catch (error) {
+      // The gate is also used to validate disposable non-Git fixtures. Those
+      // have no shared artifact namespace to publish into.
+      if (!/not a git repository/i.test(String(error?.message))) throw error;
+    }
+    if (lease) {
+      try {
+        await publishFile({ source: summaryFile, destination: join(root, 'artifacts', 'package-contents.json') });
+      } finally {
+        await lease.release();
+      }
+    }
+  } finally {
+    await rm(summaryDirectory, { recursive: true, force: true });
+  }
   if (
     missing.length ||
     unexpected.length ||

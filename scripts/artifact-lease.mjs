@@ -1,5 +1,7 @@
 /** Serialize generated quality artifacts with the product's crash-recoverable lease store. */
 import { randomUUID } from 'node:crypto';
+import { copyFile, mkdir, rename, rm } from 'node:fs/promises';
+import { posix, win32 } from 'node:path';
 import { LeaseError, LeaseManager, getGitDir } from '../src/lease.mjs';
 
 export const ARTIFACT_LEASE_ENV = 'OFFLOAD_ARTIFACT_LEASE';
@@ -55,6 +57,29 @@ export function formatArtifactLeaseMarker({ jobId, ownerNonce, pid }) {
   const marker = { version: MARKER_VERSION, jobId, ownerNonce, pid };
   if (!validMarker(marker)) throw new Error('artifact lease marker is invalid');
   return JSON.stringify(marker);
+}
+
+/** Copy then same-directory rename one public generated artifact atomically. */
+export async function publishArtifactFile({
+  source,
+  destination,
+  platform = process.platform,
+  makeDirectory = mkdir,
+  copy = copyFile,
+  move = rename,
+  remove = rm,
+  unique = randomUUID,
+  pid = process.pid,
+} = {}) {
+  const paths = platform === 'win32' ? win32 : posix;
+  await makeDirectory(paths.dirname(destination), { recursive: true });
+  const staged = paths.join(paths.dirname(destination), `.${paths.basename(destination)}.${pid}.${unique()}.tmp`);
+  try {
+    await copy(source, staged);
+    await move(staged, destination);
+  } finally {
+    await remove(staged, { force: true });
+  }
 }
 
 /**
@@ -113,8 +138,7 @@ export async function acquireArtifactLease({
               return manager.release(marker.jobId, { ownerNonce: marker.ownerNonce });
             } catch (error) {
               if (!isRetryableReleaseError(error)) throw error;
-              if (now() >= releaseDeadline)
-                throw new Error(`timed out releasing generated-artifact lease after ${maxWaitMs}ms`);
+              if (now() >= releaseDeadline) throw new Error(`timed out releasing generated-artifact lease after ${maxWaitMs}ms`);
               await wait(Math.min(retryMs, Math.max(1, releaseDeadline - now())));
             }
           }
