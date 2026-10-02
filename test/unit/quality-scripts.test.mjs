@@ -146,7 +146,13 @@ function fakeCoverageChild(exitCode) {
 }
 
 test('coverage runner invokes c8 through Node with isolated cross-platform paths', () => {
-  const unix = coverageInvocation({ c8: '/deps/c8.js', cwd: '/repo', temporaryDirectory: '/tmp/offload-coverage-a', node: '/node' });
+  const unix = coverageInvocation({
+    c8: '/deps/c8.js',
+    cwd: '/repo',
+    temporaryDirectory: '/tmp/offload-coverage-a',
+    node: '/node',
+    platform: 'linux',
+  });
   assert.equal(unix.command, '/node');
   assert.deepEqual(unix.args.slice(0, 10), [
     '/deps/c8.js',
@@ -181,6 +187,7 @@ test('coverage runner publishes isolated reports only after a successful c8 exit
     environment: { PATH: '/bin' },
     c8: '/deps/c8.js',
     node: '/node',
+    platform: 'linux',
     temporaryRoot: '/tmp',
     createTemporaryDirectory: async (prefix) => {
       calls.push(['mkdtemp', prefix]);
