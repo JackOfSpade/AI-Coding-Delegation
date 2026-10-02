@@ -14,6 +14,7 @@ import {
   validateOffloadPluginArtifacts,
 } from '../../scripts/package-gate.mjs';
 import { analyzeStrictSkips, parseTapSkips } from '../run-suite.mjs';
+import { runCiTests } from '../../scripts/test-ci.mjs';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 
@@ -99,6 +100,38 @@ test('strict test runner parses TAP skips and rejects every skip outside the rev
   const result = analyzeStrictSkips(tap);
   assert.equal(result.loopbackSkips.length, 1);
   assert.deepEqual(result.unapprovedSkips, [{ number: 3, name: 'newly skipped regression', reason: 'oops' }]);
+});
+
+test('CI test launcher preserves a strict runner failure exit code', async () => {
+  const calls = [];
+  const child = {
+    once(event, listener) {
+      if (event === 'exit') queueMicrotask(() => listener(1));
+      return this;
+    },
+  };
+  const code = await runCiTests({
+    summaryFile: join(tmpdir(), 'offload-test-summary.json'),
+    cwd: '/test/root',
+    environment: { PATH: '/bin' },
+    makeDirectory: async (directory, options) => calls.push({ directory, options }),
+    spawnProcess: (command, args, options) => {
+      calls.push({ command, args, options });
+      return child;
+    },
+  });
+  assert.equal(code, 1);
+  assert.deepEqual(calls[0], { directory: tmpdir(), options: { recursive: true } });
+  assert.deepEqual(calls[1], {
+    command: process.execPath,
+    args: ['test/run-suite.mjs', 'all'],
+    options: {
+      cwd: '/test/root',
+      env: { PATH: '/bin', OFFLOAD_REQUIRE_LOOPBACK: '1', OFFLOAD_TEST_SUMMARY_FILE: join(tmpdir(), 'offload-test-summary.json') },
+      stdio: 'inherit',
+      windowsHide: true,
+    },
+  });
 });
 
 test('package gate keeps the two plugin manifests semantically aligned and requires JSON skill frontmatter', () => {
