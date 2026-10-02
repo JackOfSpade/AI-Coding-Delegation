@@ -104,13 +104,18 @@ export async function acquireArtifactLease({
         markerValue: formatArtifactLeaseMarker(marker),
         inherited: false,
         release: async () => {
+          // Acquisition can legitimately consume its entire contention window.
+          // Releasing is an independent operation, so it needs its own window
+          // to retry a transient lease-store mutex conflict.
+          const releaseDeadline = now() + maxWaitMs;
           for (;;) {
             try {
               return manager.release(marker.jobId, { ownerNonce: marker.ownerNonce });
             } catch (error) {
               if (!isRetryableReleaseError(error)) throw error;
-              if (now() >= deadline) throw new Error(`timed out releasing generated-artifact lease after ${maxWaitMs}ms`);
-              await wait(Math.min(retryMs, Math.max(1, deadline - now())));
+              if (now() >= releaseDeadline)
+                throw new Error(`timed out releasing generated-artifact lease after ${maxWaitMs}ms`);
+              await wait(Math.min(retryMs, Math.max(1, releaseDeadline - now())));
             }
           }
         },

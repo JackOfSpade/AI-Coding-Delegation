@@ -268,7 +268,7 @@ test('coverage runner propagates c8 failure without reading or publishing genera
   assert.deepEqual(calls, [['rm', '/tmp/offload-coverage-fixed', { recursive: true, force: true }]]);
 });
 
-test('artifact lease retries transient lease mutex contention while acquiring and releasing', async () => {
+test('artifact lease gives release a fresh retry window after acquisition contention', async () => {
   let clock = 0;
   let acquires = 0;
   let releases = 0;
@@ -288,8 +288,9 @@ test('artifact lease retries transient lease mutex contention while acquiring an
     maxWaitMs: 10,
     retryMs: 1,
     now: () => clock,
-    wait: async (milliseconds) => {
-      clock += milliseconds;
+    wait: async () => {
+      // Make acquisition consume its entire window. Release must not reuse it.
+      clock = 10;
     },
     createId: () => '1234567890123456',
     getGitDirectory: () => '/git',
