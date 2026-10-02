@@ -31,7 +31,10 @@ jobs:
           NPM_CONFIG_IGNORE_SCRIPTS: 'true'
         run: |
           set -euo pipefail
+          pack_directory="$(mktemp -d "$RUNNER_TEMP/offload-codex-pack.XXXXXX")"
+          cd "$pack_directory"
           package="$(npm pack "@openai/codex@${CODEX_VERSION}" --ignore-scripts --json | node -e 'let text = ""; process.stdin.on("data", (chunk) => (text += chunk)); process.stdin.on("end", () => process.stdout.write(JSON.parse(text)[0].filename));')"
+          # This pins the primary CLI tarball; npm resolves its runtime dependencies.
           actual="sha512-$(openssl dgst -sha512 -binary "$package" | base64 -w 0)"
           test "$actual" = "$CODEX_TARBALL_INTEGRITY"
           install_prefix="$RUNNER_TEMP/offload-codex"
