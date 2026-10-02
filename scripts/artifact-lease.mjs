@@ -1,8 +1,10 @@
 /** Serialize generated quality artifacts with the product's crash-recoverable lease store. */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { copyFile, mkdir, rename, rm } from 'node:fs/promises';
+import { mkdirSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { posix, win32 } from 'node:path';
-import { LeaseError, LeaseManager, getGitDir } from '../src/lease.mjs';
+import { LeaseError, LeaseManager } from '../src/lease.mjs';
 
 export const ARTIFACT_LEASE_ENV = 'OFFLOAD_ARTIFACT_LEASE';
 export const ARTIFACT_LEASE_PATHS = Object.freeze(['artifacts/**', 'coverage/**']);
@@ -59,6 +61,22 @@ export function formatArtifactLeaseMarker({ jobId, ownerNonce, pid }) {
   return JSON.stringify(marker);
 }
 
+/** A private temp root stable for one canonical workspace, without revealing its path. */
+export function artifactLeaseRoot({
+  cwd = process.cwd(),
+  platform = process.platform,
+  temporaryRoot = tmpdir(),
+  realpath = realpathSync,
+} = {}) {
+  const paths = platform === 'win32' ? win32 : posix;
+  const canonicalWorkspace = realpath(paths.resolve(cwd));
+  // Windows canonical paths remain case-insensitive even when the filesystem
+  // preserves spelling. POSIX keeps its byte-sensitive pathname identity.
+  const identity = platform === 'win32' ? canonicalWorkspace.toLowerCase() : canonicalWorkspace;
+  const digest = createHash('sha256').update(identity, 'utf8').digest('hex');
+  return paths.join(temporaryRoot, 'offload-artifact-leases', digest);
+}
+
 /** Copy then same-directory rename one public generated artifact atomically. */
 export async function publishArtifactFile({
   source,
@@ -98,12 +116,15 @@ export async function acquireArtifactLease({
   wait = sleep,
   createId = randomUUID,
   pid = process.pid,
-  getGitDirectory = getGitDir,
+  temporaryRoot = tmpdir(),
+  realpath = realpathSync,
+  makeDirectory = mkdirSync,
   makeLeaseManager = (options) => new LeaseManager(options),
 } = {}) {
   if (!Number.isSafeInteger(maxWaitMs) || maxWaitMs < 0 || !Number.isSafeInteger(retryMs) || retryMs < 1)
     throw new TypeError('artifact lease wait settings are invalid');
-  const gitDir = getGitDirectory(cwd, { platform });
+  const gitDir = artifactLeaseRoot({ cwd, platform, temporaryRoot, realpath });
+  makeDirectory(gitDir, { recursive: true, mode: 0o700 });
   const manager = makeLeaseManager({ gitDir, platform });
   const inherited = environment?.[ARTIFACT_LEASE_ENV];
   if (allowInherited && inherited !== undefined) {

@@ -16,7 +16,7 @@ import {
 import { analyzeStrictSkips, parseTapSkips } from '../run-suite.mjs';
 import { runCiTests } from '../../scripts/test-ci.mjs';
 import { cleanArtifacts } from '../../scripts/clean-artifacts.mjs';
-import { acquireArtifactLease, formatArtifactLeaseMarker } from '../../scripts/artifact-lease.mjs';
+import { acquireArtifactLease, artifactLeaseRoot, formatArtifactLeaseMarker } from '../../scripts/artifact-lease.mjs';
 import { coverageInvocation, runCoverage } from '../../scripts/run-coverage.mjs';
 import { npmInvocation, runReleaseCheck } from '../../scripts/release-check.mjs';
 import { LeaseError } from '../../src/lease.mjs';
@@ -316,6 +316,32 @@ test('coverage runner propagates c8 failure without reading or publishing genera
   assert.deepEqual(calls, [['rm', '/tmp/offload-coverage-fixed', { recursive: true, force: true }]]);
 });
 
+test('artifact lease root is a private stable hash of the canonical workspace on each platform', () => {
+  const posixRoot = artifactLeaseRoot({
+    cwd: '/workspace/alias',
+    temporaryRoot: '/tmp',
+    realpath: () => '/workspace/actual',
+  });
+  assert.equal(posixRoot, artifactLeaseRoot({ cwd: '/workspace/actual', temporaryRoot: '/tmp', realpath: (path) => path }));
+  assert.notEqual(posixRoot, artifactLeaseRoot({ cwd: '/workspace/other', temporaryRoot: '/tmp', realpath: (path) => path }));
+  assert.ok(posixRoot.startsWith('/tmp/offload-artifact-leases/'));
+  assert.equal(posixRoot.includes('workspace'), false);
+  assert.equal(
+    artifactLeaseRoot({
+      cwd: 'C:\\REPO',
+      platform: 'win32',
+      temporaryRoot: 'C:\\Temp',
+      realpath: (path) => path,
+    }),
+    artifactLeaseRoot({
+      cwd: 'c:\\repo',
+      platform: 'win32',
+      temporaryRoot: 'C:\\Temp',
+      realpath: (path) => path,
+    }),
+  );
+});
+
 test('artifact lease gives release a fresh retry window after acquisition contention', async () => {
   let clock = 0;
   let acquires = 0;
@@ -341,7 +367,9 @@ test('artifact lease gives release a fresh retry window after acquisition conten
       clock = 10;
     },
     createId: () => '1234567890123456',
-    getGitDirectory: () => '/git',
+    temporaryRoot: '/tmp',
+    realpath: (path) => path,
+    makeDirectory: () => {},
     makeLeaseManager: () => manager,
   });
   assert.equal(acquires, 2);
@@ -355,7 +383,9 @@ test('inherited artifact marker rejects a live lease with disjoint owned paths',
     acquireArtifactLease({
       cwd: '/repo',
       environment: { OFFLOAD_ARTIFACT_LEASE: formatArtifactLeaseMarker(marker) },
-      getGitDirectory: () => '/git',
+      temporaryRoot: '/tmp',
+      realpath: (path) => path,
+      makeDirectory: () => {},
       makeLeaseManager: () => ({ list: () => [{ ...marker, ownedPaths: ['src/**'] }] }),
     }),
     /does not name a live lease/,
