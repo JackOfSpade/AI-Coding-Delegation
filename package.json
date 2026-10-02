@@ -13,7 +13,6 @@
     "plugins",
     "install.mjs",
     "config.example.json",
-    "README.md",
     "DESIGN.md",
     "docs/SECURITY.md",
     "docs/TESTING.md",
