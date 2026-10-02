@@ -128,7 +128,21 @@ export function gitPatchApplier(repoPath, patch, { reverse, check }) {
   // A reverse check is compulsory even when application was requested.
   const env = snapshotGitEnv();
   const hooks = process.platform === 'win32' ? 'NUL' : '/dev/null';
-  const hardening = ['-C', repoPath, '-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${hooks}`];
+  // Apply exactly the byte-oriented tree semantics used by snapshots. In
+  // particular, a host-wide core.autocrlf setting must not rewrite a raw
+  // stored patch between apply and reverse/reconciliation on Windows.
+  const hardening = [
+    '-C',
+    repoPath,
+    '-c',
+    'core.fsmonitor=false',
+    '-c',
+    `core.hooksPath=${hooks}`,
+    '-c',
+    'core.autocrlf=false',
+    '-c',
+    'core.eol=lf',
+  ];
   execFileSync('git', [...hardening, 'apply', ...(reverse ? ['-R'] : []), '--check'], {
     input: patch,
     encoding: 'buffer',

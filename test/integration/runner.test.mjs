@@ -21,7 +21,9 @@ test('runner scrubs secrets and captures timeout', async () => {
   assert.equal(scrubbed.PATH, '/bin');
   assert.equal(scrubbed.LANG, 'C');
   const command = process.platform === 'win32' ? 'echo ok & ping -n 3 127.0.0.1 >NUL' : 'printf ok; sleep 1';
-  const result = await runCommand(command, { sandbox: false, timeoutMs: 40 });
+  // Leave enough scheduling headroom for a fresh Windows command process to
+  // emit its first bytes before the intentional timeout.
+  const result = await runCommand(command, { sandbox: false, timeoutMs: 250 });
   assert.equal(result.timedOut, true);
   assert.match(result.stdout, /ok/);
 });
@@ -140,7 +142,8 @@ test('Windows policy-only runner uses cmd.exe, a scrubbed profile, and taskkill 
   assert.equal(result.code, 0);
   assert.match(result.stdout, /ok/);
   assert.equal(invocation.command, 'cmd.exe');
-  assert.deepEqual(invocation.args, ['/d', '/s', '/c', 'echo ok']);
+  assert.deepEqual(invocation.args, ['/d', '/s', '/c', 'offload-command.cmd']);
+  assert.equal(invocation.options.env.OFFLOAD_COMMAND_CWD, process.cwd());
   assert.equal(invocation.options.detached, false);
   assert.equal(invocation.options.env.DEEPSEEK_API_KEY, undefined);
   assert.equal(invocation.options.env.USERPROFILE, invocation.options.env.HOME);

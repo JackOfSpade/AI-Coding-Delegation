@@ -1,10 +1,11 @@
 import { chmodSync, lstatSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { diffTreeFiles, diffTrees, git, snapshotGitEnv, snapshotWorkingTree } from './git-snapshot.mjs';
 
 const TREE_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+const nativeRealpath = realpathSync.native || realpathSync;
 
 /** A stable, caller-actionable error boundary for isolated worktree operations. */
 export class WorktreeIsolationError extends Error {
@@ -338,7 +339,7 @@ function canonicalRepo(repoPath) {
     throw new WorktreeIsolationError('repoPath must be inside a Git working tree', 'E_WORKTREE_REPO');
   }
   try {
-    return realpathSync(topLevel);
+    return nativeRealpath(topLevel);
   } catch {
     throw new WorktreeIsolationError('Git repository path cannot be resolved', 'E_WORKTREE_REPO');
   }
@@ -428,7 +429,7 @@ function makePrivateRoot(tempRoot, mkdtemp) {
   const supplied = resolve(root);
   // Never delete a path merely because an injected/broken allocator returned
   // it. It first has to prove it is exactly our direct, private child.
-  if (!isChildOf(base, supplied) || dirname(supplied) !== base || !/^offload-worktree-[A-Za-z0-9_-]+$/.test(basename(supplied)))
+  if (!isChildOf(base, supplied) || !samePath(dirname(supplied), base) || !/^offload-worktree-[A-Za-z0-9_-]+$/.test(basename(supplied)))
     throw new WorktreeIsolationError('mkdtemp returned an unsafe private directory', 'E_WORKTREE_TEMP');
   let details;
   let canonicalRoot;
@@ -437,7 +438,7 @@ function makePrivateRoot(tempRoot, mkdtemp) {
     details = lstatSync(supplied);
     if (!details.isDirectory() || details.isSymbolicLink()) throw new Error('not a real directory');
     if (typeof process.getuid === 'function' && details.uid !== process.getuid()) throw new Error('wrong owner');
-    canonicalRoot = realpathSync(supplied);
+    canonicalRoot = nativeRealpath(supplied);
     if (!samePath(canonicalRoot, supplied)) throw new Error('resolved path changed');
     provedPrivate = true;
     // mkdtemp is expected to create a private directory. Enforce that
@@ -458,7 +459,7 @@ function canonicalTempRoot(tempRoot) {
   if (typeof tempRoot !== 'string' || !tempRoot || !isAbsolute(tempRoot) || /[\0-\x1f\x7f]/.test(tempRoot))
     throw new WorktreeIsolationError('tempRoot must be an absolute server-controlled directory', 'E_WORKTREE_TEMP');
   try {
-    return realpathSync(tempRoot);
+    return nativeRealpath(tempRoot);
   } catch {
     throw new WorktreeIsolationError('tempRoot must be an existing server-controlled directory', 'E_WORKTREE_TEMP');
   }
@@ -471,7 +472,7 @@ function privateWorkspaceLocation(workspacePath, tempRoot, { requireExisting }) 
   let canonicalWorkspace = supplied;
   if (requireExisting) {
     try {
-      canonicalWorkspace = realpathSync(supplied);
+      canonicalWorkspace = nativeRealpath(supplied);
     } catch {
       throw new WorktreeIsolationError('workspacePath no longer exists', 'E_WORKTREE_RECOVERY');
     }
@@ -480,7 +481,7 @@ function privateWorkspaceLocation(workspacePath, tempRoot, { requireExisting }) 
   if (
     !samePath(join(privateRoot, 'workspace'), canonicalWorkspace) ||
     !isChildOf(base, privateRoot) ||
-    dirname(privateRoot) !== base ||
+    !samePath(dirname(privateRoot), base) ||
     !/^offload-worktree-[A-Za-z0-9_-]+$/.test(basename(privateRoot))
   ) {
     throw new WorktreeIsolationError('workspacePath is outside the private offload worktree layout', 'E_WORKTREE_RECOVERY');
@@ -678,14 +679,24 @@ function commonGitDir(repoPath) {
     throw new WorktreeIsolationError('Could not determine Git common directory', 'E_WORKTREE_RECOVERY');
   }
   try {
-    return realpathSync(resolve(repoPath, common));
+    return nativeRealpath(resolve(repoPath, common));
   } catch {
     throw new WorktreeIsolationError('Git common directory cannot be resolved', 'E_WORKTREE_RECOVERY');
   }
 }
 function isChildOf(parent, child) {
-  const rel = relative(parent, resolve(child));
-  return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+  // Canonical existing roots are preferred, but recovery also needs a safe
+  // lexical answer for a missing child. Normalize the Windows slash/case
+  // representation before the component-prefix check.
+  const normalized = (value) => {
+    const absolute = resolve(value)
+      .replaceAll('\\', '/')
+      .replace(/^\/\/?\?\//, '');
+    return process.platform === 'win32' ? absolute.toLowerCase() : absolute;
+  };
+  const base = normalized(parent);
+  const target = normalized(child);
+  return target.startsWith(base.endsWith('/') ? base : `${base}/`);
 }
 export function sameWorktreePath(left, right, { platform = process.platform, realpath = realpathSync.native || realpathSync } = {}) {
   const canonical = (value) => {
@@ -747,7 +758,7 @@ function capturePrivateRoot(privateRoot, base) {
     details = lstatSync(resolvedRoot);
     if (!details.isDirectory() || details.isSymbolicLink()) throw new Error('not a directory');
     if (typeof process.getuid === 'function' && details.uid !== process.getuid()) throw new Error('wrong owner');
-    canonical = realpathSync(resolvedRoot);
+    canonical = nativeRealpath(resolvedRoot);
   } catch {
     throw new WorktreeIsolationError('private worktree root changed or is unsafe', 'E_WORKTREE_REMOVE');
   }

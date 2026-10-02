@@ -1,6 +1,6 @@
 /** Dependency-free, scrubbed command execution with best-effort OS sandboxing. */
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtemp, realpath, rm } from 'node:fs/promises';
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep, relative, isAbsolute } from 'node:path';
 import { globToRegExp, normalizePath } from './glob.mjs';
@@ -219,6 +219,14 @@ function capture(limit) {
     },
   };
 }
+function commandScript(command, platform) {
+  // The command itself is deliberately data written to a private script, not
+  // an argument concatenated into a shell launch. The working directory is
+  // expanded by the interpreter from an environment value and remains quoted
+  // even when its path contains shell metacharacters.
+  if (platform === 'win32') return `@echo off\r\ncd /d "%OFFLOAD_COMMAND_CWD%" || exit /b 1\r\n${command}\r\n`;
+  return `cd -- "$OFFLOAD_COMMAND_CWD" || exit 1\n${command}\n`;
+}
 /** Resolves only once process close proves the process group leader has exited. */
 export async function runCommand(command, options = {}) {
   if (typeof command !== 'string' || !command.trim()) throw new TypeError('command must be a non-empty string');
@@ -247,8 +255,6 @@ export async function runCommand(command, options = {}) {
   const suppliedComspec = options.comspec;
   if (platform === 'win32' && suppliedComspec && String(suppliedComspec).split(/[\\/]/).at(-1).toLowerCase() !== 'cmd.exe')
     throw new TypeError('Windows command interpreter must be cmd.exe');
-  let executable = platform === 'win32' ? 'cmd.exe' : '/bin/sh';
-  let args = platform === 'win32' ? ['/d', '/s', '/c', command] : ['-lc', command];
   let sandbox = 'policy-only';
   if (options.requireSandbox !== undefined && typeof options.requireSandbox !== 'boolean')
     throw new TypeError('requireSandbox must be boolean');
@@ -277,25 +283,10 @@ export async function runCommand(command, options = {}) {
   if (canSandbox) {
     // Validate before creating a temp directory so a rejection has no residue.
     dir = await mkdtemp(join(tmpdir(), 'offload-sandbox-'));
-    executable = 'sandbox-exec';
-    args = [
-      '-p',
-      macosProfile({
-        repoPath: cwd,
-        gitDir: options.gitDir,
-        writablePaths: options.writablePaths || [],
-        denyRead: options.denyRead || [],
-        denyWrite: options.denyWrite || DEFAULT_DENY_WRITE,
-        tempPath: options.tempPath || dir,
-        cachePaths: options.cachePaths || [],
-        allowNetwork: options.allowNetwork === true,
-      }),
-      '/bin/sh',
-      '-lc',
-      command,
-    ];
     sandbox = 'macos';
   } else dir = await mkdtemp(join(tmpdir(), 'offload-run-'));
+  const scriptName = platform === 'win32' ? 'offload-command.cmd' : 'offload-command.sh';
+  const scriptPath = join(dir, scriptName);
   const stdout = capture(Math.floor(cap / 2)),
     stderr = capture(Math.ceil(cap / 2));
   const started = Date.now();
@@ -303,6 +294,24 @@ export async function runCommand(command, options = {}) {
   let timedOut = false;
   let cancelled = false;
   try {
+    await writeFile(scriptPath, commandScript(command, platform), { mode: 0o700 });
+    const environment = { ...scrubEnv(options.env, { home: dir, temp: dir, platform }), OFFLOAD_COMMAND_CWD: cwd };
+    const sandboxProfile =
+      sandbox === 'macos'
+        ? macosProfile({
+            repoPath: cwd,
+            gitDir: options.gitDir,
+            writablePaths: options.writablePaths || [],
+            denyRead: options.denyRead || [],
+            denyWrite: options.denyWrite || DEFAULT_DENY_WRITE,
+            // The private script directory must be readable by the sandboxed
+            // interpreter. A separately requested temporary directory remains
+            // an explicit cache capability rather than replacing that root.
+            tempPath: dir,
+            cachePaths: [...(options.cachePaths || []), ...(options.tempPath ? [options.tempPath] : [])],
+            allowNetwork: options.allowNetwork === true,
+          })
+        : undefined;
     const result = await new Promise((done, fail) => {
       let timer;
       let ultimate;
@@ -342,13 +351,22 @@ export async function runCommand(command, options = {}) {
         ultimate ||= setTimeout(() => settle(done, { code: null, signal: 'SIGKILL' }), 1_750);
       };
       const abort = () => terminate('cancel');
-      child = (options.spawnProcess || spawn)(executable, args, {
-        cwd,
-        env: scrubEnv(options.env, { home: dir, temp: dir, platform }),
+      const spawnOptions = {
+        // A fixed, private launch directory prevents an uncontrolled absolute
+        // path from becoming an interpreter argument or current directory.
+        cwd: dir,
+        env: environment,
         detached: platform !== 'win32',
         windowsHide: platform === 'win32',
         stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      };
+      const spawnProcess = options.spawnProcess || spawn;
+      // Keep each interpreter launch syntactically separate. Besides making
+      // the trust boundary obvious, this lets static analysis prove that the
+      // shell only receives the fixed private script name.
+      if (sandbox === 'macos') child = spawnProcess('sandbox-exec', ['-p', sandboxProfile, '/bin/sh', scriptName], spawnOptions);
+      else if (platform === 'win32') child = spawnProcess('cmd.exe', ['/d', '/s', '/c', scriptName], spawnOptions);
+      else child = spawnProcess('/bin/sh', [scriptName], spawnOptions);
       child.stdout.on('data', (value) => stdout.add(value));
       child.stderr.on('data', (value) => stderr.add(value));
       timer = setTimeout(() => terminate('timeout'), timeoutMs);

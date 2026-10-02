@@ -15,7 +15,7 @@ import {
   readSync,
   realpathSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, posix, win32 } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { normalizePath, pathsOverlap } from './glob.mjs';
@@ -336,7 +336,10 @@ export function getGitDir(repoPath, { execFile = execFileSync, env = process.env
     timeout: 30_000,
     maxBuffer: 1024 * 1024,
   }).trim();
-  return resolve(repoPath, value);
+  // Tests and callers can explicitly select the Git platform; do not let the
+  // host's path implementation reinterpret a POSIX fixture on Windows.
+  const paths = platform === 'win32' ? win32 : posix;
+  return paths.resolve(repoPath, value);
 }
 function defaultPidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;

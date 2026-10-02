@@ -3,6 +3,7 @@ import { constants } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { redact as foundationRedact, redactText } from './redact.mjs';
 import { validJobId } from './job-manager.mjs';
 
@@ -27,6 +28,7 @@ const PUBLICATION_ARTIFACTS = new Set(['patch.diff', 'revert.diff', 'report.md']
 const LOCK_STALE_MS = 120_000;
 const LOCK_WAIT_MS = 25;
 const LOCK_TIMEOUT_MS = 120_000;
+const WINDOWS_RENAME_ATTEMPTS = 8;
 const validId = validJobId;
 const lifecycleIdentity = (job) => ({
   status: job?.status,
@@ -35,6 +37,24 @@ const lifecycleIdentity = (job) => ({
   runnerPid: job?.runnerPid,
   runnerHeartbeatAt: job?.runnerHeartbeatAt,
 });
+
+/**
+ * Antivirus/indexing can briefly hold a just-read destination on Windows.
+ * A same-directory replacement remains atomic; retry only those transient
+ * sharing failures and leave every other publication error fail-closed.
+ */
+export async function atomicRename(path, destination, { platform = process.platform, renameFile = rename, delay = sleep } = {}) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await renameFile(path, destination);
+      return;
+    } catch (error) {
+      const transient = platform === 'win32' && ['EPERM', 'EACCES', 'EBUSY'].includes(error?.code);
+      if (!transient || attempt >= WINDOWS_RENAME_ATTEMPTS - 1) throw error;
+      await delay(Math.min(10 * 2 ** attempt, 160));
+    }
+  }
+}
 
 // JSON.stringify is deliberately not used as the canonical representation:
 // object insertion order can otherwise turn an equivalent durable record into
@@ -366,7 +386,7 @@ export class JobStore {
     try {
       await writeFile(tmp, encoded, { mode: 0o600 });
       await chmod(tmp, 0o600);
-      await rename(tmp, path);
+      await atomicRename(tmp, path, { platform: this.platform });
       return sealed;
     } finally {
       await rm(tmp, { force: true }).catch(() => {});
@@ -1077,7 +1097,7 @@ export class JobStore {
         (!before && current)
       )
         throw new Error('transcript file is invalid');
-      await rename(tmp, path);
+      await atomicRename(tmp, path, { platform: this.platform });
     } finally {
       await rm(tmp, { force: true }).catch(() => {});
     }

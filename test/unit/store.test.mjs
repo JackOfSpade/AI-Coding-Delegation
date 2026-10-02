@@ -5,10 +5,41 @@ import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writ
 import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { JobStore, readStoredBytes, readStoredFile } from '../../src/store.mjs';
+import { JobStore, atomicRename, readStoredBytes, readStoredFile } from '../../src/store.mjs';
 import { AgentContext } from '../../src/agent/context.mjs';
 import { getGitDir } from '../../src/lease.mjs';
 import { cleanup, tempDir } from './helpers.mjs';
+
+test('atomic rename retries only transient Windows sharing failures', async () => {
+  const attempts = [];
+  const delays = [];
+  await atomicRename('temporary', 'job.json', {
+    platform: 'win32',
+    renameFile: async () => {
+      attempts.push('rename');
+      if (attempts.length < 3) {
+        const error = new Error('file is busy');
+        error.code = 'EPERM';
+        throw error;
+      }
+    },
+    delay: async (ms) => delays.push(ms),
+  });
+  assert.equal(attempts.length, 3);
+  assert.deepEqual(delays, [10, 20]);
+  await assert.rejects(
+    () =>
+      atomicRename('temporary', 'job.json', {
+        platform: 'linux',
+        renameFile: async () => {
+          const error = new Error('file is busy');
+          error.code = 'EPERM';
+          throw error;
+        },
+      }),
+    /file is busy/,
+  );
+});
 
 test('failed preparation or initial record publication leaves no owned job directory', async () => {
   const gitDir = tempDir();

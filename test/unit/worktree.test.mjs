@@ -27,6 +27,11 @@ function assertPrimaryMetadata(repo, before) {
 function treePinRef(workspace, name) {
   return `refs/offload/worktrees/${basename(dirname(workspace))}/${name}`;
 }
+function registeredWorktree(repo, workspace) {
+  return git(repo, ['worktree', 'list', '--porcelain', '-z'])
+    .split('\0')
+    .some((field) => field.startsWith('worktree ') && sameWorktreePath(field.slice('worktree '.length), workspace));
+}
 
 test('worktree path equality resolves Windows short-name aliases before case folding', () => {
   const realpath = (value) => value.replace('/private/tmp/OFFLOA~1/workspace', '/private/tmp/offload-worktree-abcdef/workspace');
@@ -227,11 +232,11 @@ test('ignored workspace output is audited and cleanup removes its Git worktree a
     write(join(isolated.path, 'ignored.log'), 'log\n');
     assert.deepEqual(isolated.ignoredPaths().sort(), ['generated/output.txt', 'ignored.log']);
     const workspace = isolated.path;
-    assert.equal(git(repo, ['worktree', 'list', '--porcelain']).includes(`worktree ${workspace}`), true);
+    assert.equal(registeredWorktree(repo, workspace), true);
     const first = isolated.cleanup();
     assert.equal(first.removed, true);
     assert.equal(existsSync(workspace), false);
-    assert.equal(git(repo, ['worktree', 'list', '--porcelain']).includes(`worktree ${workspace}`), false);
+    assert.equal(registeredWorktree(repo, workspace), false);
     assert.deepEqual(isolated.cleanup(), { removed: false, pruned: false, alreadyAbsent: true, cleaned: true });
     isolated = undefined;
   } finally {
@@ -365,7 +370,7 @@ test('a failed cleanup remains retryable and never removes a still-registered lo
       () => isolated.cleanup(),
       (error) => error.code === 'E_WORKTREE_REMOVE',
     );
-    assert.equal(git(repo, ['worktree', 'list', '--porcelain']).includes(`worktree ${isolated.path}`), true);
+    assert.equal(registeredWorktree(repo, isolated.path), true);
     // The handle was deliberately left open, so callers can clear a transient
     // external lock and retry rather than leaking a registered worktree.
     assert.equal(isolated.snapshot().length, 40);
@@ -396,7 +401,7 @@ test('cleanup retains a private-root replacement instead of recursively removing
       (error) => error.code === 'E_WORKTREE_REMOVE',
     );
     assert.equal(existsSync(join(originalRoot, 'must-not-delete.txt')), true);
-    assert.equal(git(repo, ['worktree', 'list', '--porcelain']).includes(`worktree ${isolated.path}`), true);
+    assert.equal(registeredWorktree(repo, isolated.path), true);
     rmSync(originalRoot, { recursive: true, force: true });
     renameSync(replacementRoot, originalRoot);
     assert.equal(isolated.cleanup().removed, true);
@@ -516,7 +521,7 @@ test('reopen rejects outside and unregistered paths, while recovery cleanup is p
       cleaned: true,
     });
     assert.equal(existsSync(workspace), false);
-    assert.equal(git(repo, ['worktree', 'list', '--porcelain']).includes(`worktree ${workspace}`), false);
+    assert.equal(registeredWorktree(repo, workspace), false);
     assert.deepEqual(cleanupIsolatedWorktree({ repoPath: repo, workspacePath: workspace }), {
       removed: false,
       pruned: false,

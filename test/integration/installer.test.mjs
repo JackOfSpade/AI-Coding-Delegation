@@ -520,7 +520,7 @@ test('Claude preserves a pre-existing exact startup hook while removing only ins
   const configHome = join(home, 'config');
   const root = process.cwd();
   const settingsPath = join(home, '.claude', 'settings.json');
-  const command = `'${process.execPath.replace(/'/g, `"'"'`)}' '${join(root, 'install.mjs').replace(/'/g, `"'"'`)}' --doctor-hook`;
+  const command = doctorHookCommand(root);
   await mkdir(dirname(settingsPath), { recursive: true });
   await writeFile(
     settingsPath,
@@ -1275,7 +1275,7 @@ test('Claude migrates its owned startup health hook to resume and fork without r
   const home = await mkdtemp(`${tmpdir()}/offload-home-`);
   const configHome = join(home, 'config');
   const root = process.cwd();
-  const command = `'${process.execPath.replace(/'/g, `"'"'`)}' '${join(root, 'install.mjs').replace(/'/g, `"'"'`)}' --doctor-hook`;
+  const command = doctorHookCommand(root);
   const settingsPath = join(home, '.claude', 'settings.json');
   await mkdir(dirname(settingsPath), { recursive: true });
   await writeFile(

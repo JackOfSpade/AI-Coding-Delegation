@@ -34,7 +34,11 @@ export function canonicalIntegrityStatePath(path) {
     current = parent;
   }
   if (lstatSync(current).isSymbolicLink()) throw rootError('integrity state directory is invalid');
-  return join(realpathSync(current), ...tail);
+  // Keep the spelling consistent with Git/Node's native Windows APIs. The
+  // JavaScript resolver can preserve an 8.3 alias while the native resolver
+  // expands it, which would otherwise make an in-repository state path look
+  // unrelated to its repository root.
+  return join((realpathSync.native || realpathSync)(current), ...tail);
 }
 
 export async function ensurePrivateIntegrityDirectory(path) {
