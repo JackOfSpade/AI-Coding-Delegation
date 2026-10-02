@@ -147,7 +147,7 @@ export async function runCoverage({
         throw error;
       }
     } finally {
-      lease.release();
+      await lease.release();
     }
     return 0;
   } finally {

@@ -50,7 +50,7 @@ export async function runReleaseCheck({
     }
     return 0;
   } finally {
-    lease.release();
+    await lease.release();
   }
 }
 

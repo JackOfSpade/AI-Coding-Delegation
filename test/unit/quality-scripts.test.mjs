@@ -15,8 +15,10 @@ import {
 } from '../../scripts/package-gate.mjs';
 import { analyzeStrictSkips, parseTapSkips } from '../run-suite.mjs';
 import { runCiTests } from '../../scripts/test-ci.mjs';
+import { acquireArtifactLease, formatArtifactLeaseMarker } from '../../scripts/artifact-lease.mjs';
 import { coverageInvocation, runCoverage } from '../../scripts/run-coverage.mjs';
 import { npmInvocation, runReleaseCheck } from '../../scripts/release-check.mjs';
+import { LeaseError } from '../../src/lease.mjs';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 
@@ -264,6 +266,51 @@ test('coverage runner propagates c8 failure without reading or publishing genera
   });
   assert.equal(code, 7);
   assert.deepEqual(calls, [['rm', '/tmp/offload-coverage-fixed', { recursive: true, force: true }]]);
+});
+
+test('artifact lease retries transient lease mutex contention while acquiring and releasing', async () => {
+  let clock = 0;
+  let acquires = 0;
+  let releases = 0;
+  const manager = {
+    acquire() {
+      acquires += 1;
+      if (acquires === 1) throw new LeaseError('busy', 'E_LEASE_BUSY');
+    },
+    release() {
+      releases += 1;
+      if (releases === 1) throw new LeaseError('busy', 'E_LEASE_BUSY');
+      return true;
+    },
+  };
+  const lease = await acquireArtifactLease({
+    cwd: '/repo',
+    maxWaitMs: 10,
+    retryMs: 1,
+    now: () => clock,
+    wait: async (milliseconds) => {
+      clock += milliseconds;
+    },
+    createId: () => '1234567890123456',
+    getGitDirectory: () => '/git',
+    makeLeaseManager: () => manager,
+  });
+  assert.equal(acquires, 2);
+  assert.equal(await lease.release(), true);
+  assert.equal(releases, 2);
+});
+
+test('inherited artifact marker rejects a live lease with disjoint owned paths', async () => {
+  const marker = { jobId: 'quality-artifacts-1234567890123456', ownerNonce: '1234567890123456', pid: 123 };
+  await assert.rejects(
+    acquireArtifactLease({
+      cwd: '/repo',
+      environment: { OFFLOAD_ARTIFACT_LEASE: formatArtifactLeaseMarker(marker) },
+      getGitDirectory: () => '/git',
+      makeLeaseManager: () => ({ list: () => [{ ...marker, ownedPaths: ['src/**'] }] }),
+    }),
+    /does not name a live lease/,
+  );
 });
 
 test('coverage publishers hold the shared artifact lease across both public renames', async () => {

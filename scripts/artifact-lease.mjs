@@ -23,6 +23,22 @@ function validMarker(value) {
   );
 }
 
+function ownsArtifactPaths(lease) {
+  return (
+    Array.isArray(lease?.ownedPaths) &&
+    lease.ownedPaths.length === ARTIFACT_LEASE_PATHS.length &&
+    lease.ownedPaths.every((path, index) => path === ARTIFACT_LEASE_PATHS[index])
+  );
+}
+
+function isRetryableAcquireError(error) {
+  return error?.code === 'E_LEASE_CONFLICT' || error?.code === 'E_LEASE_BUSY';
+}
+
+function isRetryableReleaseError(error) {
+  return error?.code === 'E_LEASE_BUSY';
+}
+
 export function parseArtifactLeaseMarker(value) {
   if (typeof value !== 'string' || value.length > 512) throw new Error('artifact lease marker is invalid');
   let marker;
@@ -69,7 +85,10 @@ export async function acquireArtifactLease({
     const marker = parseArtifactLeaseMarker(inherited);
     const held = manager
       .list()
-      .some((lease) => lease.jobId === marker.jobId && lease.ownerNonce === marker.ownerNonce && lease.pid === marker.pid);
+      .some(
+        (lease) =>
+          lease.jobId === marker.jobId && lease.ownerNonce === marker.ownerNonce && lease.pid === marker.pid && ownsArtifactPaths(lease),
+      );
     if (!held) throw new Error('artifact lease marker does not name a live lease');
     return { marker, markerValue: inherited, inherited: true, release: () => false };
   }
@@ -84,10 +103,20 @@ export async function acquireArtifactLease({
         marker,
         markerValue: formatArtifactLeaseMarker(marker),
         inherited: false,
-        release: () => manager.release(marker.jobId, { ownerNonce: marker.ownerNonce }),
+        release: async () => {
+          for (;;) {
+            try {
+              return manager.release(marker.jobId, { ownerNonce: marker.ownerNonce });
+            } catch (error) {
+              if (!isRetryableReleaseError(error)) throw error;
+              if (now() >= deadline) throw new Error(`timed out releasing generated-artifact lease after ${maxWaitMs}ms`);
+              await wait(Math.min(retryMs, Math.max(1, deadline - now())));
+            }
+          }
+        },
       };
     } catch (error) {
-      if (!(error instanceof LeaseError) || error.code !== 'E_LEASE_CONFLICT') throw error;
+      if (!(error instanceof LeaseError) || !isRetryableAcquireError(error)) throw error;
       if (now() >= deadline) throw new Error(`timed out waiting ${maxWaitMs}ms for generated-artifact lease`);
       await wait(Math.min(retryMs, Math.max(1, deadline - now())));
     }
