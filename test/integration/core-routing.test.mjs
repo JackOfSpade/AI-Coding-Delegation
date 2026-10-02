@@ -210,6 +210,31 @@ async function pollStoredJob(id, path, predicate, attempts = 160) {
   return job;
 }
 
+test('pollStoredJob retries only the expected atomic stored-record race', async () => {
+  const path = await repo('offload-poll-stored-job-');
+  const originalGet = JobStore.prototype.get;
+  let calls = 0;
+  try {
+    JobStore.prototype.get = async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('stored file is invalid or changed while opening');
+      if (calls === 2) throw new Error('stored file is invalid or changed while reading');
+      return { status: 'DONE_VERIFIED' };
+    };
+    const done = await pollStoredJob('job-id', path, (job) => job.status === 'DONE_VERIFIED');
+    assert.equal(done.status, 'DONE_VERIFIED');
+    assert.equal(calls, 3);
+
+    JobStore.prototype.get = async () => {
+      throw new Error('unexpected store failure');
+    };
+    await assert.rejects(() => pollStoredJob('job-id', path, () => false, 1), /unexpected store failure/);
+  } finally {
+    JobStore.prototype.get = originalGet;
+    await rm(path, { recursive: true, force: true });
+  }
+});
+
 test('one core routes durable jobs across canonical repository roots', async () => {
   const a = await repo('offload-core-a-'),
     b = await repo('offload-core-b-');
