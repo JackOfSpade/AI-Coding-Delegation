@@ -14,6 +14,12 @@ const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 const gitId = 'a'.repeat(40),
   nextGitId = 'b'.repeat(40),
   currentGitId = 'c'.repeat(40);
+// Worktree completion includes Git snapshots, integration, durable report
+// publication, and private-workspace cleanup.  That is deliberately slower
+// than the in-memory lifecycle tests, especially when CI is sharing I/O.
+// Keep these integration assertions about the terminal result, not an
+// incidental two-second host-performance budget.
+const WORKTREE_LIFECYCLE_TIMEOUT_SEC = 15;
 test('public job IDs share the durable Git-ref component boundary', () => {
   for (const id of ['_private', '-private', '', 'x'.repeat(129)]) assert.throws(() => validateJobId(id), /valid job id/);
   assert.equal(validateJobId('safe_job-1'), 'safe_job-1');
@@ -170,7 +176,7 @@ test('isolated lifecycle keeps primary unchanged until verified integration and 
     });
     const started = await m.start({ task: 'isolated apply', ownedPaths: ['src/**'], repoPath: repo, testCommand: 'verify' });
     assert.equal(existsSync(join(repo, 'src', 'owned.txt')), false, 'worker must not mutate primary');
-    const done = await m.wait(started.jobId, { timeoutSec: 2 });
+    const done = await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC });
     assert.equal(done.status, 'DONE_VERIFIED');
     const job = await m.store.get(started.jobId);
     assert.notEqual(workerPath, repo);
@@ -211,7 +217,7 @@ test('isolated JobManager apply and revert preserve non-NUL invalid UTF-8 patch 
       },
     });
     const started = await m.start({ task: 'preserve bytes', ownedPaths: ['tracked.txt'], repoPath: repo, testCommand: 'verify' });
-    assert.equal((await m.wait(started.jobId, { timeoutSec: 2 })).status, 'DONE_VERIFIED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'DONE_VERIFIED');
     assert.deepEqual(await readFile(join(repo, 'tracked.txt')), expected);
     const rawRevert = await m.store.readArtifactBytes(started.jobId, 'revert.diff');
     assert.ok(rawRevert.includes(Buffer.from([0xff])));
@@ -255,7 +261,7 @@ test('isolated ephemeral output is discarded while an outside-scope write blocks
       repoPath: pair.repo,
       testCommand: 'verify',
     });
-    assert.equal((await pair.m.wait(started.jobId, { timeoutSec: 2 })).status, 'DONE_VERIFIED');
+    assert.equal((await pair.m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'DONE_VERIFIED');
     assert.equal(existsSync(join(pair.repo, 'src', 'ok.txt')), true);
     assert.equal(existsSync(join(pair.repo, 'cache', 'build.log')), false);
     const job = await pair.m.store.get(started.jobId);
@@ -273,7 +279,7 @@ test('isolated ephemeral output is discarded while an outside-scope write blocks
   });
   try {
     const started = await pair.m.start({ task: 'violation', ownedPaths: ['src/**'], repoPath: pair.repo, testCommand: 'verify' });
-    assert.equal((await pair.m.wait(started.jobId, { timeoutSec: 2 })).status, 'FAILED');
+    assert.equal((await pair.m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'FAILED');
     assert.equal(existsSync(join(pair.repo, 'src', 'ok.txt')), false);
     assert.match(await pair.m.store.readArtifact(started.jobId, 'patch.diff'), /rogue\.txt/);
   } finally {
@@ -310,13 +316,13 @@ test('manual isolated repair reseeds accumulated workspace changes from the orig
       testCommand: 'verify',
       maxRepairRounds: 1,
     });
-    assert.equal((await m.wait(started.jobId, { timeoutSec: 2 })).status, 'FAILED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'FAILED');
     const failed = await m.store.get(started.jobId);
     assert.equal(existsSync(failed.workspacePath), false);
     assert.ok(failed.workspaceAfter);
     pass = true;
     await m.repair(started.jobId, ['finish accumulated work']);
-    assert.equal((await m.wait(started.jobId, { timeoutSec: 2 })).status, 'DONE_VERIFIED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'DONE_VERIFIED');
     assert.equal(await readFile(join(repo, 'src', 'first.txt'), 'utf8'), '1\n');
     assert.equal(await readFile(join(repo, 'src', 'second.txt'), 'utf8'), '2\n');
   } finally {
@@ -346,7 +352,7 @@ test('an index-only primary edit on an owned path blocks isolated integration', 
       },
     });
     const started = await m.start({ task: 'index race', ownedPaths: ['src/**'], repoPath: repo, testCommand: 'verify' });
-    assert.equal((await m.wait(started.jobId, { timeoutSec: 2 })).status, 'FAILED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'FAILED');
     assert.equal(await readFile(join(repo, 'src', 'same.txt'), 'utf8'), 'human staged\n');
     assert.equal((await m.store.get(started.jobId)).integrationConflict, true);
   } finally {
@@ -379,7 +385,7 @@ test('a verifier cannot silently author owned output after the worker completes'
       },
     });
     const started = await m.start({ task: 'do not trust verifier writes', ownedPaths: ['src/**'], repoPath: repo, testCommand: 'verify' });
-    assert.equal((await m.wait(started.jobId, { timeoutSec: 2 })).status, 'FAILED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'FAILED');
     const job = await m.store.get(started.jobId);
     assert.deepEqual(job.verifierMutations, ['src/verifier.txt']);
     assert.ok(job.scopeViolations.includes('src/verifier.txt'));
@@ -423,7 +429,7 @@ test('a failing verifier cannot seed its owned mutation into automatic or manual
       testCommand: 'verify',
       maxRepairRounds: 1,
     });
-    assert.equal((await m.wait(started.jobId, { timeoutSec: 2 })).status, 'FAILED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'FAILED');
     assert.equal(runs, 1, 'verification mutation must suppress automatic repair');
     const failed = await m.store.get(started.jobId);
     assert.deepEqual(failed.verifierMutations, ['src/verifier.txt']);
@@ -454,7 +460,7 @@ test('isolated revert rejects selected-path index drift even when worktree bytes
       },
     });
     const started = await m.start({ task: 'index-aware revert', ownedPaths: ['src/**'], repoPath: repo, testCommand: 'verify' });
-    assert.equal((await m.wait(started.jobId, { timeoutSec: 2 })).status, 'DONE_VERIFIED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'DONE_VERIFIED');
     // The primary worktree still has exactly the worker bytes, but its index
     // now has a new selected-path entry that git apply would leave behind.
     git(repo, ['add', 'src/owned.txt']);
@@ -592,7 +598,7 @@ test('terminal revert journals are reconciled after a post-apply persistence fai
       },
     });
     const started = await m.start({ task: 'revert journal', ownedPaths: ['src/**'], repoPath: repo, testCommand: 'verify' });
-    assert.equal((await m.wait(started.jobId, { timeoutSec: 2 })).status, 'DONE_VERIFIED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'DONE_VERIFIED');
     const originalUpdate = store.update.bind(store);
     store.update = async (id, changes) => {
       if (changes?.revertOutcome) throw new Error('simulated post-reverse persistence failure');

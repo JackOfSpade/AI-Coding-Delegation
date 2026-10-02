@@ -158,7 +158,10 @@ export async function runSuite({
   const roots = suite === 'all' ? ['unit', 'integration'] : [suite];
   const files = (await Promise.all(roots.map((root) => discoverTests(resolve('test', root))))).flat().sort();
   if (!files.length) throw new Error(`no ${suite} tests found`);
-  const args = ['--test'];
+  // Worktree integration tests invoke real Git processes and secure durable
+  // storage. A small fan-out avoids test-runner oversubscription turning
+  // lifecycle timing into a host-load-dependent result.
+  const args = ['--test', '--test-concurrency=4'];
   if (strictLoopback) args.push('--test-reporter=tap');
   args.push(...files);
   const child = spawn(process.execPath, args, { stdio: strictLoopback ? ['ignore', 'pipe', 'pipe'] : 'inherit', windowsHide: true });
