@@ -44,7 +44,11 @@ async function extractPackage(archive, destination) {
 
 function npmPack(args, options) {
   if (process.platform !== 'win32') return execFileSync('npm', args, options);
-  const result = spawnSync('cmd.exe', ['/d', '/s', '/c', `npm.cmd ${args.join(' ')}`], { ...options, shell: false, windowsHide: true });
+  // Node cannot reliably execute npm.cmd directly on current Node releases.
+  // Quote every argument for cmd.exe: --pack-destination receives a dynamic
+  // temporary path, which may contain spaces on a Windows runner.
+  const command = `npm.cmd ${args.map((argument) => `"${String(argument).replaceAll('"', '""')}"`).join(' ')}`;
+  const result = spawnSync('cmd.exe', ['/d', '/s', '/c', command], { ...options, shell: false, windowsHide: true });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`npm pack failed with exit ${result.status ?? 'unknown'}: ${result.stderr || ''}`);
   return result.stdout;
@@ -92,7 +96,8 @@ test('the npm package contains the runnable product and excludes legacy or test 
 });
 
 test('the extracted npm package installs, serves MCP, and uninstalls without touching the real home', async () => {
-  const temporary = await mkdtemp(join(tmpdir(), 'offload-packed-'));
+  // Keep a space in the path to exercise cmd.exe argument quoting on Windows.
+  const temporary = await mkdtemp(join(tmpdir(), 'offload packed-'));
   const cache = join(temporary, 'npm-cache');
   const destination = join(temporary, 'package');
   const home = join(temporary, 'home');
