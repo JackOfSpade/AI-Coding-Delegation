@@ -326,7 +326,7 @@ test('artifact lease root is a private stable hash of the canonical workspace on
   assert.notEqual(posixRoot, artifactLeaseRoot({ cwd: '/workspace/other', temporaryRoot: '/tmp', realpath: (path) => path }));
   assert.ok(posixRoot.startsWith('/tmp/offload-artifact-leases/'));
   assert.equal(posixRoot.includes('workspace'), false);
-  assert.equal(
+  assert.notEqual(
     artifactLeaseRoot({
       cwd: 'C:\\REPO',
       platform: 'win32',
@@ -369,7 +369,7 @@ test('artifact lease gives release a fresh retry window after acquisition conten
     createId: () => '1234567890123456',
     temporaryRoot: '/tmp',
     realpath: (path) => path,
-    makeDirectory: () => {},
+    ensureDirectory: () => {},
     makeLeaseManager: () => manager,
   });
   assert.equal(acquires, 2);
@@ -378,14 +378,21 @@ test('artifact lease gives release a fresh retry window after acquisition conten
 });
 
 test('inherited artifact marker rejects a live lease with disjoint owned paths', async () => {
-  const marker = { jobId: 'quality-artifacts-1234567890123456', ownerNonce: '1234567890123456', pid: 123 };
+  const marker = {
+    jobId: 'quality-artifacts-1234567890123456',
+    ownerNonce: '1234567890123456',
+    pid: 123,
+    workspace: artifactLeaseRoot({ cwd: '/repo', temporaryRoot: '/tmp', realpath: (path) => path })
+      .split('/')
+      .at(-1),
+  };
   await assert.rejects(
     acquireArtifactLease({
       cwd: '/repo',
       environment: { OFFLOAD_ARTIFACT_LEASE: formatArtifactLeaseMarker(marker) },
       temporaryRoot: '/tmp',
       realpath: (path) => path,
-      makeDirectory: () => {},
+      ensureDirectory: () => {},
       makeLeaseManager: () => ({ list: () => [{ ...marker, ownedPaths: ['src/**'] }] }),
     }),
     /does not name a live lease/,

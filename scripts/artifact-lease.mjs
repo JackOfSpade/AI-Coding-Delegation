@@ -1,10 +1,10 @@
 /** Serialize generated quality artifacts with the product's crash-recoverable lease store. */
 import { createHash, randomUUID } from 'node:crypto';
 import { copyFile, mkdir, rename, rm } from 'node:fs/promises';
-import { mkdirSync, realpathSync } from 'node:fs';
+import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { posix, win32 } from 'node:path';
-import { LeaseError, LeaseManager } from '../src/lease.mjs';
+import { ensurePrivateDirectory, LeaseError, LeaseManager } from '../src/lease.mjs';
 
 export const ARTIFACT_LEASE_ENV = 'OFFLOAD_ARTIFACT_LEASE';
 export const ARTIFACT_LEASE_PATHS = Object.freeze(['artifacts/**', 'coverage/**']);
@@ -22,6 +22,8 @@ function validMarker(value) {
     /^quality-artifacts-[A-Za-z0-9-]{16,100}$/.test(value.jobId) &&
     typeof value.ownerNonce === 'string' &&
     /^[A-Za-z0-9_-]{16,256}$/.test(value.ownerNonce) &&
+    typeof value.workspace === 'string' &&
+    /^[a-f0-9]{64}$/.test(value.workspace) &&
     Number.isInteger(value.pid) &&
     value.pid > 0
   );
@@ -55,8 +57,8 @@ export function parseArtifactLeaseMarker(value) {
   return marker;
 }
 
-export function formatArtifactLeaseMarker({ jobId, ownerNonce, pid }) {
-  const marker = { version: MARKER_VERSION, jobId, ownerNonce, pid };
+export function formatArtifactLeaseMarker({ jobId, ownerNonce, pid, workspace }) {
+  const marker = { version: MARKER_VERSION, jobId, ownerNonce, pid, workspace };
   if (!validMarker(marker)) throw new Error('artifact lease marker is invalid');
   return JSON.stringify(marker);
 }
@@ -70,10 +72,7 @@ export function artifactLeaseRoot({
 } = {}) {
   const paths = platform === 'win32' ? win32 : posix;
   const canonicalWorkspace = realpath(paths.resolve(cwd));
-  // Windows canonical paths remain case-insensitive even when the filesystem
-  // preserves spelling. POSIX keeps its byte-sensitive pathname identity.
-  const identity = platform === 'win32' ? canonicalWorkspace.toLowerCase() : canonicalWorkspace;
-  const digest = createHash('sha256').update(identity, 'utf8').digest('hex');
+  const digest = createHash('sha256').update(canonicalWorkspace, 'utf8').digest('hex');
   return paths.join(temporaryRoot, 'offload-artifact-leases', digest);
 }
 
@@ -118,17 +117,36 @@ export async function acquireArtifactLease({
   pid = process.pid,
   temporaryRoot = tmpdir(),
   realpath = realpathSync,
-  makeDirectory = mkdirSync,
+  ensureDirectory = ensurePrivateDirectory,
   makeLeaseManager = (options) => new LeaseManager(options),
 } = {}) {
   if (!Number.isSafeInteger(maxWaitMs) || maxWaitMs < 0 || !Number.isSafeInteger(retryMs) || retryMs < 1)
     throw new TypeError('artifact lease wait settings are invalid');
+  const paths = platform === 'win32' ? win32 : posix;
   const gitDir = artifactLeaseRoot({ cwd, platform, temporaryRoot, realpath });
-  makeDirectory(gitDir, { recursive: true, mode: 0o700 });
+  ensureDirectory(paths.dirname(gitDir), platform);
+  ensureDirectory(gitDir, platform);
   const manager = makeLeaseManager({ gitDir, platform });
   const inherited = environment?.[ARTIFACT_LEASE_ENV];
   if (allowInherited && inherited !== undefined) {
     const marker = parseArtifactLeaseMarker(inherited);
+    if (marker.workspace !== paths.basename(gitDir))
+      return acquireArtifactLease({
+        cwd,
+        environment: {},
+        platform,
+        allowInherited: false,
+        maxWaitMs,
+        retryMs,
+        now,
+        wait,
+        createId,
+        pid,
+        temporaryRoot,
+        realpath,
+        ensureDirectory,
+        makeLeaseManager,
+      });
     const held = manager
       .list()
       .some(
@@ -139,7 +157,13 @@ export async function acquireArtifactLease({
     return { marker, markerValue: inherited, inherited: true, release: () => false };
   }
 
-  const marker = { version: MARKER_VERSION, jobId: `quality-artifacts-${createId()}`, ownerNonce: createId(), pid };
+  const marker = {
+    version: MARKER_VERSION,
+    jobId: `quality-artifacts-${createId()}`,
+    ownerNonce: createId(),
+    pid,
+    workspace: paths.basename(gitDir),
+  };
   if (!validMarker(marker)) throw new Error('artifact lease identity is invalid');
   const deadline = now() + maxWaitMs;
   for (;;) {

@@ -234,8 +234,8 @@ export class LeaseManager {
     // Locks are durable authority boundaries. Creating with recursive:true
     // would silently traverse a repository-controlled offload/locks link.
     assertSafeGitAncestry(this.gitDir, this.platform);
-    privateDirectory(join(this.gitDir, 'offload'), this.platform);
-    privateDirectory(this.lockDir, this.platform);
+    ensurePrivateDirectory(join(this.gitDir, 'offload'), this.platform);
+    ensurePrivateDirectory(this.lockDir, this.platform);
   }
   #isStale(lease) {
     // A suspended owner can miss arbitrary heartbeats and later resume with
@@ -417,7 +417,7 @@ function checkedManagedDirectory(path, platform) {
       } catch {}
   }
 }
-function privateDirectory(path, platform) {
+export function ensurePrivateDirectory(path, platform = process.platform) {
   // Match JobStore's race-tolerant contract without following a link. The
   // retry handles another process creating the same managed directory.
   for (let attempt = 0; attempt < 2; attempt += 1) {
