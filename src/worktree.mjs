@@ -687,10 +687,24 @@ function isChildOf(parent, child) {
   const rel = relative(parent, resolve(child));
   return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
+export function sameWorktreePath(left, right, { platform = process.platform, realpath = realpathSync } = {}) {
+  const canonical = (value) => {
+    const resolved = resolve(value);
+    // Git may retain a Windows 8.3 path while Node has expanded it through
+    // realpath. Resolve both existing paths before comparing, but retain the
+    // lexical fallback for a missing recovery target.
+    try {
+      return realpath(resolved);
+    } catch {
+      return resolved;
+    }
+  };
+  const a = canonical(left);
+  const b = canonical(right);
+  return platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
 function samePath(left, right) {
-  const a = resolve(left);
-  const b = resolve(right);
-  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+  return sameWorktreePath(left, right);
 }
 function privateRootIsSafe(privateRoot, base) {
   try {

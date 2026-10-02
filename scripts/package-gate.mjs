@@ -173,6 +173,13 @@ export function collectPackageTargets(value, { field, allowBarePaths = false, co
 
 export async function packageGate(projectRoot = process.cwd()) {
   const root = resolve(projectRoot);
+  // Validate lifecycle hooks before asking npm to inspect the package. Older
+  // npm releases can still invoke `prepare` during `pack --dry-run` despite
+  // the ignore-scripts setting, so running pack first both weakens this gate
+  // and makes the diagnostic depend on the host npm version.
+  const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+  const lifecycleScripts = forbiddenLifecycleScripts(manifest);
+  if (lifecycleScripts.length) throw new Error(`package gate failed: forbidden lifecycle scripts ${lifecycleScripts.join(', ')}`);
   const cache = await mkdtemp(join(tmpdir(), 'offload-npm-pack-cache-'));
   let result;
   try {
@@ -197,7 +204,6 @@ export async function packageGate(projectRoot = process.cwd()) {
   const entry = packed[0];
   if (!entry || !Array.isArray(entry.files)) throw new Error('npm pack --dry-run did not describe package files');
   const files = entry.files.map((file) => file.path).sort();
-  const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
   const productionDependencies = productionFields.flatMap((field) => {
     const value = manifest[field];
     if (Array.isArray(value)) return value.map((name) => `${field}:${name}`);
@@ -218,7 +224,6 @@ export async function packageGate(projectRoot = process.cwd()) {
     ...(manifest.name === 'offload' ? offloadPluginFiles : []),
   ];
   const invalidPackageTargets = targetGroups.flatMap((group) => group.invalid);
-  const lifecycleScripts = forbiddenLifecycleScripts(manifest);
   const uniqueRequired = [...new Set(required)].sort();
   const missing = uniqueRequired.filter((file) => !files.includes(file));
   const unexpected = files.filter(isForbiddenPackagePath);

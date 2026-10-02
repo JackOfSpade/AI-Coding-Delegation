@@ -50,6 +50,15 @@ const safeStatSize = (value) => {
   if (typeof value === 'bigint') return value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : undefined;
   return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 };
+// A Windows path can have both an 8.3 spelling and a long-name spelling. Once
+// both paths have been resolved by the filesystem, comparison is
+// case-insensitive; lexical equality would reject the same directory on the
+// hosted Windows runners.
+const sameResolvedPath = (left, right) => {
+  const a = path.resolve(left);
+  const b = path.resolve(right);
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+};
 const schema = (name, description, properties, required) =>
   Object.freeze({
     type: 'function',
@@ -280,8 +289,11 @@ export class LocalTools {
     // before creating the next one.  Internal symlinks remain supported only
     // when their canonical target remains inside the repository.
     const parentParts = logical.split('/').slice(0, -1);
-    let cursor = await this.fs.realpath(this.root);
-    if (cursor !== this.root) throw new Error('Refusing repository path changed');
+    // Use the filesystem's spelling of the root for the whole walk. On
+    // Windows, `realpath` may expand an 8.3 temp-directory alias while the
+    // original caller path remains short; that is not a repository swap.
+    const root = await this.fs.realpath(this.root);
+    let cursor = root;
     for (const part of parentParts) {
       if (!part || part === '.' || part === '..') throw new Error('Refusing invalid write parent');
       const candidate = path.join(cursor, part);
@@ -301,7 +313,7 @@ export class LocalTools {
       } catch {
         throw new Error('Refusing write parent changed while creating');
       }
-      const rel = path.relative(this.root, resolved);
+      const rel = path.relative(root, resolved);
       if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) throw new Error('Refusing write outside repository');
       const details = await this.fs.lstat(resolved);
       if (!details.isDirectory() || details.isSymbolicLink()) throw new Error('Refusing invalid write parent');
@@ -310,8 +322,8 @@ export class LocalTools {
     // A writable path may resolve through a safe internal symlink.  Confirm
     // the parent we prepared is exactly the parent selected by PathPolicy;
     // otherwise a concurrent replacement changed the logical destination.
-    const expected = path.dirname(canonical);
-    if (cursor !== expected) throw new Error('Refusing write parent changed since policy check');
+    const expected = await this.fs.realpath(path.dirname(canonical));
+    if (!sameResolvedPath(cursor, expected)) throw new Error('Refusing write parent changed since policy check');
   }
   async #atomicWrite(logical, canonical, content, { mode = 0o600, expected, staleLabel = 'edit' } = {}) {
     const current = this.#writable(logical);

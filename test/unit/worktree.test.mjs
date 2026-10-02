@@ -9,6 +9,7 @@ import {
   openIsolatedWorktree,
   pinJobTrees,
   releaseJobTrees,
+  sameWorktreePath,
   snapshotPrimaryWorkingTree,
 } from '../../src/worktree.mjs';
 import { cleanup, git, makeRepo, write } from './helpers.mjs';
@@ -26,6 +27,21 @@ function assertPrimaryMetadata(repo, before) {
 function treePinRef(workspace, name) {
   return `refs/offload/worktrees/${basename(dirname(workspace))}/${name}`;
 }
+
+test('worktree path equality resolves Windows short-name aliases before case folding', () => {
+  const realpath = (value) => value.replace('/private/tmp/OFFLOA~1/workspace', '/private/tmp/offload-worktree-abcdef/workspace');
+  assert.equal(
+    sameWorktreePath('/private/tmp/OFFLOA~1/workspace', '/private/tmp/offload-worktree-abcdef/workspace', {
+      platform: 'win32',
+      realpath,
+    }),
+    true,
+  );
+  assert.equal(
+    sameWorktreePath('/private/tmp/OFFLOA~1/workspace', '/private/tmp/offload-worktree-other/workspace', { platform: 'win32', realpath }),
+    false,
+  );
+});
 
 test('isolated worktree is seeded from dirty and untracked baseline without touching primary metadata', () => {
   const repo = makeRepo();

@@ -137,7 +137,20 @@ export function git(repoPath, args, extraEnv = {}, { hooksPath, execFile = execF
   // Querying filters is itself part of the safety contract: falling back to
   // an empty override list after an error would let `git add` invoke a
   // repository/global clean or process filter outside the command sandbox.
-  const hardening = ['-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${inertHooks}`, ...disabledFilters(repoPath, env, execFile)];
+  // Internal snapshots and isolated worktrees represent exact Git objects.
+  // Do not let a host-level autocrlf preference mutate those bytes while
+  // materializing a private workspace (notably on Windows runners).
+  const hardening = [
+    '-c',
+    'core.fsmonitor=false',
+    '-c',
+    'core.autocrlf=false',
+    '-c',
+    'core.eol=lf',
+    '-c',
+    `core.hooksPath=${inertHooks}`,
+    ...disabledFilters(repoPath, env, execFile),
+  ];
   try {
     return execFile('git', [...hardening, ...args], {
       cwd: repoPath,

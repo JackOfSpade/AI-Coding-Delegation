@@ -42,6 +42,24 @@ function testCore() {
     snapshots: { create: async () => 'a'.repeat(40), diff: async () => '' },
   });
 }
+function memoryWindowsIntegrityVault(values = new Map()) {
+  return {
+    read: (credential) => values.get(credential.resource),
+    writeIfAbsent: (credential, value) => {
+      if (values.has(credential.resource)) throw new Error('exists');
+      values.set(credential.resource, value);
+    },
+  };
+}
+function integrityTestConfig({ loaded: loadedConfig = loaded, statePath, resolveKey, integrityVault } = {}) {
+  if (process.platform !== 'win32') return { loaded: loadedConfig, integrityStatePath: statePath, resolveKey };
+  return {
+    loaded: loadedConfig,
+    integrityPlatform: 'win32',
+    integrityVault: integrityVault || memoryWindowsIntegrityVault(),
+    resolveKey,
+  };
+}
 test('Core rejects malformed raw starts before initializing durable state', async () => {
   let initialized = 0;
   const core = createCore({
@@ -598,16 +616,17 @@ test('a raw-tampered sealed Core job never reaches the provider', async (t) => {
 test('credential rotation invalidates a sealed queued Core job in the same and a new Core', async () => {
   const path = await repo('offload-integrity-rotation-');
   const statePath = await mkdtemp(join(tmpdir(), 'offload-integrity-state-'));
+  const integrityVault = memoryWindowsIntegrityVault();
   let credential = 'first-credential';
   const first = createCore({
-    config: { loaded, integrityStatePath: statePath, resolveKey: () => credential },
+    config: integrityTestConfig({ statePath, integrityVault, resolveKey: () => credential }),
     snapshots: { create: async () => 'a'.repeat(40), diff: async () => '' },
   });
   const started = await first.start({ repoPath: path, task: 'rotate', ownedPaths: ['src/**'] }, { launch: false });
   credential = 'rotated-credential';
   await assert.rejects(() => first.resume(started.jobId, path), /integrity check failed/);
   const second = createCore({
-    config: { loaded, integrityStatePath: statePath, resolveKey: () => credential },
+    config: integrityTestConfig({ statePath, integrityVault, resolveKey: () => credential }),
     snapshots: { create: async () => 'a'.repeat(40), diff: async () => '' },
   });
   await assert.rejects(() => second.resume(started.jobId, path), /integrity check failed/);
@@ -616,6 +635,7 @@ test('credential rotation invalidates a sealed queued Core job in the same and a
 test('credential rotation permits only MAC-verified detached cancellation and recovery cleanup', async () => {
   const path = await repo('offload-integrity-operational-');
   const statePath = await mkdtemp(join(tmpdir(), 'offload-integrity-state-'));
+  const integrityVault = memoryWindowsIntegrityVault();
   let credential = 'first-credential';
   const calls = [];
   const resolveKey = (ref) => {
@@ -623,7 +643,7 @@ test('credential rotation permits only MAC-verified detached cancellation and re
     return credential;
   };
   const first = createCore({
-    config: { loaded, integrityStatePath: statePath, resolveKey },
+    config: integrityTestConfig({ statePath, integrityVault, resolveKey }),
     snapshots: { create: async () => 'a'.repeat(40), diff: async () => '' },
   });
   const cancellable = await first.start({ repoPath: path, task: 'detached running', ownedPaths: ['src/**'] }, { launch: false });
@@ -643,7 +663,7 @@ test('credential rotation permits only MAC-verified detached cancellation and re
   credential = 'rotated-credential';
   calls.length = 0;
   const second = createCore({
-    config: { loaded, integrityStatePath: statePath, resolveKey },
+    config: integrityTestConfig({ statePath, integrityVault, resolveKey }),
     snapshots: { create: async () => 'a'.repeat(40), diff: async () => '' },
   });
   await second.recover(path);
@@ -663,43 +683,48 @@ test('credential rotation permits only MAC-verified detached cancellation and re
   );
 });
 
-test('a missing integrity root is never recreated over a corrupt orphan job entry', async () => {
-  const path = await repo('offload-integrity-orphan-');
-  const statePath = await mkdtemp(join(tmpdir(), 'offload-integrity-state-'));
-  const first = createCore({
-    config: { loaded, integrityStatePath: statePath, resolveKey: () => 'credential' },
-    snapshots: { create: async () => 'a'.repeat(40), diff: async () => '' },
-  });
-  const started = await first.start({ repoPath: path, task: 'establish root', ownedPaths: ['src/**'] }, { launch: false });
-  const jobs = join(getGitDir(path), 'offload', 'jobs');
-  await rm(join(jobs, started.jobId), { recursive: true, force: true });
-  await mkdir(join(jobs, 'oj-corrupt-orphan'));
-  await writeFile(join(jobs, 'oj-corrupt-orphan', 'job.json'), '{"id":"oj-corrupt-orphan"');
-  await rm(join(statePath, 'integrity-root-v1'));
-  const resolverCalls = [];
-  const restarted = createCore({
-    config: {
-      loaded,
-      integrityStatePath: statePath,
-      resolveKey: (ref) => {
-        resolverCalls.push(ref);
-        return 'credential';
+test(
+  'a missing integrity root is never recreated over a corrupt orphan job entry',
+  { skip: process.platform === 'win32' && 'Windows stores integrity roots in Credential Locker' },
+  async () => {
+    const path = await repo('offload-integrity-orphan-');
+    const statePath = await mkdtemp(join(tmpdir(), 'offload-integrity-state-'));
+    const first = createCore({
+      config: { loaded, integrityStatePath: statePath, resolveKey: () => 'credential' },
+      snapshots: { create: async () => 'a'.repeat(40), diff: async () => '' },
+    });
+    const started = await first.start({ repoPath: path, task: 'establish root', ownedPaths: ['src/**'] }, { launch: false });
+    const jobs = join(getGitDir(path), 'offload', 'jobs');
+    await rm(join(jobs, started.jobId), { recursive: true, force: true });
+    await mkdir(join(jobs, 'oj-corrupt-orphan'));
+    await writeFile(join(jobs, 'oj-corrupt-orphan', 'job.json'), '{"id":"oj-corrupt-orphan"');
+    await rm(join(statePath, 'integrity-root-v1'));
+    const resolverCalls = [];
+    const restarted = createCore({
+      config: {
+        loaded,
+        integrityStatePath: statePath,
+        resolveKey: (ref) => {
+          resolverCalls.push(ref);
+          return 'credential';
+        },
       },
-    },
-  });
-  await assert.rejects(
-    () => restarted.start({ repoPath: path, task: 'must not recreate root', ownedPaths: ['lib/**'] }, { launch: false }),
-    /integrity root is unavailable/,
-  );
-  assert.deepEqual(resolverCalls, [], 'raw durable-entry detection neither parses the orphan nor resolves credentials');
-});
+    });
+    await assert.rejects(
+      () => restarted.start({ repoPath: path, task: 'must not recreate root', ownedPaths: ['lib/**'] }, { launch: false }),
+      /integrity root is unavailable/,
+    );
+    assert.deepEqual(resolverCalls, [], 'raw durable-entry detection neither parses the orphan nor resolves credentials');
+  },
+);
 
 test('initial sealed records redact the freshly preflighted literal credential', async () => {
   const path = await repo('offload-integrity-initial-redaction-');
   const statePath = await mkdtemp(join(tmpdir(), 'offload-integrity-state-'));
+  const integrityVault = memoryWindowsIntegrityVault();
   const credential = 'unusual-literal-credential-123456';
   const core = createCore({
-    config: { loaded, integrityStatePath: statePath, resolveKey: () => credential },
+    config: integrityTestConfig({ statePath, integrityVault, resolveKey: () => credential }),
     snapshots: { create: async () => 'a'.repeat(40), diff: async () => '' },
   });
   const started = await core.start(
@@ -720,6 +745,7 @@ test('initial sealed records redact the freshly preflighted literal credential',
 test('tampered keyRef never reaches a resolver before MAC verification', async () => {
   const path = await repo('offload-integrity-keyref-');
   const statePath = await mkdtemp(join(tmpdir(), 'offload-integrity-state-'));
+  const integrityVault = memoryWindowsIntegrityVault();
   const calls = [];
   const resolveKey = (ref) => {
     calls.push(ref);
@@ -728,7 +754,7 @@ test('tampered keyRef never reaches a resolver before MAC verification', async (
     throw new Error('unknown ref');
   };
   const first = createCore({
-    config: { loaded, integrityStatePath: statePath, resolveKey },
+    config: integrityTestConfig({ statePath, integrityVault, resolveKey }),
     snapshots: { create: async () => 'a'.repeat(40), diff: async () => '' },
   });
   const started = await first.start({ repoPath: path, task: 'bound', ownedPaths: ['src/**'] }, { launch: false });
@@ -738,7 +764,7 @@ test('tampered keyRef never reaches a resolver before MAC verification', async (
   await writeFile(record, JSON.stringify(tampered));
   calls.length = 0;
   const resumed = createCore({
-    config: { loaded, integrityStatePath: statePath, resolveKey },
+    config: integrityTestConfig({ statePath, integrityVault, resolveKey }),
     snapshots: { create: async () => 'a'.repeat(40), diff: async () => '' },
   });
   await assert.rejects(() => resumed.resume(started.jobId, path), /integrity check failed/);
@@ -748,6 +774,7 @@ test('tampered keyRef never reaches a resolver before MAC verification', async (
 test('sealed keyRef remains authoritative across later config edits', async () => {
   const path = await repo('offload-integrity-config-change-');
   const statePath = await mkdtemp(join(tmpdir(), 'offload-integrity-state-'));
+  const integrityVault = memoryWindowsIntegrityVault();
   const calls = [];
   const resolveKey = (ref) => {
     calls.push(ref);
@@ -756,7 +783,7 @@ test('sealed keyRef remains authoritative across later config edits', async () =
     throw new Error('unknown ref');
   };
   const original = createCore({
-    config: { loaded, integrityStatePath: statePath, resolveKey },
+    config: integrityTestConfig({ statePath, integrityVault, resolveKey }),
     snapshots: { create: async () => 'a'.repeat(40), diff: async () => '' },
   });
   const started = await original.start({ repoPath: path, task: 'stable config', ownedPaths: ['src/**'] }, { launch: false });
@@ -765,7 +792,7 @@ test('sealed keyRef remains authoritative across later config edits', async () =
   changed.config.providers.test.baseUrl = 'https://changed.example.test';
   calls.length = 0;
   const afterEdit = createCore({
-    config: { loaded: changed, integrityStatePath: statePath, resolveKey },
+    config: integrityTestConfig({ loaded: changed, statePath, integrityVault, resolveKey }),
     snapshots: { create: async () => 'a'.repeat(40), diff: async () => '' },
   });
   await assert.rejects(
@@ -784,7 +811,9 @@ test('root state rejects in-repo paths and Windows ignores hostile APPDATA/XDG',
     undefined,
   );
   assert.equal(integrityStateHintAllowed('D:\\shared', { platform: 'win32' }), false);
-  const unsafe = createCore({ config: { loaded, integrityStatePath: join(path, 'integrity-state'), resolveKey: () => 'credential' } });
+  const unsafe = createCore({
+    config: { loaded, integrityPlatform: 'darwin', integrityStatePath: join(path, 'integrity-state'), resolveKey: () => 'credential' },
+  });
   await assert.rejects(
     () => unsafe.start({ repoPath: path, task: 'unsafe hook', ownedPaths: ['src/**'] }, { launch: false }),
     /must not be inside the repository/,
