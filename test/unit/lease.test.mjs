@@ -21,6 +21,18 @@ test('private directory creation rejects a symlinked namespace intermediate', ()
   }
 });
 
+test('LeaseManager creates absent managed lock parents below an existing git directory', () => {
+  const gitDir = tempDir();
+  try {
+    const manager = new LeaseManager({ gitDir, pidAlive: () => true });
+    assert.equal(manager.acquire('parent', ['src/**'], { pid: 1, ownerNonce: nonce('parent') }).jobId, 'parent');
+    assert.equal(existsSync(join(gitDir, 'offload', 'locks', 'parent.json')), true);
+    assert.equal(manager.release('parent', { ownerNonce: nonce('parent') }), true);
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
 test('leases reject overlapping live scopes and allow disjoint jobs', () => {
   const gitDir = tempDir();
   let now = 1000;

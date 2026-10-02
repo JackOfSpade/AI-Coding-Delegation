@@ -340,6 +340,36 @@ test('artifact lease root is a private stable hash of the canonical workspace on
       realpath: (path) => path,
     }),
   );
+  const canonicalWindowsWorkspace = 'C:\\\\Repo';
+  assert.equal(
+    artifactLeaseRoot({
+      cwd: 'c:/repo',
+      platform: 'win32',
+      temporaryRoot: 'C:\\\\Temp',
+      realpath: () => canonicalWindowsWorkspace,
+    }),
+    artifactLeaseRoot({
+      cwd: '\\\\?\\C:\\\\REPO',
+      platform: 'win32',
+      temporaryRoot: 'C:\\\\Temp',
+      realpath: () => canonicalWindowsWorkspace,
+    }),
+  );
+  const canonicalUncWorkspace = '\\\\server\\share\\repo';
+  assert.equal(
+    artifactLeaseRoot({
+      cwd: '\\\\?\\UNC\\server\\share\\repo',
+      platform: 'win32',
+      temporaryRoot: 'C:\\\\Temp',
+      realpath: () => canonicalUncWorkspace,
+    }),
+    artifactLeaseRoot({
+      cwd: canonicalUncWorkspace,
+      platform: 'win32',
+      temporaryRoot: 'C:\\\\Temp',
+      realpath: () => canonicalUncWorkspace,
+    }),
+  );
 });
 
 test('artifact lease gives release a fresh retry window after acquisition contention', async () => {
