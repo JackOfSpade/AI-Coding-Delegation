@@ -1,13 +1,9 @@
 name: Client smoke
 
 on:
+  push:
+  pull_request:
   workflow_dispatch:
-    inputs:
-      clients:
-        description: Comma-separated installed clients to exercise in a disposable home
-        required: true
-        default: claude,codex,cursor
-        type: string
 
 permissions:
   contents: read
@@ -18,7 +14,7 @@ concurrency:
 
 jobs:
   client-smoke:
-    runs-on: [self-hosted]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -27,7 +23,20 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
-      - name: Exercise requested clients in a disposable home
+      - name: Install the pinned Codex CLI without lifecycle scripts
+        shell: bash
         env:
-          OFFLOAD_CLIENTS: ${{ inputs.clients }}
-        run: node scripts/client-smoke.mjs
+          CODEX_VERSION: 0.160.0
+          CODEX_TARBALL_INTEGRITY: sha512-kEtVGzjRAYAMOwJxN39bGcna7LT3IDQgq64NNJ/dDTfu4OzZaocJcyNb5/gGJ/IVF/Vj7oK7E2m3nmTan7lpjg==
+          NPM_CONFIG_IGNORE_SCRIPTS: 'true'
+        run: |
+          set -euo pipefail
+          package="$(npm pack "@openai/codex@${CODEX_VERSION}" --ignore-scripts --json | node -e 'let text = ""; process.stdin.on("data", (chunk) => (text += chunk)); process.stdin.on("end", () => process.stdout.write(JSON.parse(text)[0].filename));')"
+          actual="sha512-$(openssl dgst -sha512 -binary "$package" | base64 -w 0)"
+          test "$actual" = "$CODEX_TARBALL_INTEGRITY"
+          install_prefix="$RUNNER_TEMP/offload-codex"
+          npm install --prefix "$install_prefix" --ignore-scripts "$package"
+          echo "$install_prefix/node_modules/.bin" >> "$GITHUB_PATH"
+          "$install_prefix/node_modules/.bin/codex" --version
+      - name: Exercise Codex registration in a disposable home
+        run: node scripts/client-smoke.mjs --clients=codex
