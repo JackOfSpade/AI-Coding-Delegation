@@ -66,10 +66,7 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
       'POSIX integrity root rejects a same-inode same-size rewrite detected only by nanosecond metadata',
       'POSIX root checks require POSIX metadata',
     ],
-    [
-      'a missing integrity root is never recreated over a corrupt orphan job entry',
-      'Windows stores integrity roots in Credential Locker',
-    ],
+    ['a missing integrity root is never recreated over a corrupt orphan job entry', 'Windows stores integrity roots in Credential Locker'],
     [
       'path policy rejects broken symlink and lexical escapes before a write can follow them',
       'Windows symlink creation requires Developer Mode or elevation',

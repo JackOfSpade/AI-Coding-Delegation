@@ -156,7 +156,11 @@ function stripControls(value) {
 function scalar(value) {
   // Strip an entire terminal sequence before clipping. Clipping first could
   // leave an unterminated OSC sequence whose legitimate suffix is discarded.
-  return redactText(stripControls(String(value)).slice(0, 4_096).replace(/[\r\n]/g, '↩'));
+  return redactText(
+    stripControls(String(value))
+      .slice(0, 4_096)
+      .replace(/[\r\n]/g, '↩'),
+  );
 }
 function verifierOutput(text, lines) {
   // Verifier output is deliberately multiline, but it is always visually
