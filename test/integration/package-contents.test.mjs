@@ -4,7 +4,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, win32 as windowsPath } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 
 function tarEntries(archive) {
@@ -42,17 +42,42 @@ async function extractPackage(archive, destination) {
   }
 }
 
+function windowsNpmPackInvocation(args, options, nodeExecutable = process.execPath) {
+  // npm run supplies npm_execpath.  The sibling path lets direct `node --test`
+  // invocations work too.  Execute npm's JavaScript entry point with Node so
+  // a path containing spaces remains a single argv value instead of crossing
+  // cmd.exe's nested command/batch-file quote parsing.
+  const npmExecPath = options.env?.npm_execpath;
+  const npmCli =
+    typeof npmExecPath === 'string' && npmExecPath.endsWith('npm-cli.js')
+      ? npmExecPath
+      : windowsPath.join(windowsPath.dirname(nodeExecutable), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  return { command: nodeExecutable, args: [npmCli, ...args] };
+}
+
 function npmPack(args, options) {
   if (process.platform !== 'win32') return execFileSync('npm', args, options);
-  // Node cannot reliably execute npm.cmd directly on current Node releases.
-  // Quote every argument for cmd.exe: --pack-destination receives a dynamic
-  // temporary path, which may contain spaces on a Windows runner.
-  const command = `npm.cmd ${args.map((argument) => `"${String(argument).replaceAll('"', '""')}"`).join(' ')}`;
-  const result = spawnSync('cmd.exe', ['/d', '/s', '/c', command], { ...options, shell: false, windowsHide: true });
+  const invocation = windowsNpmPackInvocation(args, options);
+  const result = spawnSync(invocation.command, invocation.args, { ...options, shell: false, windowsHide: true });
   if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`npm pack failed with exit ${result.status ?? 'unknown'}: ${result.stderr || ''}`);
+  if (result.status !== 0)
+    throw new Error(
+      `npm pack failed with exit ${result.status ?? 'unknown'}: stderr=${JSON.stringify(result.stderr || '')}; stdout=${JSON.stringify(result.stdout || '')}`,
+    );
   return result.stdout;
 }
+
+test('Windows npm packing calls npm CLI without cmd.exe argument reparsing', () => {
+  const invocation = windowsNpmPackInvocation(
+    ['pack', '--pack-destination', 'C:\\temporary path\\offload package'],
+    { env: { npm_execpath: 'C:\\node\\node_modules\\npm\\bin\\npm-cli.js' } },
+    'C:\\node\\node.exe',
+  );
+  assert.deepEqual(invocation, {
+    command: 'C:\\node\\node.exe',
+    args: ['C:\\node\\node_modules\\npm\\bin\\npm-cli.js', 'pack', '--pack-destination', 'C:\\temporary path\\offload package'],
+  });
+});
 
 test('the npm package contains the runnable product and excludes legacy or test artifacts', async () => {
   const cache = await mkdtemp(join(tmpdir(), 'offload-npm-cache-'));
