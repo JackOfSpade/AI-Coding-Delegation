@@ -159,14 +159,7 @@
             }
           }
         ],
-        "tools": [
-          "Bash",
-          "Edit",
-          "Glob",
-          "Grep",
-          "Read",
-          "Write"
-        ],
+        "tools": ["Bash", "Edit", "Glob", "Grep", "Read", "Write"],
         "messages": [
           {
             "role": "user",
@@ -236,14 +229,7 @@
             }
           }
         ],
-        "tools": [
-          "Bash",
-          "Edit",
-          "Glob",
-          "Grep",
-          "Read",
-          "Write"
-        ],
+        "tools": ["Bash", "Edit", "Glob", "Grep", "Read", "Write"],
         "messages": [
           {
             "role": "user",

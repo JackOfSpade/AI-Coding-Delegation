@@ -12,21 +12,12 @@
   },
   "peak": {
     "utc_windows": [
-      [
-        "01:00",
-        "04:00"
-      ],
-      [
-        "06:00",
-        "10:00"
-      ]
+      ["01:00", "04:00"],
+      ["06:00", "10:00"]
     ],
     "days": "Mon-Fri (UTC date of the window)",
     "excludes": "Chinese public holidays",
-    "beijing_equivalent": [
-      "09:00-12:00",
-      "14:00-18:00"
-    ],
+    "beijing_equivalent": ["09:00-12:00", "14:00-18:00"],
     "off_peak_is_half_of_peak": true
   },
   "models": {

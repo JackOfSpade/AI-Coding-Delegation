@@ -1,0 +1,33 @@
+name: Client smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      clients:
+        description: Comma-separated installed clients to exercise in a disposable home
+        required: true
+        default: claude,codex,cursor
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: client-smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  client-smoke:
+    runs-on: [self-hosted]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Exercise requested clients in a disposable home
+        env:
+          OFFLOAD_CLIENTS: ${{ inputs.clients }}
+        run: node scripts/client-smoke.mjs

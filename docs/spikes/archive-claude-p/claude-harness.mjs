@@ -19,14 +19,23 @@ import { mkdtempSync, mkdirSync, existsSync, writeFileSync, realpathSync } from 
 import { tmpdir, homedir, platform } from 'node:os';
 import { join, delimiter } from 'node:path';
 
-export const DUMMY_KEY = 'sk-ant-dummy-not-a-real-key';
+// Deliberately not credential-shaped, so repository secret scans remain useful.
+export const DUMMY_KEY = 'mock-api-key-for-local-test-only';
 export const DUMMY_TOKEN = 'dummy-auth-token-not-real';
 
 /** Locate the claude binary: $CLAUDE_BIN, then ~/.local/bin/claude, then PATH. Returns null if absent. */
 export function findClaude() {
   const candidates = [process.env.CLAUDE_BIN, join(homedir(), '.local', 'bin', 'claude')].filter(Boolean);
   for (const p of (process.env.PATH || '').split(delimiter)) candidates.push(join(p, 'claude'));
-  return candidates.find((p) => { try { return existsSync(p); } catch { return false; } }) ?? null;
+  return (
+    candidates.find((p) => {
+      try {
+        return existsSync(p);
+      } catch {
+        return false;
+      }
+    }) ?? null
+  );
 }
 
 export const sandboxAvailable = () => platform() === 'darwin' && existsSync('/usr/bin/sandbox-exec');
@@ -46,13 +55,24 @@ export function sandboxProfile(home = homedir()) {
 /** A local HTTP proxy that refuses everything and records what was attempted: `hosts` = ['CONNECT host:443', ...]. */
 export async function startCanaryProxy() {
   const attempts = [];
-  const server = http.createServer((req, res) => { attempts.push(`HTTP ${req.method} ${req.url}`); res.writeHead(403); res.end(); });
-  server.on('connect', (req, sock) => { attempts.push(`CONNECT ${req.url}`); sock.end('HTTP/1.1 403 Forbidden\r\n\r\n'); });
+  const server = http.createServer((req, res) => {
+    attempts.push(`HTTP ${req.method} ${req.url}`);
+    res.writeHead(403);
+    res.end();
+  });
+  server.on('connect', (req, sock) => {
+    attempts.push(`CONNECT ${req.url}`);
+    sock.end('HTTP/1.1 403 Forbidden\r\n\r\n');
+  });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   return {
     url: `http://127.0.0.1:${server.address().port}`,
     attempts,
-    close: () => new Promise((r) => { server.close(() => r()); server.closeAllConnections?.(); }),
+    close: () =>
+      new Promise((r) => {
+        server.close(() => r());
+        server.closeAllConnections?.();
+      }),
   };
 }
 
@@ -66,7 +86,12 @@ export function makeTempRepo(parent = makeScratch(), files = { 'README.md': '# t
   const repo = join(parent, 'repo');
   mkdirSync(repo, { recursive: true });
   const genv = { PATH: process.env.PATH, HOME: parent, GIT_CONFIG_NOSYSTEM: '1' };
-  const git = (...a) => execFileSync('git', ['-c', 'user.name=Mock', '-c', 'user.email=mock@example.invalid', '-c', 'commit.gpgsign=false', ...a], { cwd: repo, env: genv, stdio: 'ignore' });
+  const git = (...a) =>
+    execFileSync('git', ['-c', 'user.name=Mock', '-c', 'user.email=mock@example.invalid', '-c', 'commit.gpgsign=false', ...a], {
+      cwd: repo,
+      env: genv,
+      stdio: 'ignore',
+    });
   git('init', '-q', '-b', 'main');
   for (const [name, content] of Object.entries(files)) writeFileSync(join(repo, name), content);
   git('add', '-A');
@@ -93,7 +118,10 @@ export function hermeticEnv({ configDir, homeDir, baseUrl, auth = 'api-key', tok
     for (const k of ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy']) env[k] = proxyUrl;
     env.NO_PROXY = env.no_proxy = '127.0.0.1,localhost,::1';
   }
-  for (const [k, v] of Object.entries(extra)) { if (v === null || v === undefined) delete env[k]; else env[k] = String(v); }
+  for (const [k, v] of Object.entries(extra)) {
+    if (v === null || v === undefined) delete env[k];
+    else env[k] = String(v);
+  }
   return env;
 }
 
@@ -127,7 +155,15 @@ export async function runClaude(o) {
   mkdirSync(configDir, { recursive: true });
   mkdirSync(homeDir, { recursive: true });
   const canary = o.canary === false ? null : await startCanaryProxy();
-  const env = hermeticEnv({ configDir, homeDir, baseUrl: o.baseUrl ?? o.mock.url, auth: o.auth, token: o.token, proxyUrl: canary?.url, extra: o.env });
+  const env = hermeticEnv({
+    configDir,
+    homeDir,
+    baseUrl: o.baseUrl ?? o.mock.url,
+    auth: o.auth,
+    token: o.token,
+    proxyUrl: canary?.url,
+    extra: o.env,
+  });
 
   let cli = o.cliArgs;
   if (!cli) {
@@ -144,10 +180,18 @@ export async function runClaude(o) {
   const child = spawn(cmd, argv, { cwd, env, stdio: [o.stdin === 'pipe-open' ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
   let stdout = '';
   let stderr = '';
-  child.stdout.on('data', (d) => { stdout += d; });
-  child.stderr.on('data', (d) => { stderr += d; });
+  child.stdout.on('data', (d) => {
+    stdout += d;
+  });
+  child.stderr.on('data', (d) => {
+    stderr += d;
+  });
   let timedOut = false;
-  const killer = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); setTimeout(() => child.kill('SIGKILL'), 3000).unref(); }, o.timeoutMs ?? 60000);
+  const killer = setTimeout(() => {
+    timedOut = true;
+    child.kill('SIGTERM');
+    setTimeout(() => child.kill('SIGKILL'), 3000).unref();
+  }, o.timeoutMs ?? 60000);
   const [code, signal] = await new Promise((resolve) => child.on('close', (c, s) => resolve([c, s])));
   clearTimeout(killer);
   const attempts = canary ? [...canary.attempts] : [];
@@ -157,15 +201,31 @@ export async function runClaude(o) {
   const rawLines = [];
   for (const line of stdout.split('\n')) {
     if (!line.trim()) continue;
-    try { events.push(JSON.parse(line)); } catch { rawLines.push(line); }
+    try {
+      events.push(JSON.parse(line));
+    } catch {
+      rawLines.push(line);
+    }
   }
   const result = events.find((e) => e.type === 'result');
   return {
-    code, signal, timedOut, durationMs: Date.now() - started, stdout, stderr, events, rawLines,
+    code,
+    signal,
+    timedOut,
+    durationMs: Date.now() - started,
+    stdout,
+    stderr,
+    events,
+    rawLines,
     init: events.find((e) => e.type === 'system' && e.subtype === 'init'),
     result,
     text: result?.result,
-    scratch, cwd, configDir, homeDir, env, sandboxed: useSandbox,
+    scratch,
+    cwd,
+    configDir,
+    homeDir,
+    env,
+    sandboxed: useSandbox,
     outsideAttempts: attempts, // proxy-visible attempts to reach anything but the mock
     command: [cmd, ...argv],
   };

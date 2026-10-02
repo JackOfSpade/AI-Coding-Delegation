@@ -1,0 +1,76 @@
+{
+  "name": "offload",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "bin",
+    "src",
+    "templates",
+    "plugins",
+    "install.mjs",
+    "config.example.json",
+    "README.md",
+    "DESIGN.md",
+    "docs/SECURITY.md",
+    "docs/TESTING.md",
+    "docs/spikes/01-deepseek-facts.md",
+    "docs/spikes/02-openai-surface.md"
+  ],
+  "bin": {
+    "offload": "./bin/offload.mjs"
+  },
+  "scripts": {
+    "test": "npm run test:unit && npm run test:integration",
+    "test:unit": "node test/run-suite.mjs unit",
+    "test:integration": "node test/run-suite.mjs integration",
+    "test:full": "npm test",
+    "static": "node scripts/check-syntax.mjs",
+    "lint": "eslint .",
+    "format:check": "prettier --check .",
+    "format:write": "prettier --write .",
+    "test:ci": "node scripts/test-ci.mjs",
+    "coverage": "c8 --all --include=src/**/*.mjs --reporter=text --reporter=json-summary --reports-dir=coverage --check-coverage --lines 90 --functions 90 --branches 72 npm run test:ci",
+    "artifacts:clean": "node scripts/clean-artifacts.mjs",
+    "package:check": "node scripts/package-gate.mjs",
+    "release:check": "npm run artifacts:clean && npm run static && npm run lint && npm run format:check && npm run test:ci && npm run coverage && npm run package:check"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "c8": "12.0.0",
+    "eslint": "10.11.0",
+    "globals": "17.13.0",
+    "prettier": "3.9.9"
+  },
+  "exports": {
+    ".": "./src/core.mjs",
+    "./core": "./src/core.mjs",
+    "./runtime": "./src/runner.mjs",
+    "./config": "./src/config.mjs",
+    "./secrets": "./src/secrets.mjs",
+    "./glob": "./src/glob.mjs",
+    "./policy": "./src/policy.mjs",
+    "./lease": "./src/lease.mjs",
+    "./git-snapshot": "./src/git-snapshot.mjs",
+    "./worktree": "./src/worktree.mjs",
+    "./redact": "./src/redact.mjs",
+    "./store": "./src/store.mjs",
+    "./pricing": "./src/pricing.mjs",
+    "./pricing-registry": "./src/pricing-registry.mjs",
+    "./report": "./src/report.mjs",
+    "./sandbox": "./src/sandbox.mjs",
+    "./runner": "./src/runner.mjs",
+    "./job-manager": "./src/job-manager.mjs",
+    "./mcp": "./src/mcp.mjs",
+    "./cli": "./src/cli.mjs",
+    "./provider/sse": "./src/provider/sse.mjs",
+    "./provider/openai-chat": "./src/provider/openai-chat.mjs",
+    "./agent/context": "./src/agent/context.mjs",
+    "./agent/loop": "./src/agent/loop.mjs",
+    "./agent/prompt": "./src/agent/prompt.mjs",
+    "./agent/tools": "./src/agent/tools.mjs"
+  }
+}

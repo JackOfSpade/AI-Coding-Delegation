@@ -1,6 +1,6 @@
 # Spike 01: DeepSeek API facts for deepseek-worker
 
-As of 2026-10-01 09:40-10:00 UTC. Claude Code under test: 2.1.284 (`/Users/jack/.local/bin/claude`). Node v26.4.0.
+As of 2026-10-01 09:40-10:00 UTC. Claude Code under test: 2.1.284 (a local user installation; no fixed host path). Node v26.4.0.
 
 ## How to read this doc
 
@@ -8,10 +8,10 @@ Tags: **VERIFIED** = observed first-hand in this spike (a live fetch of the docs
 
 Source classes: `[DS-docs]` DeepSeek's own docs, `[CC-docs]` code.claude.com docs, `[3P]` GitHub issues / blogs / community repos (second-hand), `[local]` ran here against a local mock, `[live]` the single dummy-key request to api.deepseek.com.
 
-Reproduction assets are in `docs/spikes/01-assets/` (mock server, runner, HTML-to-text, cost model). Fixtures are in `test/fixtures/` (`deepseek-pricing-2026-10-01.json`, `deepseek-401-bearer-dummy.json`, `cc-2.1.284-anthropic-request-shape.json`). Doc pages were fetched with:
+Archived reproduction assets are in `docs/spikes/archive-claude-p/01-assets/` (mock server, runner, HTML-to-text, cost model). Fixtures are `test/fixtures/deepseek-pricing-2026-10-01.json`, `test/fixtures/deepseek-401-bearer-dummy.json`, and `docs/spikes/archive-claude-p/cc-2.1.284-anthropic-request-shape.json`. Doc pages were fetched with:
 
 ```
-curl -sS -m 30 -L https://api-docs.deepseek.com/<path> -o x.html && python3 docs/spikes/01-assets/html2text.py x.html
+curl -sS -m 30 -L https://api-docs.deepseek.com/<path> -o x.html && python3 docs/spikes/archive-claude-p/01-assets/html2text.py x.html
 ```
 
 ## TL;DR (what changes the design)
@@ -30,14 +30,14 @@ curl -sS -m 30 -L https://api-docs.deepseek.com/<path> -o x.html && python3 docs
 
 Source: https://api-docs.deepseek.com/quick_start/pricing (fetched with the command above).
 
-| Item | `deepseek-v4-pro` | `deepseek-flash` |
-|---|---|---|
-| Version string | `DeepSeek-V4-Pro-0813` | `DeepSeek-V4.1-Flash` |
-| Context | 1M | 1M |
-| Max output | 384K | 384K |
-| Thinking | non-thinking and thinking, thinking is the default | same |
-| Vision | "Not supported" | supported |
-| Concurrency (per account) | 500 | 2500 |
+| Item                      | `deepseek-v4-pro`                                  | `deepseek-flash`      |
+| ------------------------- | -------------------------------------------------- | --------------------- |
+| Version string            | `DeepSeek-V4-Pro-0813`                             | `DeepSeek-V4.1-Flash` |
+| Context                   | 1M                                                 | 1M                    |
+| Max output                | 384K                                               | 384K                  |
+| Thinking                  | non-thinking and thinking, thinking is the default | same                  |
+| Vision                    | "Not supported"                                    | supported             |
+| Concurrency (per account) | 500                                                | 2500                  |
 
 Excerpt: `MODEL VERSION | DeepSeek-V4.1-Flash | DeepSeek-V4-Pro-0813`, `CONTEXT LENGTH | 1M`, `MAX OUTPUT | MAXIMUM: 384K`, `Vision | (yes) | Not supported`, `Concurrency Limit(3) | 2500 | 500`.
 
@@ -58,11 +58,11 @@ Source: https://api-docs.deepseek.com/guides/thinking_mode and https://api-docs.
 
 ### 1.3 Pricing (USD per 1M tokens, `[DS-docs]`, VERIFIED as documented; machine-readable copy in `test/fixtures/deepseek-pricing-2026-10-01.json`)
 
-| | Flash off-peak | Flash peak | v4-pro off-peak | v4-pro peak |
-|---|---|---|---|---|
-| Input, cache hit | 0.003 | 0.006 | 0.022 | 0.044 |
-| Input, cache miss | 0.15 | 0.30 | 0.66 | 1.32 |
-| Output | 0.60 | 1.20 | 1.98 | 3.96 |
+|                   | Flash off-peak | Flash peak | v4-pro off-peak | v4-pro peak |
+| ----------------- | -------------- | ---------- | --------------- | ----------- |
+| Input, cache hit  | 0.003          | 0.006      | 0.022           | 0.044       |
+| Input, cache miss | 0.15           | 0.30       | 0.66            | 1.32        |
+| Output            | 0.60           | 1.20       | 1.98            | 3.96        |
 
 Peak hours (footnote 2): `01:00 - 04:00 and 06:00 - 10:00 UTC, Monday through Friday, excluding Chinese public holidays`; everything else, including all of weekends and Chinese public holidays, is off-peak at half price. Chinese-language page confirms Beijing time 09:00-12:00 and 14:00-18:00 (https://api-docs.deepseek.com/zh-cn/quick_start/pricing), which is the same window.
 
@@ -94,18 +94,18 @@ Best reading: Pro is still served as Pro. Only a real response can confirm (comp
 - Same source reports: cache identity includes the client header fingerprint and request params (changing `max_tokens` or headers dropped a replay to 0%), tool order matters (reordered tools: 71% to 33%), and cold parallel requests sharing a prefix all pay miss price because the cache write is async. UNVERIFIED.
 - Usage field names on the Anthropic surface: UNVERIFIED. DeepSeek documents only `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`. The community proxy normalizes both DeepSeek-style and Anthropic-style (`cache_read_input_tokens`, `cache_creation_input_tokens`) shapes without saying which the endpoint returns. Whether Anthropic-style `input_tokens` includes cached tokens is also unknown. Defensive rule for the worker: `hit = prompt_cache_hit_tokens ?? cache_read_input_tokens ?? 0`; `miss = prompt_cache_miss_tokens ?? (input_tokens + cache_creation_input_tokens)`; if neither family is present, price all input as miss. Persist the raw `usage` JSON of the first N calls per run.
 
-### 2.3 Cost estimate: 40-turn agent session on v4-pro (`docs/spikes/01-assets/cost-model.py`, my arithmetic, assumptions stated)
+### 2.3 Cost estimate: 40-turn agent session on v4-pro (`docs/spikes/archive-claude-p/01-assets/cost-model.py`, my arithmetic, assumptions stated)
 
 Assumptions: 40 API requests; context grows linearly to 80k tokens at request 40; output 1,000 tokens/request (thinking + call), so total output 40k; per request the new uncached text is only the latest tool result (assistant output is already a persisted unit). Starting prefix: 17k tokens is the default Claude Code system+tools measured locally (69.8 KB request body for "Say hi", about 19k tokens at 3.6 chars/token), 5k with `--tools` restricted. Total input processed: 1.94M tokens (17k start) or 1.70M (5k start).
 
 17k to 80k start, v4-pro:
 
-| Cache scenario | Peak | Off-peak |
-|---|---|---|
-| No caching at all (every input token is a miss) | $2.72 | $1.36 |
-| 66% hit (third-party 4-turn measurement) | $1.09 | $0.54 |
-| 90% hit (third-party 10-turn measurement) | $0.49 | $0.25 |
-| Ideal (only new tool results + first request miss) | $0.30 | $0.15 |
+| Cache scenario                                     | Peak  | Off-peak |
+| -------------------------------------------------- | ----- | -------- |
+| No caching at all (every input token is a miss)    | $2.72 | $1.36    |
+| 66% hit (third-party 4-turn measurement)           | $1.09 | $0.54    |
+| 90% hit (third-party 10-turn measurement)          | $0.49 | $0.25    |
+| Ideal (only new tool results + first request miss) | $0.30 | $0.15    |
 
 - 5k start (restricted tools): $2.40 / $0.97 / $0.45 / $0.29 peak for the same four rows.
 - Upper bound (every one of 40 requests carries a full 80k): no cache $4.38 peak / $2.19 off-peak; 90% hit $0.71 / $0.35.
@@ -124,15 +124,15 @@ Reading: caching is worth a 5-6x reduction versus no cache; output is then about
 
 ### 3.2 Error codes (VERIFIED as documented, https://api-docs.deepseek.com/quick_start/error_codes)
 
-| Code | Meaning | Documented action |
-|---|---|---|
-| 400 | invalid body format | fix request |
-| 401 | wrong API key | fix key |
-| 402 | insufficient balance | top up |
-| 422 | invalid parameters | fix params |
-| 429 | rate limit reached | space out requests |
-| 500 | server error | retry after brief wait |
-| 503 | server overloaded | retry after brief wait |
+| Code | Meaning              | Documented action      |
+| ---- | -------------------- | ---------------------- |
+| 400  | invalid body format  | fix request            |
+| 401  | wrong API key        | fix key                |
+| 402  | insufficient balance | top up                 |
+| 422  | invalid parameters   | fix params             |
+| 429  | rate limit reached   | space out requests     |
+| 500  | server error         | retry after brief wait |
+| 503  | server overloaded    | retry after brief wait |
 
 No retry/backoff formula, no `Retry-After` guidance is documented. There is no 529. Observed 401 shape [live]: `{"error":{"message":"Authentication Fails, Your api key: ****0000 is invalid (request_id: ...)","type":"authentication_error","param":null,"code":"invalid_request_error"}}` with HTTP/2 401, `content-type: application/json`, response via CloudFront. This is an OpenAI-style envelope, NOT Anthropic's `{"type":"error","error":{...}}`. Claude Code's capability-rejection recovery matches on upstream error wording, so DeepSeek's wording matters ([CC-docs] https://code.claude.com/docs/en/llm-gateway-protocol "Automatic retry and error forwarding").
 
@@ -150,28 +150,28 @@ Source class matters: DeepSeek's own compatibility table is https://api-docs.dee
 
 ### 4.1 Claim table
 
-| # | Claim | Source class | Status | Workaround |
-|---|---|---|---|---|
-| a | `metadata.user_id` must match `^[a-zA-Z0-9_-]+$` | DS rule: `[DS-docs]` (regex stated). Failures: `[3P]` https://github.com/deepseek-ai/DeepSeek-V3/issues/1277 and https://github.com/anthropics/claude-code/issues/56643 (2026-05-06: 400 `Invalid 'user_id': string does not match pattern`) | Rule VERIFIED (docs). Enforcement today UNVERIFIED. Claude Code 2.1.284 sends `{"device_id":"<hex>","account_uuid":"","session_id":"<uuid>"}` as the string [local]. | Proxy rewrites `user_id` to a stable valid token; or first-run probe. See "user_id findings" below. |
-| b | `/v1/models` 404 preflight breaks Claude Code | blog/`[3P]` folklore | Not reproducible: `claude -p` 2.1.284 made exactly 1 request (POST /v1/messages), no `/v1/models`, no `HEAD /api/hello`, no `count_tokens` [local]. Gateway model discovery is opt-in via `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` ([CC-docs] llm-gateway-protocol). DeepSeek's actual response for `GET /anthropic/v1/models` UNVERIFIED. | Do not enable discovery. |
-| c | `tool_choice` conflicts with thinking | DS table says none/auto/any/tool supported (`[DS-docs]`). `[3P]` https://github.com/deepseek-ai/DeepSeek-V3/issues/1376 (comments 2026-06-04, 2026-08-03): on `/anthropic` with thinking on, forcing a SPECIFIC tool 400s with `Thinking mode does not support this tool_choice`, forcing `any` works, and `thinking:{"type":"disabled"}` makes all work. `[3P]` https://github.com/deepseek-ai/DeepSeek-R1/issues/836: Claude Code WebSearch fails on this. | UNVERIFIED. Claude Code's main loop sent no `tool_choice` in any capture [local]. | Disable WebSearch/WebFetch/Agent tools via `--tools`; or disable thinking via proxy. |
-| d | Thinking blocks must round-trip | Rule: `[DS-docs]` thinking_mode. Error text `The content[].thinking in the thinking mode must be passed back to the API.`: `[3P]` https://github.com/NousResearch/hermes-agent/issues/17992, https://github.com/musistudio/claude-code-router/issues/1378. Breakage reports for Claude Code 2.1.153-2.1.156 (https://github.com/farion1231/cc-switch/issues/3246, fixed by downgrading to 2.1.150 or a proxy) | Rule VERIFIED (docs). 2.1.284 replays thinking blocks with their `signature` in the assistant message that carries `tool_use`, and again across `--resume` [local mock proof]. Real DeepSeek acceptance UNVERIFIED. DeepSeek's own thinking blocks carry a UUID `signature` (`[3P]` hermes #17992). | Keep thinking blocks untouched; if a 400 with that wording appears, fail loudly (do not loop); fallback proxy injects `thinking:{"type":"disabled"}`. Claude Code strips earlier thinking blocks and retries when a signature is rejected ([CC-docs]); that can walk into this 400. |
-| e | Claude Code validates model names against an Anthropic allowlist | Single `[3P]` README: https://github.com/MG-Cafe/claudecode-deepseek-stack ("cannot pass `deepseek-v4-pro` directly") | FALSE for 2.1.284 [local]: `--model deepseek-v4-pro` and `ANTHROPIC_MODEL=deepseek-v4-pro` both reached the wire as `model: "deepseek-v4-pro"`. Only stderr noise: `[claude-code:unrecognized_model] {"model":"deepseek-v4-pro","query_source":"sdk"}`. DeepSeek's own Claude Code page sets `ANTHROPIC_MODEL=deepseek-flash[1m]`. The DS wording about "bypass the APP's model name restrictions" refers to Claude Desktop, not Claude Code. | none needed |
-| f | `[1m]` suffix | `[DS-docs]` uses it in env; `[CC-docs]` model-config: Claude Code strips it before sending | VERIFIED [local]: `ANTHROPIC_MODEL='deepseek-v4-pro[1m]'` yields wire `model: "deepseek-v4-pro"`, result `contextWindow: 1000000`, and adds beta `context-1m-2025-08-07`; without it `contextWindow: 200000`. It is a Claude Code client-side window hint, not a DeepSeek feature (DeepSeek's real window is 1M). | Use `[1m]` and set an explicit `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (CC-docs range 100k-1M). |
-| g | Subagent/WebSearch/WebFetch calls 400 with `thinking options type cannot be disabled when reasoning_effort is set` | `[3P]` https://github.com/anthropics/claude-code/issues/65863 (Claude Code 2.1.167-2.1.169, closed stale 2026-09-02; direct curl tests could not reproduce) | UNVERIFIED on 2.1.284. | Do not let the worker spawn subagents: restrict `--tools`. |
-| h | Empty final answers | `[3P]` https://github.com/deepseek-ai/DeepSeek-V3/issues/1673 (open, 2026-09-24: `finish_reason: stop`, empty `content`, answer inside reasoning; ~29% in one 45-run replay; OpenAI surface) and #1453 (closed stale: out=0 after tool results) | UNVERIFIED. | Detect empty `result`, retry once, and surface `empty_final`. |
-| i | Mid-conversation `role:"system"` messages, `context_management` field, `anthropic-beta` header | `[DS-docs]`: beta header ignored; neither `role:"system"` in `messages` nor `context_management` appears in the compatibility table | 2.1.284 sends `messages[1].role == "system"` on the very first request [local]. No issue reports found for DeepSeek. Claude Code auto-retries without a rejected mid-conversation system message ([CC-docs]) if the error wording matches. UNVERIFIED. | `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` drops `context_management` and `display:"omitted"` and trims betas but keeps role-system messages [local]; proxy can hoist them if rejected. |
+| #   | Claim                                                                                                              | Source class                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Status                                                                                                                                                                                                                                                                                                                                                                                                                                        | Workaround                                                                                                                                                                                                                                                                          |
+| --- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| a   | `metadata.user_id` must match `^[a-zA-Z0-9_-]+$`                                                                   | DS rule: `[DS-docs]` (regex stated). Failures: `[3P]` https://github.com/deepseek-ai/DeepSeek-V3/issues/1277 and https://github.com/anthropics/claude-code/issues/56643 (2026-05-06: 400 `Invalid 'user_id': string does not match pattern`)                                                                                                                                                                                                                 | Rule VERIFIED (docs). Enforcement today UNVERIFIED. Claude Code 2.1.284 sends `{"device_id":"<hex>","account_uuid":"","session_id":"<uuid>"}` as the string [local].                                                                                                                                                                                                                                                                          | Proxy rewrites `user_id` to a stable valid token; or first-run probe. See "user_id findings" below.                                                                                                                                                                                 |
+| b   | `/v1/models` 404 preflight breaks Claude Code                                                                      | blog/`[3P]` folklore                                                                                                                                                                                                                                                                                                                                                                                                                                         | Not reproducible: `claude -p` 2.1.284 made exactly 1 request (POST /v1/messages), no `/v1/models`, no `HEAD /api/hello`, no `count_tokens` [local]. Gateway model discovery is opt-in via `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` ([CC-docs] llm-gateway-protocol). DeepSeek's actual response for `GET /anthropic/v1/models` UNVERIFIED.                                                                                              | Do not enable discovery.                                                                                                                                                                                                                                                            |
+| c   | `tool_choice` conflicts with thinking                                                                              | DS table says none/auto/any/tool supported (`[DS-docs]`). `[3P]` https://github.com/deepseek-ai/DeepSeek-V3/issues/1376 (comments 2026-06-04, 2026-08-03): on `/anthropic` with thinking on, forcing a SPECIFIC tool 400s with `Thinking mode does not support this tool_choice`, forcing `any` works, and `thinking:{"type":"disabled"}` makes all work. `[3P]` https://github.com/deepseek-ai/DeepSeek-R1/issues/836: Claude Code WebSearch fails on this. | UNVERIFIED. Claude Code's main loop sent no `tool_choice` in any capture [local].                                                                                                                                                                                                                                                                                                                                                             | Disable WebSearch/WebFetch/Agent tools via `--tools`; or disable thinking via proxy.                                                                                                                                                                                                |
+| d   | Thinking blocks must round-trip                                                                                    | Rule: `[DS-docs]` thinking_mode. Error text `The content[].thinking in the thinking mode must be passed back to the API.`: `[3P]` https://github.com/NousResearch/hermes-agent/issues/17992, https://github.com/musistudio/claude-code-router/issues/1378. Breakage reports for Claude Code 2.1.153-2.1.156 (https://github.com/farion1231/cc-switch/issues/3246, fixed by downgrading to 2.1.150 or a proxy)                                                | Rule VERIFIED (docs). 2.1.284 replays thinking blocks with their `signature` in the assistant message that carries `tool_use`, and again across `--resume` [local mock proof]. Real DeepSeek acceptance UNVERIFIED. DeepSeek's own thinking blocks carry a UUID `signature` (`[3P]` hermes #17992).                                                                                                                                           | Keep thinking blocks untouched; if a 400 with that wording appears, fail loudly (do not loop); fallback proxy injects `thinking:{"type":"disabled"}`. Claude Code strips earlier thinking blocks and retries when a signature is rejected ([CC-docs]); that can walk into this 400. |
+| e   | Claude Code validates model names against an Anthropic allowlist                                                   | Single `[3P]` README: https://github.com/MG-Cafe/claudecode-deepseek-stack ("cannot pass `deepseek-v4-pro` directly")                                                                                                                                                                                                                                                                                                                                        | FALSE for 2.1.284 [local]: `--model deepseek-v4-pro` and `ANTHROPIC_MODEL=deepseek-v4-pro` both reached the wire as `model: "deepseek-v4-pro"`. Only stderr noise: `[claude-code:unrecognized_model] {"model":"deepseek-v4-pro","query_source":"sdk"}`. DeepSeek's own Claude Code page sets `ANTHROPIC_MODEL=deepseek-flash[1m]`. The DS wording about "bypass the APP's model name restrictions" refers to Claude Desktop, not Claude Code. | none needed                                                                                                                                                                                                                                                                         |
+| f   | `[1m]` suffix                                                                                                      | `[DS-docs]` uses it in env; `[CC-docs]` model-config: Claude Code strips it before sending                                                                                                                                                                                                                                                                                                                                                                   | VERIFIED [local]: `ANTHROPIC_MODEL='deepseek-v4-pro[1m]'` yields wire `model: "deepseek-v4-pro"`, result `contextWindow: 1000000`, and adds beta `context-1m-2025-08-07`; without it `contextWindow: 200000`. It is a Claude Code client-side window hint, not a DeepSeek feature (DeepSeek's real window is 1M).                                                                                                                             | Use `[1m]` and set an explicit `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (CC-docs range 100k-1M).                                                                                                                                                                                           |
+| g   | Subagent/WebSearch/WebFetch calls 400 with `thinking options type cannot be disabled when reasoning_effort is set` | `[3P]` https://github.com/anthropics/claude-code/issues/65863 (Claude Code 2.1.167-2.1.169, closed stale 2026-09-02; direct curl tests could not reproduce)                                                                                                                                                                                                                                                                                                  | UNVERIFIED on 2.1.284.                                                                                                                                                                                                                                                                                                                                                                                                                        | Do not let the worker spawn subagents: restrict `--tools`.                                                                                                                                                                                                                          |
+| h   | Empty final answers                                                                                                | `[3P]` https://github.com/deepseek-ai/DeepSeek-V3/issues/1673 (open, 2026-09-24: `finish_reason: stop`, empty `content`, answer inside reasoning; ~29% in one 45-run replay; OpenAI surface) and #1453 (closed stale: out=0 after tool results)                                                                                                                                                                                                              | UNVERIFIED.                                                                                                                                                                                                                                                                                                                                                                                                                                   | Detect empty `result`, retry once, and surface `empty_final`.                                                                                                                                                                                                                       |
+| i   | Mid-conversation `role:"system"` messages, `context_management` field, `anthropic-beta` header                     | `[DS-docs]`: beta header ignored; neither `role:"system"` in `messages` nor `context_management` appears in the compatibility table                                                                                                                                                                                                                                                                                                                          | 2.1.284 sends `messages[1].role == "system"` on the very first request [local]. No issue reports found for DeepSeek. Claude Code auto-retries without a rejected mid-conversation system message ([CC-docs]) if the error wording matches. UNVERIFIED.                                                                                                                                                                                        | `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` drops `context_management` and `display:"omitted"` and trims betas but keeps role-system messages [local]; proxy can hoist them if rejected.                                                                                             |
 
 ### user_id findings [local], VERIFIED
 
-Command (mock server + env isolation, see assets): `docs/spikes/01-assets/capture-run.sh s2_nonessential text "Say hi" ANTHROPIC_MODEL='deepseek-v4-pro[1m]' CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 --`
+Command (mock server + env isolation, see assets): `docs/spikes/archive-claude-p/01-assets/capture-run.sh s2_nonessential text "Say hi" ANTHROPIC_MODEL='deepseek-v4-pro[1m]' CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 --`
 
 Captured request: `metadata={"user_id": "{\"device_id\":\"0d91a0...\",\"account_uuid\":\"\",\"session_id\":\"f22fa66e-...\"}"}`.
 
 - The May-2026 community workaround `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (from https://github.com/deepseek-ai/DeepSeek-V3/issues/1277) does NOT change `metadata.user_id` on 2.1.284.
 - `ANTHROPIC_USER_ID=myworker_123` (suggested in the anthropics/claude-code issue) has no effect (s9 capture).
 - `--bare` does not change it either (s10).
-- Binary inspection: `strings -a /Users/jack/.local/share/claude/versions/2.1.284 | grep "function bA("` shows `return{user_id:S(D)}` where `D` merges `CLAUDE_CODE_EXTRA_METADATA` keys with `device_id`, `account_uuid`, `session_id` (JSON stringify). The only knob, `CLAUDE_CODE_EXTRA_METADATA`, adds keys; it cannot change the format.
+- Binary inspection of the local Claude executable (for example, `strings -a <path-to-claude-binary> | grep "function bA(") shows `return{user_id:S(D)}`where`D`merges`CLAUDE_CODE_EXTRA_METADATA`keys with`device_id`, `account_uuid`, `session_id`(JSON stringify). The only knob,`CLAUDE_CODE_EXTRA_METADATA`, adds keys; it cannot change the format.
 - Counter-evidence that DeepSeek may not enforce today: reports from Claude Code 2.1.167-2.1.195 on DeepSeek's official setup (June 2026) say the main loop works. UNVERIFIED either way.
 
 ## 5. Authentication on the Anthropic surface
@@ -179,10 +179,11 @@ Captured request: `metadata={"user_id": "{\"device_id\":\"0d91a0...\",\"account_
 - `Authorization: Bearer` is read as the API key: [live] command
 
   ```
-  curl -sS -i -m 30 -X POST https://api.deepseek.com/anthropic/v1/messages -H "Authorization: Bearer sk-dummy-not-a-real-key-0000" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" -d '{"model":"deepseek-v4-pro","max_tokens":1,"messages":[{"role":"user","content":"."}]}'
+  curl -sS -i -m 30 -X POST https://api.deepseek.com/anthropic/v1/messages -H "Authorization: Bearer $DEEPSEEK_API_KEY" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" -d '{"model":"deepseek-v4-pro","max_tokens":1,"messages":[{"role":"user","content":"."}]}'
   ```
 
   gave `HTTP/2 401` with body `{"error":{"message":"Authentication Fails, Your api key: ****0000 is invalid ...`. The server named the key, i.e. it parsed the Bearer value as a credential. VERIFIED. (A valid-key success cannot be shown without a key.)
+
 - `x-api-key`: DeepSeek's compatibility table says "Fully Supported", and its Anthropic-SDK example uses `ANTHROPIC_API_KEY` (which the SDK sends as `x-api-key`). I did not send a second probe (task cap of one request). UNVERIFIED behaviorally; documented.
 - DeepSeek's own Claude Code page uses `ANTHROPIC_AUTH_TOKEN` (Bearer), so both header styles are exercised by DeepSeek's own docs.
 - Claude Code mapping [local]: `ANTHROPIC_AUTH_TOKEN` sends only `Authorization: Bearer ...` (no `x-api-key` header in the s1 capture); when `ANTHROPIC_API_KEY` is also set (the `--bare` run) it sends both headers. [CC-docs] llm-gateway-connect: token variable takes precedence immediately; the API-key variable needs a one-time approval in interactive mode.
@@ -204,24 +205,24 @@ What the user should be told: every file the DeepSeek agent reads from the worki
 
 ## 7. What Claude Code 2.1.284 actually sends (all [local], VERIFIED)
 
-Method: `docs/spikes/01-assets/capture-mock.mjs` (zero-dep Node mock on 127.0.0.1) plus `capture-run.sh` (`env -i`, `HOME` and `CLAUDE_CONFIG_DIR` in a temp dir, `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>`, `ANTHROPIC_AUTH_TOKEN=sk-dummy-local-mock`, `HTTPS_PROXY` pointed at a dead port so nothing leaves the machine). Captures sanitized in `test/fixtures/cc-2.1.284-anthropic-request-shape.json`. No traffic reached api.anthropic.com or api.deepseek.com from these runs.
+Method: `docs/spikes/archive-claude-p/01-assets/capture-mock.mjs` (zero-dep Node mock on 127.0.0.1) plus `capture-run.sh` (`env -i`, `HOME` and `CLAUDE_CONFIG_DIR` in a temp dir, `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>`, `ANTHROPIC_AUTH_TOKEN=local-mock-token`, `HTTPS_PROXY` pointed at a dead port so nothing leaves the machine). Captures are sanitized in `docs/spikes/archive-claude-p/cc-2.1.284-anthropic-request-shape.json`. No traffic reached api.anthropic.com or api.deepseek.com from these runs.
 
 Default (`ANTHROPIC_MODEL='deepseek-v4-pro[1m]'`, `CLAUDE_CODE_EFFORT_LEVEL=max`) request: `POST /v1/messages?beta=true`, `stream: true`, `max_tokens: 32000`, `thinking: {"type":"adaptive","display":"omitted"}`, `output_config: {"effort":"max"}`, `context_management: {"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`, 21 tools, 3 system blocks (billing header `x-anthropic-billing-header: cc_version=2.1.284.dd4; cc_entrypoint=sdk-cli;`, with `cache_control: ephemeral` on blocks 2 and 3), `anthropic-beta` with 9 values, `anthropic-version: 2023-06-01`, headers `x-claude-code-session-id`, `x-stainless-timeout: 600`, `user-agent: claude-cli/2.1.284 (external, sdk-cli)`.
 
 Env matrix (each one `claude -p "Say hi" --output-format json`, one request each):
 
-| Env / flag | Observed wire change |
-|---|---|
-| `MAX_THINKING_TOKENS=0` | `thinking` field absent; `output_config.effort` still sent. At DeepSeek, absent means thinking ON (default). |
-| `CLAUDE_CODE_DISABLE_THINKING=1` | same: `thinking` absent |
-| `--settings '{"alwaysThinkingEnabled":false}'` | same: `thinking` absent (s13). I never saw Claude Code emit `thinking:{"type":"disabled"}` from the main loop; `[3P]` #65863 says subagent calls do. |
-| `CLAUDE_CODE_EFFORT_LEVEL=xhigh` | passed verbatim `output_config: {"effort":"xhigh"}` (DeepSeek maps it to high). Unset: `high`. |
-| `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` | no `context_management`; `thinking: {"type":"adaptive"}` without `display`; beta list cut to 5 values |
-| `CLAUDE_CODE_ATTRIBUTION_HEADER=0` | billing-header system block removed |
-| `--model deepseek-v4-pro` / `ANTHROPIC_MODEL=deepseek-v4-pro` | wire model identical, stderr `[claude-code:unrecognized_model]` only |
-| no `[1m]` | `contextWindow: 200000` instead of 1,000,000 |
-| `--tools "Read,Edit,Write,Bash,Glob,Grep" --disable-slash-commands` | 6 tools, request body 17.7 KB (about 4.9k tokens) vs 69.8 KB (about 19k tokens) default |
-| `--bare` | 3 tools (Bash, Edit, Read), 4.7 KB body (about 1.3k tokens), tiny system prompt. `--help` says auth is strictly `ANTHROPIC_API_KEY` or `apiKeyHelper` in this mode; my capture set both variables and both `authorization` and `x-api-key` headers were sent. |
+| Env / flag                                                          | Observed wire change                                                                                                                                                                                                                                          |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MAX_THINKING_TOKENS=0`                                             | `thinking` field absent; `output_config.effort` still sent. At DeepSeek, absent means thinking ON (default).                                                                                                                                                  |
+| `CLAUDE_CODE_DISABLE_THINKING=1`                                    | same: `thinking` absent                                                                                                                                                                                                                                       |
+| `--settings '{"alwaysThinkingEnabled":false}'`                      | same: `thinking` absent (s13). I never saw Claude Code emit `thinking:{"type":"disabled"}` from the main loop; `[3P]` #65863 says subagent calls do.                                                                                                          |
+| `CLAUDE_CODE_EFFORT_LEVEL=xhigh`                                    | passed verbatim `output_config: {"effort":"xhigh"}` (DeepSeek maps it to high). Unset: `high`.                                                                                                                                                                |
+| `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`                          | no `context_management`; `thinking: {"type":"adaptive"}` without `display`; beta list cut to 5 values                                                                                                                                                         |
+| `CLAUDE_CODE_ATTRIBUTION_HEADER=0`                                  | billing-header system block removed                                                                                                                                                                                                                           |
+| `--model deepseek-v4-pro` / `ANTHROPIC_MODEL=deepseek-v4-pro`       | wire model identical, stderr `[claude-code:unrecognized_model]` only                                                                                                                                                                                          |
+| no `[1m]`                                                           | `contextWindow: 200000` instead of 1,000,000                                                                                                                                                                                                                  |
+| `--tools "Read,Edit,Write,Bash,Glob,Grep" --disable-slash-commands` | 6 tools, request body 17.7 KB (about 4.9k tokens) vs 69.8 KB (about 19k tokens) default                                                                                                                                                                       |
+| `--bare`                                                            | 3 tools (Bash, Edit, Read), 4.7 KB body (about 1.3k tokens), tiny system prompt. `--help` says auth is strictly `ANTHROPIC_API_KEY` or `apiKeyHelper` in this mode; my capture set both variables and both `authorization` and `x-api-key` headers were sent. |
 
 Tool round trip (mock returns a `thinking` block with a UUID-style `signature` plus a `tool_use`): the second request carried `assistant: [thinking(signature) , tool_use]` then `user: [tool_result]`. After `claude -p ... --resume <session>`, the next request carried the earlier assistant thinking block again. So Claude Code 2.1.284 does preserve and replay thinking blocks. Mid-conversation `role:"system"` entries (`# Environment...`, `<total_tokens>...`) appear in `messages`.
 

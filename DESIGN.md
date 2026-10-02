@@ -1,169 +1,86 @@
-# offload: final design
+# offload: design
 
-Working name `offload`. Status: design locked in discussion, nothing built yet. See `HANDOFF.md` for the build plan.
+`offload` lets a local orchestrator delegate a bounded implementation, test-writing, or debugging package to a configured OpenAI-compatible worker. The orchestrator retains design, security decisions, and final review. The implementation is complete; the remaining limits and unperformed manual checks are recorded here and in [docs/TESTING.md](docs/TESTING.md).
 
-## 1. Goal
+## Roles and boundary
 
-A model in an AI coding app (the **orchestrator**: architecture, decomposition, review) hands implementation, test writing and debugging (the **worker**: any cheap model) to a local agent that edits the user's real working tree on the CURRENT branch, then gets back a compact, independently verified report. Both roles are swappable:
+- The orchestrator is any local client that can invoke the CLI or local stdio MCP server. Claude Code, Codex, and Cursor have installer routes; discovery and approval behavior remain host-specific.
+- The worker is a configured model profile. The shipped adapter is OpenAI-compatible Chat Completions; an Anthropic Messages adapter is not included.
+- The worker never opens the repository or runs Git directly. It requests bounded local tools, and only their returned text leaves the computer for the provider.
 
-- **Orchestrator** = whichever app/model you run: Claude Code (VS Code ext, desktop app, CLI), Codex, Cursor, Gemini CLI, anything that can call MCP tools or run a shell command. We do not build or configure it beyond installing the routing instructions.
-- **Worker** = a model profile in config. v1 adapter: any OpenAI-compatible chat-completions endpoint (DeepSeek, OpenAI, OpenRouter, Together, local Ollama/LM Studio). Later adapter: Anthropic Messages, so Claude can also be a worker.
+The project is a local program, not a hosted MCP service. Hosted ChatGPT/Codex/Cowork cannot reach a machine-local process without separately operated remote infrastructure or a Secure MCP Tunnel.
 
-Non-goals for v1: worktrees, auto-commit/push, subagents inside the worker, web tools, ChatGPT web (needs a public tunnel), Windows sandboxing, cloud-hosted agent runs (Codex cloud tasks cannot reach a local server).
-
-## 2. Architecture
-
-```
-Orchestrator app (any model)  ──MCP stdio──┐
-Any shell-capable agent       ──CLI────────┤
-                                           ▼
-                              offload core  (Node >= 20, zero npm dependencies)
-   ┌───────────────┬────────────────┬──────────────┬───────────────┬──────────────┐
-   config+secrets  job manager      git snapshot   agent loop      sandbox+policy
-   (profiles,      (lifecycle,      (temp-index    (model client,  (path rules,
-   keychain)       store, leases,   trees, diff,   tools, context   OS sandbox,
-                   cancel, budget)  patch, revert) mgmt, finish)    command runner)
-                                           │                 │
-                                    verifier (server runs   ▼
-                                    testCommand itself)   worker model API (HTTPS)
-```
-
-One core, two thin adapters: `offload mcp` (stdio MCP server) and `offload <subcommand>` (CLI). MCP and CLI expose the same operations, so agents without MCP still work through the shell.
-
-DeepSeek (or any worker model) never touches the repo directly. The agent loop is a local process: the model emits tool requests as text, the loop executes them locally and sends results back. Only text the tools return leaves the machine.
-
-## 3. Same-branch model
-
-Claude/Codex and the worker share one checkout and branch. Rules:
-
-1. **No history changes by the worker.** It never commits, pushes, switches branches, resets, stashes or cleans. Enforced by (a) the tool layer (no git-writing path), (b) the sandbox making `.git` read-only for commands, (c) post-run check that branch and HEAD are unchanged. Committing is the orchestrator's or user's job, after review.
-2. **Snapshots.** Before and after each run the core builds a git tree of the whole working tree (tracked and untracked, honoring `.gitignore`) using a temporary index: `GIT_INDEX_FILE=<tmp> git add -A && git write-tree`. The real index, HEAD and files are never touched. `git diff <before> <after>` is exactly the worker's change set, even when the user has uncommitted work.
-3. **Write scope.** Each job declares `ownedPaths` (globs relative to repo root). The worker can write only there (hard check in the write/edit tools on the realpath, symlink-safe, plus OS sandbox for commands). A job without narrower paths must say `["**"]` explicitly and takes the whole-repo lease.
-4. **Leases.** A lock file per running job under `<gitdir>/offload/locks/` records pid, heartbeat and ownedPaths. A new job whose paths overlap a live lease is rejected with the holder's job id. Stale leases (dead pid or old heartbeat) are reclaimed. This works across multiple app windows and multiple MCP server instances.
-5. **Violations are reported, never auto-reverted.** Files changed outside `ownedPaths`, or any branch/HEAD change, appear in the report. Auto-revert could destroy the user's concurrent edits, so the orchestrator decides.
-6. **Stale-read protection.** The worker's edit tool records a content hash at read time and refuses an edit if the file changed on disk since (protects concurrent human edits).
-7. **Revert.** Each job saves `patch.diff`. `revert` runs `git apply -R --check` first and refuses if files changed since; dry run by default.
-8. **Orchestrator discipline** (in the routing instructions): do not edit under a running job's `ownedPaths`; give parallel jobs disjoint paths.
-
-## 4. Operations (MCP tools and CLI subcommands)
-
-Async-first so clients with short tool timeouts (about a minute) work. Claude Code can also just wait.
-
-| Tool / CLI | Purpose |
-|---|---|
-| `offload_start` / `offload start` | Start a job, return immediately `{jobId, repo, branch, head, profile}` |
-| `offload_wait` / `offload wait` | Long-poll up to `timeoutSec` (default 40, max 55). Returns progress (turn, recent actions, cost so far) or the final report |
-| `offload_job` / `offload job` | No id: list recent jobs plus a health line (key found? sandbox available?). With id: `include` = `summary` / `diff` / `files` / `log` |
-| `offload_repair` / `offload repair` | Continue the same job (same message history) with a concrete defect list |
-| `offload_revert` / `offload revert` | Reverse-apply the job's patch (dry run unless `apply: true`) |
-| `offload_cancel` / `offload cancel` | Stop a running job, keep partial diff |
-
-`offload_start` input: `task` (self-contained brief), `acceptanceCriteria[]`, `ownedPaths[]` (required), `relevantPaths[]`, `testCommand`, `profile` (default from config), `effort` (`normal`|`high`), `maxRepairRounds` (0-4, default 2), `budget {maxUsd, maxTurns, timeoutMinutes}`, `allowNetwork` (default false), `extraWritable[]`, `repoPath` (absolute; default: MCP roots, then client env hints such as `CLAUDE_PROJECT_DIR`, then the server's cwd. Always accept an explicit value because not every client passes the project dir).
-
-Report (text, compact):
-```
-JOB oj-20261001-ab12  DONE_VERIFIED | DONE_UNVERIFIED | VERIFY_FAILED | FAILED | TIMEOUT | BUDGET | CANCELLED
-profile pro (deepseek-v4-pro) · 2 rounds · 7m41s · 38 turns · in 412k (cache hit 88%) out 31k · $0.41
-branch main @ a1b2c3d (unchanged)
-worker changes: M src/a.ts (+12/-3) · A tests/a.test.ts (+88)
-scope: ok | VIOLATIONS: <paths>
-verify: `npm test` PASS (exit 0, 14s)  | FAIL exit 1 + last 40 lines
-worker summary: <=1500 chars   concerns: <list>
-next: offload_job {jobId, include:"diff"} · repair · revert
-```
-
-## 5. Agent loop (the harness)
-
-**Model-facing tools:** `read_file(path, offset?, limit?)`, `list_dir`/`glob`, `grep`, `edit_file(path, old_string, new_string, replace_all?)` (exact unique match, line endings preserved), `write_file(path, content)`, `run_command(command, timeoutSec?)`, `finish({summary, concerns[], testsRun[]})`. `finish` is mandatory: a structured ending avoids the empty-final-answer failure reported for DeepSeek, and gives a clean summary.
-
-**Loop:** system prompt (short: role, scope, rules, repo conventions file such as AGENTS.md/CLAUDE.md truncated) + brief; stream the model; execute tool calls (reads in parallel, writes sequential); append results; repeat until `finish`.
-
-**Limits:** max turns (default 80), wall clock (default 30 min), budget in USD, loop detection (same failing call 3x), per-tool output caps (head+tail), file reads windowed.
-
-**Context:** append-only message list to keep provider prefix caches hot (DeepSeek caching is prefix-based). When near the window, elide the oldest large tool results to stubs (one cache reset per elision). Tool definitions and their order are constant.
-
-**Model client interface:** `chat({messages, tools, signal}) -> stream of {text, reasoning, toolCalls, usage}`. Provider quirks live in the adapter: DeepSeek reasoning passback (`reasoning_content`/thinking blocks must be returned with tool-call turns), usage normalization (hit/miss fields), retry with jittered backoff on 429/5xx/network, fatal on 401/402, SSE keep-alive comments, request timeouts.
-
-**Resume/repair:** we own the message history, so a repair round just appends the defect list and continues.
-
-## 6. Sandbox and policy
-
-- Threat model: a confused or prompt-injected agent, not a determined attacker. Repo files can contain hostile instructions, so safety does not rely on the model behaving.
-- File tools: realpath checks; write only in `ownedPaths` (+ `extraWritable`); read denylist by default (`.env*`, `*.pem`, `id_rsa*`, `.git/**` internals, `.aws`, `.ssh`, and similar); no reads outside the repo.
-- `run_command`: runs in an OS sandbox where available. macOS: `sandbox-exec` profile allowing writes only to `ownedPaths`, `extraWritable`, the temp dir and tool caches; `.git` read-only; reads limited to the repo, toolchains and system dirs; **no network** unless `allowNetwork`. The worker process itself (not the commands) holds the API key and does the network calls; commands get a scrubbed env with no secrets. Linux: bubblewrap if present (later). Where no sandbox exists, run policy-only and say `sandbox: none` in the report.
-- Known tension: `npm install`, `pip install`, `cargo fetch` need network. Default is install-free; the orchestrator sets `allowNetwork` per job when needed.
-- `sandbox-exec` is deprecated but works on current macOS. Verify the profile with real toolchains (npm, pytest, cargo, go) early.
-
-## 7. Verification
-
-After the worker finishes, the core runs `testCommand` itself in the same sandbox (with `extraWritable` for build dirs). The worker's claim is irrelevant. Failure output feeds the automatic repair rounds. If tests fail for reasons unrelated to the change (pre-existing failures), the repair prompt tells the worker to report, not chase them. No `testCommand` means `DONE_UNVERIFIED`.
-
-## 8. Config and secrets
-
-`~/.config/offload/config.json` (no secrets, safe to keep in your repo as an example):
-```json
-{
-  "providers": {
-    "deepseek": { "type": "openai-chat", "baseUrl": "https://api.deepseek.com",
-                  "keyRef": "keychain:offload-deepseek",
-                  "pricing": "deepseek-2026-10-01" }
-  },
-  "profiles": {
-    "pro":   { "provider": "deepseek", "model": "deepseek-v4-pro", "effort": "high" },
-    "flash": { "provider": "deepseek", "model": "deepseek-flash" }
-  },
-  "default": "pro",
-  "limits": { "maxTurns": 80, "timeoutMinutes": 30, "maxUsd": 2 }
-}
-```
-`keyRef` forms: `env:NAME`, `keychain:service` (macOS `security`, Linux `secret-tool`), `file:/path` (0600). GUI apps do not inherit shell env, so Keychain is the default. Per-repo `.offload.json` may set `testCommand`, `denyRead`, `extraWritable`, `disabled`. Delegation is on by default in any git repo (the user accepted the data-handling terms); `disabled: true` opts a repo out.
-
-Metering: exact tokens from provider usage, price table as data with a `fetched_at` date, peak/off-peak by UTC clock, per-job budget cap. Model name is configurable and the response `model` is logged (DeepSeek V4-Pro lifecycle is unclear in its own docs).
-
-## 9. Job store
-
-`<gitdir>/offload/jobs/<id>/`: `job.json`, `events.jsonl`, `messages.jsonl`, `patch.diff`, `report.md`. Inside `.git`, so invisible to `git status`. Secrets redacted before writing. Jobs survive server restarts (a restart marks running jobs `FAILED: server restarted` and keeps the partial diff).
-
-## 10. Routing: how orchestrators know to delegate
-
-One source text (`templates/routing.md`) rendered per client:
-- Claude Code (CLI, VS Code ext, desktop app): `~/.claude/CLAUDE.md` managed block + `~/.claude/skills/offload/SKILL.md` (full protocol, auto-triggers on phrases like "grunt work", "sub-agents", "save Claude's processing") + `/offload` slash command.
-- Codex: managed block in `~/.codex/AGENTS.md` (and MCP entry in `~/.codex/config.toml`).
-- Cursor and others: rules file plus MCP config.
-The protocol (in the skill): preflight, design and decompose with disjoint `ownedPaths`, start all independent jobs, wait, review every diff, repair loop (max 3 rounds), completion gate (no final answer while failing/unverified/out of scope), fallbacks. Existing drafts: `templates/` (rewrite for the `offload_*` names and the start/wait flow).
-
-**Discoverability.** A model delegates more reliably when it clearly knows the pathway exists, so make it visible at every layer:
-- Tool descriptions are written as when-to-use ("Use this to hand implementation, test writing or debugging to the worker model instead of doing it yourself") and tool names are self-explanatory.
-- Check in a fresh session that the tools are listed by name and not hidden behind a tool-search step; if a client defers MCP tools, make sure the names and first-line descriptions still signal the purpose.
-- Claude Code: a SessionStart hook injects one line of context ("offload available: worker <model>, key OK, sandbox <yes/no>") and reports a broken setup early. Other clients: the same line lives in the AGENTS.md or rules block.
-- The always-loaded block stays a short pointer; the full protocol lives in the skill.
-
-Compliance (does the model actually delegate?) is measured, not assumed: a behavior eval per client with stubbed tools, run with and without each of the discoverability aids above to see which ones matter.
-
-## 11. Distribution and multiple PCs
-
-Everything lives in one repo (code, docs, templates, installer, example config). No secrets in it. On another machine:
+## Architecture
 
 ```
-git clone <your-repo> offload && cd offload && node install.mjs
+orchestrator ── CLI or stdio MCP ──► core
+                                      ├─ config, credentials, integrity store
+                                      ├─ lease manager and job lifecycle
+                                      ├─ private linked-worktree isolation
+                                      ├─ model loop and bounded file tools
+                                      └─ independent verifier and report
 ```
-Zero npm dependencies, so no `npm install`. The installer is idempotent and reversible (`node install.mjs --uninstall`): checks Node >= 20; detects installed clients and registers the MCP server (`claude mcp add --scope user`, Codex `config.toml`, Cursor `mcp.json`) pointing at the clone path; writes routing blocks, skill and command; stores the key in the OS keychain (prompted, never echoed, never in shell history); copies `config.example.json` if no config exists; runs `offload doctor`. Update: `git pull && node install.mjs`. If the clone moves, re-run the installer. An optional `npm i -g github:you/offload` gives an `offload` binary on PATH, so MCP config can use `offload mcp`.
 
-`offload doctor`: Node version, git, key resolvable, sandbox available and a self-test, client registrations, and an optional live probe (a few cheap calls) that checks auth, tool-call round trip, reasoning passback, usage/cache fields and the response `model`.
+`offload mcp` and `offload <subcommand>` are thin adapters over one core. Jobs, artifacts, and lease records are kept below the repository Git directory. The worker provider key remains in the local process, never in command environments.
 
-## 12. Testing
+## Workspace isolation and integration
 
-1. Unit: config/secrets, glob/scope matching, lease locks, snapshot/diff/revert (including dirty trees), edit/read tools, policy.
-2. Mock OpenAI-compatible server fixture (scripted tool calls, streaming, reasoning_content, errors, usage) drives the agent loop and full jobs deterministically.
-3. Sandbox integration tests (macOS; skipped elsewhere): out-of-scope write blocked, `.git` write blocked, network blocked, escape attempts (symlinks, `..`, `sh -c`).
-4. MCP protocol tests against a real client (dev-only dependency allowed in tests; production stays zero-dep) and against real Claude Code and Codex.
-5. Live suite behind a flag with a budget cap: doctor probe, a set of small repo tasks (success rate, cost, cache hit rate), delegation-compliance eval.
-6. Adversarial review pass over path handling, sandbox profile, secrets in logs, process cleanup (no orphans on cancel/exit).
+Built-in-provider jobs create a private, detached linked worktree seeded from an exact temporary-index snapshot of the primary checkout. This includes the caller's tracked, staged, unstaged, and non-ignored untracked state without changing the primary index or HEAD. The worker and verifier operate only in that workspace.
 
-## 13. Risks and open verifications
+The primary checkout is changed only when all of these hold:
 
-- DeepSeek via our own loop is unproven: tool-call reliability, reasoning passback rules on the OpenAI surface, usage fields, V4-Pro availability. Needs a real key early (`doctor` + a task benchmark).
-- Sandbox vs real toolchains (npm/pytest/cargo/go) and `sandbox-exec` deprecation; Linux/Windows plans.
-- Codex desktop and other clients: MCP timeout, approval prompts, project-dir passing, whether their own sandbox restricts our server or its network access. Not tested.
-- Whether Sonnet/Codex delegate reliably from instructions alone.
-- Worker quality on large refactors without compaction beyond tool-result elision.
+1. The job ends `DONE_VERIFIED` or `DONE_UNVERIFIED`.
+2. Changed files are within `ownedPaths`; changed ignored files must be within exact caller-declared ephemeral `extraWritable` scope.
+3. Branch, HEAD, primary worktree, and primary index checks show no conflict on the exact worker-touched paths.
+4. A Git-generated, literal-path patch passes `git apply --check` before application.
+
+Only owned paths are integrated and represented by `revert.diff`. A successful verifier is also audited: it may not mutate worker-owned output after the worker completion snapshot. `extraWritable` is caller-only, must be disjoint from `ownedPaths`, permits narrow temporary outputs in the private workspace, and is discarded rather than integrated or reverted. Repository `.offload.json` cannot declare it. An ignored untracked output outside that exact ephemeral scope is a failure, not a silent omission. Failed, cancelled, timed-out, over-budget, or scope-violating work remains reviewable in the job artifacts but is never applied to the primary checkout.
+
+The worktree helper creates restricted temporary roots, validates persisted worktree locations before opening or deleting them, and cleans terminal workspaces. A lifecycle owner does not publish a terminal status until it has attempted lease release and workspace cleanup and recorded that outcome. Retained workspaces expose `workspaceCleanupError` and safe cleanup remains retryable; a stored record that cannot safely validate its workspace is explicitly marked `workspaceCleanupRequired` for manual cleanup rather than being retried with an untrusted path. Durable `refs/offload/jobs/...` snapshot refs preserve retained job records; there is no purge command. These implementation details preserve recovery and repair; they are not a substitute for a hostile-local-user security boundary.
+
+Leases reject overlapping declared write scopes while jobs are active. Independent jobs may run concurrently with disjoint scopes. The integration checks are the final defense against a human or another process changing a touched path after the job starts.
+
+## Tool policy
+
+The model-facing tools are `read_file`, `list_dir`, `glob`, `grep`, `edit_file`, `write_file`, `run_command`, and `finish`. They have bounded output and path validation.
+
+- `ownedPaths` is required and must be relative, canonical paths or globs. File reads and writes reject traversal, path escapes, and symlink escapes.
+- `edit_file` requires a prior read and matching content identity/hash.
+- `write_file` requires a complete prior read of an existing destination, then checks its identity/content again immediately before rename. Creation also detects a competing creator. Both write tools reject Git-ignored untracked paths, so a change cannot disappear from the snapshot/revert representation.
+- The denylist includes repository secret conventions and common credential stores, including `.env*`, private keys, `.pgpass`, `credentials`, keystores (`.p12`, `.pfx`, `.jks`), and Terraform state. Repository policy can add `denyRead`, but cannot weaken the default policy.
+- The worker has no tool for commit, push, branch switching, reset, stash, clean, or arbitrary Git metadata changes.
+
+## Commands, sandboxing, and verification
+
+On macOS, a working `sandbox-exec` runs worker commands and verifiers with a scrubbed environment, declared writable paths, and network denied unless `allowNetwork` is true. The profile denies the private worktree `.git` pointer, the worktree Git administration directory, and the primary common Git directory for both reads and writes; it also denies sensitive macOS host-configuration locations.
+
+Linux, Windows, and macOS without an applicable `sandbox-exec` profile are `policy-only`. Worker `run_command` is disabled there. A verifier defaults to requiring the actual macOS sandbox result; it does not trust a stale host probe. A caller may deliberately run its own trusted verifier policy-only only with `--unsafe-policy-only-verifier` (MCP: `unsafePolicyOnlyVerifier`). Repository-configured verification cannot use that bypass. A policy-only result never authorizes automatic or later repair. The option is intentionally explicit because a scrubbed environment is not OS isolation.
+
+The server, not the worker's summary, runs `testCommand`. A pass is `DONE_VERIFIED`; no command is `DONE_UNVERIFIED`. Failed verification can enqueue repair only when the verifier's actual result reports the macOS sandbox. Repair creates a new private workspace seeded from the prior private result and is refused after an applied job.
+
+## Lifecycle and recovery
+
+`start` is asynchronous. `wait` returns progress or a terminal report; `job` exposes the saved review artifacts. `cancel` writes an idempotent durable request before it tries to interrupt a local owner. A different control-plane process does not take over that detached owner's lease or workspace cleanup, so its acknowledgement can be non-terminal; consume `wait` or `job` until the terminal `CANCELLED` report. Cancellation retains a private patch/report, but does not integrate it. `revert` defaults to a reverse-apply check and can apply only a successfully integrated owned patch; a completed revert is recorded and cannot be repeated.
+
+Job, transcript, and artifact publication uses sealed pending digests and same-directory atomic renames so recovery can accept only a complete old or new record. Restart recovery reconciles an interrupted integration or revert before publishing its final status, finalizes dead work, releases its lease, and retries safe workspace cleanup.
+
+Built-in provider records are authenticated with a per-user HMAC integrity root and a job-specific key derived from canonical repository/Git paths and job ID. They bind the execution profile and a root-keyed credential fingerprint. Ordinary inspection and execution authenticate before resolving the key reference; credential rotation or a malformed/legacy record fails closed. Authenticated cancellation, recovery/finalization, lease release, and private-worktree cleanup remain possible after credential rotation because they neither resolve a key nor construct a provider.
+
+## Configuration
+
+Global configuration selects providers, profiles, and limits. Global and repository configuration are read through checked descriptors with identity, size, and high-resolution timestamp checks; repository policy also rejects a final symlink. Credentials are references: `env:NAME`, `keychain:service`, or POSIX-only owner-private `file:/absolute/path`. Secret-file reads open one checked descriptor, reject links/non-regular files and weak ownership/mode, and compare descriptor identity, size, and high-resolution timestamps before and after reading. This narrows same-user replacement races; it cannot make Node filesystem access descriptor-relative.
+
+The optional repo-root `.offload.json` contains only `testCommand`, `denyRead`, and `disabled`. It is a narrow policy input, not a capability grant. In particular, `extraWritable` must be supplied by the caller and remains ephemeral.
+
+## Distribution and quality gates
+
+The installer configures local Claude/Codex/Cursor routes without placing secrets in the repository. The Codex personal plugin is preferred; the native skill is only its fallback, never a duplicate. The MCP skill resource and local plugin describe the same orchestration protocol.
+
+CI runs the strict suite on Ubuntu with Node 20, 22, and 24, and on current macOS and Windows with Node 24. The release job adds syntax/static checks, ESLint, Prettier, strict test-skip handling, coverage thresholds, package-content/extracted-install validation, and sanitized artifact upload. A manual self-hosted client-smoke workflow uses disposable homes. See [docs/TESTING.md](docs/TESTING.md) for exact commands and what remains manual.
+
+## Known limits
+
+- The recorded DeepSeek probe and one disposable job are narrow historical samples, not evidence of general provider reliability, pricing, cache semantics, rate limits, or reasoning replay behavior.
+- `sandbox-exec` is deprecated. Real npm, pytest, Cargo, and Go toolchains still need release-time macOS smoke coverage.
+- Linux and Windows are policy-only for commands. Real client discovery, approvals, and hosted/MCP-tunnel operation require their own manual smoke tests.
+- The controls defend against a fallible or prompt-injected worker; they are not a boundary against a same-user attacker that can alter the checkout, Git directory, installed program, or local process state.

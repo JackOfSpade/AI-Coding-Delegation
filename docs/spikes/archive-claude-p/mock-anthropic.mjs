@@ -74,7 +74,14 @@ const sleep = (ms, signal) =>
   new Promise((resolve) => {
     if (signal?.aborted) return resolve();
     const t = setTimeout(resolve, Math.min(ms, 2 ** 31 - 1));
-    signal?.addEventListener('abort', () => { clearTimeout(t); resolve(); }, { once: true });
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(t);
+        resolve();
+      },
+      { once: true },
+    );
   });
 
 const REDACT = '[REDACTED]';
@@ -95,7 +102,11 @@ function redactHeaders(h) {
 }
 
 const textOf = (c) =>
-  typeof c === 'string' ? c : Array.isArray(c) ? c.map((b) => (typeof b === 'string' ? b : b?.text ?? (b?.type === 'image' ? '[image]' : ''))).join('') : '';
+  typeof c === 'string'
+    ? c
+    : Array.isArray(c)
+      ? c.map((b) => (typeof b === 'string' ? b : (b?.text ?? (b?.type === 'image' ? '[image]' : '')))).join('')
+      : '';
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -113,8 +124,11 @@ function readBody(req) {
       }
       const raw = buf.toString('utf8');
       if (!raw) return resolve({});
-      try { resolve({ json: JSON.parse(raw), raw }); }
-      catch (e) { resolve({ raw, parseError: e.message }); }
+      try {
+        resolve({ json: JSON.parse(raw), raw });
+      } catch (e) {
+        resolve({ raw, parseError: e.message });
+      }
     });
     req.on('error', reject);
   });
@@ -164,7 +178,7 @@ function instanceFromSchema(schema, hint = 'Mock') {
   if (!schema || typeof schema !== 'object') return hint;
   if ('const' in schema) return schema.const;
   if (Array.isArray(schema.enum) && schema.enum.length) return schema.enum[0];
-  const type = Array.isArray(schema.type) ? schema.type.find((t) => t !== 'null') ?? 'null' : schema.type;
+  const type = Array.isArray(schema.type) ? (schema.type.find((t) => t !== 'null') ?? 'null') : schema.type;
   const alt = schema.anyOf || schema.oneOf;
   if (!type && Array.isArray(alt) && alt.length) return instanceFromSchema(alt.find((s) => s.type !== 'null') ?? alt[0], hint);
   switch (type) {
@@ -174,12 +188,19 @@ function instanceFromSchema(schema, hint = 'Mock') {
       for (const k of Object.keys(props)) o[k] = instanceFromSchema(props[k], `${hint} ${k}`);
       return o;
     }
-    case 'array': return [];
-    case 'string': return hint;
-    case 'integer': case 'number': return 0;
-    case 'boolean': return false;
-    case 'null': return null;
-    default: return hint;
+    case 'array':
+      return [];
+    case 'string':
+      return hint;
+    case 'integer':
+    case 'number':
+      return 0;
+    case 'boolean':
+      return false;
+    case 'null':
+      return null;
+    default:
+      return hint;
   }
 }
 
@@ -225,7 +246,8 @@ function normalizeTurn(t) {
   if (typeof t === 'string') return { blocks: [text(t)] };
   if (Array.isArray(t)) return { blocks: t.map((b) => (typeof b === 'string' ? text(b) : b)) };
   if (typeof t === 'object' && ['text', 'thinking', 'tool_use'].includes(t.type)) return { blocks: [t] };
-  if (typeof t === 'object') return { ...t, ...(Array.isArray(t.blocks) ? { blocks: t.blocks.map((b) => (typeof b === 'string' ? text(b) : b)) } : {}) };
+  if (typeof t === 'object')
+    return { ...t, ...(Array.isArray(t.blocks) ? { blocks: t.blocks.map((b) => (typeof b === 'string' ? text(b) : b)) } : {}) };
   return null;
 }
 
@@ -233,7 +255,8 @@ function normalizeTurn(t) {
 function materializeBlocks(blocks) {
   return (blocks ?? []).map((b) => {
     if (b.type === 'tool_use') return { ...b, id: b.id ?? nextId('toolu'), input: b.input ?? {} };
-    if (b.type === 'thinking') return { ...b, ...(b.signature === undefined ? { signature: `mocksig${randomBytes(6).toString('hex')}` } : {}) };
+    if (b.type === 'thinking')
+      return { ...b, ...(b.signature === undefined ? { signature: `mocksig${randomBytes(6).toString('hex')}` } : {}) };
     return { ...b };
   });
 }
@@ -249,38 +272,75 @@ function buildUsage(body, blocks, turnUsage) {
   };
 }
 
-function safeParse(s) { try { return JSON.parse(s); } catch { return {}; } }
+function safeParse(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return {};
+  }
+}
 
 function buildMessage({ id, model, blocks, stopReason, usage }) {
   return {
-    id, type: 'message', role: 'assistant', model,
+    id,
+    type: 'message',
+    role: 'assistant',
+    model,
     content: blocks.map((b) => {
       if (b.type === 'text') return { type: 'text', text: b.text };
-      if (b.type === 'thinking') return { type: 'thinking', thinking: b.thinking, ...(b.signature !== null ? { signature: b.signature } : {}) };
+      if (b.type === 'thinking')
+        return { type: 'thinking', thinking: b.thinking, ...(b.signature !== null ? { signature: b.signature } : {}) };
       return { type: 'tool_use', id: b.id, name: b.name, input: typeof b.input === 'string' ? safeParse(b.input) : b.input };
     }),
-    stop_reason: stopReason, stop_sequence: null, usage,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage,
   };
 }
 
 function buildSseEvents({ id, model, blocks, stopReason, usage, chunk }) {
   const ev = [];
-  ev.push(['message_start', { type: 'message_start', message: { id, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { ...usage, output_tokens: 1 } } }]);
+  ev.push([
+    'message_start',
+    {
+      type: 'message_start',
+      message: {
+        id,
+        type: 'message',
+        role: 'assistant',
+        model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { ...usage, output_tokens: 1 },
+      },
+    },
+  ]);
   blocks.forEach((b, index) => {
     if (b.type === 'text') {
       ev.push(['content_block_start', { type: 'content_block_start', index, content_block: { type: 'text', text: '' } }]);
       if (index === 0) ev.push(['ping', { type: 'ping' }]);
-      for (const piece of splitChunks(b.text, chunk)) ev.push(['content_block_delta', { type: 'content_block_delta', index, delta: { type: 'text_delta', text: piece } }]);
+      for (const piece of splitChunks(b.text, chunk))
+        ev.push(['content_block_delta', { type: 'content_block_delta', index, delta: { type: 'text_delta', text: piece } }]);
     } else if (b.type === 'thinking') {
       ev.push(['content_block_start', { type: 'content_block_start', index, content_block: { type: 'thinking', thinking: '' } }]);
       if (index === 0) ev.push(['ping', { type: 'ping' }]);
-      for (const piece of splitChunks(b.thinking, chunk)) ev.push(['content_block_delta', { type: 'content_block_delta', index, delta: { type: 'thinking_delta', thinking: piece } }]);
-      if (b.signature !== null) ev.push(['content_block_delta', { type: 'content_block_delta', index, delta: { type: 'signature_delta', signature: b.signature } }]);
+      for (const piece of splitChunks(b.thinking, chunk))
+        ev.push(['content_block_delta', { type: 'content_block_delta', index, delta: { type: 'thinking_delta', thinking: piece } }]);
+      if (b.signature !== null)
+        ev.push([
+          'content_block_delta',
+          { type: 'content_block_delta', index, delta: { type: 'signature_delta', signature: b.signature } },
+        ]);
     } else if (b.type === 'tool_use') {
-      ev.push(['content_block_start', { type: 'content_block_start', index, content_block: { type: 'tool_use', id: b.id, name: b.name, input: {} } }]);
+      ev.push([
+        'content_block_start',
+        { type: 'content_block_start', index, content_block: { type: 'tool_use', id: b.id, name: b.name, input: {} } },
+      ]);
       if (index === 0) ev.push(['ping', { type: 'ping' }]);
       const json = typeof b.input === 'string' ? b.input : JSON.stringify(b.input ?? {});
-      for (const piece of splitChunks(json, chunk)) ev.push(['content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: piece } }]);
+      for (const piece of splitChunks(json, chunk))
+        ev.push(['content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: piece } }]);
     }
     ev.push(['content_block_stop', { type: 'content_block_stop', index }]);
   });
@@ -336,7 +396,11 @@ export async function startMock(options = {}) {
   function flushLog(rec) {
     if (!opts.logFile || logged.has(rec)) return;
     logged.add(rec);
-    try { appendFileSync(opts.logFile, JSON.stringify(rec) + '\n'); } catch { /* best effort */ }
+    try {
+      appendFileSync(opts.logFile, JSON.stringify(rec) + '\n');
+    } catch {
+      /* best effort */
+    }
   }
 
   function checkAuth(req, rec) {
@@ -359,7 +423,11 @@ export async function startMock(options = {}) {
 
   function errorBody(status, body) {
     if (body !== undefined) return body;
-    return { type: 'error', error: { type: ERROR_TYPES[status] ?? 'api_error', message: `mock error ${status}` }, request_id: nextId('req') };
+    return {
+      type: 'error',
+      error: { type: ERROR_TYPES[status] ?? 'api_error', message: `mock error ${status}` },
+      request_id: nextId('req'),
+    };
   }
 
   async function handleMessages(req, res, rec, parsed, gone) {
@@ -372,19 +440,34 @@ export async function startMock(options = {}) {
     const model = body?.model ?? 'mock-model';
 
     if (opts.rejectBetas?.length) {
-      const sent = String(req.headers['anthropic-beta'] ?? '').split(',').map((b) => b.trim()).filter(Boolean);
+      const sent = String(req.headers['anthropic-beta'] ?? '')
+        .split(',')
+        .map((b) => b.trim())
+        .filter(Boolean);
       const bad = sent.filter((b) => opts.rejectBetas.includes(b));
       if (bad.length) {
         rec.response = { source: 'rejectBetas', status: 400, rejectedBetas: bad };
         const list = bad.map((b) => `\`${b}\``).join(', ');
-        return sendJson(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: `Unexpected value(s) ${list} for the \`anthropic-beta\` header. Please consult our documentation at docs.anthropic.com or try again without the header.` }, request_id: nextId('req') });
+        return sendJson(res, 400, {
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message: `Unexpected value(s) ${list} for the \`anthropic-beta\` header. Please consult our documentation at docs.anthropic.com or try again without the header.`,
+          },
+          request_id: nextId('req'),
+        });
       }
     }
 
     const ctx = {
       n: counters[kind]++, // 0-based index among requests of the same kind
-      kind, isAux: kind === 'aux', isSubagent: kind === 'agent', agentId,
-      seq: rec.seq, body, model,
+      kind,
+      isAux: kind === 'aux',
+      isSubagent: kind === 'agent',
+      agentId,
+      seq: rec.seq,
+      body,
+      model,
       lastToolResults: extractToolResults(body),
       request: rec,
     };
@@ -401,9 +484,16 @@ export async function startMock(options = {}) {
       if (t) source = `${src === agentScript ? 'agentScript' : 'script'}[${ctx.n}]`;
     }
     if (!t) {
-      if (kind === 'aux') { t = normalizeTurn(auxTurn(body)); source = 'aux-default'; }
-      else if (kind === 'agent') { t = { blocks: [text('agent done')], stopReason: 'end_turn' }; source = 'agent-default'; }
-      else { t = { blocks: [text(opts.defaultText)], stopReason: 'end_turn' }; source = 'exhausted-default'; }
+      if (kind === 'aux') {
+        t = normalizeTurn(auxTurn(body));
+        source = 'aux-default';
+      } else if (kind === 'agent') {
+        t = { blocks: [text('agent done')], stopReason: 'end_turn' };
+        source = 'agent-default';
+      } else {
+        t = { blocks: [text(opts.defaultText)], stopReason: 'end_turn' };
+        source = 'exhausted-default';
+      }
     }
     rec.response = { source };
 
@@ -411,8 +501,15 @@ export async function startMock(options = {}) {
     if (t.hangMs !== undefined) {
       rec.response.hangMs = t.hangMs;
       await sleep(t.hangMs, gone.signal);
-      if (gone.signal.aborted) { rec.response.clientClosed = true; return; }
-      if (!t.blocks && t.status === undefined) { rec.response.dropped = true; req.socket.destroy(); return; }
+      if (gone.signal.aborted) {
+        rec.response.clientClosed = true;
+        return;
+      }
+      if (!t.blocks && t.status === undefined) {
+        rec.response.dropped = true;
+        req.socket.destroy();
+        return;
+      }
     }
 
     // ---- error injection ----
@@ -430,17 +527,31 @@ export async function startMock(options = {}) {
     rec.response = { ...rec.response, status: 200, stream, id, model: outModel, stopReason, blocks };
 
     if (!stream) {
-      return sendJson(res, 200, buildMessage({ id, model: outModel, blocks, stopReason, usage }), { 'request-id': nextId('req'), ...(t.headers ?? {}) });
+      return sendJson(res, 200, buildMessage({ id, model: outModel, blocks, stopReason, usage }), {
+        'request-id': nextId('req'),
+        ...(t.headers ?? {}),
+      });
     }
 
-    res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive', 'request-id': nextId('req'), ...(t.headers ?? {}) });
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+      'request-id': nextId('req'),
+      ...(t.headers ?? {}),
+    });
     res.socket?.setNoDelay(true);
     const events = buildSseEvents({ id, model: outModel, blocks, stopReason, usage, chunk: t.chunk ?? opts.chunk });
     let sent = 0;
     for (const [name, data] of events) {
-      if (res.destroyed || gone.signal.aborted) { rec.response.clientClosed = true; return; }
+      if (res.destroyed || gone.signal.aborted) {
+        rec.response.clientClosed = true;
+        return;
+      }
       if (t.streamError && sent === (t.streamError.afterEvents ?? 2)) {
-        res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: t.streamError.type ?? 'overloaded_error', message: t.streamError.message ?? 'mock stream error' } })}\n\n`);
+        res.write(
+          `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: t.streamError.type ?? 'overloaded_error', message: t.streamError.message ?? 'mock stream error' } })}\n\n`,
+        );
         rec.response.streamError = true;
         return res.end();
       }
@@ -463,7 +574,11 @@ export async function startMock(options = {}) {
     const url = new URL(req.url, 'http://127.0.0.1');
     const path = url.pathname.replace(/\/+$/, '') || '/';
     const rec = {
-      seq: ++seq, ts: new Date().toISOString(), method: req.method, path, query: url.search ? url.search.slice(1) : '',
+      seq: ++seq,
+      ts: new Date().toISOString(),
+      method: req.method,
+      path,
+      query: url.search ? url.search.slice(1) : '',
       headers: redactHeaders(req.headers),
     };
     // Aborted when the client goes away (or the mock closes) so stalls / slow streams stop promptly.
@@ -473,11 +588,19 @@ export async function startMock(options = {}) {
     try {
       const parsed = await readBody(req);
       if (parsed.json !== undefined) rec.body = parsed.json;
-      else if (parsed.raw) { rec.bodyRaw = parsed.raw.slice(0, 4000); if (parsed.parseError) rec.bodyParseError = parsed.parseError; }
+      else if (parsed.raw) {
+        rec.bodyRaw = parsed.raw.slice(0, 4000);
+        if (parsed.parseError) rec.bodyParseError = parsed.parseError;
+      }
       const authOk = checkAuth(req, rec);
       arrive(rec);
 
-      if (req.method === 'OPTIONS') { rec.kind = 'options'; rec.response = { status: 204 }; res.writeHead(204); return res.end(); }
+      if (req.method === 'OPTIONS') {
+        rec.kind = 'options';
+        rec.response = { status: 204 };
+        res.writeHead(204);
+        return res.end();
+      }
 
       const isMessages = req.method === 'POST' && path.endsWith('/v1/messages');
       const isCount = req.method === 'POST' && path.endsWith('/v1/messages/count_tokens');
@@ -487,7 +610,10 @@ export async function startMock(options = {}) {
       if (override) {
         rec.kind = 'route-override';
         rec.response = { status: override.status ?? 200 };
-        if (req.method === 'HEAD') { res.writeHead(override.status ?? 200, override.headers ?? {}); return res.end(); }
+        if (req.method === 'HEAD') {
+          res.writeHead(override.status ?? 200, override.headers ?? {});
+          return res.end();
+        }
         return sendJson(res, override.status ?? 200, override.body ?? {}, override.headers ?? {});
       }
       if (!authOk && (isMessages || isCount)) {
@@ -505,26 +631,40 @@ export async function startMock(options = {}) {
       if (isModels) {
         // DeepSeek's Anthropic surface has no /v1/models: 404 by default.
         rec.kind = 'models';
-        const mr = opts.modelsResponse ?? { status: 404, body: { type: 'error', error: { type: 'not_found_error', message: 'Not Found' } } };
+        const mr = opts.modelsResponse ?? {
+          status: 404,
+          body: { type: 'error', error: { type: 'not_found_error', message: 'Not Found' } },
+        };
         rec.response = { status: mr.status };
         return sendJson(res, mr.status, mr.body ?? {});
       }
       // Anything else (HEAD /api/hello connectivity probe, telemetry, event logging, ...): succeed quietly.
       rec.kind = 'other';
       rec.response = { status: 200 };
-      if (req.method === 'HEAD') { res.writeHead(200); return res.end(); }
+      if (req.method === 'HEAD') {
+        res.writeHead(200);
+        return res.end();
+      }
       return sendJson(res, 200, {});
     } catch (e) {
       rec.error = String(e?.stack ?? e);
-      if (!res.headersSent) { try { sendJson(res, 500, { type: 'error', error: { type: 'api_error', message: `mock internal error: ${e.message}` } }); } catch { /* ignore */ } }
-      else res.destroy();
+      if (!res.headersSent) {
+        try {
+          sendJson(res, 500, { type: 'error', error: { type: 'api_error', message: `mock internal error: ${e.message}` } });
+        } catch {
+          /* ignore */
+        }
+      } else res.destroy();
     } finally {
       if (!requests.includes(rec)) arrive(rec);
       flushLog(rec);
     }
   });
 
-  server.on('connection', (s) => { sockets.add(s); s.on('close', () => sockets.delete(s)); });
+  server.on('connection', (s) => {
+    sockets.add(s);
+    s.on('close', () => sockets.delete(s));
+  });
   server.keepAliveTimeout = 5000;
 
   await new Promise((resolve, reject) => {
@@ -545,16 +685,30 @@ export async function startMock(options = {}) {
       counters.main = counters.agent = counters.aux = 0;
     },
     /** Clear recorded requests (script and cursors untouched). */
-    reset() { requests.length = 0; },
+    reset() {
+      requests.length = 0;
+    },
     mainRequests: () => requests.filter((r) => r.kind === 'main'),
     agentRequests: () => requests.filter((r) => r.kind === 'agent'),
     auxRequests: () => requests.filter((r) => r.kind === 'aux'),
     /** Resolve once `predicate(requests)` is true (re-checked on every new request). */
     waitFor(predicate, timeoutMs = 30000) {
       return new Promise((resolve, reject) => {
-        const check = () => { if (predicate(requests)) { cleanup(); resolve(requests); } };
-        const t = setTimeout(() => { cleanup(); reject(new Error('mock.waitFor timeout')); }, timeoutMs);
-        const cleanup = () => { clearTimeout(t); const i = waiters.indexOf(check); if (i >= 0) waiters.splice(i, 1); };
+        const check = () => {
+          if (predicate(requests)) {
+            cleanup();
+            resolve(requests);
+          }
+        };
+        const t = setTimeout(() => {
+          cleanup();
+          reject(new Error('mock.waitFor timeout'));
+        }, timeoutMs);
+        const cleanup = () => {
+          clearTimeout(t);
+          const i = waiters.indexOf(check);
+          if (i >= 0) waiters.splice(i, 1);
+        };
         waiters.push(check);
         check();
       });
@@ -562,7 +716,10 @@ export async function startMock(options = {}) {
     async close() {
       closing.abort();
       for (const rec of requests) {
-        if (!logged.has(rec)) { rec.response = { ...(rec.response ?? {}), incomplete: true }; flushLog(rec); }
+        if (!logged.has(rec)) {
+          rec.response = { ...(rec.response ?? {}), incomplete: true };
+          flushLog(rec);
+        }
       }
       await new Promise((resolve) => {
         server.close(() => resolve());
@@ -584,7 +741,7 @@ async function loadScript(file) {
     return mod.default ?? mod.script ?? [];
   }
   const j = JSON.parse(readFileSync(p, 'utf8'));
-  return Array.isArray(j) ? j : j.turns ?? j.script ?? [];
+  return Array.isArray(j) ? j : (j.turns ?? j.script ?? []);
 }
 
 async function cli(argv) {
@@ -598,7 +755,9 @@ async function cli(argv) {
     else args[a.slice(2)] = true;
   }
   if (args.help || args.h) {
-    process.stdout.write('usage: node mock-anthropic.mjs [--script script.json|script.mjs] [--agent-script file] [--port 0] [--log file.jsonl] [--base-path /anthropic] [--expect-token TOKEN]\n');
+    process.stdout.write(
+      'usage: node mock-anthropic.mjs [--script script.json|script.mjs] [--agent-script file] [--port 0] [--log file.jsonl] [--base-path /anthropic] [--expect-token TOKEN]\n',
+    );
     return;
   }
   const mock = await startMock({
@@ -610,11 +769,17 @@ async function cli(argv) {
     expectToken: args['expect-token'] ? String(args['expect-token']) : undefined,
   });
   process.stdout.write(mock.url + '\n');
-  const stop = async () => { await mock.close(); process.exit(0); };
+  const stop = async () => {
+    await mock.close();
+    process.exit(0);
+  };
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  cli(process.argv.slice(2)).catch((e) => { process.stderr.write(`${e.stack ?? e}\n`); process.exit(1); });
+  cli(process.argv.slice(2)).catch((e) => {
+    process.stderr.write(`${e.stack ?? e}\n`);
+    process.exit(1);
+  });
 }

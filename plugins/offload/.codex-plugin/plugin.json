@@ -1,0 +1,20 @@
+{
+  "name": "offload",
+  "version": "0.1.0+codex.68d670d0ba88fc07",
+  "description": "Delegate bounded implementation, testing, and debugging work to a local offload worker.",
+  "author": {
+    "name": "Offload"
+  },
+  "keywords": ["delegation", "coding", "testing", "local"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Offload",
+    "shortDescription": "Delegate bounded local coding work",
+    "longDescription": "Guidance for planning, delegating, verifying, and reviewing bounded local implementation work.",
+    "developerName": "Offload",
+    "category": "Productivity",
+    "capabilities": ["Interactive"],
+    "defaultPrompt": ["Help me delegate a bounded implementation task.", "Review this offloaded job before I accept it."],
+    "brandColor": "#2563EB"
+  }
+}
