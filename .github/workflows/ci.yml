@@ -39,6 +39,11 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run test:ci
+      # package-gate chooses npm.cmd on Windows; exercise that launcher in CI
+      # instead of relying solely on the Linux release-gate job.
+      - name: Validate package contents on Windows
+        if: matrix.os == 'windows-latest'
+        run: npm run package:check
 
   quality:
     name: Release gate
