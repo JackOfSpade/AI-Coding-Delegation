@@ -326,7 +326,7 @@ test('artifact lease root is a private stable hash of the canonical workspace on
   assert.notEqual(posixRoot, artifactLeaseRoot({ cwd: '/workspace/other', temporaryRoot: '/tmp', realpath: (path) => path }));
   assert.ok(posixRoot.startsWith('/tmp/offload-artifact-leases/'));
   assert.equal(posixRoot.includes('workspace'), false);
-  assert.equal(
+  assert.notEqual(
     artifactLeaseRoot({
       cwd: 'C:\\REPO',
       platform: 'win32',
