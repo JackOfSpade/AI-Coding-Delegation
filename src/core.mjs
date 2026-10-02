@@ -58,7 +58,12 @@ export function integrityStateHintAllowed(hint, { platform = process.platform } 
 function integrityStatePath({ hint, repoPath, gitDir, platform = process.platform } = {}) {
   if (!integrityStateHintAllowed(hint, { platform })) throw new Error('custom integrity state paths are unsupported on Windows');
   const path = canonicalIntegrityStatePath(hint || defaultIntegrityStatePath());
-  if (insidePath(path, repoPath) || insidePath(path, gitDir))
+  // Canonicalize every side before containment. Git and Node may render the
+  // same Windows path with a short-name alias, which must not let an in-repo
+  // integrity root bypass the authority check.
+  const root = canonicalIntegrityStatePath(repoPath);
+  const gitRoot = canonicalIntegrityStatePath(gitDir);
+  if (insidePath(path, root) || insidePath(path, gitRoot))
     throw new Error('integrity state directory must not be inside the repository or git directory');
   return path;
 }
@@ -374,7 +379,12 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
             const statePath =
               integrityPlatform === 'win32'
                 ? undefined
-                : integrityStatePath({ hint: config.integrityStatePath, repoPath: root, gitDir: getGitDir(root), platform: integrityPlatform });
+                : integrityStatePath({
+                    hint: config.integrityStatePath,
+                    repoPath: root,
+                    gitDir: getGitDir(root),
+                    platform: integrityPlatform,
+                  });
             created.integrity = integrityAdapter({
               repoPath: root,
               gitDir: getGitDir(root),

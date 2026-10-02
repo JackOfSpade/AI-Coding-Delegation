@@ -44,7 +44,13 @@ test('doctor runs Git plumbing with a credential-free hardened environment', () 
   assert.equal(calls.length, 2);
   for (const call of calls) {
     assert.equal(call.command, 'git');
-    assert.deepEqual(call.args.slice(0, 5), ['--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null']);
+    assert.deepEqual(call.args.slice(0, 5), [
+      '--no-optional-locks',
+      '-c',
+      'core.fsmonitor=false',
+      '-c',
+      `core.hooksPath=${process.platform === 'win32' ? 'NUL' : '/dev/null'}`,
+    ]);
     assert.equal(call.options.env.OPENAI_API_KEY, undefined);
     assert.equal(call.options.env.DEEPSEEK_API_KEY, undefined);
     assert.equal(call.options.env.GIT_TERMINAL_PROMPT, '0');

@@ -240,14 +240,14 @@ export async function runCommand(command, options = {}) {
     };
   const platform = options.platform || process.platform;
   let dir;
-  // Never use an inherited environment value to select the command
-  // interpreter. A test/runtime caller may supply a cmd.exe path explicitly;
-  // command text remains the explicit user-requested operation, never an
-  // environment-derived shell fragment.
+  // Never use an inherited or caller-selected value to choose a command
+  // interpreter. In particular, COMSPEC is mutable process environment and
+  // can point at an arbitrary program. Windows commands always use the fixed
+  // system command name, resolved by CreateProcess rather than shell text.
   const suppliedComspec = options.comspec;
   if (platform === 'win32' && suppliedComspec && String(suppliedComspec).split(/[\\/]/).at(-1).toLowerCase() !== 'cmd.exe')
     throw new TypeError('Windows command interpreter must be cmd.exe');
-  let executable = platform === 'win32' ? suppliedComspec || 'cmd.exe' : '/bin/sh';
+  let executable = platform === 'win32' ? 'cmd.exe' : '/bin/sh';
   let args = platform === 'win32' ? ['/d', '/s', '/c', command] : ['-lc', command];
   let sandbox = 'policy-only';
   if (options.requireSandbox !== undefined && typeof options.requireSandbox !== 'boolean')

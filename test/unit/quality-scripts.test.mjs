@@ -140,7 +140,7 @@ test('syntax gate includes project scripts while excluding generated and depende
     ]);
     const targets = await discoverSyntaxTargets(directory);
     assert.deepEqual(
-      targets.map((path) => path.slice(directory.length + 1)),
+      targets.map((path) => path.slice(directory.length + 1).replaceAll('\\', '/')),
       ['root.mjs', 'scripts/release.cjs', 'src/entry.js'],
     );
   } finally {

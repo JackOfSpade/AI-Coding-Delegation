@@ -702,7 +702,15 @@ export function sameWorktreePath(left, right, { platform = process.platform, rea
   };
   const a = canonical(left);
   const b = canonical(right);
-  return platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+  // Git reports forward-slash paths while Node usually returns backslashes;
+  // native realpath may also add an extended-path prefix. These are all the
+  // same Windows filesystem identity, not distinct cleanup targets.
+  const windows = (value) =>
+    value
+      .replaceAll('\\', '/')
+      .replace(/^\/\/?\?\//, '')
+      .toLowerCase();
+  return platform === 'win32' ? windows(a) === windows(b) : a === b;
 }
 function samePath(left, right) {
   return sameWorktreePath(left, right);

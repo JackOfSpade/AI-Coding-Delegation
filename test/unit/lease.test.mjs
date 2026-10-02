@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as nodeFs from 'node:fs';
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import { LeaseManager, getGitDir, readLeaseJson } from '../../src/lease.mjs';
 import { cleanup, tempDir } from './helpers.mjs';
@@ -100,7 +100,7 @@ test('a lease held in a separate process blocks an overlapping acquisition and i
   let child;
   try {
     const modulePath = fileURLToPath(new URL('../../src/lease.mjs', import.meta.url));
-    const program = `import { LeaseManager } from ${JSON.stringify(modulePath)}; const m = new LeaseManager({gitDir: ${JSON.stringify(gitDir)}}); m.acquire('child', ['src/**'], {ownerNonce:'child-owner-nonce'}); console.log('ready'); setTimeout(() => {}, 10000);`;
+    const program = `import { LeaseManager } from ${JSON.stringify(pathToFileURL(modulePath).href)}; const m = new LeaseManager({gitDir: ${JSON.stringify(gitDir)}}); m.acquire('child', ['src/**'], {ownerNonce:'child-owner-nonce'}); console.log('ready'); setTimeout(() => {}, 10000);`;
     child = spawn(process.execPath, ['--input-type=module', '--eval', program], { stdio: ['ignore', 'pipe', 'pipe'] });
     await waitForReady(child);
     const manager = new LeaseManager({ gitDir });

@@ -1,6 +1,6 @@
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, resolve, win32 } from 'node:path';
+import { dirname, isAbsolute, join, posix, resolve, win32 } from 'node:path';
 
 export const DEFAULT_CONFIG = Object.freeze({
   providers: {
@@ -46,8 +46,10 @@ export function defaultConfigPath(env = process.env, home = homedir(), platform 
     const base = env.APPDATA || path.join(home, 'AppData', 'Roaming');
     return path.join(base, 'offload', 'config.json');
   }
-  if (env.XDG_CONFIG_HOME) return join(env.XDG_CONFIG_HOME, 'offload', 'config.json');
-  return join(home, '.config', 'offload', 'config.json');
+  // `platform` is injectable, so never let the host separator leak into a
+  // request for a POSIX location while tests/tools are running on Windows.
+  if (env.XDG_CONFIG_HOME) return posix.join(env.XDG_CONFIG_HOME, 'offload', 'config.json');
+  return posix.join(home, '.config', 'offload', 'config.json');
 }
 
 export function deepMerge(base, override) {

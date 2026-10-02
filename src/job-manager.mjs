@@ -267,6 +267,32 @@ const primaryIndexChanged = (repoPath, before, paths) => {
   }
 };
 
+/**
+ * Repository roots are an authority boundary, but their textual spelling is
+ * not stable on Windows: Git, Node, and the filesystem can disagree about
+ * slash direction, drive-letter case, and the extended-path prefix. Compare
+ * canonical filesystem identities instead of the serialization used by one
+ * particular tool.
+ */
+export function sameRepositoryPath(left, right, { platform = process.platform } = {}) {
+  if (typeof left !== 'string' || typeof right !== 'string' || !left || !right) return false;
+  const canonical = (value) => {
+    try {
+      return (realpathSync.native || realpathSync)(resolve(value));
+    } catch {
+      return resolve(value);
+    }
+  };
+  const normalizeWindows = (value) =>
+    value
+      .replaceAll('\\', '/')
+      .replace(/^\/\/?\?\//, '')
+      .toLowerCase();
+  const a = canonical(left),
+    b = canonical(right);
+  return platform === 'win32' ? normalizeWindows(a) === normalizeWindows(b) : a === b;
+}
+
 /** Lifecycle manager. Its worker/snapshot/lease collaborators are intentionally injected. */
 export class JobManager {
   constructor({
@@ -293,7 +319,7 @@ export class JobManager {
     this.report = report;
     this.setTimeout = setTimeoutFn;
     this.clearTimeout = clearTimeoutFn;
-    this.repoPath = config.repoPath ? realpathSync(resolve(config.repoPath)) : undefined;
+    this.repoPath = config.repoPath ? (realpathSync.native || realpathSync)(resolve(config.repoPath)) : undefined;
     this.running = new Map();
     this.controllers = new Map();
   }
@@ -681,7 +707,8 @@ export class JobManager {
     } catch {
       repoPath = undefined;
     }
-    if (!this.repoPath || repoPath !== this.repoPath) throw new Error('stored job repository does not match this manager');
+    if (!this.repoPath || !sameRepositoryPath(repoPath, this.repoPath))
+      throw new Error('stored job repository does not match this manager');
     if (
       !validBranchName(job.branch) ||
       !validGitObjectId(job.head) ||
@@ -742,11 +769,11 @@ export class JobManager {
     let repoPath = resolve(input.repoPath || this.config.repoPath || process.cwd());
     try {
       repoPath = this.config.repoRoot ? await this.config.repoRoot(repoPath) : git(repoPath, ['rev-parse', '--show-toplevel']);
-      repoPath = realpathSync(resolve(repoPath));
+      repoPath = (realpathSync.native || realpathSync)(resolve(repoPath));
     } catch {
       throw new Error('repoPath must be inside a git working tree');
     }
-    if (this.repoPath && repoPath !== this.repoPath) throw new Error('repoPath does not match this manager');
+    if (this.repoPath && !sameRepositoryPath(repoPath, this.repoPath)) throw new Error('repoPath does not match this manager');
     this.repoPath ||= repoPath;
     if (this.config.disabled) throw new Error('offload is disabled for this repository');
     if (input.profile && this.config.profiles && !this.config.profiles[input.profile]) throw new Error(`unknown profile: ${input.profile}`);

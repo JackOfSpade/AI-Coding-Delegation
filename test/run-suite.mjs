@@ -20,6 +20,10 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
     ['macOS sandbox cannot rewrite a linked-worktree .git pointer through broad writable scope', ''],
     ['macOS sandbox denies configured secret reads, symlink escapes, and exposes a disposable HOME', ''],
     ['macOS sandbox denies readable host configuration subtrees after toolchain allowances', ''],
+    [
+      'macOS profile protects linked-worktree Git metadata from broad temp and writable allowances',
+      'macOS Seatbelt profile paths use POSIX semantics',
+    ],
     ['no protected host configuration subtree exists on this host', 'no protected host configuration subtree exists on this host'],
     [
       'Windows PowerShell can construct a SID-scoped Global mutex with a current-user-only ACL',
@@ -36,6 +40,10 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
     ['snapshot patch carries binary blobs, executable modes and symlinks when supported', ''],
     ['worktree materialization neither runs repository filters nor inherits provider credentials', ''],
     ['literal Git pathspecs preserve a POSIX backslash filename', 'backslash is a Windows separator, not a portable filename byte'],
+    [
+      'NUL name-status preserves literal unusual filenames without diff-header parsing',
+      'Windows cannot create newline-containing filenames',
+    ],
     ['secret files require owner-only permissions', 'file: key references intentionally fail closed on Windows ACL semantics'],
     [
       'POSIX secret files require current-user ownership before and after open',

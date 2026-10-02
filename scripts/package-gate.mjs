@@ -137,6 +137,14 @@ export function npmPackCommand(platform = process.platform) {
   return platform === 'win32' ? 'npm.cmd' : 'npm';
 }
 
+function npmPackInvocation(args, platform = process.platform) {
+  if (platform !== 'win32') return { command: 'npm', args };
+  // Node 24 cannot reliably exec a .cmd file directly. All command tokens
+  // here are package-gate literals, and cmd.exe itself is fixed rather than
+  // selected from COMSPEC or another environment variable.
+  return { command: 'cmd.exe', args: ['/d', '/s', '/c', `npm.cmd ${args.join(' ')}`] };
+}
+
 function isSafePackageTarget(value, allowBarePaths) {
   if (typeof value !== 'string' || !value || value.includes('\\')) return false;
   if (value.startsWith('./'))
@@ -188,14 +196,11 @@ export async function packageGate(projectRoot = process.cwd()) {
   const cache = await mkdtemp(join(tmpdir(), 'offload-npm-pack-cache-'));
   let result;
   try {
-    result = spawnSync(npmPackCommand(), ['pack', '--dry-run', '--json', '--ignore-scripts'], {
+    const invocation = npmPackInvocation(['pack', '--dry-run', '--json', '--ignore-scripts']);
+    result = spawnSync(invocation.command, invocation.args, {
       cwd: root,
       encoding: 'utf8',
       env: npmPackEnvironment(process.env, cache, cache),
-      // Node cannot directly execute a .cmd file. All arguments are fixed
-      // literals, so invoking cmd.exe here does not create an argument
-      // injection boundary.
-      shell: process.platform === 'win32',
       windowsHide: true,
     });
   } finally {

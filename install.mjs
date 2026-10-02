@@ -18,7 +18,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const MAX_ARTIFACT_BYTES = 1_048_576;
 const BIGINT_STAT_OPTIONS = Object.freeze({ bigint: true });
 export function sameModulePath(left, right, platform = process.platform) {
-  return platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
+  return platform === 'win32' ? left.replaceAll('\\', '/').toLowerCase() === right.replaceAll('\\', '/').toLowerCase() : left === right;
 }
 /** Determine whether this module was the script Node was asked to execute.
  * Canonical paths make invocation through a symlink work; the lexical fallback

@@ -290,19 +290,23 @@ test('path-filtered tree diffs use safe top-level glob pathspecs', () => {
     cleanup(repo);
   }
 });
-test('NUL name-status preserves literal unusual filenames without diff-header parsing', () => {
-  const repo = makeRepo();
-  try {
-    const before = snapshotWorkingTree(repo);
-    write(join(repo, 'odd name\tand\nnewline.txt'), 'x\n');
-    write(join(repo, 'src\\not-under-src.txt'), 'y\n');
-    const after = snapshotWorkingTree(repo);
-    const files = diffTreeFiles(repo, before, after);
-    assert.deepEqual(files.map((file) => file.path).sort(), ['odd name\tand\nnewline.txt', 'src\\not-under-src.txt']);
-  } finally {
-    cleanup(repo);
-  }
-});
+test(
+  'NUL name-status preserves literal unusual filenames without diff-header parsing',
+  { skip: process.platform === 'win32' && 'Windows cannot create newline-containing filenames' },
+  () => {
+    const repo = makeRepo();
+    try {
+      const before = snapshotWorkingTree(repo);
+      write(join(repo, 'odd name\tand\nnewline.txt'), 'x\n');
+      write(join(repo, 'src\\not-under-src.txt'), 'y\n');
+      const after = snapshotWorkingTree(repo);
+      const files = diffTreeFiles(repo, before, after);
+      assert.deepEqual(files.map((file) => file.path).sort(), ['odd name\tand\nnewline.txt', 'src\\not-under-src.txt']);
+    } finally {
+      cleanup(repo);
+    }
+  },
+);
 test('NUL name-status fails closed for an unrepresentable filename', () => {
   const raw = Buffer.concat([Buffer.from('M\0invalid-'), Buffer.from([0xff]), Buffer.from('.txt\0')]);
   assert.throws(

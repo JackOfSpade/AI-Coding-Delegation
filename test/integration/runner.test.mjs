@@ -99,19 +99,23 @@ test('runCommand profiles preserve default read denials and add custom denials o
   assert.match(profile, /deny file-read\* \(regex #"\(\?i\)\^.*id_ed25519/);
   assert.equal(profile.split('custom\\\\.secret').length - 1, 1, 'custom denies are retained without duplicate profile rules');
 });
-test('macOS profile protects linked-worktree Git metadata from broad temp and writable allowances', () => {
-  const workspace = '/private/tmp/offload-worktree-abc/workspace';
-  const commonGit = '/private/tmp/primary/.git';
-  const gitDir = `${commonGit}/worktrees/worker`;
-  const profile = macosProfile({ repoPath: workspace, gitDir, tempPath: '/private/tmp', writablePaths: ['**'], denyRead: ['.git/**'] });
-  for (const path of [`${workspace}/.git`, gitDir, commonGit]) {
-    assert.ok(profile.includes(`(deny file-read* (subpath "${path}"))`), `${path} must not be readable`);
-    assert.ok(profile.includes(`(deny file-write* (subpath "${path}"))`), `${path} must not be writable`);
-  }
-  const broadWrite = profile.indexOf('(allow file-write* (regex #"^/private/tmp/offload-worktree-abc/workspace/.*$"))');
-  assert.ok(broadWrite >= 0);
-  assert.ok(profile.indexOf(`(deny file-write* (subpath "${workspace}/.git"))`) > broadWrite);
-});
+test(
+  'macOS profile protects linked-worktree Git metadata from broad temp and writable allowances',
+  { skip: process.platform === 'win32' && 'macOS Seatbelt profile paths use POSIX semantics' },
+  () => {
+    const workspace = '/private/tmp/offload-worktree-abc/workspace';
+    const commonGit = '/private/tmp/primary/.git';
+    const gitDir = `${commonGit}/worktrees/worker`;
+    const profile = macosProfile({ repoPath: workspace, gitDir, tempPath: '/private/tmp', writablePaths: ['**'], denyRead: ['.git/**'] });
+    for (const path of [`${workspace}/.git`, gitDir, commonGit]) {
+      assert.ok(profile.includes(`(deny file-read* (subpath "${path}"))`), `${path} must not be readable`);
+      assert.ok(profile.includes(`(deny file-write* (subpath "${path}"))`), `${path} must not be writable`);
+    }
+    const broadWrite = profile.indexOf('(allow file-write* (regex #"^/private/tmp/offload-worktree-abc/workspace/.*$"))');
+    assert.ok(broadWrite >= 0);
+    assert.ok(profile.indexOf(`(deny file-write* (subpath "${workspace}/.git"))`) > broadWrite);
+  },
+);
 test('Windows policy-only runner uses cmd.exe, a scrubbed profile, and taskkill for child trees', async () => {
   let invocation;
   const child = new EventEmitter();
@@ -120,7 +124,6 @@ test('Windows policy-only runner uses cmd.exe, a scrubbed profile, and taskkill 
   child.stderr = new EventEmitter();
   const result = await runCommand('echo ok', {
     platform: 'win32',
-    comspec: 'C:\\Windows\\System32\\cmd.exe',
     sandbox: true,
     env: { Path: 'C:\\Windows', DEEPSEEK_API_KEY: 'nope', SystemRoot: 'C:\\Windows', ComSpec: 'cmd.exe' },
     taskkill: () => ({ status: 1 }),
@@ -136,7 +139,7 @@ test('Windows policy-only runner uses cmd.exe, a scrubbed profile, and taskkill 
   assert.equal(result.sandbox, 'policy-only');
   assert.equal(result.code, 0);
   assert.match(result.stdout, /ok/);
-  assert.equal(invocation.command, 'C:\\Windows\\System32\\cmd.exe');
+  assert.equal(invocation.command, 'cmd.exe');
   assert.deepEqual(invocation.args, ['/d', '/s', '/c', 'echo ok']);
   assert.equal(invocation.options.detached, false);
   assert.equal(invocation.options.env.DEEPSEEK_API_KEY, undefined);

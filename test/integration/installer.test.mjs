@@ -30,6 +30,10 @@ const install = (options) =>
     },
     ...options,
   });
+const doctorHookCommand = (root) => {
+  const quote = (value) => (process.platform === 'win32' ? `"${value}"` : `'${value.replace(/'/g, `"'"'`)}'`);
+  return `${quote(process.execPath)} ${quote(join(root, 'install.mjs'))} --doctor-hook`;
+};
 test('installer main-module detection resolves symlinks and Windows casing without import side effects', async (t) => {
   assert.equal(sameModulePath('C:\\Program Files\\Offload\\INSTALL.MJS', 'c:\\program files\\offload\\install.mjs', 'win32'), true);
   assert.equal(
@@ -449,7 +453,7 @@ test('Claude upgrade removes only owned legacy hooks and permissions, preserving
   const home = await mkdtemp(`${tmpdir()}/offload-home-`);
   const configHome = join(home, 'config');
   const root = process.cwd();
-  const command = `'${process.execPath.replace(/'/g, `"'"'`)}' '${join(root, 'install.mjs').replace(/'/g, `"'"'`)}' --doctor-hook`;
+  const command = doctorHookCommand(root);
   await mkdir(join(home, '.claude'), { recursive: true });
   await writeFile(
     join(home, '.claude', 'settings.json'),

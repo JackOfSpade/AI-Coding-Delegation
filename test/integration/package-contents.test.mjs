@@ -42,12 +42,19 @@ async function extractPackage(archive, destination) {
   }
 }
 
+function npmPack(args, options) {
+  if (process.platform !== 'win32') return execFileSync('npm', args, options);
+  const result = spawnSync('cmd.exe', ['/d', '/s', '/c', `npm.cmd ${args.join(' ')}`], { ...options, shell: false, windowsHide: true });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`npm pack failed with exit ${result.status ?? 'unknown'}: ${result.stderr || ''}`);
+  return result.stdout;
+}
+
 test('the npm package contains the runnable product and excludes legacy or test artifacts', async () => {
   const cache = await mkdtemp(join(tmpdir(), 'offload-npm-cache-'));
   try {
-    const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
     const result = JSON.parse(
-      execFileSync(npm, ['pack', '--dry-run', '--json', '--ignore-scripts'], {
+      npmPack(['pack', '--dry-run', '--json', '--ignore-scripts'], {
         cwd: process.cwd(),
         encoding: 'utf8',
         timeout: 30_000,
@@ -92,9 +99,8 @@ test('the extracted npm package installs, serves MCP, and uninstalls without tou
   const configHome = join(temporary, 'config');
   try {
     await mkdir(cache, { recursive: true });
-    const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
     const packed = JSON.parse(
-      execFileSync(npm, ['pack', '--json', '--ignore-scripts', '--pack-destination', temporary], {
+      npmPack(['pack', '--json', '--ignore-scripts', '--pack-destination', temporary], {
         cwd: process.cwd(),
         encoding: 'utf8',
         timeout: 30_000,
