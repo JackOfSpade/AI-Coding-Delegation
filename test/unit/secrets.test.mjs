@@ -19,7 +19,7 @@ import { cleanup, tempDir } from './helpers.mjs';
 const decodeWindowsPayload = (value) => JSON.parse(Buffer.from(value, 'base64').toString('utf8'));
 
 test('environment key references resolve without exposing values in errors', () => {
-  assert.equal(resolveKeyRef('env:OFFLOAD_TEST_KEY', { env: { OFFLOAD_TEST_KEY: 'super-secret\n' } }), 'super-secret');
+  assert.equal(resolveKeyRef('env:OFFLOAD_TEST_KEY', { env: { OFFLOAD_TEST_KEY: `super-secret${'\r\n'.repeat(2048)}` } }), 'super-secret');
   assert.throws(
     () => resolveKeyRef('env:MISSING', { env: {} }),
     (error) => error.code === 'E_SECRET_NOT_FOUND' && !/super-secret/.test(error.message),

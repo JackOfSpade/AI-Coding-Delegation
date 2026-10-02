@@ -43,6 +43,16 @@ test('report strips terminal controls and credential-shaped text', () => {
   assert.match(report, /API_KEY=\[REDACTED\]|Bearer \[REDACTED\]/);
 });
 
+test('report strips OSC terminal sequences with long untrusted payloads', () => {
+  const report = compactReport({
+    id: 'oj-osc',
+    status: 'FAILED',
+    error: `before\u001b]8;;https://example.invalid/${'^['.repeat(2048)}\u0007after`,
+  });
+  assert.match(report, /beforeafter/);
+  assert.doesNotMatch(report, /example\.invalid|\x1b|\x07/);
+});
+
 test('report cannot be line-forged through paths or scalar metadata', () => {
   const report = compactReport({
     id: 'oj-3',

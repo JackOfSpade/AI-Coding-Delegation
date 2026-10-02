@@ -81,7 +81,13 @@ export function resolveKeyRef(ref, options = {}) {
     secret = readKeychainSecret(value, options);
   }
   if (typeof secret !== 'string' || !secret.trim()) throw new SecretError('Secret was not found', 'E_SECRET_NOT_FOUND');
-  const normalized = secret.replace(/[\r\n]+$/, '');
+  // Keep this linear for values returned by an external credential store.
+  // The former quantified trailing-newline regexp was needlessly susceptible
+  // to pathological input analysis and does not express this small operation
+  // as clearly as an explicit scan.
+  let end = secret.length;
+  while (end && (secret.charCodeAt(end - 1) === 0x0a || secret.charCodeAt(end - 1) === 0x0d)) end -= 1;
+  const normalized = secret.slice(0, end);
   if (!normalized || Buffer.byteLength(normalized) > MAX_SECRET_BYTES || /[\0-\x1f\x7f]/.test(normalized))
     throw new SecretError('Secret has invalid size or characters', 'E_SECRET_INVALID');
   return normalized;

@@ -687,16 +687,17 @@ function isChildOf(parent, child) {
   const rel = relative(parent, resolve(child));
   return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
-export function sameWorktreePath(left, right, { platform = process.platform, realpath = realpathSync } = {}) {
+export function sameWorktreePath(left, right, { platform = process.platform, realpath = realpathSync.native || realpathSync } = {}) {
   const canonical = (value) => {
-    const resolved = resolve(value);
     // Git may retain a Windows 8.3 path while Node has expanded it through
-    // realpath. Resolve both existing paths before comparing, but retain the
-    // lexical fallback for a missing recovery target.
+    // realpath.  Call the resolver with the supplied absolute path first:
+    // resolving it before an injected/native resolver turns `/private/...`
+    // into a drive-qualified path on Windows and prevents 8.3 aliases from
+    // being expanded. Retain a lexical fallback for a missing recovery target.
     try {
-      return realpath(resolved);
+      return realpath(value);
     } catch {
-      return resolved;
+      return resolve(value);
     }
   };
   const a = canonical(left);

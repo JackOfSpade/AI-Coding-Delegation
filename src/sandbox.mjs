@@ -240,7 +240,14 @@ export async function runCommand(command, options = {}) {
     };
   const platform = options.platform || process.platform;
   let dir;
-  let executable = platform === 'win32' ? options.comspec || process.env.ComSpec || process.env.COMSPEC || 'cmd.exe' : '/bin/sh';
+  // Never use an inherited environment value to select the command
+  // interpreter. A test/runtime caller may supply a cmd.exe path explicitly;
+  // command text remains the explicit user-requested operation, never an
+  // environment-derived shell fragment.
+  const suppliedComspec = options.comspec;
+  if (platform === 'win32' && suppliedComspec && String(suppliedComspec).split(/[\\/]/).at(-1).toLowerCase() !== 'cmd.exe')
+    throw new TypeError('Windows command interpreter must be cmd.exe');
+  let executable = platform === 'win32' ? suppliedComspec || 'cmd.exe' : '/bin/sh';
   let args = platform === 'win32' ? ['/d', '/s', '/c', command] : ['-lc', command];
   let sandbox = 'policy-only';
   if (options.requireSandbox !== undefined && typeof options.requireSandbox !== 'boolean')

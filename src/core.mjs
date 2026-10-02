@@ -55,8 +55,8 @@ export function defaultIntegrityStatePath({ platform = process.platform, env = p
 export function integrityStateHintAllowed(hint, { platform = process.platform } = {}) {
   return platform !== 'win32' || !hint;
 }
-function integrityStatePath({ hint, repoPath, gitDir } = {}) {
-  if (!integrityStateHintAllowed(hint)) throw new Error('custom integrity state paths are unsupported on Windows');
+function integrityStatePath({ hint, repoPath, gitDir, platform = process.platform } = {}) {
+  if (!integrityStateHintAllowed(hint, { platform })) throw new Error('custom integrity state paths are unsupported on Windows');
   const path = canonicalIntegrityStatePath(hint || defaultIntegrityStatePath());
   if (insidePath(path, repoPath) || insidePath(path, gitDir))
     throw new Error('integrity state directory must not be inside the repository or git directory');
@@ -374,7 +374,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
             const statePath =
               integrityPlatform === 'win32'
                 ? undefined
-                : integrityStatePath({ hint: config.integrityStatePath, repoPath: root, gitDir: getGitDir(root) });
+                : integrityStatePath({ hint: config.integrityStatePath, repoPath: root, gitDir: getGitDir(root), platform: integrityPlatform });
             created.integrity = integrityAdapter({
               repoPath: root,
               gitDir: getGitDir(root),

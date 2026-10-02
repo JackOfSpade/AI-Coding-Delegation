@@ -9,6 +9,7 @@ import { checkSyntaxTargets, discoverSyntaxTargets } from '../../scripts/check-s
 import {
   collectPackageTargets,
   isForbiddenPackagePath,
+  npmPackCommand,
   npmPackEnvironment,
   validateOffloadPluginArtifacts,
 } from '../../scripts/package-gate.mjs';
@@ -75,6 +76,11 @@ test('package gate gives npm an isolated credential-free environment', () => {
   assert.equal(env.NPM_TOKEN, undefined);
   assert.equal(env.OPENAI_API_KEY, undefined);
   assert.notEqual(env.npm_config_userconfig, '/host/npmrc');
+});
+
+test('package gate selects a runnable npm launcher on Windows', () => {
+  assert.equal(npmPackCommand('linux'), 'npm');
+  assert.equal(npmPackCommand('win32'), 'npm.cmd');
 });
 
 test('strict test runner parses TAP skips and rejects every skip outside the reviewed allowlist', () => {

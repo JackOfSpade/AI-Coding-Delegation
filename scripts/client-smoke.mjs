@@ -32,6 +32,10 @@ function run(command, args, label) {
     encoding: 'utf8',
     maxBuffer: 64 * 1024,
     timeout: 10_000,
+    // The disposable smoke clients are .cmd launchers on Windows. Node's
+    // direct spawn cannot execute batch files, while every command and
+    // argument here is fixed by the validated client list above.
+    shell: process.platform === 'win32',
     windowsHide: true,
   });
   if (result.error?.code === 'ENOENT') throw new Error(`${label} is unavailable on this self-hosted runner`);

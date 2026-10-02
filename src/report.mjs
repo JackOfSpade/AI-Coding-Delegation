@@ -116,14 +116,47 @@ export function compactReport(job) {
 function parseTimestamp(value) {
   return typeof value === 'string' || value instanceof Date ? Date.parse(value) : NaN;
 }
+function stripTerminalEscapes(value) {
+  const input = String(value);
+  let output = '';
+  for (let index = 0; index < input.length; index += 1) {
+    if (input.charCodeAt(index) !== 0x1b) {
+      output += input[index];
+      continue;
+    }
+    const kind = input.charCodeAt(index + 1);
+    if (kind === 0x5b) {
+      // CSI: consume through its final byte (0x40–0x7e).
+      index += 2;
+      while (index < input.length && (input.charCodeAt(index) < 0x40 || input.charCodeAt(index) > 0x7e)) index += 1;
+      continue;
+    }
+    if (kind === 0x5d) {
+      // OSC: terminate at BEL or ST (ESC \\). This bounded linear scan avoids
+      // a backtracking expression over untrusted verifier output.
+      index += 2;
+      while (index < input.length) {
+        if (input.charCodeAt(index) === 0x07) break;
+        if (input.charCodeAt(index) === 0x1b && input.charCodeAt(index + 1) === 0x5c) {
+          index += 1;
+          break;
+        }
+        index += 1;
+      }
+      continue;
+    }
+  }
+  return output;
+}
 function stripControls(value) {
-  return String(value)
-    .replace(/\x1B(?:\[[0-?]*[ -\/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g, '')
+  return stripTerminalEscapes(value)
     .replace(/\t/g, '↹')
     .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
 }
 function scalar(value) {
-  return redactText(stripControls(String(value).slice(0, 4_096)).replace(/[\r\n]/g, '↩'));
+  // Strip an entire terminal sequence before clipping. Clipping first could
+  // leave an unterminated OSC sequence whose legitimate suffix is discarded.
+  return redactText(stripControls(String(value)).slice(0, 4_096).replace(/[\r\n]/g, '↩'));
 }
 function verifierOutput(text, lines) {
   // Verifier output is deliberately multiline, but it is always visually

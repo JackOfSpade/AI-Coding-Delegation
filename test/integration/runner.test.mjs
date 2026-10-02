@@ -149,6 +149,13 @@ test('Windows policy-only runner uses cmd.exe, a scrubbed profile, and taskkill 
   );
   assert.deepEqual(taskkill.slice(0, 2), ['taskkill.exe', ['/PID', '987', '/T', '/F']]);
 });
+
+test('Windows policy-only runner never selects a non-cmd interpreter', async () => {
+  await assert.rejects(
+    () => runCommand('echo should-not-run', { platform: 'win32', comspec: 'C:\\unsafe\\shell.exe' }),
+    /must be cmd\.exe/,
+  );
+});
 test('runner bounds a single oversized output chunk without retaining the whole tail', async () => {
   const child = new EventEmitter();
   child.pid = 4242;

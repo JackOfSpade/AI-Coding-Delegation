@@ -349,9 +349,10 @@ test(
     const gitDir = tempDir();
     try {
       mkdirSync(join(gitDir, 'offload', 'jobs'), { recursive: true, mode: 0o700 });
-      const moduleUrl = new URL('../../src/store.mjs', import.meta.url).href;
-      const program = `import { JobStore } from ${JSON.stringify(moduleUrl)}; process.getuid = () => 987654; try { await new JobStore({ gitDir: ${JSON.stringify(gitDir)} }).init(); process.exitCode = 1; } catch (error) { if (!/job storage (ancestry|directory) is insecure/.test(error.message)) throw error; }`;
-      const result = spawnSync(process.execPath, ['--input-type=module', '--eval', program], { encoding: 'utf8' });
+      const result = spawnSync(process.execPath, ['test/fixtures/store-ownership-probe.mjs'], {
+        encoding: 'utf8',
+        env: { ...process.env, OFFLOAD_TEST_GIT_DIR: gitDir },
+      });
       assert.equal(result.status, 0, result.stderr);
     } finally {
       cleanup(gitDir);

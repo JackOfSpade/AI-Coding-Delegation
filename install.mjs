@@ -32,7 +32,11 @@ export function isMainModule({
   if (typeof entry !== 'string' || !entry) return false;
   const modulePath = fileURLToPath(moduleUrl);
   try {
-    return sameModulePath(realpath(resolve(entry)), realpath(modulePath), platform);
+    // Preserve the supplied spelling for realpath. On Windows, resolving it
+    // first can turn a testable/real 8.3 or symlink spelling into a different
+    // drive-qualified lexical path before the resolver has a chance to
+    // canonicalize it.
+    return sameModulePath(realpath(entry), realpath(modulePath), platform);
   } catch {
     return sameModulePath(resolve(entry), resolve(modulePath), platform);
   }

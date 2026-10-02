@@ -132,6 +132,11 @@ export function npmPackEnvironment(baseEnv, isolatedHome, cache, platform = proc
   return env;
 }
 
+/** Windows command files require cmd.exe; POSIX can execute npm directly. */
+export function npmPackCommand(platform = process.platform) {
+  return platform === 'win32' ? 'npm.cmd' : 'npm';
+}
+
 function isSafePackageTarget(value, allowBarePaths) {
   if (typeof value !== 'string' || !value || value.includes('\\')) return false;
   if (value.startsWith('./'))
@@ -183,10 +188,14 @@ export async function packageGate(projectRoot = process.cwd()) {
   const cache = await mkdtemp(join(tmpdir(), 'offload-npm-pack-cache-'));
   let result;
   try {
-    result = spawnSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
+    result = spawnSync(npmPackCommand(), ['pack', '--dry-run', '--json', '--ignore-scripts'], {
       cwd: root,
       encoding: 'utf8',
       env: npmPackEnvironment(process.env, cache, cache),
+      // Node cannot directly execute a .cmd file. All arguments are fixed
+      // literals, so invoking cmd.exe here does not create an argument
+      // injection boundary.
+      shell: process.platform === 'win32',
       windowsHide: true,
     });
   } finally {
