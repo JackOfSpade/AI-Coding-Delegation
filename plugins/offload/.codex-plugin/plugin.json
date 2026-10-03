@@ -1,6 +1,6 @@
 {
   "name": "offload",
-  "version": "0.1.0+codex.68d670d0ba88fc07",
+  "version": "0.1.0+codex.a0ec858fbf26ad4f",
   "description": "Delegate bounded implementation, testing, and debugging work to a local offload worker.",
   "author": {
     "name": "Offload"

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { runCommand, scrubEnv, macosProfile, staticWritableRoot, sandboxAvailable, terminateWindowsTree } from '../../src/sandbox.mjs';
 import { mkdtemp, access, mkdir, symlink, writeFile } from 'node:fs/promises';
@@ -61,7 +62,8 @@ test('runner honors pre-abort and compiles globs to static sandbox roots', async
   const profile = macosProfile({ repoPath: '/repo', gitDir: '/actual/git', writablePaths: ['/repo/**'], denyRead: ['.env*'] });
   assert.doesNotMatch(profile, /\*\*/);
   assert.match(profile, /deny file-write\* \(subpath "\/actual\/git"\)/);
-  assert.match(profile, /\(\?i\)\^/);
+  assert.match(profile, /\^\(\?i:\/repo\//);
+  assert.doesNotMatch(profile, /\(\?i\)\^/, 'Seatbelt rejects a bare inline case-insensitive option before an anchor');
   for (const path of [
     '/usr/local/etc',
     '/opt/homebrew/etc',
@@ -76,27 +78,42 @@ test('runner honors pre-abort and compiles globs to static sandbox roots', async
   assert.match(relativeGit, /subpath "\/repo\/\.git"/);
   assert.match(relativeGit, /\/repo\/src\\\\\/\.\*/);
   const broad = macosProfile({ repoPath: '/repo', writablePaths: ['**'] });
-  assert.match(broad, /deny file-write\* \(regex #"\(\?i\)\^\/repo\//, 'broad writable scopes still deny protected paths');
+  assert.match(broad, /deny file-write\* \(regex #"\^\(\?i:\/repo\//, 'broad writable scopes still deny protected paths');
   assert.ok(
     broad.indexOf('(allow file-write* (regex #"^/repo/.*$"))') < broad.lastIndexOf('(deny file-write*'),
     'secret/config write denies follow the broad workspace allow',
   );
   assert.match(
     broad,
-    /deny file-read\* \(regex #"\(\?i\)\^\/repo\/\\\\\.env/,
+    /deny file-read\* \(regex #"\^\(\?i:\/repo\/\\\\\.env/,
     'default secret reads are denied even with no caller denyRead',
   );
   assert.match(
     broad,
-    /deny file-read\* \(regex #"\(\?i\)\^\/repo\/(?:\(\?:\.\*\\\\\/\)\?)?id_ed25519/,
+    /deny file-read\* \(regex #"\^\(\?i:\/repo\/(?:\(\?:\.\*\\\\\/\)\?)?id_ed25519/,
     'default private-key reads are denied even with no caller denyRead',
   );
   assert.throws(() => macosProfile({ repoPath: '/repo\nforged', writablePaths: [] }), /control characters/);
 });
+test(
+  'macOS Seatbelt accepts scoped case-insensitive deny regex syntax before profile application',
+  { skip: process.platform !== 'darwin' && 'requires macOS sandbox-exec' },
+  (t) => {
+    const profile = macosProfile({ repoPath: '/private/tmp/offload-seatbelt-regression', writablePaths: ['**'] });
+    const result = spawnSync('/usr/bin/sandbox-exec', ['-p', profile, '/usr/bin/true'], { encoding: 'utf8', timeout: 2_000 });
+    if (result.error?.code === 'ENOENT') return t.skip('sandbox-exec is not installed');
+
+    // A macOS container may reject applying an otherwise valid profile. That
+    // failure is separate from the EX_DATAERR (65) emitted for profile syntax,
+    // so keep this a parser regression test rather than an entitlement probe.
+    assert.notEqual(result.status, 65, result.stderr || 'sandbox-exec rejected the generated profile syntax');
+    assert.doesNotMatch(result.stderr || '', /unexpected \^ operator|syntax error|parse error/i);
+  },
+);
 test('macOS profiles deny exact nested sensitive pointer paths for reads and writes', () => {
   const profile = macosProfile({ repoPath: '/repo', writablePaths: ['**'] });
   for (const suffix of ['\\\\.git', '\\\\.aws', '\\\\.ssh', '\\\\.azure', '\\\\.kube', '\\\\.config\\\\/gcloud']) {
-    const nested = `(?:.*\\\\/)?${suffix}$`;
+    const nested = `(?:.*\\\\/)?${suffix})$`;
     for (const kind of ['read', 'write'])
       assert.ok(
         profile.split('\n').some((line) => line.includes(`deny file-${kind}*`) && line.includes(nested)),
@@ -114,15 +131,15 @@ test('runCommand profiles preserve default read denials and add custom denials o
     sandboxProbe: () => true,
     denyRead: ['custom.secret', '.env*'],
     spawnProcess(command, args) {
-      assert.equal(command, 'sandbox-exec');
+      assert.equal(command, '/usr/bin/sandbox-exec');
       profile = args[1];
       queueMicrotask(() => child.emit('close', 0, null));
       return child;
     },
   });
   assert.equal(result.sandbox, 'macos');
-  assert.match(profile, /deny file-read\* \(regex #"\(\?i\)\^.*\\\\\.env/);
-  assert.match(profile, /deny file-read\* \(regex #"\(\?i\)\^.*id_ed25519/);
+  assert.match(profile, /deny file-read\* \(regex #"\^\(\?i:.*\\\\\.env/);
+  assert.match(profile, /deny file-read\* \(regex #"\^\(\?i:.*id_ed25519/);
   assert.equal(profile.split('custom\\\\.secret').length - 1, 1, 'custom denies are retained without duplicate profile rules');
 });
 test(

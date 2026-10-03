@@ -19,6 +19,7 @@ test('config merges nested defaults and validates profile references', () => {
   assert.equal(DEFAULT_CONFIG.default, 'pro');
   assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles).sort(), ['flash', 'pro']);
   assert.equal(DEFAULT_CONFIG.providers.deepseek.keyRef, 'keychain:offload-deepseek');
+  assert.equal(DEFAULT_CONFIG.profiles.pro.model, 'deepseek-v4-pro');
   const merged = deepMerge(DEFAULT_CONFIG, {
     limits: { maxTurns: 4 },
     providers: { x: { type: 'openai-chat', baseUrl: 'https://x.example.test', keyRef: 'env:X' } },

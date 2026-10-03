@@ -723,6 +723,31 @@ test('a finite budget rejects malformed normalized usage before tool execution',
   );
   assert.equal(executed, 0);
 });
+test('provider cache usage must be internally consistent before accounting or tool execution', async () => {
+  let executed = 0;
+  const provider = {
+    async *chat() {
+      yield {
+        usage: { inputTokens: 10, outputTokens: 1, cacheHitTokens: 7, cacheMissTokens: 2 },
+        toolCalls: [call('finish', '{"summary":"x"}')],
+      };
+    },
+  };
+  await assert.rejects(
+    () =>
+      new AgentLoop({
+        provider,
+        tools: {
+          execute: async () => {
+            executed++;
+            return { finish: { summary: 'bad', concerns: [], testsRun: [] } };
+          },
+        },
+      }).run({ task: 'x' }),
+    /invalid usage/,
+  );
+  assert.equal(executed, 0);
+});
 test('context append and progress callbacks expose durable incremental state', async () => {
   const appended = [],
     progress = [];

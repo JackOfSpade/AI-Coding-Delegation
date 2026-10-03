@@ -58,6 +58,14 @@ const normalizedUsage = (usage) => {
     if (!Number.isSafeInteger(usage[name]) || usage[name] < 0) throw new Error('Provider yielded invalid usage');
     result[name] = usage[name];
   }
+  // Keep this boundary's normalized record identical to Meter's accounting
+  // invariant. Without this, a custom provider's individually valid but
+  // contradictory cache counters reach progress/accounting before Meter
+  // rejects them later in the same stream.
+  result.cacheHitTokens ??= 0;
+  result.cacheMissTokens ??= result.inputTokens - result.cacheHitTokens;
+  if (result.cacheMissTokens < 0 || result.cacheHitTokens + result.cacheMissTokens !== result.inputTokens)
+    throw new Error('Provider yielded invalid usage');
   if (
     Object.hasOwn(usage, 'totalTokens') &&
     (!Number.isSafeInteger(usage.totalTokens) || usage.totalTokens < 0 || usage.totalTokens !== result.inputTokens + result.outputTokens)

@@ -292,8 +292,17 @@ export function replaceManaged(content, block, uninstall = false) {
   const ends = [...content.matchAll(new RegExp(END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'))];
   if (begins.length !== ends.length || begins.length > 1 || (begins.length && begins[0].index > ends[0].index))
     throw new Error('refusing malformed or duplicate offload managed block');
-  if (begins.length) return `${content.slice(0, begins[0].index)}${uninstall ? '' : block}${content.slice(ends[0].index + END.length)}`;
-  return uninstall ? content : `${content}${content && !content.endsWith('\n') ? '\n' : ''}${block}\n`;
+  // The delimiter belongs to the surrounding document, not the template. On
+  // Windows a checked-out template can be CRLF, while on POSIX it is LF; use
+  // the existing document when it has an established convention and otherwise
+  // inherit the template's final newline. This avoids mixed EOLs and repeated
+  // installs adding blank lines at the retained suffix boundary.
+  const eol = content.includes('\r\n') || (!content.includes('\n') && block.includes('\r\n')) ? '\r\n' : '\n';
+  const normalizedBlock = !uninstall ? block.replace(/\r\n?|\n/g, eol) : block;
+  const managedBlock = !uninstall && normalizedBlock.endsWith(eol) ? normalizedBlock.slice(0, -eol.length) : normalizedBlock;
+  if (begins.length)
+    return `${content.slice(0, begins[0].index)}${uninstall ? '' : managedBlock}${content.slice(ends[0].index + END.length)}`;
+  return uninstall ? content : `${content}${content && !content.endsWith('\n') ? eol : ''}${managedBlock}${eol}`;
 }
 async function updateManaged(path, block, uninstall, backups) {
   const original = await read(path);

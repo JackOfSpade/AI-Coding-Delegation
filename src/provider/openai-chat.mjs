@@ -119,6 +119,18 @@ const oneAlias = (source, names, label, { required = false } = {}) => {
   return source[present[0]];
 };
 
+const validUsageCounter = (value) => Number.isSafeInteger(value) && value >= 0;
+// Some OpenAI-compatible providers redundantly report cache hits at both the
+// top level and in prompt-token details.  Treat matching counters as one
+// authoritative value, but never resolve a disagreement or malformed value by
+// picking whichever representation happens to be checked first.
+const reconcileDuplicateCounter = (nested, direct, label) => {
+  if (nested === MISSING_USAGE_FIELD) return direct;
+  if (direct === MISSING_USAGE_FIELD) return nested;
+  if (!validUsageCounter(nested) || !validUsageCounter(direct) || nested !== direct) throw new ProviderError(`Conflicting usage.${label}`);
+  return nested;
+};
+
 export function normalizeUsage(usage) {
   if (!isPlainRecord(usage)) throw new ProviderError('Invalid SSE usage');
   const detailValue = oneAlias(usage, ['prompt_tokens_details', 'input_tokens_details'], 'details');
@@ -130,8 +142,8 @@ export function normalizeUsage(usage) {
     if (!Number.isSafeInteger(value) || value < 0) throw new ProviderError(`Invalid usage.${name}`);
   const nestedHit = oneAlias(details, ['cached_tokens', 'cache_hit_tokens'], 'cacheHitTokens');
   const directHit = oneAlias(usage, ['cache_hit_tokens', 'prompt_cache_hit_tokens'], 'cacheHitTokens');
-  if (nestedHit !== MISSING_USAGE_FIELD && directHit !== MISSING_USAGE_FIELD) throw new ProviderError('Ambiguous usage.cacheHitTokens');
-  const cacheHitTokens = nestedHit !== MISSING_USAGE_FIELD ? nestedHit : directHit !== MISSING_USAGE_FIELD ? directHit : 0;
+  const cacheHitTokens = reconcileDuplicateCounter(nestedHit, directHit, 'cacheHitTokens');
+  const normalizedCacheHitTokens = cacheHitTokens === MISSING_USAGE_FIELD ? 0 : cacheHitTokens;
   const nestedMiss = oneAlias(details, ['cache_miss_tokens'], 'cacheMissTokens');
   const directMiss = oneAlias(usage, ['cache_miss_tokens', 'prompt_cache_miss_tokens'], 'cacheMissTokens');
   if (nestedMiss !== MISSING_USAGE_FIELD && directMiss !== MISSING_USAGE_FIELD) throw new ProviderError('Ambiguous usage.cacheMissTokens');
@@ -140,20 +152,19 @@ export function normalizeUsage(usage) {
       ? nestedMiss
       : directMiss !== MISSING_USAGE_FIELD
         ? directMiss
-        : Math.max(0, inputTokens - cacheHitTokens);
+        : Math.max(0, inputTokens - normalizedCacheHitTokens);
   const totalValue = oneAlias(usage, ['total_tokens'], 'totalTokens');
   const totalTokens = totalValue === MISSING_USAGE_FIELD ? inputTokens + outputTokens : totalValue;
   if (
-    !Number.isSafeInteger(cacheHitTokens) ||
+    !validUsageCounter(normalizedCacheHitTokens) ||
     !Number.isSafeInteger(cacheMissTokens) ||
-    cacheHitTokens < 0 ||
     cacheMissTokens < 0 ||
-    cacheHitTokens + cacheMissTokens !== inputTokens
+    normalizedCacheHitTokens + cacheMissTokens !== inputTokens
   )
     throw new ProviderError('Invalid cache usage');
   if (!Number.isSafeInteger(totalTokens) || totalTokens < 0 || totalTokens !== inputTokens + outputTokens)
     throw new ProviderError('Invalid usage.totalTokens');
-  return { inputTokens, outputTokens, cacheHitTokens, cacheMissTokens, totalTokens };
+  return { inputTokens, outputTokens, cacheHitTokens: normalizedCacheHitTokens, cacheMissTokens, totalTokens };
 }
 
 /** OpenAI chat-completions adapter. A whole successful attempt is buffered

@@ -115,12 +115,59 @@ test('installer is idempotent and removes only managed routing blocks', async ()
   const home = await mkdtemp(`${tmpdir()}/offload-home-`);
   const root = process.cwd();
   await install({ root, home, configHome: join(home, 'config'), clients: ['claude', 'codex', 'cursor'] });
-  await install({ root, home, configHome: join(home, 'config'), clients: ['claude', 'codex', 'cursor'] });
+  const claudePath = join(home, '.claude', 'CLAUDE.md');
+  const afterFirstInstall = await readFile(claudePath, 'utf8');
+  const repeated = await install({ root, home, configHome: join(home, 'config'), clients: ['claude', 'codex', 'cursor'] });
+  assert.ok(!repeated.changed.includes(claudePath), 'a repeated install must not rewrite the managed Claude memory block');
+  assert.equal(await readFile(claudePath, 'utf8'), afterFirstInstall, 'a repeated install must not accumulate trailing newlines');
   const doc = await readFile(join(home, '.codex', 'AGENTS.md'), 'utf8');
   assert.equal((doc.match(/BEGIN offload/g) || []).length, 1);
+  assert.match(afterFirstInstall, /invokes `\/offload`/);
+  assert.match(afterFirstInstall, /configured profile `pro`/);
+  assert.match(afterFirstInstall, /provider-maintained current DeepSeek Pro route/);
+  assert.match(afterFirstInstall, /Never invent a generic “latest Pro” model name/);
+  assert.match(afterFirstInstall, /private linked worktree with file tools even on a policy-only host/);
+  assert.match(afterFirstInstall, /Never use Claude Code native subagents/);
+  assert.match(afterFirstInstall, /explicitly selected supported profile name overrides that default/);
+  assert.match(doc, /names DeepSeek\/DeepSeek-V4-Pro/);
+  assert.match(doc, /not permission to infer a profile/);
   await install({ root, home, configHome: join(home, 'config'), clients: ['claude', 'codex', 'cursor'], uninstall: true });
   assert.doesNotMatch(await readFile(join(home, '.codex', 'AGENTS.md'), 'utf8'), /BEGIN offload/);
   assert.throws(() => replaceManaged('<!-- BEGIN offload', 'x'), /malformed/);
+});
+test('installer preserves CRLF document boundaries through repeat, uninstall, and reinstall', async () => {
+  const product = await mkdtemp(`${tmpdir()}/offload-crlf-memory-product-`);
+  const home = await mkdtemp(`${tmpdir()}/offload-crlf-memory-home-`);
+  const configHome = join(home, 'config');
+  const claudePath = join(home, '.claude', 'CLAUDE.md');
+  try {
+    for (const path of ['bin', 'plugins', 'templates']) await cp(join(process.cwd(), path), join(product, path), { recursive: true });
+    for (const path of ['install.mjs', 'config.example.json']) await cp(join(process.cwd(), path), join(product, path));
+    await mkdir(dirname(claudePath), { recursive: true });
+    await writeFile(claudePath, 'before\r\n<!-- BEGIN offload old -->old<!-- END offload -->\r\n\r\nafter\r\n');
+
+    await install({ root: product, home, configHome, clients: ['claude'] });
+    const afterFirstInstall = await readFile(claudePath, 'utf8');
+    assert.match(afterFirstInstall, /^before\r\n<!--[\s\S]*<!-- END offload -->\r\n\r\nafter\r\n$/);
+    assert.doesNotMatch(afterFirstInstall, /\r\r\n/, 'the replacement must retain, not duplicate, CRLF delimiters');
+    assert.doesNotMatch(afterFirstInstall, /(?:^|[^\r])\n/, 'the replacement must not introduce bare LF into a CRLF document');
+
+    const repeated = await install({ root: product, home, configHome, clients: ['claude'] });
+    assert.ok(!repeated.changed.includes(claudePath));
+    assert.equal(await readFile(claudePath, 'utf8'), afterFirstInstall);
+
+    await install({ root: product, home, configHome, clients: ['claude'], uninstall: true });
+    assert.equal(await readFile(claudePath, 'utf8'), 'before\r\n\r\n\r\nafter\r\n');
+
+    await install({ root: product, home, configHome, clients: ['claude'] });
+    const reinstalled = await readFile(claudePath, 'utf8');
+    assert.match(reinstalled, /^before\r\n\r\n\r\nafter\r\n<!--[\s\S]*<!-- END offload -->\r\n$/);
+    assert.doesNotMatch(reinstalled, /\r\r\n/);
+    assert.doesNotMatch(reinstalled, /(?:^|[^\r])\n/, 'reinstall must retain CRLF rather than append a bare LF');
+  } finally {
+    await rm(product, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true });
+  }
 });
 test('installer rejects malformed state before changing client routing files', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-home-`);
@@ -260,6 +307,9 @@ test('managed replacement preserves unrelated bytes and rejects duplicate marker
   const next = replaceManaged(before, '<!-- BEGIN offload new -->y<!-- END offload -->');
   assert.equal(next, '  pre\n<!-- BEGIN offload new -->y<!-- END offload -->\n\npost  ');
   assert.equal(replaceManaged(next, '', true), '  pre\n\n\npost  ');
+  const crlfBlock = '<!-- BEGIN offload new -->\r\n<!-- END offload -->\r\n';
+  assert.equal(replaceManaged('', crlfBlock), '<!-- BEGIN offload new -->\r\n<!-- END offload -->\r\n');
+  assert.equal(replaceManaged('user\n', crlfBlock), 'user\n<!-- BEGIN offload new -->\n<!-- END offload -->\n');
   assert.throws(
     () => replaceManaged('<!-- BEGIN offload -->a<!-- END offload --><!-- BEGIN offload -->b<!-- END offload -->', 'x'),
     /duplicate/,

@@ -14,6 +14,9 @@ const SECRET =
 const CAPABILITY_ENV =
   /^(?:SSH_AUTH_SOCK|SSH_AGENT_PID|GPG_AGENT_INFO|GNUPGHOME|GOOGLE_APPLICATION_CREDENTIALS|AWS_SHARED_CREDENTIALS_FILE|AWS_CONFIG_FILE)$/i;
 const CAP = 256 * 1024;
+// This Apple system binary is the enforcement boundary. Never resolve it via
+// PATH, which an untrusted repository command environment can influence.
+const SANDBOX_EXECUTABLE = '/usr/bin/sandbox-exec';
 // `/usr/local` and `/opt/homebrew` are broadly readable for interpreters and
 // libraries.  Their etc trees are host configuration, however, and `/Library`
 // includes machine credentials and management policy.  These denies appear
@@ -53,7 +56,7 @@ export function sandboxAvailable(platform = process.platform, profile) {
   // policy-only runner when sandbox-exec cannot actually apply it.
   const probe = profile ?? macosProfile({ repoPath: process.cwd(), tempPath: tmpdir() });
   try {
-    return spawnSync('sandbox-exec', ['-p', probe, '/usr/bin/true'], { stdio: 'ignore', timeout: 2_000 }).status === 0;
+    return spawnSync(SANDBOX_EXECUTABLE, ['-p', probe, '/usr/bin/true'], { stdio: 'ignore', timeout: 2_000 }).status === 0;
   } catch {
     return false;
   }
@@ -90,7 +93,10 @@ function denyFilter(kind, repoPath, pattern) {
   const root = seatbeltString(regexEscape(resolve(repoPath)));
   // Repository secret conventions are case-insensitive: macOS volumes often
   // are too, and `.ENV`/`ID_RSA` should not become readable on a Linux volume.
-  return `(deny file-${kind}* (regex #"(?i)^${root}/${seatbeltString(source)}$"))`;
+  // Seatbelt rejects a bare inline option before an anchored expression
+  // (`(?i)^...$`). Scope the option inside the anchors instead, preserving
+  // case-insensitive matching while keeping the complete path anchored.
+  return `(deny file-${kind}* (regex #"^(?i:${root}/${seatbeltString(source)})$"))`;
 }
 export function macosProfile({
   repoPath,
@@ -364,7 +370,7 @@ export async function runCommand(command, options = {}) {
       // Keep each interpreter launch syntactically separate. Besides making
       // the trust boundary obvious, this lets static analysis prove that the
       // shell only receives the fixed private script name.
-      if (sandbox === 'macos') child = spawnProcess('sandbox-exec', ['-p', sandboxProfile, '/bin/sh', scriptName], spawnOptions);
+      if (sandbox === 'macos') child = spawnProcess(SANDBOX_EXECUTABLE, ['-p', sandboxProfile, '/bin/sh', scriptName], spawnOptions);
       else if (platform === 'win32') child = spawnProcess('cmd.exe', ['/d', '/s', '/c', scriptName], spawnOptions);
       else child = spawnProcess('/bin/sh', [scriptName], spawnOptions);
       child.stdout.on('data', (value) => stdout.add(value));

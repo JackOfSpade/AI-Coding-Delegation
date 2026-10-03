@@ -239,6 +239,11 @@ test('MCP keeps current requests stateless and legacy initialize envelopes separ
     assert.match(discovery.instructions, /Offload skill/);
     assert.match(discovery.instructions, /skill:\/\/offload\/offload\/SKILL\.md/);
     assert.match(discovery.instructions, /repoPath/);
+    assert.match(discovery.instructions, /native Claude subagents/);
+    assert.match(discovery.instructions, /profile "pro"/);
+    assert.match(discovery.instructions, /policy-only/);
+    assert.match(discovery.instructions, /Do not invent a “latest Pro” model/);
+    assert.match(discovery.instructions, /policy-only hosts workers edit permitted private-worktree files, no shell/);
     assert.ok(discovery.instructions.length < 512);
   }
   const annotations = Object.fromEntries(list.tools.map((tool) => [tool.name, tool.annotations]));
@@ -265,6 +270,18 @@ test('MCP keeps current requests stateless and legacy initialize envelopes separ
     );
   assert.match(list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.ownedPaths.description, /exclusively owns/);
   assert.match(list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.allowNetwork.description, /only/);
+  assert.match(
+    list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.profile.description,
+    /provider-maintained DeepSeek Pro\/high/,
+  );
+  assert.match(
+    list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.profile.description,
+    /explicitly selected supported profile overrides/,
+  );
+  assert.match(
+    list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.effort.description,
+    /Omit it to retain the selected profile/,
+  );
   await server.close();
 });
 test('MCP applies current envelopes per request, rejects malformed current metadata, and retains legacy compatibility', async () => {
@@ -369,6 +386,16 @@ test('MCP applies current envelopes per request, rejects malformed current metad
 test('MCP exposes the canonical static skill with exact resources and safe request handling', async () => {
   const expectedText = await readFile(new URL('../../plugins/offload/skills/offload/SKILL.md', import.meta.url), 'utf8');
   const expectedFrontmatter = jsonFrontmatter(expectedText);
+  assert.match(expectedFrontmatter.description, /\/offload/);
+  assert.match(expectedFrontmatter.description, /DeepSeek-V4-Pro/);
+  assert.equal(expectedFrontmatter['argument-hint'], '<task or verification request>');
+  assert.equal(Object.hasOwn(expectedFrontmatter.metadata || {}, 'argument-hint'), false);
+  assert.match(expectedText, /Do \*\*not\*\* satisfy that request with Claude Code's native subagents/);
+  assert.match(expectedText, /explicitly set `profile: "pro"`/);
+  assert.match(expectedText, /omit `effort`/);
+  assert.match(expectedText, /explicitly selects a supported profile name, use that exact profile instead/);
+  assert.match(expectedText, /not as a request to infer, override, or invent a profile/);
+  assert.match(expectedText, /do \*\*not\*\* add `unsafePolicyOnlyVerifier` merely to get a worker test/);
   const digest = `sha256:${createHash('sha256').update(Buffer.from(expectedText, 'utf8')).digest('hex')}`;
   const size = Buffer.byteLength(expectedText, 'utf8');
   const input = new PassThrough(),

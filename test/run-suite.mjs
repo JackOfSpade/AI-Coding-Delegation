@@ -24,6 +24,7 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
       'macOS profile protects linked-worktree Git metadata from broad temp and writable allowances',
       'macOS Seatbelt profile paths use POSIX semantics',
     ],
+    ['macOS Seatbelt accepts scoped case-insensitive deny regex syntax before profile application', 'requires macOS sandbox-exec'],
     ['no protected host configuration subtree exists on this host', 'no protected host configuration subtree exists on this host'],
     [
       'Windows PowerShell can construct a SID-scoped Global mutex with a current-user-only ACL',

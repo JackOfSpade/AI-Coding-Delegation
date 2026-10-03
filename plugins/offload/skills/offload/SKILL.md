@@ -1,14 +1,24 @@
 ---
 {
   "name": "offload",
-  "description": "Delegate a bounded implementation, test, or debugging package to a local worker while retaining design and review. Use when the user explicitly asks to offload/delegate, or when a clearly bounded multi-file change benefits from parallel implementation and independent verification.",
-  "metadata": { "argument-hint": "<task or verification request>" }
+  "description": "Delegate a bounded implementation, test, or debugging package to a local worker while retaining design and review. Use when the user invokes /offload, asks to offload or delegate, or asks for DeepSeek or DeepSeek-V4-Pro workers. Do not use native Claude subagents for that request.",
+  "argument-hint": "<task or verification request>"
 }
 ---
 
 # Offload protocol
 
 You are the architect, orchestrator and reviewer. Built-in jobs run in a private linked worktree seeded from an exact snapshot of the primary checkout; the worker never commits, pushes, or switches branches. Only successful owned changes may later integrate after primary-checkout conflict checks. Respect “solo”, “no offload”, or “do it yourself”: do the work directly.
+
+Workers can directly edit their permitted files in that private worktree using file tools even on policy-only hosts; no worker shell is exposed there. Primary Claude must review the resulting diff and perform verification before its final answer.
+
+## Routing contract
+
+When the user invokes `/offload`, asks to **delegate** or **offload**, or names **DeepSeek** / **DeepSeek-V4-Pro**, use this Offload MCP service for bounded worker packages. Do **not** satisfy that request with Claude Code's native subagents. The primary Claude session keeps architecture, decomposition, security decisions, integration decisions, broad verification, and the final review.
+
+For default routing, explicitly set `profile: "pro"` and omit `effort`, so the configured provider-maintained DeepSeek Pro route and its high effort are used. The current official request ID is `deepseek-v4-pro`; it is configuration data, not a generic provider alias to invent or send. If DeepSeek publishes a future Pro ID or changes its pricing, wait for a trusted package/config and pricing update rather than probing, guessing, or silently accepting an unpriced substitution. If the user explicitly selects a supported profile name, use that exact profile instead and still omit `effort` to preserve its configured effort. Treat a provider or model name in the user's prose as a trigger for Offload, not as a request to infer, override, or invent a profile.
+
+Use `/offload` followed directly by the user's actual task; do not require them to paste a routing paragraph. State-changing Offload calls still require normal host approval.
 
 Tools (prefix `mcp__offload__` in Claude Code): `offload_start`, `offload_wait`, `offload_job`, `offload_repair`, `offload_revert`, `offload_cancel`. If tools are unavailable, the same operations exist as `offload <subcommand>` in the shell.
 
@@ -27,13 +37,13 @@ Call `offload_job` with no arguments. If tools or health are unavailable, say so
 - One package is one coherent change a worker can finish and verify alone.
 - Every package gets `ownedPaths`, the globs it may write (for example `src/auth/**`, `tests/auth/**`). Parallel packages MUST have disjoint `ownedPaths`. `extraWritable` must also be disjoint from `ownedPaths` and from every other package's writable scope. `["**"]` locks the whole repo.
 - Shared contracts (types, interfaces, config, migrations): do them first, or put exact signatures in the brief of every package that depends on them.
-- Provide `testCommand`: the narrowest command that proves the package. The server runs it itself after the worker finishes. It requires an actual macOS sandbox by default. On a policy-only host, use a caller-supplied trusted command only with explicit `unsafePolicyOnlyVerifier: true`; that high-friction exception can never repair. Without a command the result is `DONE_UNVERIFIED` and you must verify.
+- Provide `testCommand`: the narrowest command that proves the package. The server runs it itself after the worker finishes. It requires an actual macOS sandbox by default. On a policy-only host, do **not** add `unsafePolicyOnlyVerifier` merely to get a worker test: omit `testCommand`, expect `DONE_UNVERIFIED`, and run the relevant tests yourself after reviewing the integrated diff. Use a caller-supplied trusted command with explicit `unsafePolicyOnlyVerifier: true` only when the user has specifically authorized that exception; it can never repair.
 - `task` is a self-contained brief: goal, design decisions, `relevantPaths` to read first, constraints, what NOT to change. `acceptanceCriteria` are checkable statements.
 - Set `allowNetwork` only if the package truly needs installs. Use `extraWritable` only for narrow temporary build/cache paths: its output is discarded, never integrated or reverted.
 
 ## 3. Run
 
-- Start independent packages together; start dependent packages after prerequisites are accepted.
+- Start independent packages together; start dependent packages after prerequisites are accepted. Every default `offload_start` must include `profile: "pro"` and omit `effort`; an explicitly selected supported profile name overrides that default. Do not substitute a model name in this field.
 - Wait until each returns a final report. `offload_cancel` is an idempotent durable request, not proof that a separately owned detached worker has already stopped; after cancelling, call `offload_wait` or `offload_job` until terminal `CANCELLED` before reusing its scope.
 - While workers run you may read, plan and review finished packages. Do not edit under any running package's `ownedPaths`; integration will refuse a primary-path/index/branch/HEAD conflict rather than overwrite it.
 

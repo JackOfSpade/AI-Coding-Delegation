@@ -48,6 +48,54 @@ test('usage favors prompt_tokens_details and unknown prices are representable', 
     totalTokens: 12,
   });
 });
+test('usage accepts matching duplicated cache-hit counters across provider aliases', () => {
+  for (const [detailsKey, directKey] of [
+    ['cached_tokens', 'cache_hit_tokens'],
+    ['cached_tokens', 'prompt_cache_hit_tokens'],
+    ['cache_hit_tokens', 'prompt_cache_hit_tokens'],
+  ]) {
+    assert.deepEqual(
+      normalizeUsage({
+        prompt_tokens: 10,
+        completion_tokens: 2,
+        prompt_tokens_details: { [detailsKey]: 7 },
+        [directKey]: 7,
+      }),
+      { inputTokens: 10, outputTokens: 2, cacheHitTokens: 7, cacheMissTokens: 3, totalTokens: 12 },
+    );
+  }
+});
+test('usage normalizes the complete DeepSeek Chat Completions usage shape', () => {
+  assert.deepEqual(
+    normalizeUsage({
+      prompt_tokens: 10,
+      completion_tokens: 2,
+      total_tokens: 12,
+      prompt_tokens_details: { cached_tokens: 7 },
+      prompt_cache_hit_tokens: 7,
+      prompt_cache_miss_tokens: 3,
+    }),
+    { inputTokens: 10, outputTokens: 2, cacheHitTokens: 7, cacheMissTokens: 3, totalTokens: 12 },
+  );
+});
+test('usage rejects conflicting or malformed duplicated cache-hit counters', () => {
+  for (const [nestedHit, directHit] of [
+    [7, 6],
+    [7.5, 7.5],
+    [-1, -1],
+    [7, 7.5],
+  ])
+    assert.throws(
+      () =>
+        normalizeUsage({
+          prompt_tokens: 10,
+          completion_tokens: 2,
+          prompt_tokens_details: { cached_tokens: nestedHit },
+          cache_hit_tokens: directHit,
+        }),
+      /Conflicting usage.cacheHitTokens/,
+    );
+});
 test('usage counters must be safe, internally consistent integers', () => {
   for (const usage of [
     { prompt_tokens: 1.5, completion_tokens: 1 },
@@ -62,7 +110,8 @@ test('usage requires one explicit counter for each billable direction', async ()
     { prompt_tokens: 1 },
     { completion_tokens: 1 },
     { prompt_tokens: 1, input_tokens: 1, completion_tokens: 1 },
-    { prompt_tokens: 1, completion_tokens: 1, prompt_tokens_details: { cached_tokens: 0 }, prompt_cache_hit_tokens: 0 },
+    { prompt_tokens: 1, completion_tokens: 1, prompt_tokens_details: { cached_tokens: 0, cache_hit_tokens: 0 } },
+    { prompt_tokens: 1, completion_tokens: 1, cache_hit_tokens: 0, prompt_cache_hit_tokens: 0 },
   ])
     assert.throws(() => normalizeUsage(usage), /Missing|Ambiguous/);
 

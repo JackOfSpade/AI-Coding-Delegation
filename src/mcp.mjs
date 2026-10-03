@@ -15,7 +15,7 @@ const MAX_SKILL_FILES = 100,
   MAX_SKILL_MD_BYTES = 262_144,
   MAX_SKILL_TOTAL_BYTES = 5_242_880;
 const SERVER_INSTRUCTIONS =
-  'Offload skill: read skill://offload/offload/SKILL.md for bounded implementation, test, or debugging delegation. Start a job, wait for its verified result, then review its diff. Supply an absolute repoPath when ambiguous. Do not edit paths owned by a running job.';
+  'Offload skill: read skill://offload/offload/SKILL.md for /offload, delegate, or DeepSeek. Use Offload, not native Claude subagents; primary owns design, security, and review. Default profile "pro" uses DeepSeek’s current Pro/high route; an explicit profile overrides. Do not invent a “latest Pro” model; future IDs/pricing need a trusted update. Model words only route. On policy-only hosts workers edit permitted private-worktree files, no shell; primary reviews/verifies. Supply repoPath if ambiguous.';
 const SKILLS_EXTENSION = { 'io.modelcontextprotocol/skills': {} };
 const startProps = {
   task: { type: 'string', minLength: 1, maxLength: 32_000 },
@@ -40,8 +40,18 @@ const startProps = {
     description:
       'High-friction consent for this caller-supplied testCommand to run policy-only when no macOS sandbox can be applied. A policy-only result can never trigger repair.',
   },
-  profile: { type: 'string', minLength: 1, maxLength: 128 },
-  effort: { enum: ['normal', 'high'] },
+  profile: {
+    type: 'string',
+    minLength: 1,
+    maxLength: 128,
+    description:
+      'Explicit configured profile. Default "pro" uses the current provider-maintained DeepSeek Pro/high route; an explicitly selected supported profile overrides. Never infer a generic latest model from task prose.',
+  },
+  effort: {
+    enum: ['normal', 'high'],
+    description:
+      'Optional configuration override. Omit it to retain the selected profile\'s configured effort, including default profile "pro" high effort.',
+  },
   maxRepairRounds: { type: 'integer', minimum: 0, maximum: 4 },
   budget: {
     type: 'object',
@@ -90,7 +100,7 @@ const requiresUserInteraction = new Set(['offload_start', 'offload_repair', 'off
 const TOOLS = [
   [
     'offload_start',
-    'Start a bounded worker implementation, test, or debugging job; it may edit files and spend provider budget.',
+    'Start a bounded Offload worker implementation, test, or debugging job; it may edit files and spend provider budget. Default DeepSeek delegation to configured profile "pro"; an explicitly selected supported profile overrides. Never use a native Claude subagent.',
     startProps,
     ['task', 'ownedPaths'],
   ],
