@@ -20,6 +20,33 @@ test('report surfaces configured/response model and dated pricing provenance wit
   assert.match(report, /concerns: provider response model/);
   assert.doesNotMatch(report, /api\.deepseek\.com|Bearer|sk-/);
 });
+test('report includes only a bounded numeric provider timeout', () => {
+  const report = compactReport({
+    id: 'oj-timeout',
+    status: 'TIMEOUT',
+    providerFailure: { kind: 'attempt_timeout', attempts: 1, timeoutMs: 300_000, endpoint: 'https://secret.invalid' },
+  });
+  assert.match(report, /provider failure: attempt_timeout after 1 attempt \(300s limit\)/);
+  assert.doesNotMatch(report, /secret\.invalid/);
+});
+test('report renders only recognized provider finish-reason diagnostics', () => {
+  const safe = compactReport({ id: 'oj-finish', status: 'FAILED', providerFinishReason: 'content_filter' });
+  const unsafe = compactReport({ id: 'oj-finish-raw', status: 'FAILED', providerFinishReason: 'provider-secret-reason' });
+  assert.match(safe, /provider finish reason: content_filter/);
+  assert.doesNotMatch(unsafe, /provider finish reason|provider-secret-reason/);
+});
+test('report mode directs review to reportResult and never suggests diffs, repair, or revert', () => {
+  const report = compactReport({
+    id: 'analysis-1',
+    mode: 'report',
+    status: 'DONE_UNVERIFIED',
+    workspacePath: '/private/workspace',
+    summary: 'analysis complete',
+  });
+  assert.match(report, /private read-only worktree · never integrated into primary/);
+  assert.match(report, /next: read reportResult/);
+  assert.doesNotMatch(report, /include:"diff"|revert|repair/);
+});
 test('report does not claim an applied branch remained unchanged after integration drift', () => {
   const report = compactReport({
     id: 'oj-drift',

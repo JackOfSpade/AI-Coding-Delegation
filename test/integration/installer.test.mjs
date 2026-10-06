@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { access, constants, cp, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { access, constants, cp, mkdtemp, mkdir, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import {
   install as rawInstall,
   isMainModule,
@@ -34,6 +35,32 @@ const doctorHookCommand = (root) => {
   const quote = (value) => (process.platform === 'win32' ? `"${value}"` : `'${value.replace(/'/g, `"'"'`)}'`);
   return `${quote(process.execPath)} ${quote(join(root, 'install.mjs'))} --doctor-hook`;
 };
+function fakeClaudeCli({ statePath, calls, mutate = true } = {}) {
+  return (command, args, options) => {
+    calls.push({ command, args, options });
+    const operation = args?.[1];
+    if (operation === 'add') {
+      if (!mutate) return { status: 0, stdout: '' };
+      const current = existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : {};
+      current.mcpServers ||= {};
+      if (current.mcpServers.offload) return { status: 1, stderr: 'offload already exists' };
+      const divider = args.indexOf('--');
+      current.mcpServers.offload = { type: 'stdio', command: args[divider + 1], args: args.slice(divider + 2), env: {} };
+      mkdirSync(dirname(statePath), { recursive: true });
+      writeFileSync(statePath, JSON.stringify(current));
+      return { status: 0, stdout: '' };
+    }
+    if (operation === 'remove') {
+      if (!mutate) return { status: 0, stdout: '' };
+      const current = existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : {};
+      if (!current.mcpServers?.offload) return { status: 1, stderr: 'offload not found' };
+      delete current.mcpServers.offload;
+      writeFileSync(statePath, JSON.stringify(current));
+      return { status: 0, stdout: '' };
+    }
+    return { status: 1, stderr: 'unexpected Claude command' };
+  };
+}
 test('installer main-module detection resolves symlinks and Windows casing without import side effects', async (t) => {
   assert.equal(sameModulePath('C:\\Program Files\\Offload\\INSTALL.MJS', 'c:\\program files\\offload\\install.mjs', 'win32'), true);
   assert.equal(
@@ -55,6 +82,7 @@ test('installer main-module detection resolves symlinks and Windows casing witho
   const result = spawnSync(process.execPath, [link, '--doctor-hook'], { cwd: process.cwd(), encoding: 'utf8', timeout: 5_000 });
   assert.ok([0, 2].includes(result.status), result.stderr);
   assert.match(result.stdout, /^offload: node /);
+  assert.match(result.stdout, /schema 1 · report\/inputFiles yes · restart the MCP client after updates/);
 });
 test('installer CLI grammar rejects dangerous typos before any install mutation or prompt', async () => {
   assert.deepEqual(parseInstallerArgs(['--skip-key', '--clients', 'claude,codex']), {
@@ -122,18 +150,134 @@ test('installer is idempotent and removes only managed routing blocks', async ()
   assert.equal(await readFile(claudePath, 'utf8'), afterFirstInstall, 'a repeated install must not accumulate trailing newlines');
   const doc = await readFile(join(home, '.codex', 'AGENTS.md'), 'utf8');
   assert.equal((doc.match(/BEGIN offload/g) || []).length, 1);
-  assert.match(afterFirstInstall, /invokes `\/offload`/);
+  assert.match(afterFirstInstall, /Use Offload only when the user invokes `\/offload` as a slash command/);
   assert.match(afterFirstInstall, /configured profile `pro`/);
   assert.match(afterFirstInstall, /provider-maintained current DeepSeek Pro route/);
   assert.match(afterFirstInstall, /Never invent a generic “latest Pro” model name/);
-  assert.match(afterFirstInstall, /private linked worktree with file tools even on a policy-only host/);
-  assert.match(afterFirstInstall, /Never use Claude Code native subagents/);
+  assert.match(afterFirstInstall, /on policy-only hosts they also have no worker shell/);
+  assert.match(afterFirstInstall, /edit permitted private-worktree files with file tools/);
+  assert.match(
+    afterFirstInstall,
+    /nor do bounded, multi-file, implementation, testing, debugging, Workflow, ultracode, or native-subagent requests/,
+  );
+  assert.match(afterFirstInstall, /including Sonnet ultracode\/native-agent workflows/);
+  assert.match(afterFirstInstall, /A standalone instruction not to use native subagents does not select Offload/);
+  assert.match(afterFirstInstall, /For a `\/offload` command invocation, end every final answer/);
+  assert.match(
+    afterFirstInstall,
+    /A mention, quotation, negation, or discussion of `\/offload`, offload, delegation, DeepSeek, a provider, or a model does not select Offload/,
+  );
+  assert.doesNotMatch(afterFirstInstall, /as well as for clearly bounded multi-file implementation/);
   assert.match(afterFirstInstall, /explicitly selected supported profile name overrides that default/);
-  assert.match(doc, /names DeepSeek\/DeepSeek-V4-Pro/);
-  assert.match(doc, /not permission to infer a profile/);
+  assert.match(doc, /invokes `\/offload` as a slash command/);
+  assert.match(doc, /nor do bounded, multi-file, implementation, testing, debugging, Workflow, ultracode, or native-subagent requests/);
+  assert.match(doc, /A standalone instruction not to use native subagents does not select Offload/);
+  assert.match(doc, /provider or model name never routes work to Offload/);
   await install({ root, home, configHome: join(home, 'config'), clients: ['claude', 'codex', 'cursor'], uninstall: true });
   assert.doesNotMatch(await readFile(join(home, '.codex', 'AGENTS.md'), 'utf8'), /BEGIN offload/);
   assert.throws(() => replaceManaged('<!-- BEGIN offload', 'x'), /malformed/);
+});
+test('installer stores a Claude skill recovery copy outside skill discovery', async () => {
+  const home = await mkdtemp(`${tmpdir()}/offload-skill-backup-home-`);
+  const configHome = join(home, 'config');
+  const skills = [['claude', join(home, '.claude')]];
+  for (const [, clientHome] of skills) {
+    await mkdir(join(clientHome, 'skills', 'offload'), { recursive: true });
+    await writeFile(join(clientHome, 'skills', 'offload', 'SKILL.md'), `user-owned ${basename(clientHome)} skill\n`);
+  }
+
+  const first = await install({ root: process.cwd(), home, configHome, clients: ['claude'] });
+  for (const [, clientHome] of skills) {
+    const legacy = join(clientHome, 'skills', 'offload', 'SKILL.md.offload.bak');
+    const backup = join(clientHome, 'offload-backups', 'SKILL.md.offload.bak');
+    assert.equal(await readFile(backup, 'utf8'), `user-owned ${basename(clientHome)} skill\n`);
+    await assert.rejects(access(legacy), /ENOENT/);
+    assert.ok(first.backups.includes(backup));
+  }
+
+  const repeated = await install({ root: process.cwd(), home, configHome, clients: ['claude'] });
+  assert.deepEqual(repeated.backups, [], 'a repeat must retain the first recovery copy without creating another one');
+});
+test('installer migrates legacy adjacent skill backups without replacing an existing recovery copy', async () => {
+  const home = await mkdtemp(`${tmpdir()}/offload-legacy-skill-backup-home-`);
+  const configHome = join(home, 'config');
+  const skillDirectory = join(home, '.claude', 'skills', 'offload');
+  const legacy = join(skillDirectory, 'SKILL.md.offload.bak');
+  const backupDirectory = join(home, '.claude', 'offload-backups');
+  const preferred = join(backupDirectory, 'SKILL.md.offload.bak');
+  const migrated = `${preferred}.legacy-1`;
+  await mkdir(skillDirectory, { recursive: true });
+  await mkdir(backupDirectory, { recursive: true });
+  await writeFile(legacy, 'older adjacent recovery copy\n');
+  await writeFile(preferred, 'existing safe recovery copy\n');
+
+  const first = await install({ root: process.cwd(), home, configHome, clients: ['claude'] });
+  assert.equal(await readFile(preferred, 'utf8'), 'existing safe recovery copy\n');
+  assert.equal(await readFile(migrated, 'utf8'), 'older adjacent recovery copy\n');
+  await assert.rejects(access(legacy), /ENOENT/);
+  assert.ok(first.backups.includes(migrated));
+
+  const repeated = await install({ root: process.cwd(), home, configHome, clients: ['claude'] });
+  assert.deepEqual(repeated.backups, [], 'a migrated legacy copy must not be copied again on a later update');
+  await assert.rejects(access(`${preferred}.legacy-2`), /ENOENT/);
+});
+test('fresh-home uninstall does not create client or skill-backup directories', async () => {
+  const home = await mkdtemp(`${tmpdir()}/offload-fresh-uninstall-home-`);
+  try {
+    const result = await install({
+      root: process.cwd(),
+      home,
+      configHome: join(home, 'config'),
+      clients: ['claude', 'codex'],
+      uninstall: true,
+    });
+    assert.deepEqual(result.changed, []);
+    for (const directory of [join(home, '.claude'), join(home, '.codex')]) {
+      assert.equal(existsSync(directory), false, `no client root created at ${directory}`);
+      assert.equal(existsSync(join(directory, 'offload-backups')), false, `no backup directory created below ${directory}`);
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+test('installer refuses symlinked native skill and backup ancestry without touching external files', async () => {
+  const home = await mkdtemp(`${tmpdir()}/offload-symlinked-skill-home-`);
+  const configHome = join(home, 'config');
+  const outsideSkill = await mkdtemp(`${tmpdir()}/offload-symlinked-skill-outside-`);
+  const outsideBackups = await mkdtemp(`${tmpdir()}/offload-symlinked-backup-outside-`);
+  const victim = join(outsideSkill, 'offload', 'SKILL.md');
+  const externalBackup = join(outsideBackups, 'SKILL.md.offload.bak');
+  try {
+    await install({ root: process.cwd(), home, configHome, clients: ['claude'] });
+    await mkdir(dirname(victim), { recursive: true });
+    await writeFile(victim, 'external native skill must remain untouched\n');
+    await rm(join(home, '.claude', 'skills'), { recursive: true, force: true });
+    await symlink(outsideSkill, join(home, '.claude', 'skills'));
+    await assert.rejects(() => install({ root: process.cwd(), home, configHome, clients: ['claude'] }), /symlinked client backup path/);
+    await assert.rejects(
+      () => install({ root: process.cwd(), home, configHome, clients: ['claude'], uninstall: true }),
+      /symlinked client backup path/,
+    );
+    assert.equal(await readFile(victim, 'utf8'), 'external native skill must remain untouched\n');
+
+    const backupHome = await mkdtemp(`${tmpdir()}/offload-symlinked-backup-home-`);
+    try {
+      await mkdir(join(backupHome, '.claude', 'skills', 'offload'), { recursive: true });
+      await symlink(outsideBackups, join(backupHome, '.claude', 'offload-backups'));
+      await writeFile(externalBackup, 'external backup must remain untouched\n');
+      await assert.rejects(
+        () => install({ root: process.cwd(), home: backupHome, configHome: join(backupHome, 'config'), clients: ['claude'] }),
+        /symlinked client backup path/,
+      );
+      assert.equal(await readFile(externalBackup, 'utf8'), 'external backup must remain untouched\n');
+    } finally {
+      await rm(backupHome, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+    await rm(outsideSkill, { recursive: true, force: true });
+    await rm(outsideBackups, { recursive: true, force: true });
+  }
 });
 test('installer preserves CRLF document boundaries through repeat, uninstall, and reinstall', async () => {
   const product = await mkdtemp(`${tmpdir()}/offload-crlf-memory-product-`);
@@ -337,14 +481,54 @@ test('installer uses client-specific blocks and installs reversible narrow Claud
   assert.ok(!after.permissions.allow.includes('mcp__offload__offload_start'));
   assert.equal(after.hooks.SessionStart.length, 0);
 });
-test('installer detects clients, updates only manifest-owned registrations, and preserves edits', async () => {
+test('installer flags a legacy managed update for restart once, then records the current runtime identity', async () => {
+  const home = await mkdtemp(`${tmpdir()}/offload-home-`);
+  const configHome = join(home, 'config');
+  const first = await install({ root: process.cwd(), home, configHome, clients: ['claude'] });
+  assert.equal(first.restart.required, false, 'a first install has no already-running managed server to replace');
+  assert.match(first.runtime.buildHash, /^sha256:[0-9a-f]{64}$/);
+  assert.match(first.runtime.skillHash, /^sha256:[0-9a-f]{64}$/);
+  const statePath = join(configHome, 'offload', 'installer-state.json');
+  const legacy = JSON.parse(await readFile(statePath, 'utf8'));
+  delete legacy.runtime;
+  await writeFile(statePath, JSON.stringify(legacy));
+
+  const upgraded = await install({ root: process.cwd(), home, configHome, clients: ['claude'] });
+  assert.deepEqual(upgraded.restart, {
+    required: true,
+    reason: 'offload runtime artifacts changed',
+    action:
+      'Restart Claude Code or the MCP client to load the updated Offload server and skill. The installer does not kill live processes.',
+  });
+  const repeated = await install({ root: process.cwd(), home, configHome, clients: ['claude'] });
+  assert.deepEqual(repeated.restart, { required: false });
+});
+test('installer uses the official Claude CLI for manifest-owned registration and preserves user replacements', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-home-`);
   const root = process.cwd();
   const configHome = join(home, 'config');
   await install({ root, home, configHome, env: { PATH: '' } });
   await assert.rejects(readFile(join(home, '.claude.json')), /ENOENT/);
-  await mkdir(join(home, '.claude'), { recursive: true });
-  await install({ root, home, configHome });
+  const executable = join(home, 'bin', 'claude');
+  const statePath = join(home, '.claude.json');
+  const env = { PATH: dirname(executable), OFFLOAD_API_KEY: 'must-not-reach-claude' };
+  const calls = [];
+  const commandExists = async (path) => path === executable;
+  const runCommand = fakeClaudeCli({ statePath, calls });
+  await install({ root, home, configHome, env, clients: ['claude'], commandExists, runCommand });
+  assert.deepEqual(calls[0].args, [
+    'mcp',
+    'add',
+    '--scope',
+    'user',
+    'offload',
+    '--',
+    process.execPath,
+    join(root, 'bin', 'offload.mjs'),
+    'mcp',
+  ]);
+  assert.equal(calls[0].options.env.OFFLOAD_API_KEY, undefined);
+  assert.equal(calls[0].options.env.HOME, home);
   const original = JSON.parse(await readFile(join(home, '.claude.json'), 'utf8')).mcpServers.offload;
   const moved = await mkdtemp(`${tmpdir()}/offload-moved-`);
   await cp(join(root, 'templates'), join(moved, 'templates'), { recursive: true });
@@ -352,17 +536,130 @@ test('installer detects clients, updates only manifest-owned registrations, and 
   await cp(join(root, 'bin'), join(moved, 'bin'), { recursive: true });
   await cp(join(root, 'install.mjs'), join(moved, 'install.mjs'));
   await cp(join(root, 'config.example.json'), join(moved, 'config.example.json'));
-  await install({ root: moved, home, configHome, clients: ['claude'] });
+  calls.length = 0;
+  await install({ root: moved, home, configHome, clients: ['claude'], env, commandExists, runCommand });
+  assert.deepEqual(
+    calls.map(({ args }) => args.slice(0, 5)),
+    [
+      ['mcp', 'remove', '--scope', 'user', 'offload'],
+      ['mcp', 'add', '--scope', 'user', 'offload'],
+    ],
+  );
   const updated = JSON.parse(await readFile(join(home, '.claude.json'), 'utf8')).mcpServers.offload;
   assert.notDeepEqual(updated, original);
   assert.equal(updated.args[0], join(moved, 'bin', 'offload.mjs'));
   updated.args.push('--user-edit');
   await writeFile(join(home, '.claude.json'), JSON.stringify({ mcpServers: { offload: updated } }));
-  await install({ root, home, configHome, clients: ['claude'] });
+  calls.length = 0;
+  const result = await install({ root, home, configHome, clients: ['claude'], env, commandExists, runCommand });
+  assert.equal(result.claudeMcp.status, 'user-owned');
+  assert.equal(calls.length, 0);
   const preserved = JSON.parse(await readFile(join(home, '.claude.json'), 'utf8')).mcpServers.offload;
   assert.equal(preserved.args.at(-1), '--user-edit');
-  await install({ root, home, configHome, clients: ['claude'], uninstall: true });
+  await install({ root, home, configHome, clients: ['claude'], uninstall: true, env, commandExists, runCommand });
   assert.equal(JSON.parse(await readFile(join(home, '.claude.json'), 'utf8')).mcpServers.offload.args.at(-1), '--user-edit');
+});
+test('installer never rewrites opaque Claude auth-shaped state when registering through the CLI', async () => {
+  const home = await mkdtemp(`${tmpdir()}/offload-home-`);
+  const configHome = join(home, 'config');
+  const statePath = join(home, '.claude.json');
+  const original =
+    '{\n  "oauthSession": {"accessToken":"opaque", "refreshToken":"opaque"},\n  "mcpServers": {"other": {"command":"safe"}}\n}\n';
+  await writeFile(statePath, original);
+  const executable = join(home, 'bin', 'claude');
+  const calls = [];
+  const result = await install({
+    root: process.cwd(),
+    home,
+    configHome,
+    clients: ['claude'],
+    env: { PATH: dirname(executable) },
+    commandExists: async (path) => path === executable,
+    // This fake is intentionally non-mutating: it represents the official
+    // client boundary and proves the installer itself does not replace the
+    // auth-adjacent file to make registration appear to succeed.
+    runCommand: fakeClaudeCli({ statePath, calls, mutate: false }),
+  });
+  assert.equal(result.claudeMcp.status, 'add-unconfirmed');
+  assert.equal(await readFile(statePath, 'utf8'), original);
+  assert.deepEqual(calls[0].args.slice(0, 5), ['mcp', 'add', '--scope', 'user', 'offload']);
+});
+test('installer leaves malformed or symlinked Claude MCP state untouched without invoking Claude', async (t) => {
+  for (const [label, setup] of [
+    [
+      'malformed',
+      async ({ statePath }) => {
+        const original = '{ malformed Claude state\n';
+        await writeFile(statePath, original);
+        return {
+          assertUnchanged: async () => assert.equal(await readFile(statePath, 'utf8'), original),
+        };
+      },
+    ],
+    [
+      'symlinked',
+      async ({ home, statePath }) => {
+        const target = join(home, 'external-claude-state.json');
+        const original = '{"mcpServers":{"other":{"command":"safe"}}}\n';
+        await writeFile(target, original);
+        try {
+          await symlink(target, statePath);
+        } catch (error) {
+          if (error.code === 'EPERM' || error.code === 'EACCES') t.skip(`symlink creation unavailable: ${error.code}`);
+          else throw error;
+          return undefined;
+        }
+        const link = await readlink(statePath);
+        return {
+          assertUnchanged: async () => {
+            assert.equal(await readlink(statePath), link);
+            assert.equal(await readFile(target, 'utf8'), original);
+          },
+        };
+      },
+    ],
+  ]) {
+    const home = await mkdtemp(`${tmpdir()}/offload-claude-state-${label}-`);
+    const statePath = join(home, '.claude.json');
+    const fixture = await setup({ home, statePath });
+    if (!fixture) continue;
+    const executable = join(home, 'bin', 'claude');
+    const calls = [];
+    const result = await install({
+      root: process.cwd(),
+      home,
+      configHome: join(home, 'config'),
+      clients: ['claude'],
+      env: { PATH: dirname(executable) },
+      commandExists: async (path) => path === executable,
+      runCommand: fakeClaudeCli({ statePath, calls }),
+    });
+    assert.equal(result.claudeMcp.status, 'state-unreadable', `${label} state must block registration`);
+    assert.deepEqual(calls, [], `${label} state must not invoke the Claude CLI`);
+    await fixture.assertUnchanged();
+  }
+});
+test('installer invokes a Windows Claude .cmd launcher through bounded cmd.exe quoting', async () => {
+  const home = await mkdtemp(`${tmpdir()}/offload-home-`);
+  const executable = join(home, 'Program Files', 'Claude', 'claude.cmd');
+  const calls = [];
+  const result = await install({
+    root: process.cwd(),
+    home,
+    configHome: join(home, 'config'),
+    clients: ['claude'],
+    platform: 'win32',
+    env: { Path: dirname(executable), ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+    commandExists: async (path) => path === executable,
+    runCommand: (command, args, options) => {
+      calls.push({ command, args, options });
+      return { status: 0, stdout: '' };
+    },
+  });
+  assert.equal(result.claudeMcp.status, 'add-unconfirmed');
+  assert.equal(calls[0].command, 'C:\\Windows\\System32\\cmd.exe');
+  assert.deepEqual(calls[0].args.slice(0, 3), ['/d', '/s', '/c']);
+  assert.match(calls[0].args[3], /".*claude\.cmd" "mcp" "add" "--scope" "user" "offload" "--"/);
 });
 test('installer rejects invalid client JSON on uninstall and uses a Windows-safe hook command', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-home-`);
@@ -461,8 +758,17 @@ test('installer uses relocated Claude and Codex homes consistently with doctor',
   const home = await mkdtemp(`${tmpdir()}/offload-home-`);
   const claudeDir = join(home, 'claude-state');
   const codexDir = join(home, 'codex-state');
-  const env = { HOME: home, CLAUDE_CONFIG_DIR: claudeDir, CODEX_HOME: codexDir };
-  await install({ root: process.cwd(), home, configHome: join(home, 'config'), clients: ['claude', 'codex'], env });
+  const executable = join(home, 'bin', 'claude');
+  const env = { HOME: home, CLAUDE_CONFIG_DIR: claudeDir, CODEX_HOME: codexDir, PATH: dirname(executable) };
+  await install({
+    root: process.cwd(),
+    home,
+    configHome: join(home, 'config'),
+    clients: ['claude', 'codex'],
+    env,
+    commandExists: async (path) => path === executable,
+    runCommand: fakeClaudeCli({ statePath: join(claudeDir, '.claude.json'), calls: [] }),
+  });
   assert.ok(JSON.parse(await readFile(join(claudeDir, '.claude.json'), 'utf8')).mcpServers.offload);
   await assert.rejects(readFile(join(home, '.claude.json')), /ENOENT/);
   assert.match(await readFile(join(claudeDir, 'skills', 'offload', 'SKILL.md'), 'utf8'), /argument-hint/);
@@ -552,6 +858,139 @@ test('Claude upgrade removes only owned legacy hooks and permissions, preserving
   assert.ok(!settings.permissions.allow.includes('mcp__offload__offload_wait'));
   assert.ok(settings.hooks.SessionStart.some((entry) => entry.matcher === '' && entry.hooks[0].command === 'user-hook'));
 });
+test('Claude consolidates manifest-owned doctor hooks from legacy source and package roots', async () => {
+  const home = await mkdtemp(`${tmpdir()}/offload-hook-migration-home-`);
+  const configHome = join(home, 'config');
+  const packagedRoot = join(home, 'prefix', 'lib', 'node_modules', 'offload');
+  const sourceRoot = join(home, 'Desktop', 'AI-Coding-Delegation');
+  for (const path of ['bin', 'plugins', 'templates']) await cp(join(process.cwd(), path), join(packagedRoot, path), { recursive: true });
+  for (const path of ['install.mjs', 'config.example.json']) await cp(join(process.cwd(), path), join(packagedRoot, path));
+  const canonical = doctorHookCommand(packagedRoot);
+  const legacySource = doctorHookCommand(sourceRoot);
+  const settingsPath = join(home, '.claude', 'settings.json');
+  await mkdir(dirname(settingsPath), { recursive: true });
+  await writeFile(
+    settingsPath,
+    JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { matcher: 'startup', hooks: [{ type: 'command', command: 'user-hook' }] },
+          {
+            matcher: 'startup|resume|fork',
+            hooks: [
+              { type: 'command', command: canonical },
+              { type: 'command', command: 'user-sibling' },
+            ],
+          },
+          { matcher: 'resume', hooks: [{ type: 'command', command: legacySource }] },
+          { matcher: 'fork', hooks: [{ type: 'command', command: legacySource }] },
+        ],
+      },
+    }),
+  );
+  await mkdir(join(configHome, 'offload'), { recursive: true });
+  await writeFile(
+    join(configHome, 'offload', 'installer-state.json'),
+    JSON.stringify({
+      version: 1,
+      registrations: {},
+      files: {},
+      plugins: {},
+      claudeSettings: {
+        hookCommand: legacySource,
+        hookMatcher: 'resume',
+        hookOwned: true,
+        rules: [],
+      },
+    }),
+  );
+
+  await install({ root: packagedRoot, home, configHome, clients: ['claude'] });
+  const settings = JSON.parse(await readFile(settingsPath, 'utf8'));
+  const hooks = settings.hooks.SessionStart.flatMap((entry) => entry.hooks);
+  assert.equal(hooks.filter((hook) => hook.command === canonical).length, 1);
+  assert.equal(
+    hooks.some((hook) => hook.command === legacySource),
+    true,
+  );
+  assert.equal(
+    settings.hooks.SessionStart.some((entry) => entry.matcher === 'resume' && entry.hooks.some((hook) => hook.command === legacySource)),
+    false,
+  );
+  assert.ok(settings.hooks.SessionStart.some((entry) => entry.matcher === 'startup' && entry.hooks[0].command === 'user-hook'));
+  assert.ok(
+    settings.hooks.SessionStart.some(
+      (entry) => entry.matcher === 'startup|resume|fork' && entry.hooks.some((hook) => hook.command === 'user-sibling'),
+    ),
+  );
+  const manifest = JSON.parse(await readFile(join(configHome, 'offload', 'installer-state.json'), 'utf8'));
+  assert.equal(manifest.claudeSettings.hookOwned, false, 'a pre-existing canonical hook remains user-owned');
+  await install({ root: packagedRoot, home, configHome, clients: ['claude'] });
+  let repeated = JSON.parse(await readFile(settingsPath, 'utf8'));
+  assert.ok(
+    repeated.hooks.SessionStart.some((entry) => entry.matcher === 'fork' && entry.hooks.some((hook) => hook.command === legacySource)),
+    'a same-looking hook outside the recorded matcher remains untouched on repeat',
+  );
+  await install({ root: packagedRoot, home, configHome, clients: ['claude'], uninstall: true });
+  repeated = JSON.parse(await readFile(settingsPath, 'utf8'));
+  assert.ok(
+    repeated.hooks.SessionStart.some(
+      (entry) => entry.matcher === 'startup|resume|fork' && entry.hooks.some((hook) => hook.command === canonical),
+    ),
+    'uninstall must retain the pre-existing canonical hook',
+  );
+});
+test('Claude migrates only its manifest-recorded Windows-quoted doctor hook', async () => {
+  const home = await mkdtemp(`${tmpdir()}/offload-windows-hook-migration-home-`);
+  const configHome = join(home, 'config');
+  const root = process.cwd();
+  const current = `"${process.execPath}" "${join(root, 'install.mjs')}" --doctor-hook`;
+  const legacySource = '"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\jack\\Desktop\\AI-Coding-Delegation\\install.mjs" --doctor-hook';
+  const settingsPath = join(home, '.claude', 'settings.json');
+  await mkdir(dirname(settingsPath), { recursive: true });
+  await writeFile(
+    settingsPath,
+    JSON.stringify({
+      hooks: {
+        SessionStart: [
+          {
+            matcher: 'startup',
+            hooks: [
+              { type: 'command', command: legacySource },
+              { type: 'command', command: 'user-hook' },
+            ],
+          },
+        ],
+      },
+    }),
+  );
+  await mkdir(join(configHome, 'offload'), { recursive: true });
+  await writeFile(
+    join(configHome, 'offload', 'installer-state.json'),
+    JSON.stringify({
+      version: 1,
+      registrations: {},
+      files: {},
+      plugins: {},
+      claudeSettings: {
+        hookCommand: legacySource,
+        hookMatcher: 'startup',
+        hookOwned: true,
+        rules: [],
+      },
+    }),
+  );
+
+  await install({ root, home, configHome, clients: ['claude'], platform: 'win32' });
+  const settings = JSON.parse(await readFile(settingsPath, 'utf8'));
+  const hooks = settings.hooks.SessionStart.flatMap((entry) => entry.hooks);
+  assert.equal(
+    hooks.some((hook) => hook.command === legacySource),
+    false,
+  );
+  assert.equal(hooks.filter((hook) => hook.command === current).length, 1);
+  assert.ok(hooks.some((hook) => hook.command === 'user-hook'));
+});
 test('Claude uninstall removes owned grants even when the hook was deleted', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-home-`);
   const configHome = join(home, 'config');
@@ -587,6 +1026,12 @@ test('Claude preserves a pre-existing exact startup hook while removing only ins
   assert.equal(manifest.claudeSettings.hookOwned, true);
   assert.equal(manifest.claudeSettings.hookMatcher, 'startup|resume|fork');
   assert.deepEqual(manifest.claudeSettings.rules, ['mcp__offload__offload_job']);
+  await install({ root, home, configHome, clients: ['claude'] });
+  settings = JSON.parse(await readFile(settingsPath, 'utf8'));
+  assert.ok(
+    settings.hooks.SessionStart.some((entry) => entry.matcher === 'startup' && entry.hooks.some((hook) => hook.command === command)),
+    'a later reinstall must retain the pre-existing exact hook',
+  );
   await install({ root, home, configHome, clients: ['claude'], uninstall: true });
   settings = JSON.parse(await readFile(settingsPath, 'utf8'));
   assert.ok(settings.permissions.allow.includes('mcp__offload__offload_wait'));
@@ -774,6 +1219,111 @@ test('Codex desktop plugin installs from the personal marketplace without a dupl
   assert.doesNotMatch(await readFile(join(codexHome, 'config.toml'), 'utf8'), /mcp_servers\.offload/);
   await assert.rejects(access(join(home, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md')), /ENOENT/);
 });
+test('Codex plugin list accepts the current pluginId-based structured response', async () => {
+  const home = await mkdtemp(`${tmpdir()}/offload-plugin-`);
+  const executable = join(home, 'bin', 'codex');
+  let adds = 0;
+  const structuredList = {
+    installed: [
+      {
+        pluginId: 'offload@personal',
+        name: 'offload',
+        marketplaceName: 'personal',
+        version: '0.1.0+codex.7757ccd5d04f5ca6',
+        installed: true,
+        enabled: true,
+        source: { source: 'local', path: '/outside-the-installer-home/plugins/offload' },
+      },
+    ],
+  };
+  try {
+    const result = await rawInstall({
+      root: process.cwd(),
+      home,
+      configHome: join(home, 'config'),
+      clients: ['codex'],
+      env: { PATH: dirname(executable) },
+      commandExists: async (path) => path === executable,
+      runCommand: (_command, args) => {
+        if (args.includes('list')) return { status: 0, stdout: Buffer.from(JSON.stringify(structuredList)), stderr: 'harmless warning' };
+        if (args.includes('add')) adds++;
+        return { status: 0, stdout: '{}' };
+      },
+    });
+    assert.equal(result.plugin.active, true, JSON.stringify(result.plugin));
+    assert.equal(result.plugin.preexisting, true, JSON.stringify(result.plugin));
+    assert.equal(adds, 0, 'a confirmed installed+enabled plugin must not be re-added');
+    await assert.rejects(access(join(home, '.codex', 'skills', 'offload', 'SKILL.md')), /ENOENT/);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+test('Codex plugin list rejects a contradictory pluginId even when display fields match', async () => {
+  const home = await mkdtemp(`${tmpdir()}/offload-plugin-`);
+  const executable = join(home, 'bin', 'codex');
+  let adds = 0;
+  try {
+    const result = await rawInstall({
+      root: process.cwd(),
+      home,
+      configHome: join(home, 'config'),
+      clients: ['codex'],
+      env: { PATH: dirname(executable) },
+      commandExists: async (path) => path === executable,
+      runCommand: (_command, args) => {
+        if (args.includes('list'))
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              installed: [{ pluginId: 'offload@other', name: 'offload', marketplaceName: 'personal', installed: true, enabled: true }],
+            }),
+          };
+        if (args.join(' ') === 'plugin --help') return { status: 0, stdout: 'Commands:\n  add\n  list\n  remove\n' };
+        if (args.includes('add')) adds++;
+        return { status: 0, stdout: '{}' };
+      },
+    });
+    assert.equal(result.plugin.active, false, JSON.stringify(result.plugin));
+    assert.equal(result.plugin.blockNative, true, JSON.stringify(result.plugin));
+    assert.equal(result.plugin.retained, true, JSON.stringify(result.plugin));
+    assert.equal(adds, 0, 'a mismatched identity must not trigger a potentially duplicate plugin add');
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+test('Codex plugin list rejects a malformed present pluginId even when display fields match', async () => {
+  const home = await mkdtemp(`${tmpdir()}/offload-plugin-`);
+  const executable = join(home, 'bin', 'codex');
+  let adds = 0;
+  try {
+    const result = await rawInstall({
+      root: process.cwd(),
+      home,
+      configHome: join(home, 'config'),
+      clients: ['codex'],
+      env: { PATH: dirname(executable) },
+      commandExists: async (path) => path === executable,
+      runCommand: (_command, args) => {
+        if (args.includes('list'))
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              installed: [{ pluginId: null, name: 'offload', marketplaceName: 'personal', installed: true, enabled: true }],
+            }),
+          };
+        if (args.join(' ') === 'plugin --help') return { status: 0, stdout: 'Commands:\n  add\n  list\n  remove\n' };
+        if (args.includes('add')) adds++;
+        return { status: 0, stdout: '{}' };
+      },
+    });
+    assert.equal(result.plugin.active, false, JSON.stringify(result.plugin));
+    assert.equal(result.plugin.blockNative, true, JSON.stringify(result.plugin));
+    assert.equal(result.plugin.retained, true, JSON.stringify(result.plugin));
+    assert.equal(adds, 0, 'a malformed identity must not trigger a potentially duplicate plugin add');
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
 test('plugin content versions remain canonical when a Windows checkout supplies CRLF artifacts', async () => {
   const product = await mkdtemp(`${tmpdir()}/offload-crlf-product-`);
   const home = await mkdtemp(`${tmpdir()}/offload-crlf-home-`);
@@ -915,7 +1465,7 @@ test('an installer-owned Codex plugin refreshes on its content version and falls
   const codexManifest = join(product, 'plugins', 'offload', '.codex-plugin', 'plugin.json');
   await writeFile(
     codexManifest,
-    (await readFile(codexManifest, 'utf8')).replace('Delegate bounded local coding work', 'Delegate scoped local coding work'),
+    (await readFile(codexManifest, 'utf8')).replace('"Explicit /offload slash command only"', '"Explicit /offload command only"'),
   );
   await setVersion();
   calls.length = 0;
@@ -1123,8 +1673,9 @@ test('Codex plugin uses cmd.exe safely on Windows and Cursor never receives a gl
 test('tampered Codex plugin state cannot delete arbitrary files during uninstall', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-plugin-`);
   const configHome = join(home, 'config');
-  const victim = join(home, 'keep-me.txt');
-  await writeFile(victim, 'user data');
+  const victim = join(home, 'elsewhere', 'skills', 'offload', 'SKILL.md.offload.bak');
+  await mkdir(dirname(victim), { recursive: true });
+  await writeFile(victim, 'user recovery copy');
   await mkdir(join(configHome, 'offload'), { recursive: true });
   await writeFile(
     join(configHome, 'offload', 'installer-state.json'),
@@ -1132,7 +1683,7 @@ test('tampered Codex plugin state cannot delete arbitrary files during uninstall
       version: 1,
       registrations: {},
       files: {},
-      plugins: { codex: { source: join(home, 'elsewhere'), files: { [victim]: '0'.repeat(64) } } },
+      plugins: { codex: { source: join(home, 'elsewhere'), files: {} } },
     }),
   );
   await assert.rejects(
@@ -1147,7 +1698,8 @@ test('tampered Codex plugin state cannot delete arbitrary files during uninstall
     }),
     /invalid offload Codex plugin installer state/,
   );
-  assert.equal(await readFile(victim, 'utf8'), 'user data');
+  assert.equal(await readFile(victim, 'utf8'), 'user recovery copy');
+  await assert.rejects(access(join(home, '.codex', 'offload-backups', 'SKILL.md.offload.bak')), /ENOENT/);
 });
 test('plugin uninstall does not follow a substituted source symlink', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-plugin-`);
@@ -1170,15 +1722,19 @@ test('plugin uninstall does not follow a substituted source symlink', async () =
       plugins: { codex: { source, files: { [recorded]: createHash('sha256').update('outside skill').digest('hex') } } },
     }),
   );
-  await rawInstall({
-    root: join(home, 'missing'),
-    home,
-    configHome,
-    clients: ['codex'],
-    uninstall: true,
-    env: { PATH: '' },
-    commandExists: async () => false,
-  });
+  await assert.rejects(
+    () =>
+      rawInstall({
+        root: join(home, 'missing'),
+        home,
+        configHome,
+        clients: ['codex'],
+        uninstall: true,
+        env: { PATH: '' },
+        commandExists: async () => false,
+      }),
+    /symlinked client backup path/,
+  );
   assert.equal(await readFile(victim, 'utf8'), 'outside skill');
 });
 test('uninstall relinquishes ownership after an owned plugin source was manually deleted', async () => {

@@ -4,7 +4,8 @@
       "type": "openai-chat",
       "baseUrl": "https://api.deepseek.com",
       "keyRef": "keychain:offload-deepseek",
-      "pricing": "deepseek-2026-10-01"
+      "pricing": "deepseek-2026-10-01",
+      "attemptTimeoutMs": 300000
     }
   },
   "profiles": {

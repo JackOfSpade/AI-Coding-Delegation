@@ -1,7 +1,34 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { sseJson } from '../../src/provider/sse.mjs';
-import { OpenAIChatProvider, normalizeUsage } from '../../src/provider/openai-chat.mjs';
+import {
+  DEFAULT_ATTEMPT_TIMEOUT_MS,
+  OpenAIChatProvider,
+  ProviderError,
+  normalizeProviderFinishReason,
+  normalizeUsage,
+  providerFailure,
+} from '../../src/provider/openai-chat.mjs';
+
+test('provider attempt timeout defaults and exposes only bounded numeric metadata', () => {
+  const provider = new OpenAIChatProvider({ baseUrl: 'https://example.test', model: 'm' });
+  assert.equal(provider.timeoutMs, DEFAULT_ATTEMPT_TIMEOUT_MS);
+  assert.equal(
+    new OpenAIChatProvider({ baseUrl: 'https://example.test', model: 'm', timeoutMs: null }).timeoutMs,
+    DEFAULT_ATTEMPT_TIMEOUT_MS,
+  );
+  assert.deepEqual(providerFailure(new ProviderError('timeout', { kind: 'attempt_timeout', attempts: 1, timeoutMs: 300_000 })), {
+    kind: 'attempt_timeout',
+    attempts: 1,
+    timeoutMs: 300_000,
+  });
+  assert.deepEqual(
+    providerFailure(
+      new ProviderError('timeout', { kind: 'attempt_timeout', attempts: 1, timeoutMs: 1, endpoint: 'https://secret.invalid' }),
+    ),
+    { kind: 'attempt_timeout', attempts: 1 },
+  );
+});
 
 test('SSE handles split UTF-8 and CRLF event boundaries', async () => {
   const bytes = new TextEncoder().encode('data: {"word":"é"}\r\n\r\ndata: [DONE]\r\n\r\n');
@@ -47,6 +74,13 @@ test('usage favors prompt_tokens_details and unknown prices are representable', 
     cacheMissTokens: 3,
     totalTokens: 12,
   });
+});
+test('provider finish reasons use a closed diagnostics-only vocabulary', () => {
+  assert.equal(normalizeProviderFinishReason('stop'), 'stop');
+  assert.equal(normalizeProviderFinishReason('content_filter'), 'content_filter');
+  assert.equal(normalizeProviderFinishReason('provider-secret-reason'), 'other');
+  assert.equal(normalizeProviderFinishReason(null), undefined);
+  assert.equal(normalizeProviderFinishReason({ raw: 'provider-secret-reason' }), undefined);
 });
 test('usage accepts matching duplicated cache-hit counters across provider aliases', () => {
   for (const [detailsKey, directKey] of [
@@ -184,6 +218,62 @@ test('provider forwards disabled thinking and permits a named tool choice', asyn
   assert.deepEqual(body.thinking, { type: 'disabled' });
   assert.deepEqual(body.tool_choice, { type: 'function', function: { name: 'echo' } });
 });
+test('official DeepSeek capability is exact and a per-call required-tool focus disables constructor reasoning', async () => {
+  let body;
+  const provider = new OpenAIChatProvider({
+    baseUrl: 'https://api.deepseek.com',
+    model: 'deepseek-v4-pro',
+    reasoningEffort: 'high',
+    thinking: { type: 'enabled' },
+    retries: 0,
+    fetchImpl: async (_url, init) => {
+      body = JSON.parse(init.body);
+      return new Response('data: [DONE]\n\n', { status: 200 });
+    },
+  });
+  assert.equal(provider.supportsForcedImplementationFocusFor('deepseek-v4-pro'), true);
+  assert.equal(
+    provider.supportsForcedImplementationFocusFor('deepseek-flash'),
+    false,
+    'request model must match the configured official model',
+  );
+  for await (const _ of provider.chat({
+    messages: [],
+    tools: [],
+    thinking: { type: 'disabled' },
+    reasoning_effort: 'none',
+    tool_choice: 'required',
+  })) {
+  }
+  assert.deepEqual(body.thinking, { type: 'disabled' });
+  assert.equal(body.reasoning_effort, 'none');
+  assert.equal(body.tool_choice, 'required');
+  assert.equal(
+    new OpenAIChatProvider({
+      baseUrl: 'https://api.deepseek.com',
+      model: 'unrecognized-deepseek-model',
+    }).supportsForcedImplementationFocusFor('unrecognized-deepseek-model'),
+    false,
+  );
+  assert.equal(
+    new OpenAIChatProvider({ baseUrl: 'https://proxy.example.test', model: 'deepseek-v4-pro' }).supportsForcedImplementationFocusFor(
+      'deepseek-v4-pro',
+    ),
+    false,
+  );
+  assert.equal(
+    new OpenAIChatProvider({ baseUrl: 'https://api.deepseek.com:8443', model: 'deepseek-v4-pro' }).supportsForcedImplementationFocusFor(
+      'deepseek-v4-pro',
+    ),
+    false,
+  );
+  assert.equal(
+    new OpenAIChatProvider({ baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-v4-pro' }).supportsForcedImplementationFocusFor(
+      'deepseek-v4-pro',
+    ),
+    false,
+  );
+});
 test('provider appends chat operation to a root or v1 API base exactly once', async () => {
   let endpoint;
   const provider = new OpenAIChatProvider({
@@ -280,7 +370,7 @@ test('provider rejects conflicting tool fragments and preserves index order', as
     }
   }, /Conflicting tool call id/);
 });
-test('provider accepts nullable text and reasoning fields in streaming tool-call chunks', async () => {
+test('provider preserves explicit nullable reasoning in streaming tool-call chunks for exact replay', async () => {
   const provider = new OpenAIChatProvider({
     baseUrl: 'http://localhost',
     model: 'm',
@@ -293,7 +383,92 @@ test('provider accepts nullable text and reasoning fields in streaming tool-call
   });
   const events = [];
   for await (const event of provider.chat({ messages: [], tools: [] })) events.push(event);
-  assert.deepEqual(events, [{ toolCalls: [{ id: 'call-1', name: 'echo', arguments: '{}' }], model: undefined }]);
+  assert.deepEqual(events, [
+    { reasoning: null, model: undefined },
+    { toolCalls: [{ id: 'call-1', name: 'echo', arguments: '{}' }], model: undefined },
+  ]);
+});
+
+test('provider preserves explicit empty reasoning in streaming tool-call chunks for exact replay', async () => {
+  const provider = new OpenAIChatProvider({
+    baseUrl: 'http://localhost',
+    model: 'm',
+    retries: 0,
+    fetchImpl: async () =>
+      new Response(
+        'data: {"choices":[{"delta":{"reasoning_content":"","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"echo","arguments":"{}"}}]}}]}\n\ndata: [DONE]\n\n',
+        { status: 200 },
+      ),
+  });
+  const events = [];
+  for await (const event of provider.chat({ messages: [], tools: [] })) events.push(event);
+  assert.deepEqual(events, [
+    { reasoning: '', model: undefined },
+    { toolCalls: [{ id: 'call-1', name: 'echo', arguments: '{}' }], model: undefined },
+  ]);
+});
+
+test('provider accepts identical reasoning aliases and rejects conflicting aliases', async () => {
+  const matching = new OpenAIChatProvider({
+    baseUrl: 'http://localhost',
+    model: 'm',
+    retries: 0,
+    fetchImpl: async () =>
+      new Response('data: {"choices":[{"delta":{"reasoning_content":"same","reasoning":"same"}}]}\n\ndata: [DONE]\n\n', { status: 200 }),
+  });
+  const events = [];
+  for await (const event of matching.chat({ messages: [], tools: [] })) events.push(event);
+  assert.deepEqual(events, [{ reasoning: 'same', model: undefined }]);
+
+  const conflicting = new OpenAIChatProvider({
+    baseUrl: 'http://localhost',
+    model: 'm',
+    retries: 0,
+    fetchImpl: async () =>
+      new Response('data: {"choices":[{"delta":{"reasoning_content":"first","reasoning":"second"}}]}\n\ndata: [DONE]\n\n', {
+        status: 200,
+      }),
+  });
+  await assert.rejects(async () => {
+    for await (const _ of conflicting.chat({ messages: [], tools: [] })) {
+    }
+  }, /Conflicting response reasoning aliases/);
+});
+
+test('provider replays a nullable non-thinking tool response without adding a forced tool choice', async () => {
+  let body;
+  const provider = new OpenAIChatProvider({
+    baseUrl: 'https://api.deepseek.com',
+    model: 'deepseek-v4-pro',
+    thinking: { type: 'enabled' },
+    reasoningEffort: 'high',
+    retries: 0,
+    fetchImpl: async (_url, init) => {
+      body = JSON.parse(init.body);
+      return new Response('data: [DONE]\n\n', { status: 200 });
+    },
+  });
+  for await (const _ of provider.chat({
+    messages: [
+      {
+        role: 'assistant',
+        content: '',
+        reasoning_content: null,
+        tool_calls: [
+          { id: 'write-1', type: 'function', function: { name: 'write_file', arguments: '{"path":"src/a.mjs","content":"x"}' } },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'write-1', content: 'WROTE: src/a.mjs' },
+    ],
+    tools: [],
+    thinking: { type: 'disabled' },
+    reasoning_effort: 'none',
+  })) {
+  }
+  assert.deepEqual(body.thinking, { type: 'disabled' });
+  assert.equal(body.reasoning_effort, 'none');
+  assert.ok(!Object.hasOwn(body, 'tool_choice'));
+  assert.deepEqual(body.messages[0].reasoning_content, null);
 });
 test('provider rejects oversized or control-bearing response model metadata', async () => {
   const provider = new OpenAIChatProvider({
@@ -349,6 +524,23 @@ test('provider emits a terminal conflict marker for metadata that arrives after 
     { model: 'first', modelConflict: true },
   ]);
 });
+test('provider emits one normalized terminal finish reason without raw provider text', async () => {
+  const raw = 'provider-secret-reason';
+  const provider = new OpenAIChatProvider({
+    baseUrl: 'http://localhost',
+    model: 'm',
+    retries: 0,
+    fetchImpl: async () =>
+      new Response(
+        `data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":"${raw}"}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":{"raw":"${raw}"}}]}\n\ndata: [DONE]\n\n`,
+        { status: 200 },
+      ),
+  });
+  const events = [];
+  for await (const event of provider.chat({ messages: [], tools: [] })) events.push(event);
+  assert.deepEqual(events, [{ text: 'x', model: undefined }, { providerFinishReason: 'other' }]);
+  assert.doesNotMatch(JSON.stringify(events), new RegExp(raw));
+});
 test('provider bounds untrusted tool-call fragments before buffering them', async () => {
   const provider = new OpenAIChatProvider({
     baseUrl: 'http://localhost',
@@ -387,6 +579,53 @@ test('provider errors expose HTTP status without echoing an arbitrary error body
       return true;
     },
   );
+});
+test('an uncapped provider-owned attempt timeout retries once and can recover', async () => {
+  let attempts = 0;
+  const provider = new OpenAIChatProvider({
+    baseUrl: 'http://localhost',
+    model: 'm',
+    timeoutMs: 5,
+    retries: 1,
+    fetchImpl: async (_url, { signal }) => {
+      attempts++;
+      if (attempts === 1)
+        return new Promise((_resolve, reject) =>
+          signal.addEventListener('abort', () => reject(new Error('provider timeout test')), { once: true }),
+        );
+      return new Response('data: {"choices":[{"delta":{}}]}\n\ndata: [DONE]\n\n', { status: 200 });
+    },
+  });
+  for await (const _ of provider.chat({ messages: [], tools: [] })) {
+  }
+  assert.equal(attempts, 2);
+});
+test('external cancellation is not relabeled as a provider attempt timeout', async () => {
+  const controller = new AbortController();
+  let requestStarted;
+  const started = new Promise((resolve) => {
+    requestStarted = resolve;
+  });
+  const provider = new OpenAIChatProvider({
+    baseUrl: 'http://localhost',
+    model: 'm',
+    timeoutMs: 1_000,
+    retries: 1,
+    fetchImpl: async (_url, { signal }) => {
+      requestStarted();
+      return new Promise((_resolve, reject) =>
+        signal.addEventListener('abort', () => reject(new Error('provider-side text must not become classification')), { once: true }),
+      );
+    },
+  });
+  const request = (async () => {
+    for await (const _ of provider.chat({ messages: [], tools: [], signal: controller.signal })) {
+    }
+  })();
+  await started;
+  const cancellation = new Error('outer request cancelled');
+  controller.abort(cancellation);
+  await assert.rejects(request, (error) => error === cancellation);
 });
 test('retry backoff unregisters its abort listener after a normal delay', async () => {
   const controller = new AbortController();

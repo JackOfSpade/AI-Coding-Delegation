@@ -4,18 +4,14 @@ import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { redact as foundationRedact, redactText } from './redact.mjs';
+import { redact as foundationRedact, redactText, safeTokenAccountingValue } from './redact.mjs';
 import { validJobId } from './job-manager.mjs';
 
-// Accounting names such as inputTokens are not credentials.  Never redact a
-// numeric count merely because it contains the word "token".
-const usageTokenKey = (key) =>
-  /^(?:tokens|(?:input|output|prompt|completion|total|cached|cachehit|cachemiss|reasoning)(?:tokens?|tokencount))$/i.test(
-    String(key).replace(/[-_ ]/g, ''),
-  );
-const secretKey = (key) =>
+// Keep the accounting exception shared with the foundation redactor. A
+// token-shaped key only bypasses redaction when its value is a safe count.
+const secretKey = (key, value) =>
   key !== 'credentialFingerprint' &&
-  !usageTokenKey(key) &&
+  !safeTokenAccountingValue(key, value) &&
   /(?:api[_-]?key|authorization|secret|password|credential|bearer|(?:access|refresh|auth|session|id)?[_-]?token)/i.test(key);
 const MAX_TRANSCRIPT_BYTES = 4 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
@@ -135,7 +131,7 @@ function validPublicationState(value) {
 export function redact(value) {
   if (Array.isArray(value)) return value.map(redact);
   if (value && typeof value === 'object')
-    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, secretKey(k) ? '[REDACTED]' : redact(v)]));
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, secretKey(k, v) ? '[REDACTED]' : redact(v)]));
   if (typeof value === 'string') return value.replace(/\b(?:sk|rk|key|bearer)[-_A-Za-z0-9]{12,}\b/gi, '[REDACTED]');
   return value;
 }
@@ -337,9 +333,14 @@ export class JobStore {
         throw new Error('job integrity key is unavailable');
       }
     }
-    const job = this.integrityRequired(prepared)
-      ? { ...prepared, transcriptDigest: digest(''), transcriptBytes: 0, artifactDigests: {} }
-      : prepared;
+    // A transcript can be replayed only while every assistant reasoning
+    // record is byte-for-byte original.  Persist this positive capability at
+    // creation, rather than treating an absent legacy field as permission to
+    // replay a transcript whose historical redaction status is unknowable.
+    const replayable = { ...prepared, transcriptReplayable: true };
+    const job = this.integrityRequired(replayable)
+      ? { ...replayable, transcriptDigest: digest(''), transcriptBytes: 0, artifactDigests: {} }
+      : replayable;
     // Preparing/signing can fail (and #writeJob can reject an overlarge or
     // unserializable record).  Do all of that before claiming a durable name,
     // then remove only the empty directory this invocation successfully made.
@@ -512,7 +513,10 @@ export class JobStore {
   async event(id, event) {
     await this.init();
     const directory = await this.#assertJobDirectory(id);
-    const line = JSON.stringify(foundationRedact(redact({ at: this.now().toISOString(), ...event }), this.secrets)) + '\n';
+    // The event timestamp is an envelope field owned by the store. Keep it
+    // last so an event payload cannot forge when the durable transition was
+    // recorded.
+    const line = JSON.stringify(foundationRedact(redact({ ...event, at: this.now().toISOString() }, this.secrets))) + '\n';
     return this.#withJobLock(id, () => this.#serial(() => this.#appendBounded(join(directory, 'events.jsonl'), line)));
   }
   async messages(id, message) {
@@ -525,7 +529,20 @@ export class JobStore {
     const directory = await this.#assertJobDirectory(id);
     if (!Array.isArray(messages) || messages.length === 0 || messages.some((message) => !validMessage(message)))
       throw new Error('invalid transcript message');
-    const lines = messages.map((message) => JSON.stringify(foundationRedact(redact(message), this.secrets)) + '\n');
+    const storedMessages = messages.map((message) => foundationRedact(redact(message), this.secrets));
+    // DeepSeek requires exact assistant reasoning on a later tool/reasoning
+    // replay.  Durable artifacts must still redact credentials, so remember
+    // the one-way fact that redaction changed reasoning rather than retaining
+    // the original secret-bearing text anywhere on disk.
+    const reasoningRedacted = messages.some((message, index) => {
+      const stored = storedMessages[index];
+      return (
+        message?.role === 'assistant' &&
+        typeof message.reasoning_content === 'string' &&
+        stored?.reasoning_content !== message.reasoning_content
+      );
+    });
+    const lines = storedMessages.map((message) => JSON.stringify(message) + '\n');
     if (lines.some((line) => Buffer.byteLength(line) > MAX_TRANSCRIPT_BYTES)) throw new Error('transcript record exceeds size limit');
     return this.#withJobLock(id, () =>
       this.#serial(async () => {
@@ -552,22 +569,29 @@ export class JobStore {
         const text = `${prefix}${lines.join('')}`;
         const bytes = Buffer.byteLength(text);
         if (bytes > MAX_TRANSCRIPT_BYTES) throw new Error('transcript exceeds size limit');
+        const replayability = reasoningRedacted ? { transcriptReplayable: false } : {};
         if (this.integrityRequired(job)) {
           // The sealed intent makes either side of a crash unambiguous: readers
           // accept precisely the old or the new full digest, never arbitrary
           // JSON that happens to be parseable at EOF.
           const pending = {
             ...job,
+            ...replayability,
             transcriptDigest: digest(current),
             transcriptBytes: Buffer.byteLength(current),
             transcriptPendingDigest: digest(text),
             transcriptPendingBytes: bytes,
           };
           await this.#writeJob(pending);
+        } else if (reasoningRedacted) {
+          // Publish the conservative marker first.  A crash before the
+          // transcript rename can make a clean transcript non-replayable,
+          // but can never make a redacted reasoning record replayable.
+          await this.#writeJob({ ...job, transcriptReplayable: false });
         }
         await this.#replaceStoredFile(path, text);
         if (this.integrityRequired(job)) {
-          const committed = { ...job, transcriptDigest: digest(text), transcriptBytes: bytes };
+          const committed = { ...job, ...replayability, transcriptDigest: digest(text), transcriptBytes: bytes };
           delete committed.transcriptPendingDigest;
           delete committed.transcriptPendingBytes;
           await this.#writeJob(committed);
@@ -1218,7 +1242,7 @@ function validMessage(value) {
   if (value.role === 'assistant')
     return (
       messageText(value.content) &&
-      (value.reasoning_content === undefined || messageText(value.reasoning_content)) &&
+      (value.reasoning_content === undefined || value.reasoning_content === null || messageText(value.reasoning_content)) &&
       (value.tool_calls === undefined ||
         (Array.isArray(value.tool_calls) &&
           value.tool_calls.length > 0 &&

@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { redactText } from './redact.mjs';
 import { readRegularFile } from './regular-file.mjs';
+import { runtimeIdentity } from './identity.mjs';
+import { validateJobRequest } from './job-manager.mjs';
 const SKILL_NAME = 'offload';
 const SKILL_URI = 'skill://offload/offload/SKILL.md';
 const SKILL_ROOT = fileURLToPath(new URL('../plugins/offload/skills/offload/', import.meta.url));
@@ -15,17 +17,30 @@ const MAX_SKILL_FILES = 100,
   MAX_SKILL_MD_BYTES = 262_144,
   MAX_SKILL_TOTAL_BYTES = 5_242_880;
 const SERVER_INSTRUCTIONS =
-  'Offload skill: read skill://offload/offload/SKILL.md for /offload, delegate, or DeepSeek. Use Offload, not native Claude subagents; primary owns design, security, and review. Default profile "pro" uses DeepSeek’s current Pro/high route; an explicit profile overrides. Do not invent a “latest Pro” model; future IDs/pricing need a trusted update. Model words only route. On policy-only hosts workers edit permitted private-worktree files, no shell; primary reviews/verifies. Supply repoPath if ambiguous.';
+  'Offload skill: opt-in only. A conversational client may call offload_start only for an actual `/offload <task>` slash command. Prose, mentions, quotes, or negations of Offload, delegation, DeepSeek, providers, or models never authorize it. Read skill://offload/offload/SKILL.md. /offload: no native Claude subagents; profile "pro". Do not invent a “latest Pro” model. On policy-only hosts workers edit permitted private-worktree files, no shell. Supply repoPath if ambiguous.';
 const SKILLS_EXTENSION = { 'io.modelcontextprotocol/skills': {} };
 const startProps = {
   task: { type: 'string', minLength: 1, maxLength: 32_000 },
+  mode: {
+    enum: ['write', 'report'],
+    description:
+      'Omit or use write for the existing editable-job behavior. Use report for a read-only analysis job: ownedPaths and extraWritable must be omitted/empty, and its private worktree is never integrated into the primary checkout.',
+  },
   acceptanceCriteria: { type: 'array', maxItems: 100, items: { type: 'string', minLength: 1, maxLength: 4_000 } },
   ownedPaths: {
     type: 'array',
-    minItems: 1,
+    minItems: 0,
     maxItems: 128,
     items: { type: 'string', minLength: 1, maxLength: 1_024 },
-    description: 'Required relative paths or globs this job exclusively owns while it runs; do not edit them concurrently.',
+    description:
+      'Required non-empty relative paths or globs for write jobs, which this job exclusively owns while it runs. Report jobs must omit this or provide an empty array.',
+  },
+  inputFiles: {
+    type: 'array',
+    maxItems: 32,
+    items: { type: 'string', minLength: 1, maxLength: 4096 },
+    description:
+      'Report-mode only: absolute regular files under the server OS temp root; macOS also accepts /private/tmp (and its /tmp alias). Configured server scratch roots may also apply. Files are size-limited, copied read-only into the private worktree, and returned only by private relative paths in reportResult. A rejected call reports canonical allowed roots before any job is created.',
   },
   relevantPaths: { type: 'array', maxItems: 128, items: { type: 'string', minLength: 1, maxLength: 1_024 } },
   testCommand: {
@@ -33,7 +48,7 @@ const startProps = {
     minLength: 1,
     maxLength: 8_192,
     description:
-      'Verifier command run by the server. It requires an actual macOS sandbox unless unsafePolicyOnlyVerifier is explicitly true.',
+      'Verifier command run exactly once by the server after the worker finishes. It requires an actual macOS sandbox unless unsafePolicyOnlyVerifier is explicitly true. For node --test, use explicit test files or quoted globs; bare directories (for example, node --test acceptance test) can be resolved as modules by current Node releases.',
   },
   unsafePolicyOnlyVerifier: {
     type: 'boolean',
@@ -100,9 +115,9 @@ const requiresUserInteraction = new Set(['offload_start', 'offload_repair', 'off
 const TOOLS = [
   [
     'offload_start',
-    'Start a bounded Offload worker implementation, test, or debugging job; it may edit files and spend provider budget. Default DeepSeek delegation to configured profile "pro"; an explicitly selected supported profile overrides. Never use a native Claude subagent.',
+    'A conversational client may use this tool only to fulfill an actual `/offload <task>` slash command; do not infer authorization from ordinary prose or mentions, quotes, or negations of Offload, delegation, DeepSeek, providers, or models. Start a bounded write job or explicit read-only report/analysis job; both spend provider budget. Reports never integrate and return reportResult text/JSON. Default DeepSeek delegation uses configured profile "pro"; an explicitly selected supported profile overrides. Never use a native Claude subagent.',
     startProps,
-    ['task', 'ownedPaths'],
+    ['task'],
   ],
   [
     'offload_wait',
@@ -148,7 +163,10 @@ const TOOLS = [
 const TOOL_BY_NAME = new Map(TOOLS.map((tool) => [tool.name, tool]));
 const protocol = '2025-06-18';
 const modernProtocol = '2026-07-28';
-const serverInfo = { name: 'offload', version: '0.1.0' };
+// `name` and `version` retain MCP's legacy ServerInfo shape. The additive
+// fingerprints let a client distinguish a live-but-old stdio process from the
+// package it just installed without treating the package version as unique.
+const serverInfo = runtimeIdentity();
 function skillFailure(message) {
   const error = new Error(`offload skill artifact unavailable: ${message}`);
   error.code = 'E_SKILL_ARTIFACT';
@@ -457,6 +475,26 @@ export function createMcpServer(
     const tool = TOOL_BY_NAME.get(name);
     if (!tool) throw new Error(`unknown tool: ${name}`);
     validateSchema(args, tool.inputSchema);
+    if (name === 'offload_start') {
+      const mode = args.mode || 'write';
+      if (mode === 'write' && (!Array.isArray(args.ownedPaths) || !args.ownedPaths.length))
+        throw new Error('ownedPaths is required for write jobs');
+      if (mode === 'write' && args.inputFiles !== undefined) throw new Error('inputFiles are available only to report jobs');
+      if (
+        mode === 'report' &&
+        ((args.ownedPaths && args.ownedPaths.length) ||
+          (args.extraWritable !== undefined && (!Array.isArray(args.extraWritable) || args.extraWritable.length)))
+      )
+        throw new Error('report jobs must not declare writable paths');
+      if (
+        mode === 'report' &&
+        (args.testCommand !== undefined || Object.hasOwn(args, 'unsafePolicyOnlyVerifier') || Object.hasOwn(args, 'allowNetwork'))
+      )
+        throw new Error('report jobs do not run verifiers or allow network access');
+      // Keep MCP's raw boundary aligned with Core/CLI before dispatching to a
+      // potentially injected Core implementation.
+      validateJobRequest(args);
+    }
     return args;
   };
   const invoke = (name, args, signal) => {
@@ -465,17 +503,19 @@ export function createMcpServer(
       offload_start: () =>
         core.start({
           task: args.task,
+          mode: args.mode,
           acceptanceCriteria: args.acceptanceCriteria,
           ownedPaths: args.ownedPaths,
+          inputFiles: args.inputFiles,
           relevantPaths: args.relevantPaths,
           testCommand: args.testCommand,
-          unsafePolicyOnlyVerifier: args.unsafePolicyOnlyVerifier,
+          ...(args.unsafePolicyOnlyVerifier !== undefined ? { unsafePolicyOnlyVerifier: args.unsafePolicyOnlyVerifier } : {}),
           profile: args.profile,
           effort: args.effort,
           maxRepairRounds: args.maxRepairRounds,
           budget: args.budget,
-          allowNetwork: args.allowNetwork,
-          extraWritable: args.extraWritable,
+          ...(args.allowNetwork !== undefined ? { allowNetwork: args.allowNetwork } : {}),
+          ...(args.extraWritable !== undefined ? { extraWritable: args.extraWritable } : {}),
           repoPath: args.repoPath,
         }),
       offload_wait: () => core.wait(args.jobId, { repoPath: args.repoPath, timeoutSec: args.timeoutSec, signal }),

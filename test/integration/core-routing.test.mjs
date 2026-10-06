@@ -1,13 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { createCore, defaultIntegrityStatePath, insidePath, integrityStateHintAllowed } from '../../src/core.mjs';
+import { dirname, join } from 'node:path';
+import {
+  createCore,
+  defaultIntegrityStatePath,
+  insidePath,
+  integrityStateHintAllowed,
+  isolatedWorkspaceReadablePaths,
+} from '../../src/core.mjs';
+import { validateJobRequest } from '../../src/job-manager.mjs';
 import { WINDOWS_INTEGRITY_ROOT_CREDENTIAL } from '../../src/integrity.mjs';
 import { JobStore } from '../../src/store.mjs';
 import { getGitDir } from '../../src/lease.mjs';
+import { cleanupIsolatedWorktree, createIsolatedWorktree, openIsolatedWorktree } from '../../src/worktree.mjs';
 import { sandboxAvailable } from '../../src/sandbox.mjs';
 import { createMockOpenAIServer } from '../mock-openai-server.mjs';
 
@@ -70,6 +79,37 @@ test('Core rejects malformed raw starts before initializing durable state', asyn
     },
   });
   await assert.rejects(() => core.start({ task: 'x', ownedPaths: [] }), /ownedPaths/);
+  await assert.rejects(() => core.start({ task: 'x', ownedPaths: ['src/**'], inputFiles: ['/tmp/result.json'] }), /inputFiles/);
+  assert.doesNotThrow(() => validateJobRequest({ task: 'report', mode: 'report' }));
+  const sensitiveInput = '/tmp/customer-秘密-export.json';
+  for (const request of [
+    { task: `review ${sensitiveInput}`, inputFiles: [sensitiveInput] },
+    { task: 'review input one', inputFiles: [sensitiveInput], acceptanceCriteria: ['summarize customer-秘密-export.json'] },
+    { task: 'review input one', inputFiles: [sensitiveInput], relevantPaths: ['customer-秘密-export.json'] },
+    { task: 'review input one', inputFiles: [sensitiveInput], denyRead: ['customer-秘密-export.json'] },
+  ])
+    assert.throws(
+      () => validateJobRequest({ mode: 'report', ...request }),
+      /use input ordinals or generic private paths/,
+      'report request text must not retain a raw external input reference',
+    );
+  assert.doesNotThrow(() =>
+    validateJobRequest({
+      mode: 'report',
+      task: 'review input 01',
+      inputFiles: [sensitiveInput],
+      acceptanceCriteria: ['summarize the private manifest input'],
+      relevantPaths: ['.offload-report-inputs/input-01'],
+    }),
+  );
+  assert.doesNotThrow(() => validateJobRequest({ mode: 'report', task: 'analyze data', inputFiles: ['/tmp/a'] }));
+  await assert.rejects(
+    () => core.start({ mode: 'report', task: `review ${sensitiveInput}`, inputFiles: [sensitiveInput] }),
+    /use input ordinals or generic private paths/,
+  );
+  assert.doesNotThrow(() => validateJobRequest({ task: 'report', mode: 'report', extraWritable: [] }));
+  assert.throws(() => validateJobRequest({ task: 'report', mode: 'report', extraWritable: ['tmp/**'] }), /writable paths/);
+  assert.throws(() => validateJobRequest({ task: 'report', mode: 'report', extraWritable: null }), /writable paths/);
   await assert.rejects(() => core.start({ task: '', ownedPaths: ['src/**'] }), /task/);
   await assert.rejects(() => core.start({ task: 'x', ownedPaths: ['src/**'], budget: { maxUSd: 1 } }), /budget/);
   await assert.rejects(() => core.start({ task: 'x', ownedPaths: ['src/**'], repoPath: '' }), /repoPath/);
@@ -91,6 +131,183 @@ test('Core rejects malformed raw starts before initializing durable state', asyn
     await assert.rejects(operation, /valid job id/);
   await assert.rejects(() => core.recover('relative-repo'), /repoPath/);
   assert.equal(initialized, 0);
+});
+test('Core grants command parent traversal only to an isolated workspace', () => {
+  const workspace = '/private/var/folders/test/offload-worktree-1/workspace';
+  assert.deepEqual(isolatedWorkspaceReadablePaths({ workspacePath: workspace }, workspace), [dirname(workspace)]);
+  assert.deepEqual(isolatedWorkspaceReadablePaths({ workspacePath: workspace }, '/repo'), []);
+  assert.deepEqual(isolatedWorkspaceReadablePaths({}, '/repo'), []);
+  assert.deepEqual(isolatedWorkspaceReadablePaths({ workspacePath: 'relative-workspace' }, 'relative-workspace'), []);
+});
+test('Core rejects report input references introduced by merged repository denyRead policy', async () => {
+  const path = await repo('offload-core-report-deny-reference-');
+  const sensitiveInput = '/tmp/customer-秘密-export.json';
+  const configured = { ...loaded, repoConfig: { denyRead: ['customer-秘密-export.json'] } };
+  const core = createCore({
+    config: { loaded: configured, resolveKey: () => 'credential' },
+    worker: { run: async () => assert.fail('report worker must not launch') },
+    snapshots: { create: async () => 'a'.repeat(40), diff: async () => '' },
+  });
+  try {
+    await assert.rejects(
+      () => core.start({ mode: 'report', task: 'review input 01', inputFiles: [sensitiveInput], repoPath: path }),
+      /use input ordinals or generic private paths/,
+    );
+  } finally {
+    await core.shutdown();
+    await rm(path, { recursive: true, force: true });
+  }
+});
+test('Core starts a report job without injecting write or verifier fields', async () => {
+  const path = await repo('offload-core-report-projection-');
+  const isolation = { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree };
+  const core = createCore({
+    config: { loaded, resolveKey: () => 'credential', isolation },
+    isolation,
+    worker: { run: async () => ({ status: 'DONE', report: 'private analysis complete' }) },
+  });
+  try {
+    const started = await core.start({ mode: 'report', task: 'analyze only', repoPath: path });
+    const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    assert.equal(done.status, 'DONE_UNVERIFIED');
+    assert.equal(done.mode, 'report');
+  } finally {
+    await core.shutdown();
+    await rm(path, { recursive: true, force: true });
+  }
+});
+test('report worker external input transcript is ephemeral while its report remains durable', async (t) => {
+  const path = await repo('offload-core-private-report-');
+  const scratch = await mkdtemp(join(tmpdir(), 'offload-private-report-input-'));
+  const sensitiveName = 'customer-acme-secret-export.json';
+  const sensitiveBody = 'EXTERNAL_BODY_DO_NOT_PERSIST_8c093ed6';
+  const input = join(scratch, sensitiveName);
+  const isolation = { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree };
+  let server;
+  try {
+    await writeFile(input, sensitiveBody);
+    server = await createMockOpenAIServer([
+      { chunks: [toolChunk('read-private-input', 'read_file', { path: '.offload-report-inputs/input-01' }), usageChunk] },
+      {
+        chunks: [
+          toolChunk('finish-private-report', 'finish', {
+            summary: 'read private input',
+            report: 'Private input was reviewed.',
+            concerns: [],
+            testsRun: ['read input'],
+          }),
+          usageChunk,
+        ],
+      },
+    ]);
+  } catch (error) {
+    if (error.code === 'EPERM') {
+      t.skip('loopback networking is unavailable in this sandbox');
+      return;
+    }
+    throw error;
+  }
+  try {
+    const secureLoaded = structuredClone(loaded);
+    secureLoaded.config.providers.test.baseUrl = server.baseUrl;
+    // The mock streams `mock-model`; bind this fixture's configured profile to
+    // that exact priced model instead of weakening production model checks.
+    secureLoaded.config.profiles.test.model = 'mock-model';
+    const pricingTable = {
+      fetched_at: '2026-10-01',
+      models: {
+        'mock-model': {
+          usd_per_1m: {
+            input_cache_hit: { off_peak: 0, peak: 0 },
+            input_cache_miss: { off_peak: 0, peak: 0 },
+            output: { off_peak: 0, peak: 0 },
+          },
+        },
+      },
+    };
+    const core = createCore({
+      config: { loaded: secureLoaded, pricingTable, resolveKey: () => 'credential', isolation, reportInputRoots: [scratch] },
+      isolation,
+    });
+    try {
+      const started = await core.start({
+        mode: 'report',
+        task: 'review private connector result',
+        inputFiles: [input],
+        // The mock must make one read tool turn and a separate finish turn.
+        budget: { maxTurns: 2 },
+        repoPath: path,
+      });
+      const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      assert.equal(done.status, 'DONE_UNVERIFIED');
+      assert.equal(done.reportResult.text, 'Private input was reviewed.');
+      assert.deepEqual(done.reportResult.inputs, [{ path: '.offload-report-inputs/input-01', bytes: Buffer.byteLength(sensitiveBody) }]);
+      const store = core.manager.store;
+      assert.match(await store.readArtifact(started.jobId, 'report.md'), /worker summary: read private input/);
+      assert.deepEqual(await store.readMessages(started.jobId), []);
+      const messagePath = join(getGitDir(path), 'offload', 'jobs', started.jobId, 'messages.jsonl');
+      assert.equal(existsSync(messagePath), false, 'report jobs do not create a durable transcript');
+      const record = JSON.stringify(await store.get(started.jobId));
+      assert.doesNotMatch(record, new RegExp(sensitiveName));
+      assert.doesNotMatch(JSON.stringify(done), new RegExp(sensitiveName));
+      assert.doesNotMatch(JSON.stringify(server.requests[0].body), new RegExp(sensitiveName));
+      assert.match(JSON.stringify(server.requests[0].body), /\.offload-report-inputs\/input-01/);
+      assert.doesNotMatch(record, new RegExp(sensitiveBody));
+      assert.equal(server.requests.length, 2);
+      assert.match(JSON.stringify(server.requests[1].body), new RegExp(sensitiveBody), 'worker can read the generic private copy');
+    } finally {
+      await core.shutdown();
+    }
+  } finally {
+    await server.close();
+    await rm(path, { recursive: true, force: true });
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+test('Core passes the current write-job turn allowance into the initial system prompt', async (t) => {
+  const path = await repo('offload-core-turn-guidance-');
+  let server;
+  try {
+    server = await createMockOpenAIServer([{ chunks: [finishChunk('guided'), usageChunk] }]);
+  } catch (error) {
+    if (error.code === 'EPERM') {
+      t.skip('loopback networking is unavailable in this sandbox');
+      return;
+    }
+    throw error;
+  }
+  try {
+    const configured = structuredClone(loaded);
+    configured.config.providers.test.baseUrl = server.baseUrl;
+    configured.config.profiles.test.model = 'mock-model';
+    const pricingTable = {
+      fetched_at: '2026-10-01',
+      models: {
+        'mock-model': {
+          usd_per_1m: {
+            input_cache_hit: { off_peak: 0, peak: 0 },
+            input_cache_miss: { off_peak: 0, peak: 0 },
+            output: { off_peak: 0, peak: 0 },
+          },
+        },
+      },
+    };
+    const core = createCore({ config: { loaded: configured, pricingTable, resolveKey: () => 'credential' } });
+    try {
+      const started = await core.start({ task: 'write a focused change', ownedPaths: ['src/**'], budget: { maxTurns: 2 }, repoPath: path });
+      const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      assert.equal(done.status, 'DONE_UNVERIFIED');
+      const system = server.requests[0].body.messages.find((message) => message.role === 'system')?.content;
+      assert.match(system, /2 model turns available/);
+      assert.match(system, /Batch independent reads and lists/);
+      assert.doesNotMatch(system, /write a focused change/, 'the task remains a separate user turn');
+    } finally {
+      await core.shutdown();
+    }
+  } finally {
+    await server.close();
+    await rm(path, { recursive: true, force: true });
+  }
 });
 const finishChunk = (summary = 'ok') => ({
   model: 'mock-model',
@@ -114,6 +331,148 @@ const toolChunk = (id, name, args) => ({
   choices: [{ delta: { tool_calls: [{ index: 0, id, type: 'function', function: { name, arguments: JSON.stringify(args) } }] } }],
 });
 const usageChunk = { model: 'mock-model', choices: [{ delta: {} }], usage: { prompt_tokens: 1, completion_tokens: 1 } };
+test('Core restart of a queued budget finish uses only the trusted finish projection', async () => {
+  const path = await repo('offload-core-budget-finish-restart-');
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  const sse = (chunks) => `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('')}data: [DONE]\n\n`;
+  globalThis.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    return new Response(sse([finishChunk('recovered'), usageChunk]), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  };
+  try {
+    const configured = structuredClone(loaded);
+    configured.config.providers.test.baseUrl = 'http://127.0.0.1:4321/v1';
+    configured.config.profiles.test.model = 'mock-model';
+    const pricingTable = {
+      fetched_at: '2026-10-01',
+      models: {
+        'mock-model': {
+          usd_per_1m: {
+            input_cache_hit: { off_peak: 0, peak: 0 },
+            input_cache_miss: { off_peak: 0, peak: 0 },
+            output: { off_peak: 0, peak: 0 },
+          },
+        },
+      },
+    };
+    const core = createCore({ config: { loaded: configured, pricingTable, resolveKey: () => 'credential' } });
+    try {
+      const started = await core.start(
+        { task: 'TASK_MUST_NOT_REACH_RECOVERED_PROVIDER', ownedPaths: ['src/**'], budget: { maxTurns: 2 }, repoPath: path },
+        { launch: false },
+      );
+      const store = core.manager.store;
+      const initial = await store.get(started.jobId);
+      await store.messagesBatch(started.jobId, [
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              id: 'durable-write',
+              type: 'function',
+              function: { name: 'write_file', arguments: '{"path":"src/recovered.mjs","content":"SOURCE_MUST_NOT_REACH_PROVIDER"}' },
+            },
+          ],
+        },
+        { role: 'tool', tool_call_id: 'durable-write', name: 'write_file', content: 'written' },
+      ]);
+      // This simulates a dead active owner. Release its old start lease first;
+      // recovery must acquire a new nonce before the private restart handoff.
+      await core.manager.releaseLease(started.jobId, { ownerNonce: initial.leaseOwnerNonce });
+      await store.update(started.jobId, {
+        status: 'RUNNING',
+        handoffState: 'RUNNING',
+        runnerPid: 999999999,
+        runnerHeartbeatAt: new Date(0).toISOString(),
+        budgetFinishRecovery: 'queued',
+      });
+      assert.equal(await core.manager.recover(), 1);
+      const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      assert.equal(done.status, 'DONE_UNVERIFIED');
+      assert.equal(requests.length, 1);
+      const request = requests[0];
+      assert.deepEqual(request.messages, [{ role: 'user', content: 'Call the finish tool now.' }]);
+      assert.deepEqual(
+        request.tools.map((tool) => tool.function.name),
+        ['finish'],
+      );
+      assert.doesNotMatch(JSON.stringify(request), /(?:TASK|SOURCE)_MUST_NOT_REACH_(?:RECOVERED_)?PROVIDER/);
+    } finally {
+      await core.shutdown();
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(path, { recursive: true, force: true });
+  }
+});
+test('manual repair gets a fresh worker timeout round after a stale original wall clock and records repair lifecycle events', async () => {
+  const path = await repo('offload-core-repair-timeout-');
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  const sse = (chunks) => `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('')}data: [DONE]\n\n`;
+  const responses = [
+    () => new Response(JSON.stringify({ error: { message: 'mock error' } }), { status: 503 }),
+    () => new Response(sse([finishChunk('repaired'), usageChunk]), { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+  ];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return responses.shift()();
+  };
+  try {
+    const configured = structuredClone(loaded);
+    configured.config.providers.test.baseUrl = 'http://127.0.0.1:4321/v1';
+    configured.config.profiles.test.model = 'mock-model';
+    configured.config.limits = { maxTurns: 1, timeoutMinutes: 1, maxUsd: 1 };
+    const pricingTable = {
+      fetched_at: '2026-10-01',
+      models: {
+        'mock-model': {
+          usd_per_1m: {
+            input_cache_hit: { off_peak: 0, peak: 0 },
+            input_cache_miss: { off_peak: 0, peak: 0 },
+            output: { off_peak: 0, peak: 0 },
+          },
+        },
+      },
+    };
+    const core = createCore({ config: { loaded: configured, pricingTable, resolveKey: () => 'credential' } });
+    try {
+      const started = await core.start({ task: 'retry provider failure', ownedPaths: ['src/**'], repoPath: path });
+      const failed = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      assert.equal(failed.status, 'FAILED');
+      assert.deepEqual(failed.providerFailure, { kind: 'http', attempts: 1, status: 503 });
+      // This is the observed failure mode: a repair requested much later than
+      // the original wall start must still run its own active worker round.
+      // Simulate a durable record created before attemptTimeoutMs was added;
+      // repairs must safely use the adapter default rather than rejecting it.
+      const legacyRecord = await core.manager.store.get(started.jobId);
+      const legacyProfile = { ...legacyRecord.executionProfile };
+      delete legacyProfile.attemptTimeoutMs;
+      await core.manager.store.update(started.jobId, { executionProfile: legacyProfile });
+      await core.manager.store.update(started.jobId, { wallStartedAt: new Date(Date.now() - 113 * 60_000).toISOString() });
+      await core.repair(started.jobId, ['retry the transient provider failure'], { repoPath: path });
+      const repaired = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      assert.equal(repaired.status, 'DONE_UNVERIFIED');
+      assert.equal(requests.length, 2, 'repair must make at least one new worker request');
+      const events = (await core.manager.store.readArtifact(started.jobId, 'events.jsonl'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line));
+      assert(events.some((event) => event.type === 'started' && event.reason === 'repair'));
+      assert(events.some((event) => event.type === 'progress' && event.recentActions?.includes('repair_queued')));
+      const providerFinished = events.find((event) => event.type === 'finished' && event.providerFailure?.kind === 'http');
+      assert.deepEqual(providerFinished.providerFailure, { kind: 'http', attempts: 1, status: 503 });
+      assert.doesNotMatch(JSON.stringify(providerFinished), /127\.0\.0\.1|mock error/i);
+    } finally {
+      await core.shutdown();
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(path, { recursive: true, force: true });
+  }
+});
 async function writeMockConfig(home, server, extra = {}) {
   const configDir = join(home, 'config', 'offload');
   await mkdir(configDir, { recursive: true });
@@ -359,6 +718,18 @@ test('a no-id server listing does not bind its incidental cwd as a repository', 
   const result = await core.job();
   assert.deepEqual(result.jobs, []);
   assert.deepEqual(result.health.repositories, []);
+  assert.ok(['macos', 'policy-only'].includes(result.health.sandbox));
+  assert.equal(typeof result.health.sandboxReason, 'string');
+  assert.equal(result.health.sandboxStatus.reason, result.health.sandboxReason);
+  assert.equal(result.health.sandboxStatus.signal, result.health.sandboxProbeSignal);
+  assert.equal(result.health.sandboxProbeCommand, '/usr/bin/sandbox-exec -p <generated-offload-profile> /usr/bin/true');
+  assert.equal(result.health.server.name, 'offload');
+  assert.equal(result.health.server.version, '0.1.0');
+  assert.equal(result.health.server.schemaRevision, 1);
+  assert.deepEqual(result.health.server.capabilities, { reportMode: true, inputFiles: true });
+  assert.match(result.health.server.buildHash, /^sha256:[0-9a-f]{64}$/);
+  assert.match(result.health.server.skillHash, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(result.health.server.restartRequired, false);
   assert.equal(core.manager, undefined);
 });
 
@@ -583,6 +954,79 @@ test('an MCP root hint becomes the canonical default only when no explicit repo 
   const explicit = await core.start({ repoPath: b, task: 'explicit', ownedPaths: ['lib/**'] });
   assert.equal(hinted.repo, canonicalA);
   assert.equal(explicit.repo, core.setDefaultRepo(b));
+});
+
+test('Core snapshots the configured provider attempt timeout and resolves the adapter default for legacy provider config', async () => {
+  const path = await repo('offload-core-attempt-timeout-'),
+    legacyPath = await repo('offload-core-attempt-timeout-legacy-');
+  const configured = structuredClone(loaded);
+  configured.config.providers.test.attemptTimeoutMs = 45_000;
+  const explicit = createCore({
+    config: { loaded: configured },
+    worker: { run: async () => ({ status: 'DONE' }) },
+    snapshots: { create: async () => 'a'.repeat(40), diff: async () => '' },
+  });
+  const legacy = testCore();
+  try {
+    const custom = await explicit.start({ repoPath: path, task: 'snapshot timeout', ownedPaths: ['src/**'] }, { launch: false });
+    assert.equal((await explicit.manager.store.get(custom.jobId)).executionProfile.attemptTimeoutMs, 45_000);
+    const defaulted = await legacy.start({ repoPath: legacyPath, task: 'default timeout', ownedPaths: ['src/**'] }, { launch: false });
+    assert.equal((await legacy.manager.store.get(defaulted.jobId)).executionProfile.attemptTimeoutMs, 300_000);
+  } finally {
+    await explicit.shutdown();
+    await legacy.shutdown();
+    await rm(path, { recursive: true, force: true });
+    await rm(legacyPath, { recursive: true, force: true });
+  }
+});
+
+test('Core forwards the accepted provider attempt timeout to the worker adapter', async () => {
+  const path = await repo('offload-core-forward-attempt-timeout-');
+  const configured = structuredClone(loaded);
+  configured.config.providers.test = {
+    ...configured.config.providers.test,
+    baseUrl: 'http://127.0.0.1:4321/v1',
+    attemptTimeoutMs: 45_000,
+  };
+  configured.config.profiles.test.model = 'mock-model';
+  const pricingTable = {
+    fetched_at: '2026-10-01',
+    models: {
+      'mock-model': {
+        usd_per_1m: {
+          input_cache_hit: { off_peak: 0, peak: 0 },
+          input_cache_miss: { off_peak: 0, peak: 0 },
+          output: { off_peak: 0, peak: 0 },
+        },
+      },
+    },
+  };
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const seenDelays = [];
+  globalThis.fetch = async (_url, { signal }) =>
+    new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error('provider aborted')), { once: true }));
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    seenDelays.push(delay);
+    if (delay === 45_000) {
+      queueMicrotask(() => callback(...args));
+      return { unref() {} };
+    }
+    return originalSetTimeout(callback, delay, ...args);
+  };
+  const core = createCore({ config: { loaded: configured, pricingTable, resolveKey: () => 'credential' } });
+  try {
+    const started = await core.start({ repoPath: path, task: 'forward provider timeout', ownedPaths: ['src/**'] });
+    const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 5 });
+    assert.equal(done.status, 'TIMEOUT');
+    assert.deepEqual(done.providerFailure, { kind: 'attempt_timeout', attempts: 1, timeoutMs: 45_000 });
+    assert.ok(seenDelays.includes(45_000));
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
+    await core.shutdown();
+    await rm(path, { recursive: true, force: true });
+  }
 });
 
 test('initializing a repo recovers interrupted jobs before job visibility', async () => {

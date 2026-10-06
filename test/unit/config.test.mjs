@@ -19,6 +19,7 @@ test('config merges nested defaults and validates profile references', () => {
   assert.equal(DEFAULT_CONFIG.default, 'pro');
   assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles).sort(), ['flash', 'pro']);
   assert.equal(DEFAULT_CONFIG.providers.deepseek.keyRef, 'keychain:offload-deepseek');
+  assert.equal(DEFAULT_CONFIG.providers.deepseek.attemptTimeoutMs, 300_000);
   assert.equal(DEFAULT_CONFIG.profiles.pro.model, 'deepseek-v4-pro');
   const merged = deepMerge(DEFAULT_CONFIG, {
     limits: { maxTurns: 4 },
@@ -57,6 +58,18 @@ test('config merges nested defaults and validates profile references', () => {
       }),
     (error) => error.code === 'E_CONFIG_PROVIDER',
   );
+  assert.equal(
+    validateConfig({
+      ...merged,
+      providers: { ...merged.providers, x: { ...merged.providers.x, attemptTimeoutMs: 45_000 } },
+    }).providers.x.attemptTimeoutMs,
+    45_000,
+  );
+  for (const attemptTimeoutMs of [29_999, 600_001, 30_000.5, '300000'])
+    assert.throws(
+      () => validateConfig({ ...merged, providers: { ...merged.providers, x: { ...merged.providers.x, attemptTimeoutMs } } }),
+      ConfigError,
+    );
   assert.throws(
     () =>
       validateConfig({

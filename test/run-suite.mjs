@@ -19,12 +19,24 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
     ['macOS sandbox broad writable scope cannot overwrite protected secrets or future policy', ''],
     ['macOS sandbox cannot rewrite a linked-worktree .git pointer through broad writable scope', ''],
     ['macOS sandbox denies configured secret reads, symlink escapes, and exposes a disposable HOME', ''],
-    ['macOS sandbox denies readable host configuration subtrees after toolchain allowances', ''],
+    [
+      'macOS sandbox gives Node a physical disposable temp root and read-only private-worktree parent traversal',
+      'requires an available macOS sandbox',
+    ],
+    ['macOS sandbox denies exact host configuration roots after toolchain allowances', 'requires an available macOS sandbox'],
     [
       'macOS profile protects linked-worktree Git metadata from broad temp and writable allowances',
       'macOS Seatbelt profile paths use POSIX semantics',
     ],
-    ['macOS Seatbelt accepts scoped case-insensitive deny regex syntax before profile application', 'requires macOS sandbox-exec'],
+    ['macOS Seatbelt applies the complete generated profile when the host permits a basic profile', 'requires an available macOS sandbox'],
+    [
+      'macOS sandbox permits shell startup and stdout/stderr null redirection with data-only literals',
+      'requires an available macOS sandbox',
+    ],
+    ['macOS Homebrew Node runs a dependency-free npm test inside the sandbox', 'requires a Homebrew Node on macOS'],
+    ['macOS Homebrew Node runs a dependency-free npm test inside the sandbox', 'requires an available macOS sandbox'],
+    ['macOS sandbox denies protected files through case-folded and Unicode-normalized root aliases', 'requires an available macOS sandbox'],
+    ['macOS sandbox denies exact host configuration roots after toolchain allowances', 'requires an available macOS sandbox'],
     ['no protected host configuration subtree exists on this host', 'no protected host configuration subtree exists on this host'],
     [
       'Windows PowerShell can construct a SID-scoped Global mutex with a current-user-only ACL',

@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { JobStore } from '../../src/store.mjs';
 import { JobManager, validateJobId, validateJobRequest } from '../../src/job-manager.mjs';
+import { terminalStatuses } from '../../src/report.mjs';
 import { gitPatchApplier, gitSnapshots } from '../../src/core.mjs';
 import { createIsolatedWorktree, openIsolatedWorktree, cleanupIsolatedWorktree } from '../../src/worktree.mjs';
 import { cleanup, git, makeRepo, write } from '../unit/helpers.mjs';
@@ -37,6 +38,17 @@ test('public job results expose cleanup errors without exposing a workspace path
   assert.equal(result.workspaceCleanupRequired, true);
   assert.match(result.workspaceCleanupError, /manual workspace cleanup/);
   assert.doesNotMatch(JSON.stringify(result), /private\/worktree/);
+});
+test('public job results expose only bounded provider failure metadata', () => {
+  const manager = new JobManager({ store: {} });
+  const result = manager.public({
+    id: 'provider-status',
+    repoPath: '/repo',
+    status: 'TIMEOUT',
+    providerFailure: { kind: 'attempt_timeout', attempts: 1, status: 599, url: 'https://secret.invalid' },
+  });
+  assert.deepEqual(result.providerFailure, { kind: 'attempt_timeout', attempts: 1 });
+  assert.doesNotMatch(JSON.stringify(result), /secret\.invalid/);
 });
 test('recovery never heals a job explicitly excluded as active', async () => {
   const job = { id: 'active-job', status: 'RUNNING', createdAt: new Date().toISOString() };
@@ -145,10 +157,399 @@ test('async start and server verification produce a durable final report', async
   assert.match(done.report, /verify: `test` PASS/);
   assert.match(await m.store.readArtifact(job.jobId, 'patch.diff'), /patch/);
 });
+test('non-isolated verifier receives no private-worktree parent capability', async () => {
+  const m = await manager({ run: async () => ({ status: 'DONE' }) });
+  let verifierOptions;
+  m.runner.verify = async (_command, options) => {
+    verifierOptions = options;
+    return { command: 'test', verdict: 'PASS', result: { code: 0, sandbox: 'macos' } };
+  };
+  const started = await m.start({ task: 'verify primary', ownedPaths: ['src/**'], repoPath: process.cwd(), testCommand: 'test' });
+  assert.equal((await m.wait(started.jobId, { timeoutSec: 1 })).status, 'DONE_VERIFIED');
+  assert.equal(Object.hasOwn(verifierOptions, 'readablePaths'), false);
+});
+test('provider failure classification is durable and replaces an injected raw error', async () => {
+  const m = await manager({
+    run: async () => ({
+      status: 'TIMEOUT',
+      turns: 3,
+      error: 'https://secret.invalid/chat?API_KEY=must-not-persist',
+      providerFailure: { kind: 'attempt_timeout', attempts: 1, timeoutMs: 300_000, url: 'https://secret.invalid' },
+    }),
+  });
+  const started = await m.start({ task: 'provider wait', ownedPaths: ['src/**'], repoPath: process.cwd() });
+  const done = await m.wait(started.jobId, { timeoutSec: 1 });
+  assert.equal(done.status, 'TIMEOUT');
+  assert.deepEqual(done.providerFailure, { kind: 'attempt_timeout', attempts: 1, timeoutMs: 300_000 });
+  assert.match(done.report, /provider failure: attempt_timeout after 1 attempt \(300s limit\)/);
+  assert.match(done.report, /Provider request timed out after 300s/);
+  const stored = JSON.stringify(await m.store.get(started.jobId));
+  assert.doesNotMatch(stored, /secret\.invalid|must-not-persist/i);
+  const events = (await m.store.readArtifact(started.jobId, 'events.jsonl'))
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line));
+  const finished = events.find((event) => event.type === 'finished');
+  assert.deepEqual(finished.providerFailure, { kind: 'attempt_timeout', attempts: 1, timeoutMs: 300_000 });
+  assert.doesNotMatch(JSON.stringify(finished), /secret\.invalid|must-not-persist/i);
+});
+test('redacted durable reasoning blocks detached resume and repair before a worker can invoke a provider', async () => {
+  let runs = 0;
+  const m = await manager({
+    run: async (_job, api) => {
+      runs += 1;
+      if (runs === 1) {
+        await api.appendMessages([
+          {
+            role: 'assistant',
+            content: '',
+            reasoning_content: 'credential sk-abcdefghijklmnop',
+            tool_calls: [{ id: 'read-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"src/a.mjs"}' } }],
+          },
+          { role: 'tool', tool_call_id: 'read-1', content: 'READ: src/a.mjs' },
+        ]);
+        return { status: 'FAILED', turns: 1 };
+      }
+      assert.fail('a replay-unsafe transcript must not reach the worker');
+    },
+  });
+  const started = await m.start({ task: 'redacted replay', ownedPaths: ['src/**'], repoPath: process.cwd() });
+  const failed = await m.wait(started.jobId, { timeoutSec: 1 });
+  assert.equal(failed.status, 'FAILED');
+  assert.equal(runs, 1);
+  const persisted = await m.store.get(started.jobId);
+  assert.equal(persisted.transcriptReplayable, false);
+  assert.doesNotMatch(JSON.stringify(persisted), /sk-abcdefghijklmnop/);
+
+  await m.repair(started.jobId, ['continue safely']);
+  const repaired = await m.wait(started.jobId, { timeoutSec: 1 });
+  assert.equal(repaired.status, 'FAILED');
+  assert.match((await m.store.get(started.jobId)).error, /reasoning is unavailable for safe provider replay/);
+  assert.equal(runs, 1, 'manual repair must fail before worker/provider invocation');
+
+  const queued = await m.start(
+    { task: 'resume safely', ownedPaths: ['src/**'], repoPath: process.cwd(), maxRepairRounds: 0 },
+    { launch: false },
+  );
+  await m.store.messagesBatch(queued.jobId, [
+    {
+      role: 'assistant',
+      content: '',
+      reasoning_content: 'credential sk-abcdefghijklmnop',
+      tool_calls: [{ id: 'read-2', type: 'function', function: { name: 'read_file', arguments: '{"path":"src/b.mjs"}' } }],
+    },
+    { role: 'tool', tool_call_id: 'read-2', content: 'READ: src/b.mjs' },
+  ]);
+  await m.store.update(queued.jobId, { handoffState: 'CHILD_ASSIGNED' });
+  await m.resume(queued.jobId);
+  const resumed = await m.wait(queued.jobId, { timeoutSec: 1 });
+  assert.equal(resumed.status, 'FAILED');
+  assert.match((await m.store.get(queued.jobId)).error, /reasoning is unavailable for safe provider replay/);
+  assert.equal(runs, 1, 'detached resume must fail before worker/provider invocation');
+});
+test('provider finish reasons persist as closed diagnostics and clear for repair', async () => {
+  const raw = 'provider-secret-reason';
+  const m = await manager({
+    run: async (_job, api) => {
+      await api.progress({ turn: 1, providerFinishReason: raw });
+      return { status: 'FAILED', turns: 1, providerFinishReason: raw };
+    },
+  });
+  const started = await m.start({ task: 'provider finish reason', ownedPaths: ['src/**'], repoPath: process.cwd() });
+  const done = await m.wait(started.jobId, { timeoutSec: 1 });
+  assert.equal(done.providerFinishReason, 'other');
+  assert.match(done.report, /provider finish reason: other/);
+  const stored = await m.store.get(started.jobId);
+  assert.equal(stored.providerFinishReason, 'other');
+  const events = (await m.store.readArtifact(started.jobId, 'events.jsonl'))
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line));
+  assert.equal(events.find((event) => event.type === 'progress' && event.providerFinishReason)?.providerFinishReason, 'other');
+  assert.equal(events.find((event) => event.type === 'finished')?.providerFinishReason, 'other');
+  assert.doesNotMatch(JSON.stringify({ done, stored, events }), new RegExp(raw));
+
+  const repaired = await m.repair(started.jobId, ['retry provider work'], { launch: false });
+  assert.equal(repaired.providerFinishReason, undefined);
+  assert.equal((await m.store.get(started.jobId)).providerFinishReason, undefined);
+});
+test('numeric reservation exhaustion propagates to progress, terminal event, public result, and report without accepting untrusted fields', async () => {
+  const reservation = {
+    conservativeInputTokens: 1234,
+    conservativeInputUsd: 0.01,
+    minOutputTokens: 16,
+    minOutputUsd: 0.005,
+    remainingUsd: 0.01,
+    requiredUsd: 0.015,
+    shortfallUsd: 0.005,
+    projection: 'deep-tool-elision',
+    elidedToolResults: 3,
+  };
+  const m = await manager({
+    run: async (_job, api) => {
+      await api.progress({ turn: 0, action: 'budget_reservation_exhausted', budgetReservation: reservation });
+      await api.progress({
+        turn: 0,
+        action: 'budget_reservation_exhausted',
+        budgetReservation: { ...reservation, secret: 'https://secret.invalid/private/path' },
+      });
+      return {
+        status: 'BUDGET',
+        turns: 0,
+        error: 'Remaining budget cannot cover a conservative prompt and minimum response reservation',
+        budgetReservation: { ...reservation, source: '/private/secret' },
+      };
+    },
+  });
+  const started = await m.start({ task: 'budget diagnostic', ownedPaths: ['src/**'], repoPath: process.cwd() });
+  const done = await m.wait(started.jobId, { timeoutSec: 1 });
+  assert.equal(done.status, 'BUDGET');
+  assert.deepEqual(done.budgetReservation, reservation);
+  assert.match(done.report, /budget reservation: deep-tool-elision/);
+  assert.match(done.report, /shortfall \$0\.005/);
+  const stored = await m.store.get(started.jobId);
+  assert.deepEqual(stored.budgetReservation, reservation);
+  const events = (await m.store.readArtifact(started.jobId, 'events.jsonl'))
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(events.find((event) => event.type === 'progress' && event.budgetReservation)?.budgetReservation, reservation);
+  assert.deepEqual(events.find((event) => event.type === 'finished')?.budgetReservation, reservation);
+  assert.doesNotMatch(JSON.stringify({ done, stored, events }), /secret\.invalid|private\/secret/);
+
+  const repaired = await m.repair(started.jobId, ['retry'], { launch: false });
+  assert.equal(repaired.budgetReservation, undefined);
+  assert.equal((await m.store.get(started.jobId)).budgetReservation, undefined);
+});
+test('a pending provider request clears the prior finish reason before the next response arrives', async () => {
+  let enteredPending;
+  const pending = new Promise((resolve) => {
+    enteredPending = resolve;
+  });
+  let releaseWorker;
+  const release = new Promise((resolve) => {
+    releaseWorker = resolve;
+  });
+  const m = await manager({
+    run: async (_job, api) => {
+      await api.progress({ turn: 1, providerFinishReason: 'length' });
+      await api.progress({ turn: 2, action: 'provider_request_pending', providerFinishReason: null });
+      enteredPending();
+      await release;
+      return { status: 'FAILED', turns: 2 };
+    },
+  });
+  const started = await m.start({ task: 'provider finish reason reset', ownedPaths: ['src/**'], repoPath: process.cwd() });
+  await pending;
+
+  const running = await m.store.get(started.jobId);
+  assert.equal(running.status, 'RUNNING');
+  assert.equal(running.providerFinishReason, undefined);
+  assert.equal(m.public(running).providerFinishReason, undefined);
+  const events = (await m.store.readArtifact(started.jobId, 'events.jsonl'))
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line));
+  const progress = events.filter((event) => event.type === 'progress');
+  assert.equal(progress.at(-2).providerFinishReason, 'length');
+  assert.equal(progress.at(-1).providerFinishReason, null);
+  assert.equal(progress.at(-1).recentActions?.[0], 'provider_request_pending');
+
+  releaseWorker();
+  const done = await m.wait(started.jobId, { timeoutSec: 1 });
+  assert.equal(done.status, 'FAILED');
+  assert.equal(done.providerFinishReason, undefined);
+});
+test('capped implementation recovery lifecycle settles after its durable response and permits repair', async () => {
+  let runs = 0;
+  const m = await manager({
+    run: async (job, api) => {
+      runs += 1;
+      if (job.cappedFinishRecovery === 'settled') return { status: 'DONE', turns: 0 };
+      await api.progress({ action: 'provider_capped_finish_recovery_queued', cappedFinishRecovery: 'queued' });
+      await api.progress({ action: 'provider_capped_finish_recover', cappedFinishRecovery: 'consumed' });
+      await api.progress({ action: 'provider_capped_implementation_recovery_settled', cappedFinishRecovery: 'settled' });
+      return { status: 'FAILED', turns: 0 };
+    },
+  });
+  const started = await m.start({ task: 'lifecycle', ownedPaths: ['src/**'], repoPath: process.cwd() });
+  const done = await m.wait(started.jobId, { timeoutSec: 1 });
+  assert.equal(done.status, 'FAILED');
+  const stored = await m.store.get(started.jobId);
+  assert.equal(stored.cappedFinishRecovery, 'settled');
+  assert.equal(stored.turns || 0, 0, 'lifecycle events must not alter accounting');
+  const events = (await m.store.readArtifact(started.jobId, 'events.jsonl'))
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line))
+    .filter((event) => event.type === 'progress');
+  assert.deepEqual(events.map((event) => event.cappedFinishRecovery).filter(Boolean), ['queued', 'consumed', 'settled']);
+  assert.ok(
+    events
+      .filter((event) => event.cappedFinishRecovery)
+      .every((event) => !Object.hasOwn(event, 'turns') && !Object.hasOwn(event, 'costUsd')),
+  );
+  await m.repair(started.jobId, ['continue after the durable capped implementation response']);
+  const repaired = await m.wait(started.jobId, { timeoutSec: 1 });
+  assert.equal(repaired.status, 'DONE_UNVERIFIED');
+  assert.equal(runs, 2, 'a settled recovery is ordinary resolved history for a later repair run');
+
+  const invalid = await manager({ run: async () => ({ status: 'DONE' }) });
+  const queued = await invalid.start({ task: 'invalid lifecycle', ownedPaths: ['src/**'], repoPath: process.cwd() }, { launch: false });
+  await invalid.store.update(queued.jobId, { cappedFinishRecovery: 'invalid' });
+  await assert.rejects(
+    async () => invalid.validatePersisted(await invalid.store.get(queued.jobId)),
+    /invalid capped implementation recovery state/,
+  );
+
+  const wrongOrder = await manager({
+    run: async (_job, api) => {
+      await api.progress({ action: 'provider_capped_finish_recover', cappedFinishRecovery: 'consumed' });
+      return { status: 'DONE' };
+    },
+  });
+  const wrongStarted = await wrongOrder.start({ task: 'wrong transition', ownedPaths: ['src/**'], repoPath: process.cwd() });
+  const wrongDone = await wrongOrder.wait(wrongStarted.jobId, { timeoutSec: 1 });
+  assert.equal(wrongDone.status, 'FAILED');
+  assert.match((await wrongOrder.store.get(wrongStarted.jobId)).error, /invalid capped implementation recovery state transition/);
+});
+test('a consumed capped implementation recovery suppresses automatic verifier repair without spending another round', async () => {
+  let runs = 0;
+  const m = await manager(
+    {
+      run: async (_job, api) => {
+        runs += 1;
+        await api.progress({ action: 'provider_capped_finish_recovery_queued', cappedFinishRecovery: 'queued' });
+        await api.progress({ action: 'provider_capped_finish_recover', cappedFinishRecovery: 'consumed' });
+        return { status: 'DONE' };
+      },
+    },
+    'fail',
+  );
+  let verifyRuns = 0;
+  m.runner.verify = async (testCommand) => {
+    verifyRuns += 1;
+    return { command: testCommand, verdict: 'FAIL', result: { code: 1, sandbox: 'macos' } };
+  };
+
+  const started = await m.start({
+    task: 'do not reopen an ambiguously billed capped implementation recovery',
+    ownedPaths: ['src/**'],
+    repoPath: process.cwd(),
+    testCommand: 'fail',
+    maxRepairRounds: 1,
+  });
+  const done = await m.wait(started.jobId, { timeoutSec: 1 });
+  const stored = await m.store.get(started.jobId);
+
+  assert.equal(done.status, 'VERIFY_FAILED');
+  assert.equal(verifyRuns, 1);
+  assert.equal(runs, 1, 'a verifier failure must not launch another worker/provider pass');
+  assert.equal(stored.rounds || 0, 0, 'suppressed automatic repair must not consume a repair round');
+  assert.equal(stored.cappedFinishRecovery, 'consumed');
+  assert.match(stored.error, /automatic repair suppressed: unresolved capped implementation recovery/);
+  await assert.rejects(() => m.repair(started.jobId, ['do not reopen']), /unresolved capped implementation recovery/);
+});
+test('a queued capped implementation recovery also suppresses automatic verifier repair', async () => {
+  let runs = 0;
+  const m = await manager(
+    {
+      run: async (_job, api) => {
+        runs += 1;
+        await api.progress({ action: 'provider_capped_finish_recovery_queued', cappedFinishRecovery: 'queued' });
+        return { status: 'DONE' };
+      },
+    },
+    'fail',
+  );
+
+  const started = await m.start({
+    task: 'do not reopen a queued capped implementation recovery',
+    ownedPaths: ['src/**'],
+    repoPath: process.cwd(),
+    testCommand: 'fail',
+    maxRepairRounds: 1,
+  });
+  const done = await m.wait(started.jobId, { timeoutSec: 1 });
+  const stored = await m.store.get(started.jobId);
+
+  assert.equal(done.status, 'VERIFY_FAILED');
+  assert.equal(runs, 1);
+  assert.equal(stored.rounds || 0, 0);
+  assert.equal(stored.cappedFinishRecovery, 'queued');
+  await assert.rejects(() => m.repair(started.jobId, ['do not reopen']), /unresolved capped implementation recovery/);
+});
+test('budget-finish lifecycle transitions are durable, validated, and suppress repair', async () => {
+  let runs = 0;
+  const m = await manager(
+    {
+      run: async (_job, api) => {
+        runs += 1;
+        await api.progress({ action: 'provider_budget_finish_recovery_queued', budgetFinishRecovery: 'queued' });
+        await api.progress({ action: 'provider_budget_finish_recover', budgetFinishRecovery: 'consumed' });
+        return { status: 'DONE' };
+      },
+    },
+    'fail',
+  );
+  m.runner.verify = async (testCommand) => ({ command: testCommand, verdict: 'FAIL', result: { code: 1, sandbox: 'macos' } });
+  const started = await m.start({
+    task: 'durable bounded finalization',
+    ownedPaths: ['src/**'],
+    repoPath: process.cwd(),
+    testCommand: 'fail',
+    maxRepairRounds: 1,
+  });
+  const done = await m.wait(started.jobId, { timeoutSec: 1 });
+  const stored = await m.store.get(started.jobId);
+  assert.equal(done.status, 'VERIFY_FAILED');
+  assert.equal(runs, 1, 'verifier failure must not append a repair prompt after this lifecycle');
+  assert.equal(stored.budgetFinishRecovery, 'consumed');
+  assert.match(stored.error, /automatic repair suppressed: unresolved budget finish recovery/);
+  await assert.rejects(() => m.repair(started.jobId, ['do not reopen']), /unresolved budget finish recovery/);
+
+  const invalid = await manager({ run: async () => ({ status: 'DONE' }) });
+  const queued = await invalid.start(
+    { task: 'invalid budget lifecycle', ownedPaths: ['src/**'], repoPath: process.cwd() },
+    { launch: false },
+  );
+  await invalid.store.update(queued.jobId, { budgetFinishRecovery: 'invalid' });
+  await assert.rejects(
+    async () => invalid.validatePersisted(await invalid.store.get(queued.jobId)),
+    /invalid budget finish recovery state/,
+  );
+
+  const wrongOrder = await manager({
+    run: async (_job, api) => {
+      await api.progress({ action: 'provider_budget_finish_recover', budgetFinishRecovery: 'consumed' });
+      return { status: 'DONE' };
+    },
+  });
+  const wrongStarted = await wrongOrder.start({ task: 'wrong budget transition', ownedPaths: ['src/**'], repoPath: process.cwd() });
+  const wrongDone = await wrongOrder.wait(wrongStarted.jobId, { timeoutSec: 1 });
+  assert.equal(wrongDone.status, 'FAILED');
+  assert.match((await wrongOrder.store.get(wrongStarted.jobId)).error, /invalid budget finish recovery state transition/);
+});
+test('a structured provider failure cannot be smuggled through as a successful worker result', async () => {
+  let verified = 0;
+  const m = await manager({
+    run: async () => ({ status: 'DONE', providerFailure: { kind: 'transport', attempts: 1, cause: 'https://secret.invalid' } }),
+  });
+  m.runner.verify = async () => {
+    verified++;
+    return { command: 'should not run', verdict: 'PASS', result: { code: 0, sandbox: 'macos' } };
+  };
+  const started = await m.start({ task: 'provider failed', ownedPaths: ['src/**'], repoPath: process.cwd() });
+  const done = await m.wait(started.jobId, { timeoutSec: 1 });
+  assert.equal(done.status, 'FAILED');
+  assert.deepEqual(done.providerFailure, { kind: 'transport', attempts: 1 });
+  assert.equal(verified, 0);
+  assert.doesNotMatch(JSON.stringify(done), /secret\.invalid/);
+});
 test('isolated lifecycle keeps primary unchanged until verified integration and supports safe revert', async () => {
   const repo = makeRepo(),
     gitDir = await mkdtemp(`${tmpdir()}/offload-isolated-manager-`);
-  let workerPath, verifierPath;
+  let workerPath, verifierPath, verifierOptions;
   try {
     write(join(repo, 'dirty.txt'), 'dirty baseline\n');
     const m = new JobManager({
@@ -164,6 +565,7 @@ test('isolated lifecycle keeps primary unchanged until verified integration and 
       runner: {
         verify: async (_command, options) => {
           verifierPath = options.cwd;
+          verifierOptions = options;
           return { command: 'verify', verdict: 'PASS', result: { code: 0, sandbox: 'macos' } };
         },
       },
@@ -181,6 +583,7 @@ test('isolated lifecycle keeps primary unchanged until verified integration and 
     const job = await m.store.get(started.jobId);
     assert.notEqual(workerPath, repo);
     assert.equal(verifierPath, workerPath);
+    assert.deepEqual(verifierOptions.readablePaths, [dirname(workerPath)]);
     assert.equal(job.applied, true);
     assert.equal(existsSync(job.workspacePath), false);
     assert.equal(await readFile(join(repo, 'src', 'owned.txt'), 'utf8'), 'worker\n');
@@ -192,6 +595,239 @@ test('isolated lifecycle keeps primary unchanged until verified integration and 
     assert.equal(existsSync(join(repo, 'src', 'owned.txt')), false);
   } finally {
     cleanup(repo);
+  }
+});
+test('report jobs copy allowlisted scratch inputs read-only, return structured findings, and never integrate', async () => {
+  const repo = makeRepo(),
+    scratch = await mkdtemp(join(tmpdir(), 'offload-report-input-')),
+    gitDir = await mkdtemp(`${tmpdir()}/offload-report-job-`),
+    input = join(scratch, 'connector-result.json');
+  write(input, JSON.stringify({ rows: [{ rule: 'limit' }, { rule: 'limit' }] }));
+  const beforeReadme = await readFile(join(repo, 'tracked.txt'));
+  const beforeTree = git(repo, ['write-tree']);
+  const beforeJobRefs = git(repo, ['for-each-ref', '--format=%(refname)', 'refs/offload/jobs']);
+  const beforeWorktreeRefs = git(repo, ['for-each-ref', '--format=%(refname)', 'refs/offload/worktrees']);
+  const beforeWorktrees = git(repo, ['worktree', 'list', '--porcelain']);
+  const inputBlob = git(repo, ['hash-object', input]);
+  const detailedReport = `Detailed report: two rows reference limit.\n${'x'.repeat(95 * 1024)}\nAPI_KEY=not-for-output\x1b]8;;https://example.invalid\x07link\x1b]8;;\x07\u202E\x85\u200e`;
+  const expansionHeavy = 'API_KEY=x 🙂 '.repeat(17_000);
+  let workerInput;
+  try {
+    const m = new JobManager({
+      store: new JobStore({ gitDir }),
+      snapshots: gitSnapshots(),
+      worker: {
+        run: async (job, api) => {
+          assert.equal(job.mode, 'report');
+          assert.deepEqual(job.ownedPaths, []);
+          if (job.task === 'missing detailed report') return { status: 'DONE', summary: 'too short' };
+          if (job.task === 'redaction expansion')
+            return {
+              status: 'DONE',
+              report: expansionHeavy,
+              concerns: [expansionHeavy.slice(0, 1_400)],
+              testsRun: [expansionHeavy.slice(0, 1_400)],
+            };
+          if (job.task === 'report failure') return { status: 'FAILED', error: 'API_KEY=not-for-output\x85\u202e' };
+          assert.equal(job.inputManifest.length, 1);
+          workerInput = join(job.workspacePath, job.inputManifest[0].path);
+          assert.equal(await readFile(workerInput, 'utf8'), await readFile(input, 'utf8'));
+          await api.appendMessage({
+            role: 'tool',
+            tool_call_id: 'private-input',
+            name: 'read_file',
+            content: 'INJECTED_EXTERNAL_BODY_MUST_NOT_PERSIST',
+          });
+          await api.appendMessages([{ role: 'user', content: 'INJECTED_EXTERNAL_BODY_MUST_NOT_PERSIST_BATCH' }]);
+          return {
+            status: 'DONE',
+            summary: 'Two limit rows found.',
+            report: detailedReport,
+            concerns: ['TOKEN=not-for-output\x85\u200e'],
+            testsRun: ['read input\x85\u200e'],
+          };
+        },
+      },
+      runner: { verify: async () => assert.fail('report jobs must not run a verifier') },
+      config: {
+        repoPath: repo,
+        reportInputRoots: [scratch],
+        git: { branch: async (path) => git(path, ['branch', '--show-current']), head: async (path) => git(path, ['rev-parse', 'HEAD']) },
+        isolation: { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree },
+      },
+    });
+    const started = await m.start({ mode: 'report', task: 'Analyze the connector result', inputFiles: [input], repoPath: repo });
+    assert.equal(started.mode, 'report');
+    const done = await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC });
+    assert.equal(done.status, 'DONE_UNVERIFIED');
+    assert.match(done.reportResult.text, /Detailed report: two rows reference limit/);
+    assert.ok(done.reportResult.text.length > 95 * 1024, 'detailed report is not limited to the summary cap');
+    assert.doesNotMatch(done.reportResult.text, /not-for-output|example\.invalid|\x1b|\x85|\u200e|\u202e/i);
+    assert.match(done.reportResult.text, /API_KEY=\[REDACTED\]/);
+    assert.deepEqual(done.reportResult.concerns, ['TOKEN=[REDACTED]']);
+    assert.deepEqual(done.reportResult.testsRun, ['read input']);
+    assert.equal(done.reportResult.inputs[0].path, '.offload-report-inputs/input-01');
+    assert.equal(done.workspaceCleanupError, undefined, 'private report workspace must clean successfully');
+    assert.deepEqual(await m.store.readMessages(started.jobId), [], 'report worker API transcript callbacks are non-durable');
+    assert.equal(
+      existsSync(join(gitDir, 'offload', 'jobs', started.jobId, 'messages.jsonl')),
+      false,
+      'report worker API callbacks do not create a transcript artifact',
+    );
+    assert.equal(existsSync(workerInput), false, 'private copied input is cleaned with the worktree');
+    assert.deepEqual(await readFile(join(repo, 'tracked.txt')), beforeReadme);
+    assert.equal(git(repo, ['write-tree']), beforeTree, 'report input must not affect the primary index');
+    assert.equal(git(repo, ['status', '--porcelain']), '', 'report job must not affect primary checkout bytes');
+    assert.equal(
+      git(repo, ['for-each-ref', '--format=%(refname)', 'refs/offload/jobs']),
+      beforeJobRefs,
+      'report jobs retain no durable job tree pin',
+    );
+    assert.equal(
+      git(repo, ['for-each-ref', '--format=%(refname)', 'refs/offload/worktrees']),
+      beforeWorktreeRefs,
+      'report cleanup releases its transient worktree pins',
+    );
+    assert.equal(
+      git(repo, ['worktree', 'list', '--porcelain']),
+      beforeWorktrees,
+      'report cleanup removes its linked worktree registration',
+    );
+    assert.throws(() => git(repo, ['cat-file', '-e', `${inputBlob}^{blob}`]), /git/);
+    const stored = await m.store.get(started.jobId);
+    const rawStored = JSON.stringify(stored);
+    assert.doesNotMatch(rawStored, /not-for-output|\x1b|\x85|\u200e|\u202e/i);
+    assert.equal(rawStored.includes(scratch), false, 'raw caller scratch input paths are not persisted');
+    const expanded = await m.start({ mode: 'report', task: 'redaction expansion', repoPath: repo });
+    const expandedDone = await m.wait(expanded.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC });
+    assert.equal(expandedDone.status, 'DONE_UNVERIFIED');
+    assert.ok(Buffer.byteLength(expandedDone.reportResult.text, 'utf8') <= 256_000);
+    assert.equal(
+      Buffer.from(expandedDone.reportResult.text).toString('utf8'),
+      expandedDone.reportResult.text,
+      'report cap keeps UTF-8 code points intact',
+    );
+    for (const entry of [...expandedDone.reportResult.concerns, ...expandedDone.reportResult.testsRun]) {
+      assert.ok(Buffer.byteLength(entry, 'utf8') <= 1_500);
+      assert.equal(Buffer.from(entry).toString('utf8'), entry, 'list cap keeps UTF-8 code points intact');
+    }
+    const failed = await m.start({ mode: 'report', task: 'report failure', repoPath: repo });
+    const failedDone = await m.wait(failed.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC });
+    assert.equal(failedDone.status, 'FAILED');
+    const failedStored = JSON.stringify(await m.store.get(failed.jobId));
+    assert.doesNotMatch(failedStored, /not-for-output|\x85|\u202e|\x1b/i);
+    await assert.rejects(
+      () => m.start({ mode: 'report', task: 'bad source', inputFiles: [join(process.cwd(), 'package.json')], repoPath: repo }),
+      /outside the caller scratch\/temp allowlist/,
+    );
+    const missing = await m.start({ mode: 'report', task: 'missing detailed report', repoPath: repo });
+    const missingDone = await m.wait(missing.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC });
+    assert.equal(missingDone.status, 'FAILED');
+    assert.match(missingDone.report, /without a detailed report/);
+    for (const cancelled of [false, true]) {
+      const queued = await m.start({ mode: 'report', task: 'detached report', repoPath: repo }, { launch: false });
+      const durable = await m.store.get(queued.jobId);
+      if (cancelled) await m.store.requestCancel(queued.jobId);
+      const settled = await m.finishDetachedTerminal(queued.jobId, {
+        ownerNonce: durable.leaseOwnerNonce,
+        expectedOwnerNonce: durable.leaseOwnerNonce,
+        status: 'FAILED',
+        error: 'detached spawn failed',
+      });
+      assert.equal(settled.status, cancelled ? 'CANCELLED' : 'FAILED');
+      assert.equal(existsSync(durable.workspacePath), false, 'lease-free detached report cleanup completes');
+    }
+    await assert.rejects(() => m.revert(started.jobId), /report jobs never integrate/);
+    await assert.rejects(() => m.repair(started.jobId, ['more detail']), /report jobs are read-only/);
+  } finally {
+    cleanup(repo);
+    cleanup(scratch);
+  }
+});
+test('report input rejection is actionable but creates no durable job or private-input artifact', async () => {
+  const repo = makeRepo(),
+    scratch = await mkdtemp(join(tmpdir(), 'offload-report-allowed-root-')),
+    gitDir = await mkdtemp(`${tmpdir()}/offload-report-rejection-job-`),
+    secretName = 'package.json',
+    input = join(process.cwd(), secretName);
+  const beforeWorktrees = git(repo, ['worktree', 'list', '--porcelain']);
+  try {
+    const store = new JobStore({ gitDir });
+    const m = new JobManager({
+      store,
+      snapshots: gitSnapshots(),
+      worker: { run: async () => assert.fail('an out-of-root report input must not launch a worker') },
+      config: {
+        repoPath: repo,
+        reportInputRoots: [scratch],
+        git: { branch: async (path) => git(path, ['branch', '--show-current']), head: async (path) => git(path, ['rev-parse', 'HEAD']) },
+        isolation: { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree },
+      },
+    });
+    const canonicalRoot = await realpath(scratch);
+    await assert.rejects(
+      () => m.start({ mode: 'report', task: 'analyze input 01', inputFiles: [input], repoPath: repo }),
+      (error) => {
+        assert.match(error.message, /outside the caller scratch\/temp allowlist/);
+        assert.match(error.message, new RegExp(canonicalRoot.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&')));
+        assert.doesNotMatch(error.message, new RegExp(secretName.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&')));
+        return true;
+      },
+    );
+    assert.deepEqual(await store.list(), [], 'a rejected source never gains a durable job record');
+    assert.deepEqual(
+      await readdir(join(gitDir, 'offload', 'jobs')).catch((error) => (error.code === 'ENOENT' ? [] : Promise.reject(error))),
+      [],
+      'no job record or input artifact is created',
+    );
+    assert.equal(git(repo, ['worktree', 'list', '--porcelain']), beforeWorktrees, 'the provisional private worktree is cleaned');
+  } finally {
+    cleanup(repo);
+    cleanup(scratch);
+    cleanup(gitDir);
+  }
+});
+test('report start restores private input permissions when durable record creation fails', async () => {
+  const repo = makeRepo(),
+    scratch = await mkdtemp(join(tmpdir(), 'offload-report-create-failure-input-')),
+    gitDir = await mkdtemp(`${tmpdir()}/offload-report-create-failure-job-`),
+    input = join(scratch, 'connector-result.json');
+  write(input, '{"ok":true}\n');
+  let workspacePath;
+  try {
+    const store = new JobStore({ gitDir });
+    store.create = async () => {
+      throw new Error('injected durable record failure');
+    };
+    const m = new JobManager({
+      store,
+      snapshots: gitSnapshots(),
+      worker: { run: async () => assert.fail('worker must not launch after a create failure') },
+      config: {
+        repoPath: repo,
+        reportInputRoots: [scratch],
+        git: { branch: async (path) => git(path, ['branch', '--show-current']), head: async (path) => git(path, ['rev-parse', 'HEAD']) },
+        isolation: {
+          create: async (options) => {
+            const workspace = await createIsolatedWorktree(options);
+            workspacePath = workspace.path;
+            return workspace;
+          },
+          open: openIsolatedWorktree,
+          cleanup: cleanupIsolatedWorktree,
+        },
+      },
+    });
+    await assert.rejects(
+      () => m.start({ mode: 'report', task: 'copy then fail', inputFiles: [input], repoPath: repo }),
+      /injected durable record failure/,
+    );
+    assert.ok(workspacePath, 'the failure happens after private report inputs are copied');
+    assert.equal(existsSync(workspacePath), false, 'private worktree is removed despite the read-only input directory');
+    assert.equal(existsSync(join(workspacePath, '.offload-report-inputs')), false);
+  } finally {
+    cleanup(repo);
+    cleanup(scratch);
   }
 });
 test('isolated JobManager apply and revert preserve non-NUL invalid UTF-8 patch bytes', async () => {
@@ -819,7 +1455,82 @@ test('cancel preserves a terminal job and validation rejects unsafe scope', asyn
   await assert.rejects(() => m.start({ task: 'x', ownedPaths: ['../outside'] }), /ownedPaths/);
   const job = await m.start({ task: 'x', ownedPaths: ['**'], repoPath: process.cwd() });
   await m.cancel(job.jobId);
-  assert.equal((await m.store.get(job.jobId)).status, 'CANCELLED');
+  assert.equal((await m.wait(job.jobId, { timeoutSec: 1 })).status, 'CANCELLED');
+});
+test('local cancellation marks and aborts promptly while its owner publishes terminal cleanup', async () => {
+  const repo = makeRepo();
+  const gitDir = await mkdtemp(`${tmpdir()}/offload-async-cancel-`);
+  let workerStarted,
+    releaseWorker,
+    cleanupCalls = 0,
+    m,
+    jobId;
+  const startedWorker = new Promise((resolve) => {
+    workerStarted = resolve;
+  });
+  const workerReleased = new Promise((resolve) => {
+    releaseWorker = resolve;
+  });
+  try {
+    m = new JobManager({
+      store: new JobStore({ gitDir }),
+      worker: {
+        // Deliberately ignore AbortSignal until the test permits completion.
+        run: async () => {
+          workerStarted();
+          await workerReleased;
+          return { status: 'DONE', report: 'worker eventually stopped' };
+        },
+      },
+      snapshots: gitSnapshots(),
+      config: {
+        repoPath: repo,
+        git: { branch: async (path) => git(path, ['branch', '--show-current']), head: async (path) => git(path, ['rev-parse', 'HEAD']) },
+        isolation: {
+          create: createIsolatedWorktree,
+          open: openIsolatedWorktree,
+          cleanup: async (options) => {
+            cleanupCalls += 1;
+            return cleanupIsolatedWorktree(options);
+          },
+        },
+      },
+    });
+    const started = await m.start({ mode: 'report', task: 'wait for cancellation', repoPath: repo });
+    jobId = started.jobId;
+    await startedWorker;
+    const workspacePath = (await m.store.get(started.jobId)).workspacePath;
+    const cancelled = await Promise.race([m.cancel(started.jobId), pause(100).then(() => 'timed out')]);
+    assert.notEqual(cancelled, 'timed out', 'cancel must not await an abort-ignoring local worker');
+    assert.equal(cancelled.done, undefined);
+    assert.equal(terminalStatuses.has(cancelled.status), false, 'the owner has not yet published a terminal state');
+    assert.equal(await m.store.cancelRequested(started.jobId), true);
+    assert.equal(existsSync(workspacePath), true, 'cancel does not race the owner workspace cleanup');
+    releaseWorker();
+    const done = await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC });
+    assert.equal(done.status, 'CANCELLED');
+    assert.ok(cleanupCalls > 0, 'the worker owner performs cleanup before terminal publication');
+    assert.equal(existsSync(workspacePath), false);
+  } finally {
+    releaseWorker?.();
+    const owner = jobId && m?.running.get(jobId);
+    const ownerStopped =
+      !owner ||
+      (await Promise.race([
+        owner.then(
+          () => true,
+          () => true,
+        ),
+        pause(2_000).then(() => false),
+      ]));
+    // Do not recursively remove files while the owner may still be publishing
+    // its terminal result. A timeout deliberately preserves the original test
+    // assertion rather than replacing it with cleanup fallout.
+    if (ownerStopped) {
+      cleanup(repo);
+      cleanup(gitDir);
+    }
+  }
 });
 test('start rejects path aliases and non-boolean capability flags before creating a job', async () => {
   const m = await manager({ run: async () => ({ status: 'DONE' }) });
@@ -844,6 +1555,27 @@ test('start rejects path aliases and non-boolean capability flags before creatin
       }),
     /executionProfile/,
   );
+  const accepted = await m.start(
+    {
+      task: 'x',
+      ownedPaths: ['src/**'],
+      executionProfile: { ...profile, attemptTimeoutMs: 300_000 },
+      repoPath: process.cwd(),
+    },
+    { launch: false },
+  );
+  assert.equal((await m.store.get(accepted.jobId)).executionProfile.attemptTimeoutMs, 300_000);
+  for (const attemptTimeoutMs of [29_999, 600_001, 30_000.5, '300000'])
+    await assert.rejects(
+      () =>
+        m.start({
+          task: 'x',
+          ownedPaths: ['src/**'],
+          executionProfile: { ...profile, attemptTimeoutMs },
+          repoPath: process.cwd(),
+        }),
+      /executionProfile/,
+    );
   await assert.rejects(
     () =>
       m.start({
@@ -1301,6 +2033,134 @@ test('recovery finalizes partial artifacts and releases the dead worker lease be
   assert.equal(released, true);
   assert.match(await store.readArtifact(job.id, 'patch.diff'), /src\/a/);
   assert.match(await store.readArtifact(job.id, 'report.md'), /server restarted/);
+});
+test('recovery relaunches only a dead queued budget-finish worker through its private handoff', async () => {
+  const gitDir = await mkdtemp(`${tmpdir()}/offload-recover-budget-finish-`);
+  const store = new JobStore({ gitDir });
+  const create = (overrides = {}) =>
+    store.create({
+      repoPath: process.cwd(),
+      task: 'resume bounded finish',
+      ownedPaths: ['src/**'],
+      branch: 'main',
+      head: gitId,
+      before: gitId,
+      status: 'RUNNING',
+      handoffState: 'RUNNING',
+      runnerPid: 999999999,
+      runnerHeartbeatAt: new Date(0).toISOString(),
+      leaseOwnerNonce: 'dead-owner',
+      budgetFinishRecovery: 'queued',
+      ...overrides,
+    });
+  const restart = await create();
+  await store.messagesBatch(restart.id, [
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'write', type: 'function', function: { name: 'write_file', arguments: '{"path":"src/a.mjs","content":"x"}' } }],
+    },
+    { role: 'tool', tool_call_id: 'write', name: 'write_file', content: 'written' },
+  ]);
+  const ordinaryQueued = await create({ status: 'QUEUED', leaseOwnerNonce: 'ordinary-owner' });
+  const liveQueued = await create({ runnerPid: process.pid, leaseOwnerNonce: 'live-owner' });
+  const missingPid = await create({ runnerPid: undefined, leaseOwnerNonce: 'missing-pid-owner' });
+  const cappedQueued = await create({ cappedFinishRecovery: 'queued', leaseOwnerNonce: 'capped-owner' });
+  const acquires = [];
+  const releases = [];
+  const runs = [];
+  const m = new JobManager({
+    store,
+    worker: {
+      run: async (job, api) => {
+        runs.push({ id: job.id, state: job.budgetFinishRecovery, defects: api.defects });
+        assert.equal(job.id, restart.id);
+        assert.equal(job.budgetFinishRecovery, 'queued');
+        await api.progress({ action: 'provider_budget_finish_recover', budgetFinishRecovery: 'consumed' });
+        return { status: 'DONE', summary: 'finished after restart' };
+      },
+    },
+    runner: { verify: async () => ({ verdict: 'PASS', result: { code: 0, sandbox: 'macos' } }) },
+    snapshots: { create: async () => gitId, diff: async () => '' },
+    leases: {
+      acquire: async (id, paths, options) => acquires.push({ id, paths, ...options }),
+      release: async (id, options) => (releases.push({ id, ...options }), true),
+    },
+    config: { repoPath: process.cwd(), git: { branch: async () => 'main', head: async () => gitId } },
+  });
+  assert.equal(await m.recover(), 4);
+  const done = await m.wait(restart.id, { timeoutSec: 1 });
+  assert.equal(done.status, 'DONE_UNVERIFIED');
+  assert.deepEqual(runs, [{ id: restart.id, state: 'queued', defects: undefined }]);
+  assert.equal((await store.get(restart.id)).budgetFinishRecovery, 'consumed');
+  assert.equal(acquires.length, 1);
+  assert.equal(acquires[0].id, restart.id);
+  assert.deepEqual(acquires[0].paths, ['src/**']);
+  assert.notEqual(acquires[0].ownerNonce, 'dead-owner');
+  assert.equal((await store.get(ordinaryQueued.id)).status, 'FAILED', 'ordinary queued jobs retain generic crash recovery, never relaunch');
+  assert.equal((await store.get(liveQueued.id)).status, 'RUNNING', 'a live PID remains authoritative');
+  assert.equal((await store.get(missingPid.id)).status, 'FAILED', 'a missing owner PID must not authorize budget recovery');
+  assert.equal((await store.get(cappedQueued.id)).status, 'FAILED', 'a capped recovery lifecycle must not authorize budget recovery');
+
+  const loser = await create({ leaseOwnerNonce: 'cas-loser-owner' });
+  let cleanupCalls = 0;
+  const loserAcquires = [];
+  const loserReleases = [];
+  const originalConditionalUpdate = store.updateOperationalIf.bind(store);
+  store.updateOperationalIf = async (id, expected, changes) => {
+    if (id === loser.id && changes.handoffState === 'BUDGET_FINISH_RECOVERY') return null;
+    return originalConditionalUpdate(id, expected, changes);
+  };
+  const loserManager = new JobManager({
+    store,
+    worker: { run: async () => assert.fail('a CAS loser must not launch') },
+    snapshots: { create: async () => gitId, diff: async () => '' },
+    leases: {
+      acquire: async (id, paths, options) => loserAcquires.push({ id, paths, ...options }),
+      release: async (id, options) => (loserReleases.push({ id, ...options }), true),
+    },
+    config: { repoPath: process.cwd(), git: { branch: async () => 'main', head: async () => gitId } },
+  });
+  loserManager.cleanupWorkspace = async () => {
+    cleanupCalls += 1;
+    return true;
+  };
+  assert.equal(await loserManager.recover(), 0);
+  assert.equal(loserAcquires.length, 1);
+  assert.equal(loserReleases.length, 1);
+  assert.equal(loserReleases[0].ownerNonce, loserAcquires[0].ownerNonce, 'only the fresh failed-claim lease is released');
+  assert.notEqual(loserReleases[0].ownerNonce, 'cas-loser-owner');
+  assert.equal(cleanupCalls, 0);
+  assert.equal((await store.get(loser.id)).budgetFinishRecovery, 'queued');
+});
+test('recovery never relaunches a consumed budget-finish lifecycle', async () => {
+  const gitDir = await mkdtemp(`${tmpdir()}/offload-recover-consumed-budget-finish-`);
+  const store = new JobStore({ gitDir });
+  const job = await store.create({
+    repoPath: process.cwd(),
+    task: 'do not replay a consumed finish',
+    ownedPaths: ['src/**'],
+    branch: 'main',
+    head: gitId,
+    before: gitId,
+    status: 'RUNNING',
+    handoffState: 'RUNNING',
+    runnerPid: 999999999,
+    runnerHeartbeatAt: new Date(0).toISOString(),
+    leaseOwnerNonce: 'consumed-owner',
+    budgetFinishRecovery: 'consumed',
+  });
+  let runs = 0;
+  const m = new JobManager({
+    store,
+    worker: { run: async () => (runs++, { status: 'DONE' }) },
+    snapshots: { create: async () => gitId, diff: async () => '' },
+    leases: { release: async () => true },
+    config: { repoPath: process.cwd(), git: { branch: async () => 'main', head: async () => gitId } },
+  });
+  assert.equal(await m.recover(), 1);
+  assert.equal(runs, 0);
+  assert.equal((await store.get(job.id)).status, 'FAILED');
 });
 test('recovery cannot overwrite a child handoff or clean after a stale release loses ownership', async () => {
   const gitDir = await mkdtemp(`${tmpdir()}/offload-recovery-handoff-race-`);

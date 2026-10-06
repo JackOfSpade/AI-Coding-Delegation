@@ -21,6 +21,30 @@ test('prompt keeps the task in the user turn rather than duplicating it in syste
   assert.match(prompt, /src\/\*\*, tmp\/\*\*/);
   assert.match(prompt, /Network access is permitted/);
 });
+test('write prompt gives finite remaining-turn guidance without changing report prompts', async () => {
+  const prompt = await buildSystemPrompt({ ownedPaths: ['src/**'], remainingTurns: 3 });
+  assert.match(prompt, /3 model turns available/);
+  assert.match(prompt, /Batch independent reads and lists/);
+  assert.match(prompt, /Prefer read_file, list_dir, glob, and grep for ordinary inspection/);
+  assert.match(prompt, /\[truncated; next offset N\], continue that file with exactly offset N/);
+  assert.match(prompt, /Reserve run_command for focused build, test, or diagnostic work after changes/);
+  assert.match(prompt, /after their required reads make an allowed tool call immediately/);
+  assert.match(prompt, /Do not emit source code, a plan, progress update, or other narrative outside tool calls/);
+  assert.match(prompt, /put source only in write_file.content/);
+  assert.match(prompt, /complete final file content with write_file/);
+  assert.match(prompt, /write one complete file per tool-call response, then continue with the next file/);
+  assert.match(prompt, /edit_file requires a fresh read of that file, including after write_file/);
+  assert.match(prompt, /configured verifier and the mandatory single finish call/);
+
+  const report = await buildSystemPrompt({ mode: 'report', remainingTurns: 3 });
+  assert.doesNotMatch(report, /model turns available/);
+  assert.doesNotMatch(report, /make an allowed tool call immediately/);
+  assert.doesNotMatch(report, /Reserve run_command for focused build/);
+  assert.match(report, /read-only analysis worker/);
+
+  const unknown = await buildSystemPrompt({ ownedPaths: ['src/**'], remainingTurns: Infinity });
+  assert.doesNotMatch(unknown, /model turns available/);
+});
 test('repository conventions reject an outside symlink and malformed content', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-prompt-'));
   const outside = path.join(os.tmpdir(), `offload-outside-${Date.now()}.md`);

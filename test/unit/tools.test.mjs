@@ -6,7 +6,7 @@ import { renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
-import { LocalTools, TOOL_DEFINITIONS } from '../../src/agent/tools.mjs';
+import { LocalTools, TOOL_DEFINITIONS, availableToolDefinitions } from '../../src/agent/tools.mjs';
 
 async function fixture() {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-tools-'));
@@ -16,11 +16,19 @@ async function fixture() {
 function git(dir, ...args) {
   execFileSync('git', ['-C', dir, ...args], { stdio: 'ignore' });
 }
+const pageMarker = (value) => value.match(/\n\[truncated; next offset (\d+)\]$/);
+const pageBody = (value) => {
+  const marker = pageMarker(value);
+  return marker ? value.slice(0, marker.index) : value;
+};
 test('tool definitions have stable names and read/edit protects concurrent writes', async () => {
   assert.deepEqual(
     TOOL_DEFINITIONS.map((t) => t.function.name),
     ['read_file', 'list_dir', 'glob', 'grep', 'edit_file', 'write_file', 'run_command', 'finish'],
   );
+  assert.match(TOOL_DEFINITIONS[0].function.description, /\[truncated; next offset N\].*exactly offset N/);
+  assert.match(TOOL_DEFINITIONS[5].function.description, /one complete owned repository file/);
+  assert.match(TOOL_DEFINITIONS[5].function.description, /Put all source content in content, never in prose/);
   const { dir, tools } = await fixture();
   await tools.read_file({ path: 'a.txt' });
   await tools.edit_file({ path: 'a.txt', old_string: 'two', new_string: 'TWO\nthree' });
@@ -28,6 +36,12 @@ test('tool definitions have stable names and read/edit protects concurrent write
   await tools.read_file({ path: 'a.txt' });
   await writeFile(path.join(dir, 'a.txt'), 'human change');
   await assert.rejects(() => tools.edit_file({ path: 'a.txt', old_string: 'human', new_string: 'x' }), /stale/);
+});
+test('read-only report tool definitions exclude edits and shell execution', () => {
+  const names = availableToolDefinitions({ allowCommand: false, readOnly: true }).map((tool) => tool.function.name);
+  assert.ok(names.includes('read_file'));
+  assert.ok(names.includes('finish'));
+  for (const name of ['edit_file', 'write_file', 'run_command']) assert.equal(names.includes(name), false);
 });
 test('tools reject out of scope writes and ambiguous edits', async () => {
   const { tools } = await fixture();
@@ -406,6 +420,7 @@ test('file reads are bounded, reject binary text, and refuse oversized edits', a
   const large = path.join(dir, 'large.txt');
   await writeFile(large, 'a'.repeat(9 * 1024 * 1024));
   assert.equal(await tools.read_file({ path: 'large.txt', limit: 16 }), 'a'.repeat(16) + '\n[truncated; next offset 16]');
+  await assert.rejects(() => tools.read_file({ path: 'large.txt', offset: 8 * 1024 * 1024, limit: 1 }), /safe prefix scan cap/);
   await assert.rejects(() => tools.edit_file({ path: 'large.txt', old_string: 'a', new_string: 'b' }), /larger than/);
   await writeFile(path.join(dir, 'binary.txt'), Buffer.from([0x61, 0, 0x62]));
   await assert.rejects(() => tools.read_file({ path: 'binary.txt' }), /binary/);
@@ -416,16 +431,234 @@ test('byte windows advance safely over split UTF-8 characters', async () => {
   assert.equal(await tools.read_file({ path: 'utf8.txt', offset: 0, limit: 1 }), 'é\n[truncated; next offset 2]');
   assert.equal(await tools.read_file({ path: 'utf8.txt', offset: 1, limit: 1 }), 'a\n[truncated; next offset 3]');
 });
+test('read_file paginates one contiguous sanitized prefix with reconstructible offsets', async () => {
+  const { dir, tools } = await fixture();
+  const content = Array.from({ length: 9_000 }, (_, index) => `line-${String(index).padStart(5, '0')}\n`).join('');
+  await writeFile(path.join(dir, 'paged.txt'), content);
+  let offset = 0;
+  let reconstructed = '';
+  while (true) {
+    const result = await tools.read_file({ path: 'paged.txt', offset });
+    const marker = result.match(/\n\[truncated; next offset (\d+)\]$/);
+    reconstructed += marker ? result.slice(0, marker.index) : result;
+    if (!marker) break;
+    const next = Number(marker[1]);
+    assert.ok(next > offset, 'every truncated page must advance');
+    assert.equal(Buffer.byteLength(reconstructed, 'utf8'), next, 'marker follows the returned contiguous prefix');
+    offset = next;
+  }
+  assert.equal(reconstructed, content);
+});
+test('read_file pagination keeps UTF-8 scalars intact at the output boundary', async () => {
+  const { dir } = await fixture();
+  const content = 'é'.repeat(300);
+  await writeFile(path.join(dir, 'utf8-pages.txt'), content);
+  const tools = new LocalTools({ repoPath: dir, ownedPaths: ['*.txt'], readCap: 64, outputCap: 128 });
+  let offset = 0;
+  let reconstructed = '';
+  while (true) {
+    const result = await tools.read_file({ path: 'utf8-pages.txt', offset });
+    const marker = result.match(/\n\[truncated; next offset (\d+)\]$/);
+    const page = marker ? result.slice(0, marker.index) : result;
+    assert.equal(page.includes('\uFFFD'), false);
+    reconstructed += page;
+    if (!marker) break;
+    const next = Number(marker[1]);
+    assert.equal(next % 2, 0, 'each page ends after a complete two-byte scalar');
+    offset = next;
+  }
+  assert.equal(reconstructed, content);
+});
+test('read_file advances from an arbitrary offset inside a four-byte UTF-8 scalar', async () => {
+  const { dir, tools } = await fixture();
+  await writeFile(path.join(dir, 'four-byte.txt'), '💩😃X');
+  const result = await tools.read_file({ path: 'four-byte.txt', offset: 1, limit: 1 });
+  const marker = pageMarker(result);
+  assert.equal(pageBody(result), '😃');
+  assert.ok(marker, 'a page with source remaining has a continuation marker');
+  assert.equal(Number(marker[1]), 8, 'the marker lands after a complete four-byte scalar');
+});
+test('read_file paginates a UTF-8 BOM without an empty-scalar failure', async () => {
+  const { dir, tools } = await fixture();
+  await writeFile(path.join(dir, 'bom.txt'), Buffer.from([0xef, 0xbb, 0xbf, 0x61]));
+  const first = await tools.read_file({ path: 'bom.txt', limit: 1 });
+  assert.equal(pageBody(first), '');
+  assert.equal(Number(pageMarker(first)[1]), 3);
+  assert.equal(await tools.read_file({ path: 'bom.txt', offset: 3, limit: 1 }), 'a');
+});
+test('read_file redacts credential spans atomically across pages and direct byte offsets', async () => {
+  const { dir } = await fixture();
+  const assignment = 'assignment-super-secret-value-that-crosses-the-read-window';
+  const bearer = 'bearer-super-secret-value-that-crosses-the-read-window';
+  const header = 'header-super-secret-value-that-crosses-the-read-window';
+  const control = 'control-super-secret-value-that-crosses-the-read-window';
+  const content = [
+    `prefix API_KEY=${assignment} suffix\n`,
+    `Authorization: ${header}\n`,
+    `Bearer ${bearer} suffix\n`,
+    `API_\x1b[31mKEY=${control}\x1b[0m suffix\n`,
+    'ordinary-tail\n',
+  ].join('');
+  await writeFile(path.join(dir, 'credentials.txt'), content);
+  // A tiny source read cap forces every sensitive value to cross the original
+  // window boundary. The independent output cap forces multiple pages too.
+  const tools = new LocalTools({ repoPath: dir, ownedPaths: ['*.txt'], readCap: 16, outputCap: 128 });
+  const secrets = [assignment, bearer, header, control];
+  const forbidden = [...secrets, ...secrets.map((value) => value.slice(0, 12)), ...secrets.map((value) => value.slice(-12))];
+  let offset = 0;
+  let pages = 0;
+  while (true) {
+    const result = await tools.read_file({ path: 'credentials.txt', offset });
+    const marker = pageMarker(result);
+    assert.ok(result.length <= 128, 'rendered page honors outputCap');
+    for (const value of forbidden) assert.doesNotMatch(result, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    if (!marker) break;
+    const next = Number(marker[1]);
+    assert.ok(next > offset, 'every continuation advances in raw source bytes');
+    assert.ok(next <= Buffer.byteLength(content), 'continuations are authoritative raw byte offsets');
+    offset = next;
+    pages += 1;
+    assert.ok(pages < 100, 'pagination terminates');
+  }
+  assert.ok(pages > 3, 'fixture exercised multiple output/read-cap pages');
+  const forms = [`API_KEY=${assignment}`, `Authorization: ${header}`, `Bearer ${bearer}`, `API_\x1b[31mKEY=${control}`];
+  for (const form of forms) {
+    const formStart = Buffer.byteLength(content.slice(0, content.indexOf(form)));
+    for (let probe = formStart; probe < formStart + Buffer.byteLength(form); probe++) {
+      const result = await tools.read_file({ path: 'credentials.txt', offset: probe, limit: 1 });
+      for (const value of secrets)
+        for (const leaked of [value, value.slice(0, 12), value.slice(-12)])
+          assert.doesNotMatch(result, new RegExp(leaked.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    }
+  }
+  const controlValueOffset = content.lastIndexOf('API_') + Buffer.byteLength('API_\x1b[31mKEY=') + 1;
+  assert.match(await tools.read_file({ path: 'credentials.txt', offset: controlValueOffset, limit: 1 }), /\[REDACTED\]/);
+});
+test('read_file preserves the Bearer label, requires whitespace, and advances tiny Bearer pages', async () => {
+  const { dir } = await fixture();
+  const content = 'Bearer abc.def\nBearerX ordinary\nBearer\nBearer private-secret tail';
+  await writeFile(path.join(dir, 'bearer.txt'), content);
+  const ordinary = new LocalTools({ repoPath: dir, ownedPaths: ['*.txt'], readCap: 512, outputCap: 128 });
+  const complete = await ordinary.read_file({ path: 'bearer.txt' });
+  assert.match(complete, /Bearer \[REDACTED\]/);
+  assert.match(complete, /BearerX ordinary/);
+  assert.match(complete, /\nBearer\n/);
+  assert.doesNotMatch(complete, /abc\.def|private-secret/);
+
+  const tiny = new LocalTools({ repoPath: dir, ownedPaths: ['*.txt'], readCap: 1, outputCap: 128 });
+  for (let offset = 0; offset < 'Bearer'.length; offset++) {
+    const result = await tiny.read_file({ path: 'bearer.txt', offset, limit: 1 });
+    const marker = pageMarker(result);
+    assert.ok(pageBody(result).length > 0, 'each label byte has a visible projection');
+    assert.ok(marker, 'a partial Bearer label keeps an advancing marker');
+    assert.ok(Number(marker[1]) > offset);
+    assert.doesNotMatch(result, /private-secret|abc\.def/);
+  }
+  let offset = content.lastIndexOf('Bearer');
+  while (true) {
+    const result = await tiny.read_file({ path: 'bearer.txt', offset });
+    const marker = pageMarker(result);
+    assert.doesNotMatch(result, /private-secret/);
+    if (!marker) break;
+    const next = Number(marker[1]);
+    assert.ok(next > offset);
+    offset = next;
+  }
+});
+test('read_file keeps raw continuation offsets monotonic around deferred Bearer text and ANSI spans', async () => {
+  const { dir } = await fixture();
+  const cases = [
+    ['deferred-ansi.txt', 'B\x1b[31m', 'B'],
+    ['deferred-ansi-incomplete.txt', 'Bear\x1b[', 'Bear'],
+  ];
+  for (const [file, content, expected] of cases) {
+    await writeFile(path.join(dir, file), content);
+    const full = new LocalTools({ repoPath: dir, ownedPaths: ['*.txt'], readCap: 64, outputCap: 128 });
+    assert.equal(await full.read_file({ path: file }), expected);
+    const tiny = new LocalTools({ repoPath: dir, ownedPaths: ['*.txt'], readCap: 1, outputCap: 128 });
+    let offset = 0;
+    let rendered = '';
+    while (true) {
+      const result = await tiny.read_file({ path: file, offset });
+      const marker = pageMarker(result);
+      rendered += pageBody(result);
+      if (!marker) break;
+      const next = Number(marker[1]);
+      assert.ok(next > offset, 'continuations never regress after stripped ANSI bytes');
+      offset = next;
+    }
+    assert.equal(rendered, expected);
+  }
+});
+test('read_file retains a sensitive-header state across long horizontal whitespace', async () => {
+  const { dir } = await fixture();
+  const secret = 'ultra-header-secret-that-must-not-leak';
+  const folded = 'folded-header-secret-that-must-not-leak';
+  const foldedCrlf = 'crlf-header-secret-that-must-not-leak';
+  const content = [
+    `Authorization${' '.repeat(100)}: ${secret}`,
+    `Authorization\n:\t${folded}`,
+    `Authorization\r\n\t: ${foldedCrlf}`,
+    'ordinary',
+  ].join('\n');
+  await writeFile(path.join(dir, 'spaced-header.txt'), content);
+  const tools = new LocalTools({ repoPath: dir, ownedPaths: ['*.txt'], readCap: 16, outputCap: 128 });
+  let offset = 0;
+  while (true) {
+    const result = await tools.read_file({ path: 'spaced-header.txt', offset });
+    const marker = pageMarker(result);
+    assert.doesNotMatch(result, /ultra-header-secret|folded-header-secret|crlf-header-secret|must-not-leak/);
+    if (!marker) break;
+    const next = Number(marker[1]);
+    assert.ok(next > offset);
+    offset = next;
+  }
+  const secretOffset = Buffer.byteLength(content.slice(0, content.indexOf(secret))) + 3;
+  assert.match(await tools.read_file({ path: 'spaced-header.txt', offset: secretOffset, limit: 1 }), /\[REDACTED\]/);
+  const foldedOffset = Buffer.byteLength(content.slice(0, content.indexOf(folded))) + 3;
+  assert.match(await tools.read_file({ path: 'spaced-header.txt', offset: foldedOffset, limit: 1 }), /\[REDACTED\]/);
+});
 test('grep searches literal text and cannot execute a catastrophic regular expression', async () => {
   const { dir, tools } = await fixture();
   await writeFile(path.join(dir, 'slow.txt'), `${'a'.repeat(30_000)}!`);
   assert.equal(await tools.grep({ pattern: '((a+)+)+$', path: '.' }), '');
   assert.match(await tools.grep({ pattern: 'aaaa!', path: '.' }), /slow\.txt/);
 });
+test(
+  'grep accepts one authorized regular file while retaining directory, deny-list, and symlink safeguards',
+  { skip: process.platform === 'win32' && 'Windows symlink creation requires Developer Mode or elevation' },
+  async () => {
+    const { dir, tools } = await fixture();
+    const outside = await mkdtemp(path.join(os.tmpdir(), 'offload-grep-outside-'));
+    await mkdir(path.join(dir, 'nested'));
+    await writeFile(path.join(dir, 'nested', 'target.txt'), 'needle in target');
+    await writeFile(path.join(dir, 'nested', 'other.txt'), 'needle in other');
+    await writeFile(path.join(dir, '.env.local'), 'needle secret');
+    await writeFile(path.join(outside, 'outside.txt'), 'needle outside');
+    await symlink(path.join(outside, 'outside.txt'), path.join(dir, 'escaped.txt'));
+    const single = await tools.grep({ pattern: 'needle', path: 'nested/target.txt' });
+    assert.match(single, /nested\/target\.txt/);
+    assert.doesNotMatch(single, /nested\/other\.txt/);
+    const directory = await tools.grep({ pattern: 'needle', path: 'nested' });
+    assert.match(directory, /nested\/target\.txt/);
+    assert.match(directory, /nested\/other\.txt/);
+    await assert.rejects(() => tools.grep({ pattern: 'needle', path: '.env.local' }), /denied/);
+    await assert.rejects(() => tools.grep({ pattern: 'needle', path: '../outside.txt' }), /outside|relative|denied/i);
+    await assert.rejects(() => tools.grep({ pattern: 'needle', path: 'escaped.txt' }), /outside|symbolic|denied/i);
+  },
+);
 test('grep streams beyond the read_file window with bounded literal matching', async () => {
   const { dir, tools } = await fixture();
   await writeFile(path.join(dir, 'later.txt'), `${'x'.repeat(70_000)}needle-after-window`);
   assert.match(await tools.grep({ pattern: 'needle-after-window' }), /later\.txt/);
+});
+test('grep caps direct-file output including its omission marker', async () => {
+  const { dir } = await fixture();
+  await writeFile(path.join(dir, 'huge-match.txt'), `${'x'.repeat(200)}needle${'y'.repeat(200)}`);
+  const tools = new LocalTools({ repoPath: dir, ownedPaths: ['*.txt'], outputCap: 128 });
+  const result = await tools.grep({ pattern: 'needle', path: 'huge-match.txt' });
+  assert.ok(result.length <= 128);
+  assert.match(result, /…\[\d+ chars omitted\]…/);
 });
 test('directory traversal is bounded and reports incomplete listings', async () => {
   const { dir, tools } = await fixture();

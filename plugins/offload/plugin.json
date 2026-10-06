@@ -1,10 +1,10 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "offload",
-  "version": "0.1.0+codex.a0ec858fbf26ad4f",
-  "description": "Delegate bounded implementation, testing, and debugging work to a local offload worker.",
+  "version": "0.1.0+codex.59c1f3a018304ba5",
+  "description": "Runs only after an explicit /offload slash-command invocation; ordinary prose does not invoke it.",
   "author": {
     "name": "Offload"
   },
-  "keywords": ["delegation", "coding", "testing", "local"]
+  "keywords": ["slash-command"]
 }

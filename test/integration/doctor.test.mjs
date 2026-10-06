@@ -56,6 +56,24 @@ test('doctor runs Git plumbing with a credential-free hardened environment', () 
     assert.equal(call.options.env.GIT_TERMINAL_PROMPT, '0');
   }
 });
+test('doctor preserves a signaled sandbox probe as a precise public diagnostic', () => {
+  const spawnProcess = (_command, args) => ({
+    status: 0,
+    stdout: args.includes('--show-toplevel') ? `${process.cwd()}\n` : 'git version test',
+  });
+  const result = doctor({
+    root: process.cwd(),
+    repoPath: process.cwd(),
+    home: process.cwd(),
+    platform: 'darwin',
+    spawnProcess,
+    sandboxSpawnProcess: () => ({ signal: 'SIGABRT' }),
+  });
+  assert.equal(result.sandbox, 'policy-only');
+  assert.equal(result.sandboxReason, 'sandbox-exec-signaled');
+  assert.equal(result.sandboxProbeSignal, 'SIGABRT');
+  assert.equal(result.sandboxProbeError, 'sandbox-exec did not apply the profile');
+});
 test('doctor recognizes escaped Windows MCP registration paths', async () => {
   const home = await mkdtemp(join(tmpdir(), 'offload-doctor-home-'));
   const root = 'C:\\Program Files\\Offload';
@@ -165,7 +183,7 @@ test('doctor rejects an invalid Claude type and unsafe Codex table variants', as
   assert.equal(registration().codex, false, 'missing approval mode is not a healthy managed registration');
 });
 
-async function liveConfig() {
+async function liveConfig({ attemptTimeoutMs } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'offload-doctor-'));
   const configPath = join(dir, 'config.json');
   const pricingFile = join(dir, 'pricing.json');
@@ -187,7 +205,15 @@ async function liveConfig() {
   await writeFile(
     configPath,
     JSON.stringify({
-      providers: { mock: { type: 'openai-chat', baseUrl: 'http://localhost', keyRef: 'env:DOCTOR_LIVE_KEY', pricingFile: 'pricing.json' } },
+      providers: {
+        mock: {
+          type: 'openai-chat',
+          baseUrl: 'http://localhost',
+          keyRef: 'env:DOCTOR_LIVE_KEY',
+          pricingFile: 'pricing.json',
+          ...(attemptTimeoutMs === undefined ? {} : { attemptTimeoutMs }),
+        },
+      },
       profiles: { mock: { provider: 'mock', model: 'mock', effort: 'high' } },
       default: 'mock',
       limits: { maxTurns: 1, timeoutMinutes: 1, maxUsd: 1 },
@@ -245,6 +271,73 @@ test('live doctor uses two no-retry, pre-reserved synthetic requests and replays
   assert.deepEqual(replay.tool_calls[0].function, { name: 'offload_doctor_echo', arguments: '{"ok":true}' });
   assert.ok(mock.requests[1].body.tools.length);
   assert.doesNotMatch(JSON.stringify(result), /live-test-key|mock reasoning|offload_doctor_echo once/);
+});
+test('live doctor preserves nullable, empty, and absent reasoning exactly in its mixed tool transcript replay', async () => {
+  const options = await liveConfig();
+  for (const [label, delta, expected] of [
+    ['null', { reasoning_content: null }, null],
+    ['empty', { reasoning_content: '' }, ''],
+    ['absent', {}, undefined],
+  ]) {
+    const mock = scriptedFetch([
+      { chunks: [{ model: 'mock', choices: [{ delta }] }, tool(), usage(9, 1)] },
+      { chunks: [{ model: 'mock', choices: [{ delta: { content: 'ok' } }] }, usage(13, 1)] },
+    ]);
+    const result = await doctorLive({ ...options, maxUsd: 0.02, fetchImpl: mock.fetchImpl });
+    const assistant = mock.requests[1].body.messages.find((message) => message.role === 'assistant');
+    assert.ok(assistant.tool_calls?.length, `${label} replay retains the tool transaction`);
+    if (expected === undefined)
+      assert.equal(Object.hasOwn(assistant, 'reasoning_content'), false, `${label} replay omits absent reasoning`);
+    else assert.equal(assistant.reasoning_content, expected, `${label} replay is exact`);
+    assert.equal(result.reasoningReplayed, expected !== undefined, `${label} diagnostic tracks field presence, not truthiness`);
+  }
+});
+test('live doctor replays a string when null reasoning placeholders surround streamed fragments', async () => {
+  const options = await liveConfig();
+  const mock = scriptedFetch([
+    {
+      chunks: [
+        { model: 'mock', choices: [{ delta: { reasoning_content: null } }] },
+        { choices: [{ delta: { reasoning_content: 'inspect ' } }] },
+        { choices: [{ delta: { reasoning_content: 'first' } }] },
+        { choices: [{ delta: { reasoning_content: null } }] },
+        tool(),
+        usage(9, 1),
+      ],
+    },
+    { chunks: [{ model: 'mock', choices: [{ delta: { content: 'ok' } }] }, usage(13, 1)] },
+  ]);
+  const result = await doctorLive({ ...options, maxUsd: 0.02, fetchImpl: mock.fetchImpl });
+  const assistant = mock.requests[1].body.messages.find((message) => message.role === 'assistant');
+  assert.equal(assistant.reasoning_content, 'inspect first');
+  assert.equal(result.reasoningReplayed, true);
+});
+test('live doctor forwards the configured provider attempt timeout', async () => {
+  const options = await liveConfig({ attemptTimeoutMs: 45_000 });
+  const originalSetTimeout = globalThis.setTimeout;
+  const seenDelays = [];
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    seenDelays.push(delay);
+    if (delay === 45_000) {
+      queueMicrotask(() => callback(...args));
+      return { unref() {} };
+    }
+    return originalSetTimeout(callback, delay, ...args);
+  };
+  try {
+    await assert.rejects(
+      doctorLive({
+        ...options,
+        maxUsd: 0.02,
+        fetchImpl: async (_url, { signal }) =>
+          new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error('provider aborted')), { once: true })),
+      }),
+      /Provider request timed out/,
+    );
+    assert.ok(seenDelays.includes(45_000));
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
 });
 test('live doctor refuses cap/usage failures and never retries an HTTP error', async () => {
   const mock = scriptedFetch([{ status: 401 }]);

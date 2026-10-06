@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, win32 as windowsPath } from 'node:path';
 import { gunzipSync } from 'node:zlib';
@@ -65,6 +65,18 @@ function npmPack(args, options) {
       `npm pack failed with exit ${result.status ?? 'unknown'}: stderr=${JSON.stringify(result.stderr || '')}; stdout=${JSON.stringify(result.stdout || '')}`,
     );
   return result.stdout;
+}
+
+function npmInstall(args, options) {
+  if (process.platform !== 'win32') {
+    const result = spawnSync('npm', args, { ...options, shell: false, windowsHide: true });
+    if (result.error) throw result.error;
+    return result;
+  }
+  const invocation = windowsNpmPackInvocation(args, options);
+  const result = spawnSync(invocation.command, invocation.args, { ...options, shell: false, windowsHide: true });
+  if (result.error) throw result.error;
+  return result;
 }
 
 test('Windows npm packing calls npm CLI without cmd.exe argument reparsing', () => {
@@ -149,6 +161,9 @@ test('the extracted npm package installs, serves MCP, and uninstalls without tou
       XDG_CONFIG_HOME: configHome,
       CLAUDE_CONFIG_DIR: join(home, '.claude'),
       CODEX_HOME: join(home, '.codex'),
+      // Package tests must never invoke a host Claude installation. Dedicated
+      // installer tests inject a fake official CLI and cover registration.
+      PATH: join(temporary, 'no-claude-on-path'),
     };
     const install = spawnSync(process.execPath, ['install.mjs', '--skip-key', '--clients=claude,codex,cursor'], {
       cwd: destination,
@@ -156,7 +171,7 @@ test('the extracted npm package installs, serves MCP, and uninstalls without tou
       timeout: 10_000,
       env,
     });
-    assert.equal(install.status, 0, install.stderr || install.stdout);
+    assert.ok([0, 2].includes(install.status), install.stderr || install.stdout);
     assert.match(await readFile(join(home, '.claude', 'CLAUDE.md'), 'utf8'), /BEGIN offload/);
     assert.match(await readFile(join(home, '.codex', 'AGENTS.md'), 'utf8'), /BEGIN offload/);
     const requests =
@@ -226,6 +241,29 @@ test('the extracted npm package installs, serves MCP, and uninstalls without tou
     assert.equal(byId(1).serverInfo.name, 'offload');
     assert.equal(byId(2).resultType, 'complete');
     const skillText = await readFile(join(destination, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md'), 'utf8');
+    const pluginManifest = JSON.parse(await readFile(join(destination, 'plugins', 'offload', 'plugin.json'), 'utf8'));
+    const codexPluginManifest = JSON.parse(await readFile(join(destination, 'plugins', 'offload', '.codex-plugin', 'plugin.json'), 'utf8'));
+    for (const manifest of [pluginManifest, codexPluginManifest]) {
+      assert.match(manifest.description, /only after an explicit \/offload slash-command invocation/);
+      assert.match(manifest.description, /ordinary prose does not invoke it/);
+      assert.doesNotMatch(manifest.description, /delegate|delegation|DeepSeek|implementation|testing|debugging|analysis/i);
+      assert.deepEqual(manifest.keywords, ['slash-command']);
+    }
+    assert.equal(codexPluginManifest.interface.shortDescription, 'Explicit /offload slash command only');
+    assert.match(codexPluginManifest.interface.longDescription, /only after the user explicitly enters \/offload/);
+    assert.doesNotMatch(
+      codexPluginManifest.interface.longDescription,
+      /delegate|delegation|DeepSeek|implementation|testing|debugging|analysis/i,
+    );
+    assert.deepEqual(codexPluginManifest.interface.defaultPrompt, ['/offload ']);
+    assert.match(skillText, /Run only after the user explicitly enters \/offload as a slash command/);
+    assert.match(skillText, /Ordinary prose does not invoke this skill/);
+    assert.doesNotMatch(
+      skillText.match(/^---[\s\S]*?---/)?.[0] || '',
+      /delegate|delegation|DeepSeek|implementation|testing|debugging|analysis/i,
+    );
+    assert.match(skillText, /On macOS, `\/private\/tmp` is also accepted/);
+    assert.match(skillText, /If the pre-job rejection identifies canonical allowed roots/);
     const resource = {
       uri: 'skill://offload/offload/SKILL.md',
       digest: `sha256:${createHash('sha256').update(Buffer.from(skillText)).digest('hex')}`,
@@ -240,8 +278,75 @@ test('the extracted npm package installs, serves MCP, and uninstalls without tou
       timeout: 10_000,
       env,
     });
-    assert.equal(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
+    assert.ok([0, 2].includes(uninstall.status), uninstall.stderr || uninstall.stdout);
     assert.doesNotMatch(await readFile(join(home, '.codex', 'AGENTS.md'), 'utf8'), /BEGIN offload/);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('a packed global install is a package copy whose installer registers its own MCP binary', async () => {
+  const temporary = await mkdtemp(join(tmpdir(), 'offload packed-global-'));
+  const cache = join(temporary, 'npm-cache');
+  const prefix = join(temporary, 'prefix');
+  const home = join(temporary, 'home');
+  const configHome = join(temporary, 'config');
+  try {
+    await mkdir(cache, { recursive: true });
+    const packed = JSON.parse(
+      npmPack(['pack', '--json', '--ignore-scripts', '--pack-destination', temporary], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        timeout: 30_000,
+        env: { ...process.env, npm_config_cache: cache, npm_config_ignore_scripts: 'true' },
+      }),
+    );
+    assert.equal(packed.length, 1);
+    const archive = join(temporary, packed[0].filename);
+    const installPackage = npmInstall(['install', '--global', '--prefix', prefix, archive, '--ignore-scripts'], {
+      cwd: temporary,
+      encoding: 'utf8',
+      timeout: 30_000,
+      env: { ...process.env, npm_config_cache: cache, npm_config_ignore_scripts: 'true' },
+    });
+    assert.equal(installPackage.status, 0, installPackage.stderr || installPackage.stdout);
+
+    const installedRoot = join(prefix, process.platform === 'win32' ? 'node_modules' : 'lib/node_modules', 'offload');
+    assert.equal((await lstat(installedRoot)).isSymbolicLink(), false, 'tarball installation must not link the source checkout');
+    assert.notEqual(
+      await realpath(installedRoot),
+      await realpath(process.cwd()),
+      'installed package root must differ from the source checkout',
+    );
+
+    const env = {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      APPDATA: join(home, 'AppData', 'Roaming'),
+      XDG_CONFIG_HOME: configHome,
+      CLAUDE_CONFIG_DIR: join(home, '.claude'),
+      CODEX_HOME: join(home, '.codex'),
+      PATH: join(temporary, 'no-claude-on-path'),
+    };
+    const runInstaller = spawnSync(process.execPath, ['install.mjs', '--skip-key', '--clients=claude'], {
+      cwd: installedRoot,
+      encoding: 'utf8',
+      timeout: 10_000,
+      env,
+    });
+    assert.ok([0, 2].includes(runInstaller.status), runInstaller.stderr || runInstaller.stdout);
+    const installerResult = JSON.parse(runInstaller.stdout);
+    assert.equal(installerResult.claudeMcp.status, 'unavailable');
+    await assert.rejects(readFile(join(home, '.claude', '.claude.json'), 'utf8'), /ENOENT/);
+
+    const uninstall = spawnSync(process.execPath, ['install.mjs', '--uninstall', '--clients=claude'], {
+      cwd: installedRoot,
+      encoding: 'utf8',
+      timeout: 10_000,
+      env,
+    });
+    assert.ok([0, 2].includes(uninstall.status), uninstall.stderr || uninstall.stdout);
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

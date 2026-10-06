@@ -5,7 +5,7 @@ import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writ
 import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { JobStore, atomicRename, readStoredBytes, readStoredFile } from '../../src/store.mjs';
+import { JobStore, atomicRename, readStoredBytes, readStoredFile, redact } from '../../src/store.mjs';
 import { AgentContext } from '../../src/agent/context.mjs';
 import { getGitDir } from '../../src/lease.mjs';
 import { cleanup, tempDir } from './helpers.mjs';
@@ -39,6 +39,32 @@ test('atomic rename retries only transient Windows sharing failures', async () =
       }),
     /file is busy/,
   );
+});
+
+test('numeric budget reservation output tokens survive storage redaction while arbitrary token-shaped secrets remain redacted', async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir });
+    const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
+    await store.update(job.id, {
+      budgetReservation: { conservativeInputTokens: 1234, minOutputTokens: 16, bearerToken: 'must-not-persist' },
+    });
+    const stored = await store.get(job.id);
+    assert.equal(stored.budgetReservation.conservativeInputTokens, 1234);
+    assert.equal(stored.budgetReservation.minOutputTokens, 16);
+    assert.equal(stored.budgetReservation.bearerToken, '[REDACTED]');
+    assert.deepEqual(redact({ conservativeInputTokens: 1234, minOutputTokens: 16, sessionToken: 'must-not-persist' }), {
+      conservativeInputTokens: 1234,
+      minOutputTokens: 16,
+      sessionToken: '[REDACTED]',
+    });
+    assert.deepEqual(redact({ conservativeInputTokens: 'must-not-persist', minOutputTokens: 'not-a-count' }), {
+      conservativeInputTokens: '[REDACTED]',
+      minOutputTokens: '[REDACTED]',
+    });
+  } finally {
+    cleanup(gitDir);
+  }
 });
 
 test('failed preparation or initial record publication leaves no owned job directory', async () => {
@@ -168,6 +194,81 @@ test('publication intents are schema-checked and concurrent stores retain both t
   }
 });
 
+test('sealed transcripts retain explicit nullable assistant reasoning for provider replay', async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir }).configureIntegrity({ requiredFor: () => true, keyForId: () => 'key' });
+    const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
+    const transcript = [
+      {
+        role: 'assistant',
+        content: '',
+        reasoning_content: null,
+        tool_calls: [
+          { id: 'write-1', type: 'function', function: { name: 'write_file', arguments: '{"path":"src/a.mjs","content":"x"}' } },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'write-1', content: 'WROTE: src/a.mjs' },
+    ];
+    await store.messagesBatch(job.id, transcript);
+    const restored = await store.readMessages(job.id);
+    assert.equal(restored[0].reasoning_content, null);
+    assert.equal((await store.get(job.id)).transcriptReplayable, true);
+    assert.deepEqual(new AgentContext(restored).snapshot(), transcript);
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
+test('redacted assistant reasoning is durably marked non-replayable without retaining the secret', async () => {
+  const gitDir = tempDir();
+  const secret = 'sk-abcdefghijklmnop';
+  try {
+    const store = new JobStore({ gitDir }).configureIntegrity({ requiredFor: () => true, keyForId: () => 'key' });
+    const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
+    await store.messagesBatch(job.id, [
+      {
+        role: 'assistant',
+        content: '',
+        reasoning_content: `credential ${secret}`,
+        tool_calls: [{ id: 'read-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"src/a.mjs"}' } }],
+      },
+      { role: 'tool', tool_call_id: 'read-1', content: 'READ: src/a.mjs' },
+    ]);
+    const stored = await store.get(job.id);
+    const transcript = await store.readMessages(job.id);
+    assert.equal(stored.transcriptReplayable, false);
+    assert.match(transcript[0].reasoning_content, /\[REDACTED\]/);
+    const durable = JSON.stringify({ stored, transcript });
+    assert.doesNotMatch(durable, new RegExp(secret));
+    assert.doesNotMatch(durable, /credential [a-z0-9_-]{12,}/i);
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
+test('clean assistant reasoning remains durably replayable', async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir }).configureIntegrity({ requiredFor: () => true, keyForId: () => 'key' });
+    const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
+    await store.messagesBatch(job.id, [
+      {
+        role: 'assistant',
+        content: '',
+        reasoning_content: 'inspect the local README',
+        tool_calls: [{ id: 'read-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"README.md"}' } }],
+      },
+      { role: 'tool', tool_call_id: 'read-1', content: 'READ: README.md' },
+    ]);
+    const restored = await store.readMessages(job.id);
+    assert.equal((await store.get(job.id)).transcriptReplayable, true);
+    assert.equal(restored[0].reasoning_content, 'inspect the local README');
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
 test('publication locks grace a partial owner and serialize concurrent event records', async () => {
   const gitDir = tempDir();
   try {
@@ -193,6 +294,23 @@ test('publication locks grace a partial owner and serialize concurrent event rec
     assert.equal(lines.length, 4);
     assert.deepEqual(lines.map((event) => event.index).sort(), [0, 1, 2, 3]);
     assert.ok(lines.every((event) => event.payload === payload));
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
+test('event envelopes retain the store timestamp when a caller supplies at', async () => {
+  const gitDir = tempDir();
+  try {
+    const at = new Date('2026-10-05T12:34:56.000Z');
+    const store = new JobStore({ gitDir, now: () => at });
+    const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
+    await store.event(job.id, { type: 'progress', at: 'forged-time' });
+    const [event] = (await store.readArtifact(job.id, 'events.jsonl'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.equal(event.at, at.toISOString());
   } finally {
     cleanup(gitDir);
   }

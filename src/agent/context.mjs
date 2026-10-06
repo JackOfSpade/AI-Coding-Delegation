@@ -139,6 +139,98 @@ export class AgentContext {
   snapshot() {
     return this.messages.map((message) => cloneMessage(message, { includeElided: true }));
   }
+  /**
+   * Yield provider-only transcript variants that progressively replace the
+   * oldest bulky tool results with the same neutral marker used by durable
+   * transcript retention.  This never changes this.messages (or invokes a
+   * persistence callback): callers may use one variant for a single request
+   * without changing what a later repair can replay.
+   *
+   * Every result of the newest complete assistant tool-call transaction is
+   * intentionally never a candidate. keepRecentToolResults additionally
+   * retains that many newer *older* results, while assistant reasoning, calls,
+   * identifiers, and message order remain byte-for-byte cloned from durable
+   * state.
+   */
+  *providerBudgetElisionSnapshots() {
+    const source = this.snapshot();
+    const toolIndexes = source.flatMap((message, index) => (message.role === 'tool' ? [index] : []));
+    const protectedIndexes = newestCompleteToolTransactionIndexes(source) ?? new Set();
+    const olderToolIndexes = toolIndexes.filter((index) => !protectedIndexes.has(index));
+    const eligible = olderToolIndexes
+      .slice(0, Math.max(0, olderToolIndexes.length - this.keepRecentToolResults))
+      .filter((index) => source[index].elided !== true);
+    const compact = source.map((message) => cloneMessage(message, { includeElided: true }));
+    let elidedToolResults = 0;
+    for (const index of eligible) {
+      const original = compact[index].content;
+      compact[index].content = toolOutputElisionMarker(original.length);
+      elidedToolResults++;
+      yield {
+        messages: compact.map((message) => cloneMessage(message, { includeElided: true })),
+        elidedToolResults,
+      };
+    }
+  }
+  /**
+   * Yield a second, provider-only budget fallback after every ordinary
+   * retention-preserving projection has already proved unaffordable.  It
+   * starts from the most compact ordinary projection, then relaxes that
+   * quality retention oldest-first. The ordinary projection was already tried
+   * by the caller, so this yields only strictly deeper candidates. The newest
+   * complete assistant tool-call transaction is never touched: a model must
+   * receive every result needed to answer its most recently issued calls.
+   *
+   * Like providerBudgetElisionSnapshots(), this is only a request projection.
+   * It neither alters durable state nor calls persistence callbacks.
+   */
+  *providerBudgetDeepElisionSnapshots() {
+    const source = this.snapshot();
+    const protectedIndexes = newestCompleteToolTransactionIndexes(source);
+    if (!protectedIndexes) return;
+    const toolIndexes = source.flatMap((message, index) => (message.role === 'tool' ? [index] : []));
+    const olderToolIndexes = toolIndexes.filter((index) => !protectedIndexes.has(index));
+    const ordinaryEligible = new Set(
+      olderToolIndexes
+        .slice(0, Math.max(0, olderToolIndexes.length - this.keepRecentToolResults))
+        .filter((index) => source[index].elided !== true),
+    );
+    const compact = source.map((message) => cloneMessage(message, { includeElided: true }));
+    for (const index of ordinaryEligible) compact[index].content = toolOutputElisionMarker(compact[index].content.length);
+    const eligible = olderToolIndexes.filter(
+      (index) => !ordinaryEligible.has(index) && !protectedIndexes.has(index) && source[index].elided !== true,
+    );
+    let elidedToolResults = ordinaryEligible.size;
+    for (const index of eligible) {
+      const original = compact[index].content;
+      compact[index].content = toolOutputElisionMarker(original.length);
+      elidedToolResults++;
+      yield {
+        messages: compact.map((message) => cloneMessage(message, { includeElided: true })),
+        elidedToolResults,
+      };
+    }
+  }
+}
+const toolOutputElisionMarker = (chars) => `[tool output elided: ${chars} chars; request a narrower read if needed]`;
+function newestCompleteToolTransactionIndexes(messages) {
+  let newest;
+  for (let index = 0; index < messages.length; index++) {
+    const assistant = messages[index];
+    if (assistant.role !== 'assistant' || !Array.isArray(assistant.tool_calls) || assistant.tool_calls.length === 0) continue;
+    const ids = new Set(assistant.tool_calls.map((call) => call?.id));
+    if (ids.size !== assistant.tool_calls.length || ids.has(undefined)) continue;
+    const results = messages.slice(index + 1, index + 1 + assistant.tool_calls.length);
+    if (
+      results.length !== assistant.tool_calls.length ||
+      results.some((result) => result?.role !== 'tool' || !ids.has(result.tool_call_id)) ||
+      new Set(results.map((result) => result.tool_call_id)).size !== ids.size
+    )
+      continue;
+    newest = new Set(results.map((_result, offset) => index + 1 + offset));
+    index += results.length;
+  }
+  return newest;
 }
 function messageChars(message) {
   return typeof message?.content === 'string'
@@ -153,11 +245,17 @@ function messageChars(message) {
 }
 function elideMessages(messages, maxToolChars, keepRecentToolResults) {
   const tools = messages.map((message, index) => [message, index]).filter(([message]) => message.role === 'tool' && !message.elided);
+  const protectedIndexes = newestCompleteToolTransactionIndexes(messages) ?? new Set();
+  const olderTools = tools.filter(([, index]) => !protectedIndexes.has(index));
   let chars = tools.reduce((total, [message]) => total + (message.content?.length ?? 0), 0);
-  for (const [message] of tools.slice(0, Math.max(0, tools.length - keepRecentToolResults))) {
+  // A current tool-call transaction is an atomic provider replay unit. Its
+  // results may exceed maxToolChars together, but splitting or eliding one
+  // would make the preceding assistant call unreplayable. Retention applies
+  // in addition to that transaction, to the newest older results.
+  for (const [message] of olderTools.slice(0, Math.max(0, olderTools.length - keepRecentToolResults))) {
     if (chars <= maxToolChars) break;
     const original = message.content ?? '';
-    message.content = `[tool output elided: ${original.length} chars; request a narrower read if needed]`;
+    message.content = toolOutputElisionMarker(original.length);
     message.elided = true;
     chars -= original.length - message.content.length;
   }
@@ -216,7 +314,10 @@ function validateMessageShape(message) {
     return;
   }
   if (message.role === 'assistant') {
-    if (!boundedText(message.content) || (message.reasoning_content !== undefined && !boundedText(message.reasoning_content)))
+    if (
+      !boundedText(message.content) ||
+      (message.reasoning_content !== undefined && message.reasoning_content !== null && !boundedText(message.reasoning_content))
+    )
       throw new Error('Conversation transcript has an invalid role or assistant content');
     if (
       message.tool_calls !== undefined &&

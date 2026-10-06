@@ -1,9 +1,10 @@
 /** Dependency-free, scrubbed command execution with best-effort OS sandboxing. */
 import { spawn, spawnSync } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep, relative, isAbsolute } from 'node:path';
-import { globToRegExp, normalizePath } from './glob.mjs';
+import { normalizePath } from './glob.mjs';
 import { DEFAULT_DENY_READ, DEFAULT_DENY_WRITE } from './policy.mjs';
 
 const SECRET =
@@ -17,6 +18,7 @@ const CAP = 256 * 1024;
 // This Apple system binary is the enforcement boundary. Never resolve it via
 // PATH, which an untrusted repository command environment can influence.
 const SANDBOX_EXECUTABLE = '/usr/bin/sandbox-exec';
+const MACOS_SHELL_SELECTOR = '/private/var/select/sh';
 // `/usr/local` and `/opt/homebrew` are broadly readable for interpreters and
 // libraries.  Their etc trees are host configuration, however, and `/Library`
 // includes machine credentials and management policy.  These denies appear
@@ -30,6 +32,7 @@ const MACOS_HOST_CONFIG_DENY = Object.freeze([
   '/Library/Application Support/com.apple.TCC',
   '/Library/Security',
 ]);
+const denyPath = (kind, path) => [`(deny file-${kind}* (literal ${q(path)}))`, `(deny file-${kind}* (subpath ${q(path)}))`];
 export function scrubEnv(env = process.env, { home, temp, platform = process.platform } = {}) {
   const result = {};
   const windows = platform === 'win32';
@@ -47,19 +50,74 @@ export function scrubEnv(env = process.env, { home, temp, platform = process.pla
   result.NO_COLOR = '1';
   return result;
 }
+const SANDBOX_PROBE_COMMAND = `${SANDBOX_EXECUTABLE} -p <generated-offload-profile> /usr/bin/true`;
+const SANDBOX_PROBE_OUTPUT_CAP = 4 * 1024;
+const probeText = (value) =>
+  String(value || '')
+    .replace(/\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g, '')
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '')
+    .trim()
+    .slice(0, SANDBOX_PROBE_OUTPUT_CAP);
+
+/**
+ * Establish whether Seatbelt can apply the exact restrictive profile we use.
+ *
+ * The boolean API below remains deliberately small for execution decisions,
+ * while this structured form preserves the otherwise easy-to-lose host
+ * failure.  In particular, a present sandbox-exec binary is not evidence of
+ * isolation: managed hosts can deny sandbox_apply even for a permissive
+ * profile.
+ */
+export function sandboxStatus(platform = process.platform, profile, { spawnProcess = spawnSync } = {}) {
+  if (platform !== 'darwin')
+    return { available: false, reason: 'platform-not-darwin', probe: SANDBOX_PROBE_COMMAND, error: `platform is ${platform}` };
+  const canonicalPath = (value) => {
+    try {
+      return realpathSync(value);
+    } catch {
+      return resolve(value);
+    }
+  };
+  const generatedProfile = profile ?? macosProfile({ repoPath: canonicalPath(process.cwd()), tempPath: canonicalPath(tmpdir()) });
+  let result;
+  try {
+    result = spawnProcess(SANDBOX_EXECUTABLE, ['-p', generatedProfile, '/usr/bin/true'], {
+      encoding: 'utf8',
+      timeout: 2_000,
+      maxBuffer: SANDBOX_PROBE_OUTPUT_CAP,
+      windowsHide: true,
+    });
+  } catch (error) {
+    return {
+      available: false,
+      reason: 'sandbox-exec-spawn-failed',
+      probe: SANDBOX_PROBE_COMMAND,
+      error: probeText(error?.message || error),
+    };
+  }
+  if (result?.status === 0) return { available: true, reason: 'profile-applied', probe: SANDBOX_PROBE_COMMAND };
+
+  const error = probeText(result?.stderr || result?.error?.message || result?.stdout || 'sandbox-exec did not apply the profile');
+  let reason = 'sandbox-exec-failed';
+  if (result?.error?.code === 'ENOENT') reason = 'sandbox-exec-missing';
+  else if (result?.error?.code === 'ETIMEDOUT') reason = 'sandbox-exec-probe-timed-out';
+  else if (typeof result?.signal === 'string' && result.signal) reason = 'sandbox-exec-signaled';
+  else if (/sandbox_apply:\s*operation not permitted/i.test(error)) reason = 'sandbox-apply-not-permitted';
+  else if (result?.status === 65 || /(?:parse|syntax|unexpected).*(?:error|operator)|(?:parse|syntax) error/i.test(error))
+    reason = 'sandbox-profile-rejected';
+  return {
+    available: false,
+    reason,
+    probe: SANDBOX_PROBE_COMMAND,
+    ...(Number.isInteger(result?.status) ? { exitCode: result.status } : {}),
+    ...(typeof result?.signal === 'string' && result.signal ? { signal: result.signal } : {}),
+    ...(error ? { error } : {}),
+  };
+}
+
 /** A binary on PATH is not enough: managed macOS hosts can forbid applying a profile. */
 export function sandboxAvailable(platform = process.platform, profile) {
-  if (platform !== 'darwin') return false;
-  // The binary can be present and permissive profiles can compile while a
-  // real restrictive profile aborts under managed/macOS entitlement setups.
-  // Probe the same profile shape used by commands and fail closed to the
-  // policy-only runner when sandbox-exec cannot actually apply it.
-  const probe = profile ?? macosProfile({ repoPath: process.cwd(), tempPath: tmpdir() });
-  try {
-    return spawnSync(SANDBOX_EXECUTABLE, ['-p', probe, '/usr/bin/true'], { stdio: 'ignore', timeout: 2_000 }).status === 0;
-  } catch {
-    return false;
-  }
+  return sandboxStatus(platform, profile).available;
 }
 const q = (value) => JSON.stringify(String(value));
 function seatbeltPath(value) {
@@ -76,7 +134,101 @@ export function staticWritableRoot(value, repoPath) {
   return root === sep && repoPath ? base : root;
 }
 const seatbeltString = (value) => String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
-const regexEscape = (value) => String(value).replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
+const asciiPair = (character) =>
+  character === character.toLowerCase() ? `${character}${character.toUpperCase()}` : `${character}${character.toLowerCase()}`;
+const asciiLetter = (character) => /[A-Za-z]/.test(character);
+const SEATBELT_CLASS_LITERAL = new Set(['.', '/', '*', '+', '?', '(', ')', '{', '}', '|', '$']);
+/**
+ * Encode one exact pathname character without JavaScript-style regex escapes.
+ * Allow rules fail closed for uncommon syntax; deny rules use `.` only as a
+ * conservative one-character superset.
+ */
+function seatbeltLiteralCharacter(character, { deny = false } = {}) {
+  if (SEATBELT_CLASS_LITERAL.has(character)) return `[${character}]`;
+  // The remaining regex delimiters cannot be represented in an exact raw
+  // Seatbelt expression without another escape dialect. Denies may broaden
+  // by one byte; allows must fail closed. Ordinary Unicode and punctuation
+  // (including # and ~) are literal and remain supported.
+  if (/["\\[\]\^]/.test(character)) {
+    if (deny) return '.';
+    throw new TypeError(`sandbox path has unsupported regex character: ${character}`);
+  }
+  return character;
+}
+function seatbeltLiteral(value, options) {
+  return [...String(value)].map((character) => seatbeltLiteralCharacter(character, options)).join('');
+}
+/** Compile a normalized glob in Seatbelt's native regex dialect, never JS escapes. */
+function seatbeltGlobSource(pattern, { deny = false } = {}) {
+  let source = '';
+  for (let index = 0; index < pattern.length; index += 1) {
+    const character = pattern[index];
+    if (character === '*') {
+      if (pattern[index + 1] === '*') {
+        while (pattern[index + 1] === '*') index += 1;
+        if (pattern[index + 1] === '/') {
+          // sandbox-exec accepts ordinary capture groups but silently ignores
+          // the non-capturing `(?:...)` form for path matching.
+          source += '(.*[/])?';
+          index += 1;
+        } else source += '.*';
+      } else source += '[^/]*';
+      continue;
+    }
+    if (character === '?') {
+      source += '[^/]';
+      continue;
+    }
+    if (character === '[') {
+      const close = pattern.indexOf(']', index + 1);
+      const raw = close === -1 ? null : pattern.slice(index + 1, close);
+      const characterClass = raw?.startsWith('!') ? `^${raw.slice(1)}` : raw;
+      try {
+        if (raw === null || !characterClass || characterClass === '^' || /[\\/]/.test(characterClass)) throw new Error('invalid class');
+        new RegExp(`[${characterClass}]`);
+        // Negated classes must not consume a separator; put `/` directly in
+        // the excluded class rather than relying on unsupported lookaround.
+        source += characterClass.startsWith('^') ? `[^/${characterClass.slice(1)}]` : `[${characterClass}]`;
+        index = close;
+        continue;
+      } catch {
+        if (deny) {
+          source += '.';
+          continue;
+        }
+        throw new TypeError(`sandbox glob has unsupported character class: ${pattern}`);
+      }
+    }
+    source += seatbeltLiteralCharacter(character, { deny });
+  }
+  return source;
+}
+/** Compile literal path text to a Seatbelt regex fragment with ASCII case folding. */
+function caseInsensitiveLiteral(value) {
+  return [...String(value)]
+    .map((character) => (asciiLetter(character) ? `[${asciiPair(character)}]` : seatbeltLiteralCharacter(character, { deny: true })))
+    .join('');
+}
+/**
+ * Case-fold the literal portions of a validated glob before compiling it.
+ * A bracket class has subtle regex semantics (`[A-z]`, negation, and malformed
+ * classes included), so do not reinterpret it.  A whole `*` segment is a
+ * conservative superset of every one-segment class match, which protects the
+ * caller's intent without risking a case-folding under-match.
+ */
+export function caseInsensitiveGlob(value) {
+  return value
+    .split('/')
+    .map((segment) => {
+      if (
+        segment.includes('[') ||
+        [...segment].some((character) => !asciiLetter(character) && character.toLowerCase() !== character.toUpperCase())
+      )
+        return '*';
+      return [...segment].map((character) => (asciiLetter(character) ? `[${asciiPair(character)}]` : character)).join('');
+    })
+    .join('/');
+}
 function sandboxGlobFilter(kind, repoPath, value) {
   const root = resolve(repoPath);
   const raw = typeof value === 'string' ? value : String(value);
@@ -84,24 +236,28 @@ function sandboxGlobFilter(kind, repoPath, value) {
   const absolute = isAbsolute(raw) ? resolve(raw) : resolve(root, raw);
   const rel = relative(root, absolute).replaceAll('\\', '/');
   if (!rel || rel.startsWith('../') || rel === '..') throw new TypeError(`sandbox path is outside repository: ${value}`);
-  const source = globToRegExp(rel).source.replace(/^\^/, '').replace(/\$$/, '');
-  return `(${kind} file-write* (regex #"^${seatbeltString(regexEscape(root))}/${seatbeltString(source)}$"))`;
+  const source = seatbeltGlobSource(normalizePath(rel));
+  return `(${kind} file-write* (regex #"^${seatbeltString(seatbeltLiteral(root))}[/]${seatbeltString(source)}$"))`;
 }
 function denyFilter(kind, repoPath, pattern) {
   const safePattern = normalizePath(pattern);
-  const source = globToRegExp(safePattern).source.replace(/^\^/, '').replace(/\$$/, '');
-  const root = seatbeltString(regexEscape(resolve(repoPath)));
+  // Seatbelt accepts scoped `(?i:...)` syntax but does not apply it when
+  // matching `regex` path filters. Compile ordinary literal portions into
+  // explicit ASCII case pairs; bracket-containing segments intentionally
+  // become `*` in caseInsensitiveGlob, conservatively over-denying rather
+  // than risking a narrower credential rule.
+  const insensitive = caseInsensitiveGlob(safePattern);
+  const source = seatbeltGlobSource(insensitive, { deny: true });
+  const root = seatbeltString(caseInsensitiveLiteral(resolve(repoPath)));
   // Repository secret conventions are case-insensitive: macOS volumes often
   // are too, and `.ENV`/`ID_RSA` should not become readable on a Linux volume.
-  // Seatbelt rejects a bare inline option before an anchored expression
-  // (`(?i)^...$`). Scope the option inside the anchors instead, preserving
-  // case-insensitive matching while keeping the complete path anchored.
-  return `(deny file-${kind}* (regex #"^(?i:${root}/${seatbeltString(source)})$"))`;
+  return `(deny file-${kind}* (regex #"^${root}[/]${seatbeltString(source)}$"))`;
 }
 export function macosProfile({
   repoPath,
   gitDir = join(repoPath, '.git'),
   writablePaths = [],
+  readablePaths = [],
   denyRead = [],
   denyWrite = DEFAULT_DENY_WRITE,
   tempPath,
@@ -112,8 +268,11 @@ export function macosProfile({
     throw new TypeError('denyRead must be relative glob strings');
   if (!Array.isArray(denyWrite) || denyWrite.some((path) => typeof path !== 'string'))
     throw new TypeError('denyWrite must be relative glob strings');
-  if (!Array.isArray(writablePaths) || !Array.isArray(cachePaths)) throw new TypeError('sandbox writable/cache paths must be arrays');
-  for (const value of [repoPath, gitDir, tempPath, ...writablePaths, ...cachePaths].filter((value) => value !== undefined))
+  if (!Array.isArray(writablePaths) || !Array.isArray(readablePaths) || !Array.isArray(cachePaths))
+    throw new TypeError('sandbox writable/readable/cache paths must be arrays');
+  for (const value of [repoPath, gitDir, tempPath, ...writablePaths, ...readablePaths, ...cachePaths].filter(
+    (value) => value !== undefined,
+  ))
     seatbeltPath(value);
   const root = resolve(repoPath);
   const resolvedGit = isAbsolute(gitDir) ? resolve(gitDir) : resolve(root, gitDir);
@@ -129,7 +288,22 @@ export function macosProfile({
   const commonGit = basename(dirname(resolvedGit)) === 'worktrees' ? dirname(dirname(resolvedGit)) : resolvedGit;
   const protectedGitPaths = [...new Set([join(root, '.git'), resolvedGit, commonGit])];
   const resolvedTemp = tempPath && resolve(tempPath);
+  // This is an explicit read capability for server-authenticated paths that
+  // sit outside the repository root (currently, only a private worktree's
+  // parent). It is deliberately distinct from cache/writable capabilities:
+  // never add it to `write`.
+  const resolvedReadable = readablePaths.map((value) => (isAbsolute(value) ? resolve(value) : resolve(root, value)));
   const resolvedCache = cachePaths.map((value) => (isAbsolute(value) ? resolve(value) : resolve(root, value)));
+  // Exact metadata on each server-controlled path ancestor permits path
+  // traversal/getcwd without granting directory contents. This matters when
+  // macOS presents a lexical `/var` path physically under `/private/var`.
+  // Homebrew toolchains are installed below /opt/homebrew. macOS needs to
+  // stat the literal /opt ancestor while resolving those binaries and
+  // libraries; this grants no child data (and /opt/homebrew/etc remains
+  // explicitly denied below).
+  const traversalMetadata = new Set(['/opt']);
+  for (const path of [root, resolvedTemp, ...resolvedReadable, ...resolvedCache, dirname(MACOS_SHELL_SELECTOR)].filter(Boolean))
+    for (let parent = dirname(path); parent !== sep; parent = dirname(parent)) traversalMetadata.add(parent);
   const read = [
     root,
     '/System',
@@ -141,6 +315,7 @@ export function macosProfile({
     '/opt/homebrew',
     '/dev/null',
     resolvedTemp,
+    ...resolvedReadable,
     ...resolvedCache,
   ].filter(Boolean);
   const write = [resolvedTemp, ...resolvedCache].filter(Boolean);
@@ -152,16 +327,44 @@ export function macosProfile({
     '(deny default)',
     '(allow process*)',
     '(allow sysctl-read)',
-    ...read.map((path) => `(allow file-read* (subpath ${q(path)}))`),
-    ...MACOS_HOST_CONFIG_DENY.map((path) => `(deny file-read* (subpath ${q(path)}))`),
-    ...protectedGitPaths.map((path) => `(deny file-read* (subpath ${q(path)}))`),
+    // Current sandbox-exec builds can abort a child with sysctl-read and a
+    // restrictive profile unless the root directory node itself is readable.
+    // `literal "/"` exposes directory data only, never descendants; explicit
+    // deny rules still protect every host subtree below it.
+    '(allow file-read-data (literal "/"))',
+    // macOS resolves /bin/sh through this system selector on current hosts.
+    // Allow that one executable and its exact metadata node, never the
+    // selector directory subtree. The selector is a symlink on current
+    // hosts; launching it otherwise emits a noisy metadata denial.
+    `(allow file-read-data (literal ${q(MACOS_SHELL_SELECTOR)}))`,
+    `(allow file-read-metadata (literal ${q(MACOS_SHELL_SELECTOR)}))`,
+    // Shell redirections commonly target this null device; it is a sink, not
+    // a readable host tree.
+    '(allow file-write-data (literal "/dev/null"))',
+    ...[...traversalMetadata].sort().map((path) => `(allow file-read-metadata (literal ${q(path)}))`),
+    // `subpath` does not grant the directory node itself. Permit each exact
+    // root as data too, so the shell can enter its physical cwd without
+    // broadening access to any descendant beyond the paired subpath rule.
+    ...read.flatMap((path) => [`(allow file-read-data (literal ${q(path)}))`, `(allow file-read* (subpath ${q(path)}))`]),
+    // `subpath` does not include the directory node. Pair exact and
+    // descendant denies so broad toolchain/cache grants cannot rename, remove,
+    // or inspect a protected Git/config directory itself.
+    ...MACOS_HOST_CONFIG_DENY.flatMap((path) => denyPath('read', path)),
+    ...protectedGitPaths.flatMap((path) => denyPath('read', path)),
     ...writablePaths.map((path) => sandboxGlobFilter('allow', root, path)),
     ...write.map((path) => `(allow file-write* (subpath ${q(path)}))`),
-    ...protectedGitPaths.map((path) => `(deny file-write* (subpath ${q(path)}))`),
+    ...protectedGitPaths.flatMap((path) => denyPath('write', path)),
     ...denyWrite.map((pattern) => denyFilter('write', root, pattern)),
     ...protectedRead.map((pattern) => denyFilter('read', root, pattern)),
     ...(allowNetwork ? ['(allow network*)'] : []),
   ].join('\n');
+}
+/** Map an absolute lexical path under a canonical sandbox root to that root. */
+export function sandboxCanonicalPath(value, cwd, sandboxCwd) {
+  if (typeof value !== 'string' || !isAbsolute(value)) return value;
+  const rel = relative(cwd, resolve(value));
+  if (!rel) return sandboxCwd;
+  return rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel) ? value : join(sandboxCwd, rel);
 }
 /** Best-effort descendant termination on Windows; Windows has no POSIX process groups. */
 export function terminateWindowsTree(pid, taskkill = spawnSync) {
@@ -270,6 +473,7 @@ export async function runCommand(command, options = {}) {
     repoPath: cwd,
     gitDir: options.gitDir,
     writablePaths: options.writablePaths || [],
+    readablePaths: options.readablePaths || [],
     denyRead: options.denyRead || [],
     denyWrite: options.denyWrite || DEFAULT_DENY_WRITE,
     tempPath: options.tempPath || tmpdir(),
@@ -286,11 +490,37 @@ export async function runCommand(command, options = {}) {
   // try sandbox-exec. In particular a caller must not bypass it with
   // sandbox:false or inherit a policy-only non-macOS runner.
   if (options.requireSandbox && !canSandbox) throw new Error('Required macOS sandbox is unavailable for this command');
+  const sandboxCwd = canSandbox ? await realpath(cwd) : cwd;
+  // Rewrite absolute paths beneath a lexical `/var` worktree to the same
+  // physical worktree spelling. Relative globs remain relative so their
+  // existing scope validation is unchanged.
+  const sandboxPath = (value) => (canSandbox ? sandboxCanonicalPath(value, cwd, sandboxCwd) : value);
+  const sandboxWritablePaths = (options.writablePaths || []).map(sandboxPath);
+  // Canonicalize explicit external read roots too. In particular, macOS
+  // renders a lexical `/var/...` worktree under `/private/var/...`; handing
+  // Seatbelt the former makes an otherwise authorized cwd fail at runtime.
+  // Missing roots fail before execution rather than becoming an ambient,
+  // best-effort read grant.
+  const sandboxReadablePaths = canSandbox
+    ? await Promise.all(
+        (options.readablePaths || []).map(async (value) => {
+          const path = sandboxPath(value);
+          if (typeof path !== 'string' || !isAbsolute(path)) throw new TypeError('sandbox readable paths must be absolute');
+          return realpath(path);
+        }),
+      )
+    : options.readablePaths || [];
+  const sandboxCachePaths = (options.cachePaths || []).map(sandboxPath);
+  const sandboxGitDir = sandboxPath(options.gitDir);
   if (canSandbox) {
     // Validate before creating a temp directory so a rejection has no residue.
     dir = await mkdtemp(join(tmpdir(), 'offload-sandbox-'));
     sandbox = 'macos';
   } else dir = await mkdtemp(join(tmpdir(), 'offload-run-'));
+  // The macOS sandbox resolves its current directory through physical paths.
+  // Grant the freshly created private directory by that spelling so a lexical
+  // `/var` temporary path cannot lose its `/private/var` ancestry at launch.
+  const sandboxTempPath = sandbox === 'macos' ? await realpath(dir) : dir;
   const scriptName = platform === 'win32' ? 'offload-command.cmd' : 'offload-command.sh';
   const scriptPath = join(dir, scriptName);
   const stdout = capture(Math.floor(cap / 2)),
@@ -301,20 +531,35 @@ export async function runCommand(command, options = {}) {
   let cancelled = false;
   try {
     await writeFile(scriptPath, commandScript(command, platform), { mode: 0o700 });
-    const environment = { ...scrubEnv(options.env, { home: dir, temp: dir, platform }), OFFLOAD_COMMAND_CWD: cwd };
+    const environment = {
+      // Seatbelt evaluates the physical path. Using the lexical `/var` alias
+      // here causes Node's os.tmpdir()/mkdtemp to target a path the profile
+      // has not granted on macOS. Keep policy-only behavior unchanged.
+      ...scrubEnv(options.env, {
+        home: sandbox === 'macos' ? sandboxTempPath : dir,
+        temp: sandbox === 'macos' ? sandboxTempPath : dir,
+        platform,
+      }),
+      OFFLOAD_COMMAND_CWD: sandbox === 'macos' ? sandboxCwd : cwd,
+    };
+    // Homebrew Node may otherwise load its host OpenSSL configuration before
+    // the command starts. Never inherit a caller-selected configuration path:
+    // use the inert null device only after a real macOS sandbox was applied.
+    if (sandbox === 'macos') environment.OPENSSL_CONF = '/dev/null';
     const sandboxProfile =
       sandbox === 'macos'
         ? macosProfile({
-            repoPath: cwd,
-            gitDir: options.gitDir,
-            writablePaths: options.writablePaths || [],
+            repoPath: sandboxCwd,
+            gitDir: sandboxGitDir,
+            writablePaths: sandboxWritablePaths,
+            readablePaths: sandboxReadablePaths,
             denyRead: options.denyRead || [],
             denyWrite: options.denyWrite || DEFAULT_DENY_WRITE,
             // The private script directory must be readable by the sandboxed
             // interpreter. A separately requested temporary directory remains
             // an explicit cache capability rather than replacing that root.
-            tempPath: dir,
-            cachePaths: [...(options.cachePaths || []), ...(options.tempPath ? [options.tempPath] : [])],
+            tempPath: sandboxTempPath,
+            cachePaths: [...sandboxCachePaths, ...(options.tempPath ? [sandboxPath(options.tempPath)] : [])],
             allowNetwork: options.allowNetwork === true,
           })
         : undefined;

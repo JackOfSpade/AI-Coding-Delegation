@@ -15,11 +15,15 @@ export function resolveClientPaths({ home, env = process.env, platform = process
     claudeSettings: join(claudeDir, 'settings.json'),
     claudeMemory: join(claudeDir, 'CLAUDE.md'),
     claudeSkill: join(claudeDir, 'skills', 'offload', 'SKILL.md'),
+    // Keep installer recovery material outside the live skill tree.  Clients
+    // may discover every file below `skills`, including old adjacent backups.
+    claudeSkillBackupDir: join(claudeDir, 'offload-backups'),
     claudeLegacyCommand: join(claudeDir, 'commands', 'offload.md'),
     codexDir,
     codexConfig: join(codexDir, 'config.toml'),
     codexMemory: join(codexDir, 'AGENTS.md'),
     codexSkill: join(codexDir, 'skills', 'offload', 'SKILL.md'),
+    codexSkillBackupDir: join(codexDir, 'offload-backups'),
     cursorConfig: join(userHome, '.cursor', 'mcp.json'),
     cursorRule: join(userHome, '.cursor', 'rules', 'offload.md'),
   };

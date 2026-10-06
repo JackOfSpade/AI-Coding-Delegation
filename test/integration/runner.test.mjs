@@ -2,11 +2,31 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { runCommand, scrubEnv, macosProfile, staticWritableRoot, sandboxAvailable, terminateWindowsTree } from '../../src/sandbox.mjs';
-import { mkdtemp, access, mkdir, symlink, writeFile } from 'node:fs/promises';
+import {
+  runCommand,
+  scrubEnv,
+  macosProfile,
+  staticWritableRoot,
+  sandboxAvailable,
+  sandboxStatus,
+  sandboxCanonicalPath,
+  caseInsensitiveGlob,
+  terminateWindowsTree,
+} from '../../src/sandbox.mjs';
+import { globToRegExp } from '../../src/glob.mjs';
+import { mkdtemp, access, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
+
+// Keep capability-gated TAP output stable: strict CI approves this exact
+// rationale for the small set of live Seatbelt integration probes below.
+const MACOS_SANDBOX_SKIP_REASON = 'requires an available macOS sandbox';
+const HOMEBREW_NODE = process.platform === 'darwin' && process.execPath.startsWith('/opt/homebrew/');
+// Commands are deliberately executed through a shell.  JSON string literals
+// are not shell literals: a template literal in the embedded Node program
+// would otherwise let `/bin/sh` expand `${...}` before Node sees it.
+const shellQuote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
 test('runner scrubs secrets and captures timeout', async () => {
   const scrubbed = scrubEnv({
     API_KEY: 'no',
@@ -52,6 +72,46 @@ test('runner scrubs secrets and captures timeout', async () => {
   assert.equal(result.timedOut, true);
   assert.match(result.stdout, /ok/);
 });
+test('sandbox probe distinguishes a host policy denial from missing binary or a rejected profile', () => {
+  const denied = sandboxStatus('darwin', '(version 1)', {
+    spawnProcess(command, args, options) {
+      assert.equal(command, '/usr/bin/sandbox-exec');
+      assert.deepEqual(args, ['-p', '(version 1)', '/usr/bin/true']);
+      assert.equal(options.timeout, 2_000);
+      return { status: 71, stderr: 'sandbox-exec: sandbox_apply: Operation not permitted\n' };
+    },
+  });
+  assert.deepEqual(denied, {
+    available: false,
+    reason: 'sandbox-apply-not-permitted',
+    probe: '/usr/bin/sandbox-exec -p <generated-offload-profile> /usr/bin/true',
+    exitCode: 71,
+    error: 'sandbox-exec: sandbox_apply: Operation not permitted',
+  });
+  const missing = sandboxStatus('darwin', '(version 1)', {
+    spawnProcess: () => ({ error: { code: 'ENOENT', message: 'spawnSync ENOENT' } }),
+  });
+  assert.equal(missing.reason, 'sandbox-exec-missing');
+  const rejected = sandboxStatus('darwin', '(bad profile)', { spawnProcess: () => ({ status: 65, stderr: 'syntax error' }) });
+  assert.equal(rejected.reason, 'sandbox-profile-rejected');
+  const signaled = sandboxStatus('darwin', '(version 1)', { spawnProcess: () => ({ signal: 'SIGABRT' }) });
+  assert.deepEqual(signaled, {
+    available: false,
+    reason: 'sandbox-exec-signaled',
+    probe: '/usr/bin/sandbox-exec -p <generated-offload-profile> /usr/bin/true',
+    signal: 'SIGABRT',
+    error: 'sandbox-exec did not apply the profile',
+  });
+  const noisy = sandboxStatus('darwin', '(version 1)', {
+    spawnProcess: () => ({
+      status: 71,
+      stderr: '\x1b]8;;https://example.invalid\x07sandbox_apply:\x1b]8;;\x07 Operation not permitted\x85\u202e',
+    }),
+  });
+  assert.equal(noisy.reason, 'sandbox-apply-not-permitted');
+  assert.equal(noisy.error, 'sandbox_apply: Operation not permitted');
+  assert.equal(sandboxStatus('linux').reason, 'platform-not-darwin');
+});
 test('runner honors pre-abort and compiles globs to static sandbox roots', async () => {
   const controller = new AbortController();
   controller.abort();
@@ -59,11 +119,27 @@ test('runner honors pre-abort and compiles globs to static sandbox roots', async
   assert.equal(result.cancelled, true);
   if (process.platform === 'win32') return;
   assert.equal(staticWritableRoot('/repo/src/**', '/repo'), '/repo/src');
+  for (const [value, cwd, sandboxCwd, expected] of [
+    ['/var/private-worktree', '/var/private-worktree', '/private/var/private-worktree', '/private/var/private-worktree'],
+    ['/var/private-worktree/src/**', '/var/private-worktree', '/private/var/private-worktree', '/private/var/private-worktree/src/**'],
+    ['/outside/**', '/var/private-worktree', '/private/var/private-worktree', '/outside/**'],
+    ['src/**', '/var/private-worktree', '/private/var/private-worktree', 'src/**'],
+  ])
+    assert.equal(sandboxCanonicalPath(value, cwd, sandboxCwd), expected);
   const profile = macosProfile({ repoPath: '/repo', gitDir: '/actual/git', writablePaths: ['/repo/**'], denyRead: ['.env*'] });
   assert.doesNotMatch(profile, /\*\*/);
   assert.match(profile, /deny file-write\* \(subpath "\/actual\/git"\)/);
-  assert.match(profile, /\^\(\?i:\/repo\//);
-  assert.doesNotMatch(profile, /\(\?i\)\^/, 'Seatbelt rejects a bare inline case-insensitive option before an anchor');
+  assert.match(profile, /deny file-write\* \(literal "\/actual\/git"\)/);
+  assert.match(profile, /allow file-read-data \(literal "\/"\)/);
+  assert.doesNotMatch(profile, /allow file-read-data \(subpath "\/"\)/);
+  assert.match(profile, /allow file-read-data \(literal "\/private\/var\/select\/sh"\)/);
+  assert.match(profile, /allow file-read-metadata \(literal "\/private\/var\/select\/sh"\)/);
+  assert.doesNotMatch(profile, /subpath "\/private\/var\/select"/);
+  assert.match(profile, /allow file-read-metadata \(literal "\/opt"\)/);
+  assert.doesNotMatch(profile, /allow file-read(?:-data|\*) \(subpath "\/opt"\)/);
+  assert.ok(profile.includes('^[/][rR][eE][pP][oO][/]\[.\][eE][nN][vV]'));
+  assert.doesNotMatch(profile, /\(\?i/, 'Seatbelt does not enforce inline case-insensitive regex options');
+  assert.ok(profile.includes('(allow file-write-data (literal "/dev/null"))'));
   for (const path of [
     '/usr/local/etc',
     '/opt/homebrew/etc',
@@ -73,47 +149,104 @@ test('runner honors pre-abort and compiles globs to static sandbox roots', async
     '/Library/Application Support/com.apple.TCC',
     '/Library/Security',
   ])
-    assert.ok(profile.includes(`(deny file-read* (subpath "${path}"))`));
+    for (const selector of ['literal', 'subpath']) assert.ok(profile.includes(`(deny file-read* (${selector} "${path}"))`));
   const relativeGit = macosProfile({ repoPath: '/repo', gitDir: '.git', writablePaths: ['src/**'], denyRead: ['.env*'] });
   assert.match(relativeGit, /subpath "\/repo\/\.git"/);
-  assert.match(relativeGit, /\/repo\/src\\\\\/\.\*/);
-  const broad = macosProfile({ repoPath: '/repo', writablePaths: ['**'] });
-  assert.match(broad, /deny file-write\* \(regex #"\^\(\?i:\/repo\//, 'broad writable scopes still deny protected paths');
+  assert.match(relativeGit, /literal "\/repo\/\.git"/);
+  assert.ok(relativeGit.includes('^[/]repo[/]src[/].*$'));
+  const readOnlyParent = macosProfile({ repoPath: '/repo', readablePaths: ['/private/var/offload-worktree-parent'] });
+  assert.match(readOnlyParent, /allow file-read\* \(subpath "\/private\/var\/offload-worktree-parent"\)/);
+  assert.doesNotMatch(readOnlyParent, /allow file-write\* \(subpath "\/private\/var\/offload-worktree-parent"\)/);
+  // Explicit Git/config denies remain after any broad external read grant.
+  const readOnlyGit = macosProfile({ repoPath: '/repo', readablePaths: ['/repo/.git'] });
   assert.ok(
-    broad.indexOf('(allow file-write* (regex #"^/repo/.*$"))') < broad.lastIndexOf('(deny file-write*'),
+    readOnlyGit.lastIndexOf('(deny file-read*') > readOnlyGit.indexOf('(allow file-read* (subpath "/repo/.git"))'),
+    'Git deny rules must follow readable-path allowances',
+  );
+  const negatedScope = macosProfile({ repoPath: '/repo', writablePaths: ['src/[!a]*'] });
+  assert.ok(negatedScope.includes('src[/][^/a][^/]*'));
+  const broad = macosProfile({ repoPath: '/repo', writablePaths: ['**'] });
+  assert.match(
+    broad,
+    /deny file-write\* \(regex #"\^\[\/\]\[rR\]\[eE\]\[pP\]\[oO\]\[\/\]/,
+    'broad writable scopes still deny protected paths',
+  );
+  assert.ok(
+    broad.indexOf('(allow file-write* (regex #"^[/]repo[/].*$"))') < broad.lastIndexOf('(deny file-write*'),
     'secret/config write denies follow the broad workspace allow',
   );
-  assert.match(
-    broad,
-    /deny file-read\* \(regex #"\^\(\?i:\/repo\/\\\\\.env/,
-    'default secret reads are denied even with no caller denyRead',
+  assert.ok(broad.includes('^[/][rR][eE][pP][oO][/]\[.\][eE][nN][vV]'), 'default secret reads are denied even with no caller denyRead');
+  assert.ok(broad.includes('[iI][dD]_[eE][dD]25519'), 'default private-key reads are denied even with no caller denyRead');
+  assert.ok(
+    broad
+      .split('\n')
+      .filter((line) => line.includes('deny file-') && line.includes('(regex #"'))
+      .every((line) => !line.includes('\\')),
+    'Seatbelt deny regexes use character classes or conservative wildcards, never raw escapes',
   );
-  assert.match(
-    broad,
-    /deny file-read\* \(regex #"\^\(\?i:\/repo\/(?:\(\?:\.\*\\\\\/\)\?)?id_ed25519/,
-    'default private-key reads are denied even with no caller denyRead',
-  );
+  assert.doesNotMatch(broad, /\(\?[:=]/, 'Seatbelt path filters never rely on unsupported non-capturing groups or lookarounds');
+  const unicodeRoot = macosProfile({ repoPath: '/tmp/Grüße#~', writablePaths: ['src/**'] });
+  assert.ok(unicodeRoot.includes('^[/]tmp[/]Grüße#~[/]src[/].*$'));
   assert.throws(() => macosProfile({ repoPath: '/repo\nforged', writablePaths: [] }), /control characters/);
 });
+test('case-insensitive deny glob compiler never narrows bracket-class matches', () => {
+  const printable = Array.from({ length: 95 }, (_, index) => String.fromCharCode(index + 32));
+  for (const pattern of ['secret/[A-z]', 'secret/[!a-z]', 'secret/[z-a]', 'secret/[a]', 'secret/foo[bar', 'secret/é']) {
+    const intended = globToRegExp(pattern, { caseInsensitive: true });
+    const generated = globToRegExp(caseInsensitiveGlob(pattern));
+    for (const character of printable) {
+      const candidate = `secret/${character}`;
+      if (intended.test(candidate))
+        assert.equal(generated.test(candidate), true, `${pattern} must still deny ${JSON.stringify(candidate)}`);
+    }
+    for (const candidate of [
+      'secret/[z-a]',
+      'secret/[Z-A]',
+      'secret/a',
+      'secret/A',
+      'secret/foo[bar',
+      'secret/foo[BAR',
+      'secret/é',
+      'secret/É',
+    ])
+      if (intended.test(candidate))
+        assert.equal(generated.test(candidate), true, `${pattern} must still deny ${JSON.stringify(candidate)}`);
+  }
+});
 test(
-  'macOS Seatbelt accepts scoped case-insensitive deny regex syntax before profile application',
-  { skip: process.platform !== 'darwin' && 'requires macOS sandbox-exec' },
-  (t) => {
-    const profile = macosProfile({ repoPath: '/private/tmp/offload-seatbelt-regression', writablePaths: ['**'] });
+  'macOS Seatbelt applies the complete generated profile when the host permits a basic profile',
+  { skip: process.platform !== 'darwin' && MACOS_SANDBOX_SKIP_REASON },
+  async (t) => {
+    const dir = await mkdtemp(`${tmpdir()}/offload-seatbelt-regression-`);
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const root = await realpath(dir);
+    const profile = macosProfile({ repoPath: root, tempPath: root, writablePaths: ['**'] });
+    const permissive = spawnSync('/usr/bin/sandbox-exec', ['-p', '(version 1)\n(allow default)', '/usr/bin/true'], {
+      encoding: 'utf8',
+      timeout: 2_000,
+    });
+    if (permissive.error?.code === 'ENOENT') return t.skip(MACOS_SANDBOX_SKIP_REASON);
+    if (permissive.status !== 0) {
+      if (permissive.status === 71 && /sandbox_apply:\s*operation not permitted/i.test(permissive.stderr || ''))
+        return t.skip(MACOS_SANDBOX_SKIP_REASON);
+      assert.fail(permissive.stderr || permissive.signal || `permissive sandbox profile exited ${permissive.status}`);
+    }
     const result = spawnSync('/usr/bin/sandbox-exec', ['-p', profile, '/usr/bin/true'], { encoding: 'utf8', timeout: 2_000 });
-    if (result.error?.code === 'ENOENT') return t.skip('sandbox-exec is not installed');
-
-    // A macOS container may reject applying an otherwise valid profile. That
-    // failure is separate from the EX_DATAERR (65) emitted for profile syntax,
-    // so keep this a parser regression test rather than an entitlement probe.
-    assert.notEqual(result.status, 65, result.stderr || 'sandbox-exec rejected the generated profile syntax');
-    assert.doesNotMatch(result.stderr || '', /unexpected \^ operator|syntax error|parse error/i);
+    assert.equal(result.signal, null, result.stderr || 'sandbox-exec aborted under the complete generated profile');
+    assert.equal(result.status, 0, result.stderr || 'sandbox-exec rejected the complete generated profile');
   },
 );
 test('macOS profiles deny exact nested sensitive pointer paths for reads and writes', () => {
   const profile = macosProfile({ repoPath: '/repo', writablePaths: ['**'] });
-  for (const suffix of ['\\\\.git', '\\\\.aws', '\\\\.ssh', '\\\\.azure', '\\\\.kube', '\\\\.config\\\\/gcloud']) {
-    const nested = `(?:.*\\\\/)?${suffix})$`;
+  for (const suffix of [
+    '[.][gG][iI][tT]',
+    '[.][aA][wW][sS]',
+    '[.][sS][sS][hH]',
+    '[.][aA][zZ][uU][rR][eE]',
+    '[.][kK][uU][bB][eE]',
+    '[.][cC][oO][nN][fF][iI][gG][/][gG][cC][lL][oO][uU][dD]',
+  ]) {
+    const nested = `(.*[/])?${suffix}$`;
     for (const kind of ['read', 'write'])
       assert.ok(
         profile.split('\n').some((line) => line.includes(`deny file-${kind}*`) && line.includes(nested)),
@@ -126,21 +259,48 @@ test('runCommand profiles preserve default read denials and add custom denials o
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
   let profile;
+  let environment;
   const result = await runCommand('true', {
     platform: 'darwin',
     sandboxProbe: () => true,
+    env: { PATH: '/bin', OPENSSL_CONF: '/caller-controlled/openssl.cnf' },
     denyRead: ['custom.secret', '.env*'],
-    spawnProcess(command, args) {
+    spawnProcess(command, args, options) {
       assert.equal(command, '/usr/bin/sandbox-exec');
       profile = args[1];
+      environment = options.env;
       queueMicrotask(() => child.emit('close', 0, null));
       return child;
     },
   });
   assert.equal(result.sandbox, 'macos');
-  assert.match(profile, /deny file-read\* \(regex #"\^\(\?i:.*\\\\\.env/);
-  assert.match(profile, /deny file-read\* \(regex #"\^\(\?i:.*id_ed25519/);
-  assert.equal(profile.split('custom\\\\.secret').length - 1, 1, 'custom denies are retained without duplicate profile rules');
+  assert.equal(environment.OPENSSL_CONF, '/dev/null');
+  assert.doesNotMatch(profile, /\(\?i/, 'inline case options are never emitted');
+  assert.match(profile, /deny file-read\* \(regex #"\^.*\[\.\]\[eE\]\[nN\]\[vV\]/);
+  assert.match(profile, /deny file-read\* \(regex #"\^.*\[iI\]\[dD\]_\[eE\]\[dD\]25519/);
+  assert.equal(
+    profile.split('[cC][uU][sS][tT][oO][mM][.][sS][eE][cC][rR][eE][tT]').length - 1,
+    1,
+    'custom denies are retained without duplicate profile rules',
+  );
+});
+test('policy-only command environment never adds an OpenSSL configuration', async () => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  let environment;
+  const result = await runCommand('true', {
+    platform: 'linux',
+    sandbox: false,
+    env: { PATH: '/bin', OPENSSL_CONF: '/caller-controlled/openssl.cnf' },
+    spawnProcess(_command, _args, options) {
+      environment = options.env;
+      queueMicrotask(() => child.emit('close', 0, null));
+      return child;
+    },
+  });
+  assert.equal(result.sandbox, 'policy-only');
+  assert.equal(environment.OPENSSL_CONF, undefined);
 });
 test(
   'macOS profile protects linked-worktree Git metadata from broad temp and writable allowances',
@@ -151,10 +311,12 @@ test(
     const gitDir = `${commonGit}/worktrees/worker`;
     const profile = macosProfile({ repoPath: workspace, gitDir, tempPath: '/private/tmp', writablePaths: ['**'], denyRead: ['.git/**'] });
     for (const path of [`${workspace}/.git`, gitDir, commonGit]) {
-      assert.ok(profile.includes(`(deny file-read* (subpath "${path}"))`), `${path} must not be readable`);
-      assert.ok(profile.includes(`(deny file-write* (subpath "${path}"))`), `${path} must not be writable`);
+      for (const selector of ['literal', 'subpath']) {
+        assert.ok(profile.includes(`(deny file-read* (${selector} "${path}"))`), `${path} must not be readable`);
+        assert.ok(profile.includes(`(deny file-write* (${selector} "${path}"))`), `${path} must not be writable`);
+      }
     }
-    const broadWrite = profile.indexOf('(allow file-write* (regex #"^/private/tmp/offload-worktree-abc/workspace/.*$"))');
+    const broadWrite = profile.indexOf('(allow file-write* (regex #"^[/]private[/]tmp[/]offload-worktree-abc[/]workspace[/].*$"))');
     assert.ok(broadWrite >= 0);
     assert.ok(profile.indexOf(`(deny file-write* (subpath "${workspace}/.git"))`) > broadWrite);
   },
@@ -266,8 +428,9 @@ test('required sandbox cannot be bypassed with sandbox:false or a policy-only pl
 test(
   'timeout terminates a background descendant process group',
   { skip: process.platform === 'win32' && 'POSIX process-group semantics are tested separately from Windows taskkill tree termination' },
-  async () => {
+  async (t) => {
     const dir = await mkdtemp(`${tmpdir()}/offload-child-`);
+    t.after(() => rm(dir, { recursive: true, force: true }));
     const marker = join(dir, 'marker');
     const result = await runCommand(`(sleep 0.2; touch ${JSON.stringify(marker)}) & wait`, { sandbox: false, timeoutMs: 30 });
     assert.equal(result.timedOut, true);
@@ -275,58 +438,161 @@ test(
     await assert.rejects(access(marker));
   },
 );
-test('macOS sandbox blocks out-of-scope and git writes', { skip: !sandboxAvailable() }, async () => {
+test(
+  'macOS sandbox permits shell startup and stdout/stderr null redirection with data-only literals',
+  { skip: !sandboxAvailable() && MACOS_SANDBOX_SKIP_REASON },
+  async (t) => {
+    const dir = await mkdtemp(`${tmpdir()}/offload-macos-null-`);
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const result = await runCommand('printf stdout >/dev/null; printf stderr 2>/dev/null', {
+      cwd: dir,
+      writablePaths: [join(dir, '**')],
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.doesNotMatch(result.stderr, /Error opening \/private\/var\/select\/sh: Operation not permitted/);
+  },
+);
+test(
+  'macOS Homebrew Node runs a dependency-free npm test inside the sandbox',
+  {
+    skip: !HOMEBREW_NODE ? 'requires a Homebrew Node on macOS' : !sandboxAvailable() && MACOS_SANDBOX_SKIP_REASON,
+  },
+  async (t) => {
+    const dir = await mkdtemp(`${tmpdir()}/offload-macos-homebrew-node-`);
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    await mkdir(join(dir, 'test'));
+    await writeFile(
+      join(dir, 'package.json'),
+      JSON.stringify({ private: true, type: 'module', scripts: { test: "node --test 'test/*.test.mjs'" } }),
+    );
+    await writeFile(join(dir, 'test', 'smoke.test.mjs'), "import test from 'node:test';\ntest('smoke', () => {});\n");
+    const result = await runCommand('npm test', { cwd: dir, writablePaths: [join(dir, '**')], timeoutMs: 30_000 });
+    assert.equal(result.sandbox, 'macos');
+    assert.equal(result.code, 0, result.stderr);
+  },
+);
+test(
+  'macOS sandbox gives Node a physical disposable temp root and read-only private-worktree parent traversal',
+  { skip: !sandboxAvailable() && MACOS_SANDBOX_SKIP_REASON },
+  async (t) => {
+    const parent = await mkdtemp(`${tmpdir()}/offload-macos-worktree-parent-`);
+    const workspace = join(parent, 'workspace');
+    t.after(() => rm(parent, { recursive: true, force: true }));
+    await mkdir(workspace);
+    const physicalParent = await realpath(parent);
+    const program = [
+      "import { mkdtemp, rm, writeFile } from 'node:fs/promises';",
+      "import { tmpdir } from 'node:os';",
+      "import { join } from 'node:path';",
+      "const transient = await mkdtemp(join(tmpdir(), 'node-child-')); await rm(transient, { recursive: true, force: true });",
+      `process.chdir(${JSON.stringify(physicalParent)});`,
+      "try { await writeFile('parent-write-must-fail', 'no'); console.log('parent-write-unexpected'); } catch { console.log('parent-readonly'); }",
+      'console.log(`tmp:${tmpdir()}`); console.log(`cwd:${process.cwd()}`);',
+    ].join(' ');
+    const result = await runCommand(`node --input-type=module -e ${shellQuote(program)}`, {
+      cwd: workspace,
+      readablePaths: [parent],
+      writablePaths: [join(workspace, '**')],
+      timeoutMs: 30_000,
+    });
+    assert.equal(result.sandbox, 'macos');
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /parent-readonly/);
+    assert.doesNotMatch(result.stdout, /parent-write-unexpected/);
+    assert.equal(existsSync(join(parent, 'parent-write-must-fail')), false);
+    assert.match(result.stdout, /tmp:\/private\/var\//, 'TMPDIR is the physical sandbox directory');
+    assert.ok(result.stdout.includes(`cwd:${physicalParent}`), result.stdout);
+  },
+);
+test('macOS sandbox blocks out-of-scope and git writes', { skip: !sandboxAvailable() }, async (t) => {
   const dir = await mkdtemp(`${tmpdir()}/offload-macos-`);
+  t.after(() => rm(dir, { recursive: true, force: true }));
   await (await import('node:fs/promises')).mkdir(join(dir, 'src'), { recursive: true });
   await (await import('node:fs/promises')).mkdir(join(dir, '.git'), { recursive: true });
   const outside = await runCommand('touch escaped', { cwd: dir, writablePaths: [join(dir, 'src/**')] });
+  const gitNode = await runCommand('rmdir .git', { cwd: dir, writablePaths: [join(dir, '**')] });
   const gitWrite = await runCommand('touch .git/blocked', { cwd: dir, writablePaths: [join(dir, '**')] });
+  const allowed = await runCommand('printf changed > src/ordinary.txt', { cwd: dir, writablePaths: [join(dir, 'src/**')] });
   assert.notEqual(outside.code, 0);
+  assert.notEqual(gitNode.code, 0);
   assert.notEqual(gitWrite.code, 0);
+  assert.equal(allowed.code, 0, allowed.stderr);
 });
-test('macOS sandbox broad writable scope cannot overwrite protected secrets or future policy', { skip: !sandboxAvailable() }, async () => {
+test('macOS sandbox broad writable scope cannot overwrite protected secrets or future policy', { skip: !sandboxAvailable() }, async (t) => {
   const dir = await mkdtemp(`${tmpdir()}/offload-macos-protected-write-`);
+  t.after(() => rm(dir, { recursive: true, force: true }));
   await writeFile(join(dir, '.env'), 'original-env');
   await writeFile(join(dir, '.offload.json'), '{"disabled":false}');
   await writeFile(join(dir, 'id_ed25519'), 'original-key');
   await writeFile(join(dir, 'ordinary.txt'), 'before');
-  const protectedWrite = await runCommand('printf changed > .env; printf changed > .offload.json; printf changed > id_ed25519', {
-    cwd: dir,
-    writablePaths: [join(dir, '**')],
-  });
+  await mkdir(join(dir, 'nested'));
+  await writeFile(join(dir, 'nested', '.ENV'), 'original-nested-upper-env');
+  await writeFile(join(dir, 'nested', 'ID_ED25519'), 'original-nested-upper-key');
+  const protectedWrite = await runCommand(
+    'printf changed > .env; printf changed > nested/.ENV; printf changed > .offload.json; printf changed > id_ed25519; printf changed > nested/ID_ED25519',
+    {
+      cwd: dir,
+      writablePaths: [join(dir, '**')],
+    },
+  );
   const ordinaryWrite = await runCommand('printf changed > ordinary.txt', { cwd: dir, writablePaths: [join(dir, '**')] });
   assert.notEqual(protectedWrite.code, 0);
   assert.equal(await (await import('node:fs/promises')).readFile(join(dir, '.env'), 'utf8'), 'original-env');
+  assert.equal(await (await import('node:fs/promises')).readFile(join(dir, 'nested', '.ENV'), 'utf8'), 'original-nested-upper-env');
   assert.equal(await (await import('node:fs/promises')).readFile(join(dir, '.offload.json'), 'utf8'), '{"disabled":false}');
   assert.equal(await (await import('node:fs/promises')).readFile(join(dir, 'id_ed25519'), 'utf8'), 'original-key');
+  assert.equal(await (await import('node:fs/promises')).readFile(join(dir, 'nested', 'ID_ED25519'), 'utf8'), 'original-nested-upper-key');
   assert.equal(ordinaryWrite.code, 0);
   assert.equal(await (await import('node:fs/promises')).readFile(join(dir, 'ordinary.txt'), 'utf8'), 'changed');
 });
 test(
   'macOS sandbox cannot rewrite a linked-worktree .git pointer through broad writable scope',
   { skip: !sandboxAvailable() },
-  async () => {
+  async (t) => {
     const dir = await mkdtemp(`${tmpdir()}/offload-macos-linked-`);
     const common = await mkdtemp(`${tmpdir()}/offload-macos-primary-`);
+    t.after(() => Promise.all([rm(dir, { recursive: true, force: true }), rm(common, { recursive: true, force: true })]));
     const gitDir = join(common, '.git', 'worktrees', 'worker');
     await mkdir(gitDir, { recursive: true });
-    await writeFile(join(dir, '.git'), `gitdir: ${gitDir}\n`);
-    const result = await runCommand('printf forged > .git', { cwd: dir, gitDir, writablePaths: [join(dir, '**')] });
-    assert.notEqual(result.code, 0);
+    const canonicalGitDir = await realpath(gitDir);
+    const canonicalCommon = await realpath(common);
+    await writeFile(join(dir, '.git'), `gitdir: ${canonicalGitDir}\n`);
+    const options = {
+      cwd: dir,
+      gitDir: canonicalGitDir,
+      writablePaths: [join(dir, '**')],
+      cachePaths: [canonicalCommon],
+    };
+    const pointerWrite = await runCommand('printf forged > .git', options);
+    const exactGitNode = await runCommand(`rmdir ${JSON.stringify(canonicalGitDir)}`, options);
+    const allowedCacheWrite = await runCommand(`printf okay > ${JSON.stringify(join(canonicalCommon, 'ordinary.txt'))}`, options);
+    assert.notEqual(pointerWrite.code, 0);
+    assert.notEqual(exactGitNode.code, 0, exactGitNode.stderr);
+    assert.equal(allowedCacheWrite.code, 0, allowedCacheWrite.stderr);
+    await access(canonicalGitDir);
   },
 );
 test(
   'macOS sandbox denies configured secret reads, symlink escapes, and exposes a disposable HOME',
   { skip: !sandboxAvailable() },
-  async () => {
+  async (t) => {
     const dir = await mkdtemp(`${tmpdir()}/offload-macos-hardening-`);
     const outside = await mkdtemp(`${tmpdir()}/offload-macos-outside-`);
+    t.after(() => Promise.all([rm(dir, { recursive: true, force: true }), rm(outside, { recursive: true, force: true })]));
     await mkdir(join(dir, 'src'), { recursive: true });
     await writeFile(join(dir, '.env'), 'TOP_SECRET');
+    await writeFile(join(dir, '.ENV'), 'TOP_UPPER_SECRET');
     await writeFile(join(dir, 'custom.secret'), 'CUSTOM_SECRET');
+    await writeFile(join(dir, 'CUSTOM.SECRET'), 'CUSTOM_UPPER_SECRET');
     await symlink(outside, join(dir, 'src', 'escape'));
     const deniedEnv = await runCommand('cat .env', { cwd: dir, writablePaths: [join(dir, 'src/**')] });
     const deniedCustom = await runCommand('cat custom.secret', {
+      cwd: dir,
+      writablePaths: [join(dir, 'src/**')],
+      denyRead: ['custom.secret'],
+    });
+    const deniedUpperEnv = await runCommand('cat .ENV', { cwd: dir, writablePaths: [join(dir, 'src/**')] });
+    const deniedUpperCustom = await runCommand('cat CUSTOM.SECRET', {
       cwd: dir,
       writablePaths: [join(dir, 'src/**')],
       denyRead: ['custom.secret'],
@@ -335,16 +601,47 @@ test(
     const home = await runCommand('printf %s "$HOME"', { cwd: dir, writablePaths: [join(dir, 'src/**')] });
     assert.notEqual(deniedEnv.code, 0);
     assert.notEqual(deniedCustom.code, 0);
+    assert.notEqual(deniedUpperEnv.code, 0);
+    assert.notEqual(deniedUpperCustom.code, 0);
     assert.notEqual(deniedEscape.code, 0);
     assert.notEqual(home.stdout, process.env.HOME);
     assert.match(home.stdout, /offload-sandbox-/);
   },
 );
-test('macOS sandbox denies readable host configuration subtrees after toolchain allowances', { skip: !sandboxAvailable() }, async (t) => {
-  const protectedPath = ['/usr/local/etc', '/opt/homebrew/etc', '/Library/Preferences', '/Library/Keychains'].find(existsSync);
-  if (!protectedPath) return t.skip('no protected host configuration subtree exists on this host');
-  const dir = await mkdtemp(`${tmpdir()}/offload-macos-host-config-`);
-  await mkdir(join(dir, 'src'), { recursive: true });
-  const result = await runCommand(`ls ${JSON.stringify(protectedPath)}`, { cwd: dir, writablePaths: [join(dir, 'src/**')] });
-  assert.notEqual(result.code, 0);
-});
+test(
+  'macOS sandbox denies protected files through case-folded and Unicode-normalized root aliases',
+  { skip: !sandboxAvailable() && MACOS_SANDBOX_SKIP_REASON },
+  async (t) => {
+    const dir = await mkdtemp(`${tmpdir()}/offload-Grüße-`);
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    await writeFile(join(dir, '.env'), 'TOP_SECRET');
+    const name = basename(dir);
+    const aliases = [name.replace('Grüße', 'GRÜSSE'), name.normalize('NFD')]
+      .filter((alias) => alias !== name)
+      .map((alias) => join(dirname(dir), alias, '.env'));
+    for (const alias of aliases) {
+      try {
+        assert.equal(await readFile(alias, 'utf8'), 'TOP_SECRET');
+      } catch {
+        t.skip(`host filesystem does not resolve ${JSON.stringify(alias)} as an alias`);
+        return;
+      }
+      const denied = await runCommand(`cat ${JSON.stringify(alias)}`, { cwd: dir, writablePaths: [join(dir, 'src/**')] });
+      assert.notEqual(denied.code, 0, denied.stderr);
+      assert.doesNotMatch(denied.stdout, /TOP_SECRET/);
+    }
+  },
+);
+test(
+  'macOS sandbox denies exact host configuration roots after toolchain allowances',
+  { skip: !sandboxAvailable() && MACOS_SANDBOX_SKIP_REASON },
+  async (t) => {
+    const protectedPath = ['/usr/local/etc', '/opt/homebrew/etc', '/Library/Preferences', '/Library/Keychains'].find(existsSync);
+    if (!protectedPath) return t.skip('no protected host configuration subtree exists on this host');
+    const dir = await mkdtemp(`${tmpdir()}/offload-macos-host-config-`);
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    await mkdir(join(dir, 'src'), { recursive: true });
+    const result = await runCommand(`ls ${JSON.stringify(protectedPath)}`, { cwd: dir, writablePaths: [join(dir, 'src/**')] });
+    assert.notEqual(result.code, 0);
+  },
+);

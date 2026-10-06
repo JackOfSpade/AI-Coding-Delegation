@@ -22,6 +22,8 @@ test('structured token accounting remains numeric while credential tokens redact
     cacheHitTokens: 8,
     cache_miss_tokens: 4,
     totalTokenCount: 16,
+    conservativeInputTokens: 100,
+    minOutputTokens: 16,
     token: 'secret',
     accessToken: 'a',
     auth_token: 'b',
@@ -33,11 +35,32 @@ test('structured token accounting remains numeric while credential tokens redact
     cacheHitTokens: 8,
     cache_miss_tokens: 4,
     totalTokenCount: 16,
+    conservativeInputTokens: 100,
+    minOutputTokens: 16,
     token: '[REDACTED]',
     accessToken: '[REDACTED]',
     auth_token: '[REDACTED]',
     refreshToken: '[REDACTED]',
   });
+});
+
+test('token-shaped accounting fields redact non-numeric values', () => {
+  assert.deepEqual(
+    redact({
+      inputTokens: 'credential-looking-value',
+      conservativeInputTokens: 'must-not-survive',
+      minOutputTokens: 'also-not-a-count',
+      outputTokens: -1,
+      totalTokens: Number.POSITIVE_INFINITY,
+    }),
+    {
+      inputTokens: '[REDACTED]',
+      conservativeInputTokens: '[REDACTED]',
+      minOutputTokens: '[REDACTED]',
+      outputTokens: '[REDACTED]',
+      totalTokens: '[REDACTED]',
+    },
+  );
 });
 test('redaction removes complete authentication header values and error codes', () => {
   const value = redactText('Authorization: Basic c2VjcmV0 Cookie: session=also-secret\nSet-Cookie: session=third-secret');

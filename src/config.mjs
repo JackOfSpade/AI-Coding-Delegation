@@ -9,6 +9,7 @@ export const DEFAULT_CONFIG = Object.freeze({
       baseUrl: 'https://api.deepseek.com',
       keyRef: 'keychain:offload-deepseek',
       pricing: 'deepseek-2026-10-01',
+      attemptTimeoutMs: 300_000,
     },
   },
   profiles: {
@@ -149,13 +150,15 @@ export function validateConfig(config) {
       throw new ConfigError(`Provider ${name} requires type, baseUrl, and keyRef`);
     }
     assertSafeKeys(provider);
-    assertAllowedKeys(provider, ['type', 'baseUrl', 'keyRef', 'pricing', 'pricingFile'], `Provider ${name}`);
+    assertAllowedKeys(provider, ['type', 'baseUrl', 'keyRef', 'pricing', 'pricingFile', 'attemptTimeoutMs'], `Provider ${name}`);
     if (provider.type !== 'openai-chat' || !safeProviderUrl(provider.baseUrl) || !safeKeyRef(provider.keyRef))
       throw new ConfigError(`Provider ${name} has invalid connection settings`, 'E_CONFIG_PROVIDER');
     if (provider.pricing !== undefined && !boundedText(provider.pricing, MAX_NAME))
       throw new ConfigError(`Provider ${name}.pricing must be a bounded string`, 'E_CONFIG_PROVIDER');
     if (provider.pricingFile !== undefined && !boundedText(provider.pricingFile, MAX_PATH_TEXT))
       throw new ConfigError(`Provider ${name}.pricingFile must be a bounded path string`, 'E_CONFIG_PROVIDER');
+    if (provider.attemptTimeoutMs !== undefined)
+      numeric(provider.attemptTimeoutMs, `providers.${name}.attemptTimeoutMs`, 30_000, 600_000, true);
   }
   for (const [name, profile] of Object.entries(config.profiles)) {
     if (

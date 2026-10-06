@@ -7,7 +7,9 @@ import { tmpdir } from 'node:os';
 import { PassThrough, Writable } from 'node:stream';
 import { spawn } from 'node:child_process';
 import { createMcpServer, parseSkillFrontmatter, readSkillRegularUtf8 } from '../../src/mcp.mjs';
+import { runtimeIdentity } from '../../src/identity.mjs';
 const skillUri = 'skill://offload/offload/SKILL.md';
+const serverMeta = { _meta: { 'io.modelcontextprotocol/serverInfo': runtimeIdentity() } };
 const currentMeta = {
   _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28', 'io.modelcontextprotocol/clientCapabilities': {} },
 };
@@ -43,6 +45,10 @@ test('MCP lists exact tools, initializes, pings and dispatches', async () => {
   assert.match(wire, /offload_start/);
   assert.match(wire, /"id":1/);
   assert.match(wire, /"id":3/);
+  const initialized = values.find((value) => value.id === 1).result.serverInfo;
+  assert.deepEqual(initialized, runtimeIdentity());
+  assert.equal(initialized.schemaRevision, 1);
+  assert.deepEqual(initialized.capabilities, { reportMode: true, inputFiles: true });
   assert.ok(
     values.some((value) => value.id === null && value.result?.tools),
     'an explicit null id is a request, not a notification',
@@ -51,6 +57,10 @@ test('MCP lists exact tools, initializes, pings and dispatches', async () => {
     values.some((value) => value.id === null && value.error?.code === -32600),
     'an invalid request without an id must return a null-id error',
   );
+  const startTool = values.find((value) => value.id === 2).result.tools.find((tool) => tool.name === 'offload_start');
+  assert.match(startTool.inputSchema.properties.testCommand.description, /run exactly once/);
+  assert.match(startTool.inputSchema.properties.testCommand.description, /quoted globs/);
+  assert.match(startTool.inputSchema.properties.testCommand.description, /bare directories/);
   server.close();
 });
 test('MCP enforces advertised input schemas and maps only public operation options', async () => {
@@ -120,14 +130,27 @@ test('MCP enforces advertised input schemas and maps only public operation optio
   call(21, 'offload_start', { task: 'implement', ownedPaths: [] });
   call(22, 'offload_start', { task: 'implement', ownedPaths: ['src/**'], budget: { maxTurns: 1001 } });
   call(23, 'offload_repair', { jobId: 'j', defects: [] });
+  call(24, 'offload_start', { mode: 'report', task: 'analyze', inputFiles: ['/tmp/connector.json'] });
+  call(25, 'offload_start', { task: 'implement', ownedPaths: ['src/**'], inputFiles: ['/tmp/connector.json'] });
+  call(26, 'offload_start', { mode: 'report', task: 'analyze with explicit empty writable list', extraWritable: [] });
+  call(27, 'offload_start', { mode: 'report', task: 'analyze with write authority', extraWritable: ['tmp/**'] });
+  call(28, 'offload_start', {
+    mode: 'report',
+    task: 'review /tmp/customer-秘密-export.json',
+    inputFiles: ['/tmp/customer-秘密-export.json'],
+  });
   await new Promise((resolve) => setTimeout(resolve, 20));
   const responses = wire.trim().split('\n').map(JSON.parse);
-  for (const id of [1, 2, 3, 4, 5, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23])
+  for (const id of [1, 2, 3, 4, 5, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 25, 27, 28])
     assert.equal(responses.find((value) => value.id === id).result.isError, true);
   assert.equal(calls.revert.length, 2, 'invalid apply values must never reach a potentially applying reverter');
   assert.equal(calls.repair.length, 1, 'hidden launch:false must never reach core.repair');
   assert.deepEqual(calls.start[0].ownedPaths, ['src/**']);
   assert.equal(calls.start[0].unsafePolicyOnlyVerifier, true);
+  assert.equal(calls.start[1].mode, 'report');
+  assert.deepEqual(calls.start[1].inputFiles, ['/tmp/connector.json']);
+  assert.equal(calls.start[2].mode, 'report');
+  assert.deepEqual(calls.start[2].extraWritable, []);
   assert.equal(calls.wait[0][0], 'j');
   assert.equal(calls.wait[0][1].repoPath, '/repo');
   assert.equal(calls.wait[0][1].timeoutSec, 5);
@@ -237,6 +260,13 @@ test('MCP keeps current requests stateless and legacy initialize envelopes separ
     assert.equal(discovery.capabilities.extensions['io.modelcontextprotocol/skills'] instanceof Object, true);
     assert.deepEqual(discovery.capabilities.resources, {});
     assert.match(discovery.instructions, /Offload skill/);
+    assert.match(
+      discovery.instructions,
+      /conversational client may call offload_start only for an actual `\/offload <task>` slash command/,
+    );
+    assert.match(discovery.instructions, /Prose, mentions, quotes, or negations/);
+    assert.match(discovery.instructions, /DeepSeek, providers, or models never authorize it/);
+    assert.doesNotMatch(discovery.instructions, /Direct CLI\/MCP operators may explicitly call it/);
     assert.match(discovery.instructions, /skill:\/\/offload\/offload\/SKILL\.md/);
     assert.match(discovery.instructions, /repoPath/);
     assert.match(discovery.instructions, /native Claude subagents/);
@@ -269,6 +299,19 @@ test('MCP keeps current requests stateless and legacy initialize envelopes separ
       `${name} is a read-only operation`,
     );
   assert.match(list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.ownedPaths.description, /exclusively owns/);
+  const startDescription = list.tools.find((tool) => tool.name === 'offload_start').description;
+  assert.match(startDescription, /conversational client may use this tool only to fulfill an actual `\/offload <task>` slash command/);
+  assert.doesNotMatch(startDescription, /explicit direct CLI\/MCP operator request/);
+  assert.match(startDescription, /do not infer authorization from ordinary prose/);
+  assert.match(startDescription, /mentions, quotes, or negations of Offload, delegation, DeepSeek, providers, or models/);
+  assert.match(
+    list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.inputFiles.description,
+    /macOS also accepts \/private\/tmp/,
+  );
+  assert.match(
+    list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.inputFiles.description,
+    /canonical allowed roots before any job is created/,
+  );
   assert.match(list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.allowNetwork.description, /only/);
   assert.match(
     list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.profile.description,
@@ -387,15 +430,28 @@ test('MCP exposes the canonical static skill with exact resources and safe reque
   const expectedText = await readFile(new URL('../../plugins/offload/skills/offload/SKILL.md', import.meta.url), 'utf8');
   const expectedFrontmatter = jsonFrontmatter(expectedText);
   assert.match(expectedFrontmatter.description, /\/offload/);
-  assert.match(expectedFrontmatter.description, /DeepSeek-V4-Pro/);
+  assert.match(expectedFrontmatter.description, /explicitly enters \/offload as a slash command/);
   assert.equal(expectedFrontmatter['argument-hint'], '<task or verification request>');
   assert.equal(Object.hasOwn(expectedFrontmatter.metadata || {}, 'argument-hint'), false);
-  assert.match(expectedText, /Do \*\*not\*\* satisfy that request with Claude Code's native subagents/);
+  assert.match(expectedText, /Do \*\*not\*\* satisfy that `\/offload` command invocation with Claude Code's native subagents/);
+  assert.match(
+    expectedText,
+    /nor do bounded, multi-file, implementation, testing, debugging, Workflow, ultracode, or native-subagent requests/,
+  );
+  assert.match(expectedText, /including Sonnet ultracode\/native-agent workflows/);
+  assert.match(
+    expectedText,
+    /A mention, quotation, negation, or discussion of `\/offload`, offload, delegation, \*\*DeepSeek\*\* \/ \*\*DeepSeek-V4-Pro\*\*, a provider, or a model does not select Offload/,
+  );
+  assert.match(expectedText, /A standalone instruction not to use native subagents does not trigger Offload/);
+  assert.match(expectedText, /For a `\/offload` command invocation, end every final answer/);
   assert.match(expectedText, /explicitly set `profile: "pro"`/);
   assert.match(expectedText, /omit `effort`/);
-  assert.match(expectedText, /explicitly selects a supported profile name, use that exact profile instead/);
-  assert.match(expectedText, /not as a request to infer, override, or invent a profile/);
+  assert.match(expectedText, /explicitly selects a supported profile name within a `\/offload` command invocation/);
+  assert.match(expectedText, /provider or model name never triggers Offload or permits inferring, overriding, or inventing a profile/);
   assert.match(expectedText, /do \*\*not\*\* add `unsafePolicyOnlyVerifier` merely to get a worker test/);
+  assert.match(expectedText, /does not preflight or retry the command/);
+  assert.match(expectedText, /quoted globs, not bare directories/);
   const digest = `sha256:${createHash('sha256').update(Buffer.from(expectedText, 'utf8')).digest('hex')}`;
   const size = Buffer.byteLength(expectedText, 'utf8');
   const input = new PassThrough(),
@@ -428,7 +484,7 @@ test('MCP exposes the canonical static skill with exact resources and safe reque
     skills: [gotten.skill],
     ttlMs: 0,
     cacheScope: 'private',
-    _meta: { 'io.modelcontextprotocol/serverInfo': { name: 'offload', version: '0.1.0' } },
+    ...serverMeta,
   });
   assert.equal(listed.skills.length, 1);
   assert.equal(Object.hasOwn(listed, 'nextCursor'), false, 'terminal page has no cursor');
@@ -443,7 +499,7 @@ test('MCP exposes the canonical static skill with exact resources and safe reque
     contents: [{ uri: skillUri, mimeType: 'text/markdown', text: expectedText }],
     ttlMs: 0,
     cacheScope: 'private',
-    _meta: { 'io.modelcontextprotocol/serverInfo': { name: 'offload', version: '0.1.0' } },
+    ...serverMeta,
   });
   assert.deepEqual(legacyList, { resultType: 'complete', skills: [gotten.skill] }, 'skills/list accepts omitted optional params');
   assert.equal(values.find((value) => value.id === 4).error.code, -32602);

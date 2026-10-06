@@ -1,12 +1,13 @@
 import { execFileSync } from 'node:child_process';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { LeaseManager, getGitDir } from './lease.mjs';
 import { JobStore } from './store.mjs';
 import { Runner } from './runner.mjs';
 import { JobManager, validateExplicitRepoPath, validateJobId, validateJobRequest } from './job-manager.mjs';
-import { sandboxAvailable } from './sandbox.mjs';
+import { sandboxAvailable, sandboxStatus } from './sandbox.mjs';
+import { healthIdentity } from './identity.mjs';
 import { snapshotWorkingTree, diffTrees, diffTreeFiles, git as snapshotGit, snapshotGitEnv } from './git-snapshot.mjs';
 import { createIsolatedWorktree, openIsolatedWorktree, cleanupIsolatedWorktree, pinJobTrees, releaseJobTrees } from './worktree.mjs';
 import { defaultConfigPath, loadConfig, resolveConfigRelativePath } from './config.mjs';
@@ -20,7 +21,7 @@ import {
   sameCredentialFingerprint,
   validCredentialFingerprint,
 } from './integrity.mjs';
-import { OpenAIChatProvider } from './provider/openai-chat.mjs';
+import { DEFAULT_ATTEMPT_TIMEOUT_MS, OpenAIChatProvider } from './provider/openai-chat.mjs';
 import { PathPolicy } from './policy.mjs';
 import { LocalTools, availableToolDefinitions } from './agent/tools.mjs';
 import { AgentLoop } from './agent/loop.mjs';
@@ -47,6 +48,16 @@ export function insidePath(path, parent, { relativePath = relative, isAbsolutePa
   // On Windows, `path.relative` returns an absolute target when paths live on
   // different drives or UNC shares. That is never containment.
   return !isAbsolutePath(part) && (part === '' || (part !== '..' && !part.startsWith(`..${platform === 'win32' ? '\\' : '/'}`)));
+}
+/**
+ * The only external read root a worker command may receive is the direct
+ * parent of its authenticated isolated worktree. This is needed for macOS
+ * cwd resolution; it intentionally grants no parent to primary checkouts.
+ */
+export function isolatedWorkspaceReadablePaths(job, executionPath) {
+  return typeof job?.workspacePath === 'string' && isAbsolute(job.workspacePath) && job.workspacePath === executionPath
+    ? [dirname(executionPath)]
+    : [];
 }
 export function defaultIntegrityStatePath({ platform = process.platform, env = process.env, home } = {}) {
   if (platform === 'win32') return undefined;
@@ -163,6 +174,11 @@ export function gitPatchApplier(repoPath, patch, { reverse, check }) {
 export function createCore({ store, runner, worker, snapshots, leases, config = {}, now } = {}) {
   const resolvedRunner = runner || new Runner({ defaults: { sandbox: true } });
   const resolvedSnapshots = snapshots || gitSnapshots();
+  const nowMs = () => {
+    const value = typeof now === 'function' ? now() : undefined;
+    if (value instanceof Date) return value.getTime();
+    return Number.isFinite(value) ? value : Date.now();
+  };
   const states = new Map();
   const pendingStates = new Map();
   let injectedStoreRoot;
@@ -223,6 +239,10 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         // and compares the freshly resolved credential fingerprint before this
         // worker can construct a provider.
         if (state.integrity) job = await state.store.get(job.id);
+        if (job.cappedFinishRecovery !== undefined && !['queued', 'consumed', 'settled'].includes(job.cappedFinishRecovery))
+          throw new Error('stored job has invalid capped implementation recovery state');
+        if (job.budgetFinishRecovery !== undefined && !['queued', 'consumed'].includes(job.budgetFinishRecovery))
+          throw new Error('stored job has invalid budget finish recovery state');
         const execution = job.executionProfile;
         // Accepted jobs contain their resolved execution and budget snapshot. A
         // detached child must not require a still-valid mutable config/repo file.
@@ -246,35 +266,42 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           apiKey: key,
           model: profile.model,
           reasoningEffort: (job.effort || profile.effort) === 'high' ? 'high' : undefined,
+          timeoutMs: providerConfig.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS,
         });
         // A queued job is an immutable execution request.  In particular, do not
         // let a later .offload.json edit relax (or unexpectedly revoke) its policy.
         // repoPath remains the public/lease identity; a real Core job executes
         // only inside its private linked worktree.
         const executionPath = job.workspacePath || job.repoPath;
+        const readablePaths = isolatedWorkspaceReadablePaths(job, executionPath);
         const policy = new PathPolicy({
           repoPath: executionPath,
           ownedPaths: job.ownedPaths,
           extraWritable: job.extraWritable || [],
           denyRead: job.denyRead || [],
         });
-        const runCommand = sandboxAvailable()
-          ? ({ command, timeoutSec, signal }) => {
-              // Commands are only exposed where the OS sandbox can enforce the same
-              // secret-read policy as file tools. The worker process keeps the API key.
-              return resolvedRunner.run(command, {
-                cwd: executionPath,
-                gitDir: getGitDir(executionPath),
-                timeoutSec,
-                signal: signal || api.commandSignal || api.signal,
-                denyRead: policy.denyRead || [],
-                writablePaths: [...job.ownedPaths, ...(job.extraWritable || [])].map((p) => join(executionPath, p)),
-                allowNetwork: job.allowNetwork,
-                requireSandbox: true,
-              });
-            }
-          : undefined;
-        const tools = new LocalTools({ repoPath: job.repoPath, policy, ...(runCommand ? { runCommand } : {}) });
+        const runCommand =
+          job.mode !== 'report' && sandboxAvailable()
+            ? ({ command, timeoutSec, signal }) => {
+                // Commands are only exposed where the OS sandbox can enforce the same
+                // secret-read policy as file tools. The worker process keeps the API key.
+                return resolvedRunner.run(command, {
+                  cwd: executionPath,
+                  gitDir: getGitDir(executionPath),
+                  timeoutSec,
+                  signal: signal || api.commandSignal || api.signal,
+                  denyRead: policy.denyRead || [],
+                  writablePaths: [...job.ownedPaths, ...(job.extraWritable || [])].map((p) => join(executionPath, p)),
+                  // An isolated linked worktree has a server-created private
+                  // parent. Node may resolve cwd through that parent, so it
+                  // needs traversal/read access but never write authority.
+                  ...(readablePaths.length ? { readablePaths } : {}),
+                  allowNetwork: job.allowNetwork,
+                  requireSandbox: true,
+                });
+              }
+            : undefined;
+        const tools = new LocalTools({ repoPath: executionPath, policy, ...(runCommand ? { runCommand } : {}) });
         let pricing = job.pricingSnapshot || config.pricingTable || loadPricing(providerConfig.pricing);
         if (!pricing && providerConfig.pricingFile) {
           const pricePath = execution
@@ -286,38 +313,72 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
             throw new Error(`unable to load pricing file ${pricePath}: ${error.message || error}`);
           }
         }
-        const prior = (await state.store.readMessages?.(job.id)) || [];
-        const context = new AgentContext(prior, { onAppend: api.appendMessage, onAppendBatch: api.appendMessages });
+        // Report workers may read caller-supplied external bodies. Their
+        // conversational/tool transcript is therefore intentionally
+        // ephemeral: only the separately-sanitized report result is durable.
+        // Write jobs retain their exact resume and transcript semantics.
+        const prior = job.mode === 'report' ? [] : (await state.store.readMessages?.(job.id)) || [];
+        const context =
+          job.mode === 'report'
+            ? new AgentContext()
+            : new AgentContext(prior, { onAppend: api.appendMessage, onAppendBatch: api.appendMessages });
         const repair = `Repair these concrete defects:\n${(api.defects?.length ? api.defects : ['Continue the job and re-check the acceptance criteria.']).map((x) => `- ${x}`).join('\n')}`;
         const totalTurns = job.budget?.maxTurns ?? loaded?.config.limits.maxTurns,
           totalUsd = job.budget?.maxUsd ?? loaded?.config.limits.maxUsd;
         const remainingTurns = totalTurns - (job.turns || 0),
           remainingUsd = totalUsd - (job.costUsd || 0);
         const totalTimeoutMs = (job.budget?.timeoutMinutes ?? loaded?.config.limits.timeoutMinutes) * 60_000;
-        const remainingTimeoutMs =
-          totalTimeoutMs - Math.max(0, Date.now() - Date.parse(job.wallStartedAt || job.createdAt || new Date().toISOString()));
+        // A repair is a new active worker round. Its timeout must not be
+        // consumed by calendar time between the original run and a later
+        // manual repair. Turns and cost remain cumulative above, but the
+        // wall-clock allowance begins when this worker claim was made.
+        // New records always have the active-run start from JobManager's
+        // launch claim. Legacy/interrupted records may not; fall back through
+        // their historical lifecycle timestamps and finally use this worker's
+        // current clock rather than passing NaN to AgentLoop.
+        const activeRunStartedAt =
+          [job.startedAt, job.wallStartedAt, job.createdAt].map((value) => Date.parse(value || '')).find(Number.isFinite) ?? nowMs();
+        const remainingTimeoutMs = totalTimeoutMs - Math.max(0, nowMs() - activeRunStartedAt);
         if (remainingTurns < 1 || remainingUsd <= 0)
           return { status: 'BUDGET', turn: 0, costUsd: 0, usage: {}, error: 'Cumulative job budget exhausted' };
         if (remainingTimeoutMs < 1) return { status: 'TIMEOUT', turn: 0, costUsd: 0, usage: {}, error: 'Cumulative job timeout exhausted' };
         const loop = new AgentLoop({
           provider,
           tools,
-          toolDefinitions: availableToolDefinitions({ allowCommand: !!runCommand }),
+          toolDefinitions: availableToolDefinitions({ allowCommand: !!runCommand, readOnly: job.mode === 'report' }),
           context,
           pricing,
           model: profile.model,
           maxTurns: remainingTurns,
           timeoutMs: remainingTimeoutMs,
           maxUsd: remainingUsd,
+          now: nowMs,
           signal: api.signal,
           progress: api.progress,
+          persistCappedFinishRecovery: api.progress,
+          persistBudgetFinishRecovery: api.progress,
+          cappedFinishRecovery: job.cappedFinishRecovery,
+          budgetFinishRecovery: job.budgetFinishRecovery,
         });
         // The initial prompt is durable conversation state. A repair appends only
         // its defect user turn; it never repeats system/task/history prefixes.
+        // A capped implementation recovery is different: its authenticated state owns a
+        // specific two-message tail, so appending any repair/task text would
+        // turn a crash-safe one-shot continuation into a different request.
         const rawResult = await loop.run(
-          prior.length
-            ? { task: repair }
-            : { system: await buildSystemPrompt({ ...job, repoPath: executionPath, allowCommand: !!runCommand }), task: job.task },
+          (job.cappedFinishRecovery !== undefined && job.cappedFinishRecovery !== 'settled') || job.budgetFinishRecovery !== undefined
+            ? {}
+            : prior.length
+              ? { task: repair }
+              : {
+                  system: await buildSystemPrompt({
+                    ...job,
+                    repoPath: executionPath,
+                    allowCommand: !!runCommand,
+                    remainingTurns,
+                  }),
+                  task: job.task,
+                },
         );
         const responseModel = rawResult.model;
         const mismatch =
@@ -347,6 +408,28 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
     } catch {
       return false;
     }
+  };
+  // Keep the legacy `sandbox` mode stable while exposing why a policy-only
+  // host cannot apply Seatbelt. This is returned by offload_job with no id,
+  // where an orchestrator needs to decide whether verification is possible.
+  const sandboxHealth = () => {
+    const status = sandboxStatus();
+    return {
+      server: healthIdentity(),
+      sandbox: status.available ? 'macos' : 'policy-only',
+      sandboxReason: status.reason,
+      sandboxStatus: {
+        available: status.available,
+        reason: status.reason,
+        ...(status.error ? { error: status.error } : {}),
+        ...(status.exitCode != null ? { exitCode: status.exitCode } : {}),
+        ...(status.signal ? { signal: status.signal } : {}),
+      },
+      sandboxProbeCommand: status.probe,
+      ...(status.error ? { sandboxProbeError: status.error } : {}),
+      ...(status.exitCode != null ? { sandboxProbeExitCode: status.exitCode } : {}),
+      ...(status.signal ? { sandboxProbeSignal: status.signal } : {}),
+    };
   };
   const repoHints = (hint) =>
     [
@@ -434,9 +517,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
                       releasePins: releaseJobTrees,
                     },
               applyPatch: config.applyPatch || gitPatchApplier,
-              health:
-                config.health ||
-                (async () => ({ sandbox: sandboxAvailable() ? 'macos' : 'policy-only', worker: workerHealth(root), repo: root })),
+              health: config.health || (async () => ({ ...sandboxHealth(), worker: workerHealth(root), repo: root })),
             },
           });
           states.set(root, created);
@@ -488,7 +569,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
   };
   const healthWithoutRepo = async () => ({
     jobs: (await Promise.all([...states.values()].map((state) => state.manager.list()))).flat(),
-    health: { sandbox: sandboxAvailable() ? 'macos' : 'policy-only', worker: false, repositories: [...states.keys()] },
+    health: { ...sandboxHealth(), worker: false, repositories: [...states.keys()] },
   });
   const pricingMetadata = (providerConfig, loaded) => {
     let table = config.pricingTable || loadPricing(providerConfig.pricing);
@@ -558,18 +639,22 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         model: profile.model,
         effort: profile.effort,
         pricing: providerConfig.pricing,
+        attemptTimeoutMs: providerConfig.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS,
         ...(providerConfig.pricingFile ? { pricingFile: resolveConfigRelativePath(providerConfig.pricingFile, loaded.configPath) } : {}),
       };
       // Repository policy may tighten reads, but never expands write scope.
       // A repository-provided verifier is always sandbox-required; only a
       // caller-provided verifier can make the deliberately high-friction
       // policy-only exception.
+      const reportMode = input.mode === 'report';
       const callerTest = input.testCommand != null;
       const repoTest = loaded.repoConfig.testCommand;
-      const testCommand = input.testCommand ?? repoTest;
+      const testCommand = reportMode ? undefined : (input.testCommand ?? repoTest);
       const unsafePolicyOnlyVerifier = input.unsafePolicyOnlyVerifier === true;
       if (unsafePolicyOnlyVerifier && !callerTest) throw new Error('unsafePolicyOnlyVerifier requires a caller-supplied testCommand');
-      const requireSandbox = input.requireSandbox === true || (!!testCommand && (!callerTest || !unsafePolicyOnlyVerifier));
+      const requireSandbox = reportMode
+        ? false
+        : input.requireSandbox === true || (!!testCommand && (!callerTest || !unsafePolicyOnlyVerifier));
       // Avoid spending provider budget or allocating a linked workspace when
       // the real built-in lifecycle already knows no macOS sandbox can run a
       // required verifier. A profile-specific failure still fails closed in
@@ -585,11 +670,15 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           ...input,
           budget,
           repoPath: state.repoPath,
-          testCommand,
-          testCommandSource: callerTest ? 'caller' : repoTest ? 'repo' : undefined,
-          requireSandbox,
-          unsafePolicyOnlyVerifier,
-          extraWritable: [...(input.extraWritable || [])],
+          ...(reportMode
+            ? {}
+            : {
+                ...(testCommand !== undefined ? { testCommand } : {}),
+                ...(callerTest || repoTest ? { testCommandSource: callerTest ? 'caller' : 'repo' } : {}),
+                requireSandbox,
+                unsafePolicyOnlyVerifier,
+                extraWritable: [...(input.extraWritable || [])],
+              }),
           denyRead: [...new Set([...(input.denyRead || []), ...(loaded.repoConfig.denyRead || [])])],
           sandboxMode: sandboxAvailable() ? 'macos' : 'policy-only',
           configuredModel: profile.model,
@@ -614,6 +703,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       // the parent queue path. In particular, never revive a cancellation (or
       // another terminal/recovery outcome) merely because spawn completed late.
       if (!parentHandoff(job)) return { assigned: false, status: job.status };
+      const hasWriteLease = (job.ownedPaths?.length || 0) + (job.extraWritable?.length || 0) > 0;
       const nextOwnerNonce = randomUUID();
       let transferred = false;
       const releaseTransferredLease = async () => {
@@ -623,8 +713,10 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         } catch {}
       };
       try {
-        await state.manager.transferLease(id, { pid, ownerNonce: job.leaseOwnerNonce, nextOwnerNonce });
-        transferred = true;
+        if (hasWriteLease) {
+          await state.manager.transferLease(id, { pid, ownerNonce: job.leaseOwnerNonce, nextOwnerNonce });
+          transferred = true;
+        }
         // Cancellation writes a durable marker before changing lifecycle
         // state. Consume it here so a transfer that completed concurrently is
         // released using its new nonce rather than the parent's stale nonce.

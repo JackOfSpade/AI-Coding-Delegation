@@ -1,12 +1,34 @@
 import { sseJson } from './sse.mjs';
 
+export const DEFAULT_ATTEMPT_TIMEOUT_MS = 300_000;
+
 export class ProviderError extends Error {
-  constructor(message = 'Provider request failed', { status, retryable = false } = {}) {
+  constructor(message = 'Provider request failed', { status, retryable = false, kind = 'request', attempts, timeoutMs } = {}) {
     super(message);
     this.name = 'ProviderError';
     this.status = status;
     this.retryable = retryable;
+    // These fields are intentionally a closed, small vocabulary. They cross
+    // the worker boundary and must never contain a fetch/SSE error, endpoint,
+    // request body, or provider response text.
+    this.kind = ['request', 'http', 'transport', 'attempt_timeout', 'redirect', 'sse_protocol', 'sse_limit'].includes(kind)
+      ? kind
+      : 'request';
+    if (Number.isSafeInteger(attempts) && attempts > 0 && attempts <= 16) this.attempts = attempts;
+    if (this.kind === 'attempt_timeout' && Number.isSafeInteger(timeoutMs) && timeoutMs >= 30_000 && timeoutMs <= 600_000)
+      this.timeoutMs = timeoutMs;
   }
+}
+
+export function providerFailure(error) {
+  if (!(error instanceof ProviderError)) return undefined;
+  const result = { kind: error.kind };
+  if (Number.isSafeInteger(error.attempts) && error.attempts > 0 && error.attempts <= 16) result.attempts = error.attempts;
+  if (error.kind === 'attempt_timeout' && Number.isSafeInteger(error.timeoutMs) && error.timeoutMs >= 30_000 && error.timeoutMs <= 600_000)
+    result.timeoutMs = error.timeoutMs;
+  if (error.kind === 'http' && Number.isSafeInteger(error.status) && error.status >= 100 && error.status <= 599)
+    result.status = error.status;
+  return result;
 }
 // Remove the listener on both paths. Retries can be numerous and long-lived;
 // retaining one once-listener per completed retry is an avoidable leak.
@@ -41,11 +63,36 @@ const isLoopbackHost = (hostname) => {
   return host === 'localhost' || host === '::1' || /^127(?:\.\d{1,3}){3}$/.test(host);
 };
 const validModel = (value) => typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\x00-\x1F\x7F]/.test(value);
+// This is intentionally narrower than an OpenAI-compatible URL or a model
+// name prefix.  The focused-write override depends on DeepSeek's documented
+// thinking/tool-choice interaction, so a proxy or a future, unknown model
+// must retain the ordinary provider contract.
+const OFFICIAL_DEEPSEEK_FOCUS_MODELS = new Set(['deepseek-v4-pro', 'deepseek-flash', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp']);
+const supportsForcedImplementationFocus = (parsed, model) =>
+  parsed.protocol === 'https:' &&
+  parsed.hostname.toLowerCase() === 'api.deepseek.com' &&
+  parsed.port === '' &&
+  parsed.pathname === '/' &&
+  OFFICIAL_DEEPSEEK_FOCUS_MODELS.has(model);
 const validToolIdentifier = (value, max) =>
   typeof value === 'string' && value.length > 0 && value.length <= max && !/[\x00-\x1F\x7F]/.test(value);
 const MAX_TOOL_CALLS = 64;
 const MAX_TOOL_ARGUMENT_CHARS = 512_000;
 const MAX_MESSAGE_CHARS = 1_000_000;
+export const PROVIDER_FINISH_REASONS = new Set(['stop', 'length', 'tool_calls', 'function_call', 'content_filter', 'other']);
+// Finish reasons are diagnostics only. Keep their persisted vocabulary closed
+// so provider-defined strings (which can be arbitrary text) never cross the
+// worker boundary verbatim.
+export function normalizeProviderFinishReason(value) {
+  if (value === undefined || value === null || typeof value !== 'string') return undefined;
+  return PROVIDER_FINISH_REASONS.has(value) ? value : 'other';
+}
+const streamFailureKind = (error) => {
+  const message = String(error?.message || '');
+  if (/^SSE (?:event|attempt) exceeds configured size limit$/.test(message)) return 'sse_limit';
+  if (/^(?:SSE response has no body|Invalid JSON in SSE data|SSE stream ended without \[DONE\])$/.test(message)) return 'sse_protocol';
+  return undefined;
+};
 
 // Context may retain local metadata (for display or durability), but the
 // provider receives only fields in the Chat Completions wire schema. In
@@ -63,7 +110,10 @@ export function wireMessages(messages) {
         throw new ProviderError('Invalid assistant content');
       const output = { role: 'assistant', content: message.content };
       if (message.reasoning_content !== undefined) {
-        if (typeof message.reasoning_content !== 'string' || message.reasoning_content.length > MAX_MESSAGE_CHARS)
+        if (
+          message.reasoning_content !== null &&
+          (typeof message.reasoning_content !== 'string' || message.reasoning_content.length > MAX_MESSAGE_CHARS)
+        )
           throw new ProviderError('Invalid assistant reasoning');
         output.reasoning_content = message.reasoning_content;
       }
@@ -176,7 +226,7 @@ export class OpenAIChatProvider {
     apiKey,
     model,
     fetchImpl = globalThis.fetch,
-    timeoutMs = 120_000,
+    timeoutMs = DEFAULT_ATTEMPT_TIMEOUT_MS,
     retries = 3,
     headers = {},
     reasoningEffort,
@@ -203,12 +253,18 @@ export class OpenAIChatProvider {
     this.apiKey = apiKey;
     this.model = model;
     this.fetch = fetchImpl;
-    this.timeoutMs = positive(timeoutMs, 'timeoutMs', 120_000);
+    this.timeoutMs = positive(timeoutMs, 'timeoutMs', DEFAULT_ATTEMPT_TIMEOUT_MS);
     if (!this.timeoutMs) throw new TypeError('timeoutMs must be positive');
     this.retries = positive(retries, 'retries', 3);
     this.headers = headers;
     this.reasoningEffort = reasoningEffort;
     this.thinking = thinking;
+    // AgentLoop treats this as an opt-in capability, never as a heuristic.
+    // Bind it to each request model: callers can override a provider's
+    // constructor model on a chat call. It is safe to expose because it
+    // returns only a boolean, never endpoint or credential material.
+    this.supportsForcedImplementationFocusFor = (requestModel) =>
+      requestModel === model && supportsForcedImplementationFocus(parsed, requestModel);
     this.maxSseEventBytes = positive(maxSseEventBytes, 'maxSseEventBytes', 1_000_000);
     this.maxSseAttemptBytes = positive(maxSseAttemptBytes, 'maxSseAttemptBytes', 8_000_000);
     if (!this.maxSseEventBytes || !this.maxSseAttemptBytes) throw new TypeError('SSE limits must be positive');
@@ -218,7 +274,11 @@ export class OpenAIChatProvider {
     let last;
     for (let attempt = 0; attempt <= retryLimit; attempt++) {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(new Error('Provider request timed out')), this.timeoutMs);
+      let attemptTimedOut = false;
+      const timer = setTimeout(() => {
+        attemptTimedOut = true;
+        controller.abort();
+      }, this.timeoutMs);
       const abort = () => controller.abort(externalSignal.reason ?? new Error('Aborted'));
       externalSignal?.addEventListener('abort', abort, { once: true });
       try {
@@ -248,6 +308,7 @@ export class OpenAIChatProvider {
           throw new ProviderError(`Chat request failed (HTTP ${response.status})`, {
             status: response.status,
             retryable: response.status === 429 || response.status >= 500,
+            kind: 'http',
           });
         }
         const chunks = [];
@@ -259,15 +320,24 @@ export class OpenAIChatProvider {
         return chunks;
       } catch (error) {
         if (externalSignal?.aborted) throw externalSignal.reason ?? error;
+        // This controller belongs solely to the per-attempt timeout.  Keep it
+        // distinct from a caller cancellation or AgentLoop wall deadline,
+        // both of which arrive through externalSignal above.
         // Fetch/SSE errors can include arbitrary remote text too.  Preserve
         // only our status-bearing ProviderError; otherwise expose a generic
         // safe error, without retaining an error cause that logs may inspect.
-        const providerError =
-          error instanceof ProviderError
+        const providerError = attemptTimedOut
+          ? // A provider-owned attempt deadline is the one ambiguous failure
+            // we may retry for uncapped callers. Finite-budget AgentLoops pass
+            // retryLimit: 0, so they still make exactly one POST attempt.
+            new ProviderError('Provider request timed out', { kind: 'attempt_timeout', retryable: true, timeoutMs: this.timeoutMs })
+          : error instanceof ProviderError
             ? error
             : new ProviderError(/redirect/i.test(String(error?.message)) ? 'Provider redirect rejected' : 'Chat request failed', {
+                kind: /redirect/i.test(String(error?.message)) ? 'redirect' : streamFailureKind(error) || 'transport',
                 retryable: !/redirect/i.test(String(error?.message)),
               });
+        providerError.attempts = attempt + 1;
         if (!providerError.retryable || attempt === retryLimit) throw providerError;
         last = providerError;
       } finally {
@@ -288,6 +358,7 @@ export class OpenAIChatProvider {
     const requestModel = requestOptions.model ?? this.model;
     if (!validModel(requestModel)) throw new ProviderError('Invalid request model');
     const thinking = requestedThinking ?? this.thinking;
+    const reasoningEffort = requestOptions.reasoning_effort ?? this.reasoningEffort;
     if (thinking?.type === 'enabled' && (options.tool_choice === 'required' || typeof options.tool_choice === 'object'))
       throw new ProviderError('Thinking mode does not support required or named tool_choice');
     const chunks = await this.#collect(
@@ -298,9 +369,7 @@ export class OpenAIChatProvider {
         tools,
         stream: true,
         stream_options: { include_usage: true },
-        ...(this.reasoningEffort || requestOptions.reasoning_effort
-          ? { reasoning_effort: requestOptions.reasoning_effort ?? this.reasoningEffort }
-          : {}),
+        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
         ...(thinking ? { thinking } : {}),
       },
       signal,
@@ -310,7 +379,8 @@ export class OpenAIChatProvider {
     let model,
       usageSeen = false,
       modelConflict = false,
-      conflictReported = false;
+      conflictReported = false,
+      providerFinishReason;
     for (const chunk of chunks) {
       if (!chunk || typeof chunk !== 'object' || Array.isArray(chunk)) throw new ProviderError('Invalid SSE response chunk');
       if (chunk?.model !== undefined && !validModel(chunk.model)) throw new ProviderError('Invalid response model');
@@ -325,6 +395,12 @@ export class OpenAIChatProvider {
             (choice.delta !== undefined && (!choice.delta || typeof choice.delta !== 'object' || Array.isArray(choice.delta))))
         )
           throw new ProviderError('Invalid SSE response choices');
+        if (choice && Object.hasOwn(choice, 'finish_reason')) {
+          const normalizedFinishReason = normalizeProviderFinishReason(choice.finish_reason);
+          if (normalizedFinishReason !== undefined)
+            providerFinishReason =
+              providerFinishReason === undefined || providerFinishReason === normalizedFinishReason ? normalizedFinishReason : 'other';
+        }
       }
       if (chunk.model !== undefined) {
         if (model !== undefined && model !== chunk.model) modelConflict = true;
@@ -341,13 +417,22 @@ export class OpenAIChatProvider {
         throw new ProviderError('Invalid response reasoning');
       if (delta.reasoning !== undefined && delta.reasoning !== null && typeof delta.reasoning !== 'string')
         throw new ProviderError('Invalid response reasoning');
+      const hasReasoningContent = Object.hasOwn(delta, 'reasoning_content');
+      const hasReasoningAlias = Object.hasOwn(delta, 'reasoning');
+      if (hasReasoningContent && hasReasoningAlias && delta.reasoning_content !== delta.reasoning)
+        throw new ProviderError('Conflicting response reasoning aliases');
       if (delta.content) {
         if (modelConflict) conflictReported = true;
         yield { text: delta.content, model: echoedModel, ...conflict };
       }
-      if (delta.reasoning_content ?? delta.reasoning) {
+      // DeepSeek uses an explicit null reasoning_content for non-thinking
+      // tool calls. It is part of the assistant message shape and must be
+      // replayed exactly, rather than silently dropped or replaced with an
+      // invented empty string on a later request.
+      const responseReasoning = hasReasoningContent ? delta.reasoning_content : delta.reasoning;
+      if (responseReasoning !== undefined) {
         if (modelConflict) conflictReported = true;
-        yield { reasoning: delta.reasoning_content ?? delta.reasoning, model: echoedModel, ...conflict };
+        yield { reasoning: responseReasoning, model: echoedModel, ...conflict };
       }
       if (delta.tool_calls !== undefined && !Array.isArray(delta.tool_calls)) throw new ProviderError('Invalid tool call list');
       for (const part of delta.tool_calls ?? []) {
@@ -404,6 +489,7 @@ export class OpenAIChatProvider {
     // record. Surface that conflict too: otherwise a loop would account the
     // response yet proceed to execute a previously accumulated tool call.
     if (modelConflict && !conflictReported) yield { model, modelConflict: true };
+    if (providerFinishReason !== undefined) yield { providerFinishReason };
   }
 }
 export const createOpenAIChatProvider = (options) => new OpenAIChatProvider(options);

@@ -93,18 +93,24 @@ test('strict test runner parses TAP skips and rejects every skip outside the rev
   const tap = [
     'ok 1 - macOS sandbox blocks out-of-scope and git writes # SKIP',
     '  ok 2 - nested loopback # SKIP loopback networking is unavailable in this sandbox',
-    'ok 3 - newly skipped regression # SKIP oops',
-    '# ok 4 - diagnostic text # SKIP oops',
-    'ok 5 - text mentioning a skip but lacking a directive # TODO later',
+    'ok 3 - macOS sandbox gives Node a physical disposable temp root and read-only private-worktree parent traversal # SKIP requires an available macOS sandbox',
+    'ok 4 - newly skipped regression # SKIP oops',
+    '# ok 5 - diagnostic text # SKIP oops',
+    'ok 6 - text mentioning a skip but lacking a directive # TODO later',
   ].join('\r\n');
   assert.deepEqual(parseTapSkips(tap), [
     { number: 1, name: 'macOS sandbox blocks out-of-scope and git writes', reason: '' },
     { number: 2, name: 'nested loopback', reason: 'loopback networking is unavailable in this sandbox' },
-    { number: 3, name: 'newly skipped regression', reason: 'oops' },
+    {
+      number: 3,
+      name: 'macOS sandbox gives Node a physical disposable temp root and read-only private-worktree parent traversal',
+      reason: 'requires an available macOS sandbox',
+    },
+    { number: 4, name: 'newly skipped regression', reason: 'oops' },
   ]);
   const result = analyzeStrictSkips(tap);
   assert.equal(result.loopbackSkips.length, 1);
-  assert.deepEqual(result.unapprovedSkips, [{ number: 3, name: 'newly skipped regression', reason: 'oops' }]);
+  assert.deepEqual(result.unapprovedSkips, [{ number: 4, name: 'newly skipped regression', reason: 'oops' }]);
 });
 
 test('CI test launcher preserves a strict runner failure exit code', async () => {
@@ -453,6 +459,11 @@ test('artifact lease gives release a fresh retry window after acquisition conten
   };
   const lease = await acquireArtifactLease({
     cwd: '/repo',
+    // The release gate deliberately passes its marker to every test process.
+    // This unit exercises a new local acquisition, not inherited reentrancy;
+    // isolate it from that ambient parent lease so the stub need only model
+    // acquire/release contention.
+    environment: {},
     platform: 'linux',
     maxWaitMs: 10,
     retryMs: 1,
@@ -751,7 +762,14 @@ test('client smoke validates a disposable registration lifecycle without touchin
   const directory = await mkdtemp(join(tmpdir(), 'offload-fake-client-'));
   const executable = join(directory, process.platform === 'win32' ? 'claude.cmd' : 'claude');
   try {
-    await writeFile(executable, process.platform === 'win32' ? '@exit /b 0\r\n' : '#!/bin/sh\nexit 0\n');
+    const fakeClaude =
+      'const fs=require("fs");const path=require("path");const args=process.argv.slice(1);if(args[0]==="--version")process.exit(0);const file=path.join(process.env.CLAUDE_CONFIG_DIR,".claude.json");const current=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,"utf8")):{};current.mcpServers||={};if(args[1]==="add"){const mark=args.indexOf("--");current.mcpServers.offload={type:"stdio",command:args[mark+1],args:args.slice(mark+2),env:{}};}else if(args[1]==="remove"){delete current.mcpServers.offload;}else process.exit(2);fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,JSON.stringify(current));';
+    await writeFile(
+      executable,
+      process.platform === 'win32'
+        ? `@echo off\r\nnode -e "${fakeClaude.replaceAll('"', '\\"')}" %*\r\n`
+        : `#!/bin/sh\nnode -e '${fakeClaude}' "$@"\n`,
+    );
     if (process.platform !== 'win32') await chmod(executable, 0o755);
     const env = { ...process.env, PATH: `${directory}${delimiter}${process.env.PATH || process.env.Path || ''}` };
     const result = spawnSync(process.execPath, ['scripts/client-smoke.mjs', '--clients=claude'], {

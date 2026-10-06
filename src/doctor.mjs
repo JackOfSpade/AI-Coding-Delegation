@@ -3,9 +3,10 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { loadConfig, resolveConfigRelativePath } from './config.mjs';
 import { resolveKeyRef } from './secrets.mjs';
-import { macosProfile, sandboxAvailable } from './sandbox.mjs';
+import { macosProfile, sandboxStatus } from './sandbox.mjs';
+import { healthIdentity } from './identity.mjs';
 import { resolveClientPaths } from './client-paths.mjs';
-import { OpenAIChatProvider } from './provider/openai-chat.mjs';
+import { DEFAULT_ATTEMPT_TIMEOUT_MS, OpenAIChatProvider } from './provider/openai-chat.mjs';
 import { loadPricing } from './pricing-registry.mjs';
 import { priceUsage, resolveModel, samePricedModel, validatePricingTable } from './pricing.mjs';
 import { snapshotGitEnv } from './git-snapshot.mjs';
@@ -224,6 +225,7 @@ export function doctor({
   platform = process.platform,
   env = process.env,
   spawnProcess = spawnSync,
+  sandboxSpawnProcess,
 } = {}) {
   // HOME is commonly present in Windows shells (Git Bash, CI) but client
   // registrations belong under the native user profile, as does the installer.
@@ -250,14 +252,18 @@ export function doctor({
   } catch (error) {
     config = { ok: false, error: error.code || String(error.message || error) };
   }
-  const sandbox = sandboxAvailable(platform, platform === 'darwin' ? macosProfile({ repoPath: rootPath, tempPath: tmpdir() }) : undefined)
-    ? 'macos'
-    : 'policy-only';
+  const sandboxStatusResult = sandboxStatus(
+    platform,
+    platform === 'darwin' ? macosProfile({ repoPath: rootPath, tempPath: tmpdir() }) : undefined,
+    sandboxSpawnProcess ? { spawnProcess: sandboxSpawnProcess } : undefined,
+  );
+  const sandbox = sandboxStatusResult.available ? 'macos' : 'policy-only';
   // `sandboxAvailable` performs a bounded execution with the exact generated
   // profile, which establishes that macOS can apply that profile. It does not
   // prove every future filesystem allow/deny rule, so do not advertise it as
   // a complete sandbox self-test.
   return {
+    server: healthIdentity(),
     node: process.versions.node,
     nodeOk: node[0] >= 20,
     git: git.status === 0,
@@ -265,6 +271,11 @@ export function doctor({
     repo: { ok: repoProbe.status === 0, path: repoProbe.status === 0 ? repoProbe.stdout.trim() : repoCandidate },
     sandbox,
     sandboxProbe: sandbox === 'macos' ? 'profile-applied' : 'not-available',
+    sandboxReason: sandboxStatusResult.reason,
+    sandboxProbeCommand: sandboxStatusResult.probe,
+    ...(sandboxStatusResult.error ? { sandboxProbeError: sandboxStatusResult.error } : {}),
+    ...(sandboxStatusResult.exitCode != null ? { sandboxProbeExitCode: sandboxStatusResult.exitCode } : {}),
+    ...(sandboxStatusResult.signal ? { sandboxProbeSignal: sandboxStatusResult.signal } : {}),
     config,
     key,
     registration: registrations(home, rootPath, platform, env),
@@ -327,7 +338,7 @@ function worstReservation(table, model, messages, options = {}) {
   return { inputTokens, outputTokens: LIVE_MAX_TOKENS, usd: (inputTokens * inputRate + LIVE_MAX_TOKENS * outputRate) / 1_000_000 };
 }
 async function chatProbe(provider, messages, options = {}) {
-  const response = { model: undefined, usage: undefined, toolCalls: undefined, reasoning: '', acknowledged: false };
+  const response = { model: undefined, usage: undefined, toolCalls: undefined, reasoning: undefined, acknowledged: false };
   let usageRecords = 0;
   for await (const event of provider.chat({ messages, tools: LIVE_TOOL, max_tokens: LIVE_MAX_TOKENS, ...options })) {
     if (event.modelConflict) throw new Error('live probe returned conflicting model metadata');
@@ -336,7 +347,17 @@ async function chatProbe(provider, messages, options = {}) {
       if (response.model && response.model !== event.model) throw new Error('live probe returned conflicting model metadata');
       response.model ||= event.model;
     }
-    if (event.reasoning) response.reasoning += event.reasoning;
+    // `null`, an empty string, and an absent reasoning field have distinct
+    // DeepSeek transcript meanings. Streaming providers can use null as an
+    // incremental placeholder around string fragments; a string wins and is
+    // concatenated exactly for the tool-result replay.
+    if (Object.hasOwn(event, 'reasoning')) {
+      if (event.reasoning === null) {
+        if (response.reasoning === undefined) response.reasoning = null;
+      } else if (typeof event.reasoning === 'string') {
+        response.reasoning = `${typeof response.reasoning === 'string' ? response.reasoning : ''}${event.reasoning}`;
+      } else throw new Error('live probe received invalid reasoning');
+    }
     if (event.text) response.acknowledged = true;
     if (event.toolCalls) response.toolCalls = event.toolCalls;
     if (event.usage) {
@@ -378,6 +399,7 @@ export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = pr
     model: profile.model,
     retries: 0,
     thinking: { type: 'disabled' },
+    timeoutMs: providerConfig.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS,
     ...(fetchImpl ? { fetchImpl } : {}),
   });
   const firstMessages = [{ role: 'user', content: 'Use offload_doctor_echo once with {"ok":true}.' }];
@@ -418,7 +440,7 @@ export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = pr
     content: '',
     tool_calls: [{ id: call.id, type: 'function', function: { name: call.name, arguments: call.arguments } }],
   };
-  if (first.response.reasoning) assistant.reasoning_content = first.response.reasoning;
+  if (first.response.reasoning !== undefined) assistant.reasoning_content = first.response.reasoning;
   const secondMessages = [
     ...firstMessages,
     assistant,
@@ -434,7 +456,7 @@ export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = pr
     returnedModel: response.model || profile.model,
     estimatedUsd: priced.usd,
     toolCall: !!response.toolCalls?.length,
-    reasoningReturned: !!response.reasoning,
+    reasoningReturned: response.reasoning !== undefined,
   });
   return {
     live: true,
@@ -442,7 +464,7 @@ export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = pr
     requestedModel: profile.model,
     first: summarize(first),
     followup: summarize(second),
-    reasoningReplayed: !!first.response.reasoning,
+    reasoningReplayed: first.response.reasoning !== undefined,
     measuredUsd,
     reservedUsd,
   };

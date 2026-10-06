@@ -10,6 +10,7 @@ export function compactReport(job) {
   const minutes = Math.floor(elapsed / 60000),
     seconds = Math.floor(elapsed / 1000) % 60;
   const line1 = `JOB ${scalar(job.id)}  ${scalar(job.status || 'QUEUED')}`;
+  const reportMode = job.mode === 'report';
   const usage =
     job.usage &&
     typeof job.usage === 'object' &&
@@ -49,9 +50,11 @@ export function compactReport(job) {
     .join(' · ');
   const violations = Array.isArray(job.scopeViolations) ? job.scopeViolations.slice(0, 2_000) : [];
   const scope = violations.length ? `scope: VIOLATIONS: ${violations.map(scalar).join(', ')}` : 'scope: ok';
-  const isolation = job.workspacePath
-    ? `isolation: private worktree · ${job.revertUncertain ? 'reverse outcome uncertain; inspect primary' : job.revertedAt ? 'applied patch reverted' : job.integrationUncertain ? 'integration outcome uncertain; inspect primary' : job.applied === true ? 'applied to primary' : job.integrationConflict ? 'primary conflict; not applied' : 'not applied'}${job.noChanges ? ' (no owned changes)' : ''}`
-    : '';
+  const isolation = reportMode
+    ? 'isolation: private read-only worktree · never integrated into primary'
+    : job.workspacePath
+      ? `isolation: private worktree · ${job.revertUncertain ? 'reverse outcome uncertain; inspect primary' : job.revertedAt ? 'applied patch reverted' : job.integrationUncertain ? 'integration outcome uncertain; inspect primary' : job.applied === true ? 'applied to primary' : job.integrationConflict ? 'primary conflict; not applied' : 'not applied'}${job.noChanges ? ' (no owned changes)' : ''}`
+      : '';
   const discarded =
     Array.isArray(job.discardedEphemeralOutputs) && job.discardedEphemeralOutputs.length
       ? `discarded ephemeral outputs: ${job.discardedEphemeralOutputs.slice(0, 200).map(scalar).join(', ')}`
@@ -66,6 +69,9 @@ export function compactReport(job) {
       ? `concerns: ${scalar(job.concerns.slice(0, 100).map(String).join('; ')).slice(0, 1500)}`
       : '';
   const error = job.error ? `error: ${scalar(job.error).slice(0, 1500)}` : '';
+  const providerFailure = providerFailureLine(job.providerFailure);
+  const providerFinishReason = providerFinishReasonLine(job.providerFinishReason);
+  const budgetReservation = budgetReservationLine(job.budgetReservation);
   const limitation =
     job.sandboxMode === 'policy-only' || job.verify?.result?.sandbox === 'policy-only'
       ? 'sandbox: policy-only (OS isolation unavailable)'
@@ -77,9 +83,10 @@ export function compactReport(job) {
       : job.workspaceCleanupError
         ? `workspace cleanup: RETRYABLE ERROR — ${scalar(job.workspaceCleanupError)}`
         : '';
-  const nextActions = [`offload_job {jobId:${JSON.stringify(scalar(job.id))}, include:"diff"}`];
-  if (!violations.length && job.applied === true && !job.revertedAt && !job.revertUncertain) nextActions.push('revert');
+  const nextActions = reportMode ? ['read reportResult'] : [`offload_job {jobId:${JSON.stringify(scalar(job.id))}, include:"diff"}`];
+  if (!reportMode && !violations.length && job.applied === true && !job.revertedAt && !job.revertUncertain) nextActions.push('revert');
   if (
+    !reportMode &&
     !violations.length &&
     job.applied !== true &&
     !job.integrationIntent &&
@@ -106,12 +113,58 @@ export function compactReport(job) {
     workspaceCleanup,
     summary,
     concerns,
+    providerFailure,
+    providerFinishReason,
+    budgetReservation,
     error,
     `next: ${nextActions.join(' · ')}`,
   ]
     .filter(Boolean)
     .join('\n');
   return redactText(raw);
+}
+function providerFinishReasonLine(value) {
+  const reasons = new Set(['stop', 'length', 'tool_calls', 'function_call', 'content_filter', 'other']);
+  return reasons.has(value) ? `provider finish reason: ${value}` : '';
+}
+function budgetReservationLine(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+  const projections = new Set(['raw', 'tool-elision', 'deep-tool-elision']);
+  const numeric = [
+    'conservativeInputTokens',
+    'conservativeInputUsd',
+    'minOutputTokens',
+    'minOutputUsd',
+    'remainingUsd',
+    'requiredUsd',
+    'shortfallUsd',
+    'elidedToolResults',
+  ];
+  if (
+    !projections.has(value.projection) ||
+    value.minOutputTokens !== 16 ||
+    numeric.some((key) => !Number.isFinite(value[key]) || value[key] < 0)
+  )
+    return '';
+  return `budget reservation: ${value.projection}; input ${value.conservativeInputTokens} tokens/$${value.conservativeInputUsd}; minimum output ${value.minOutputTokens} tokens/$${value.minOutputUsd}; remaining $${value.remainingUsd}; required $${value.requiredUsd}; shortfall $${value.shortfallUsd}; elided tool results ${value.elidedToolResults}`;
+}
+function providerFailureLine(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+  const kinds = new Set(['request', 'http', 'transport', 'attempt_timeout', 'redirect', 'sse_protocol', 'sse_limit']);
+  if (!kinds.has(value.kind)) return '';
+  const attempt =
+    Number.isSafeInteger(value.attempts) && value.attempts > 0 && value.attempts <= 16
+      ? ` after ${value.attempts} attempt${value.attempts === 1 ? '' : 's'}`
+      : '';
+  const status =
+    value.kind === 'http' && Number.isSafeInteger(value.status) && value.status >= 100 && value.status <= 599
+      ? ` HTTP ${value.status}`
+      : '';
+  const timeout =
+    value.kind === 'attempt_timeout' && Number.isSafeInteger(value.timeoutMs) && value.timeoutMs >= 30_000 && value.timeoutMs <= 600_000
+      ? ` (${Math.floor(value.timeoutMs / 1000)}s limit)`
+      : '';
+  return `provider failure: ${scalar(value.kind)}${status}${attempt}${timeout}`;
 }
 function parseTimestamp(value) {
   return typeof value === 'string' || value instanceof Date ? Date.parse(value) : NaN;
@@ -151,7 +204,7 @@ function stripTerminalEscapes(value) {
 function stripControls(value) {
   return stripTerminalEscapes(value)
     .replace(/\t/g, '↹')
-    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
 }
 function scalar(value) {
   // Strip an entire terminal sequence before clipping. Clipping first could

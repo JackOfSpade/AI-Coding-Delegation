@@ -40,6 +40,50 @@ test('CLI validates and forwards start arguments', async () => {
     2,
   );
 });
+test('CLI accepts explicit report mode without owned paths and rejects report inputs on write jobs', async () => {
+  const out = sink(),
+    err = sink();
+  let input;
+  const status = await runCli(['start', '--mode', 'report', '--task', 'analyze', '--inputFiles', '["/tmp/result.json"]'], {
+    core: { start: async (value) => (input = value), job: async () => ({}) },
+    stdout: out.stream,
+    stderr: err.stream,
+  });
+  assert.equal(status, 0);
+  assert.equal(input.mode, 'report');
+  assert.equal(input.ownedPaths, undefined);
+  assert.deepEqual(input.inputFiles, ['/tmp/result.json']);
+  assert.equal(
+    await runCli(['start', '--task', 'write', '--ownedPaths', '["src/**"]', '--inputFiles', '["/tmp/result.json"]'], {
+      core: {},
+      stdout: out.stream,
+      stderr: err.stream,
+    }),
+    2,
+  );
+  assert.match(err.get(), /inputFiles/);
+});
+test('CLI rejects report text that repeats a raw external input reference before invoking Core', async () => {
+  const out = sink(),
+    err = sink();
+  let started = false;
+  const sensitiveInput = '/tmp/customer-秘密-export.json';
+  const status = await runCli(
+    ['start', '--mode', 'report', '--task', `review ${sensitiveInput}`, '--inputFiles', JSON.stringify([sensitiveInput])],
+    {
+      core: {
+        start: async () => {
+          started = true;
+        },
+      },
+      stdout: out.stream,
+      stderr: err.stream,
+    },
+  );
+  assert.equal(status, 2);
+  assert.equal(started, false);
+  assert.match(err.get(), /use input ordinals or generic private paths/);
+});
 test('CLI parses budget and bare booleans', async () => {
   const out = sink(),
     err = sink();

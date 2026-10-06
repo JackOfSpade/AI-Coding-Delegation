@@ -15,7 +15,9 @@ const CLI_COMMANDS = Object.freeze({
   start: {
     valueFlags: [
       'task',
+      'mode',
       'ownedPaths',
+      'inputFiles',
       'acceptanceCriteria',
       'relevantPaths',
       'testCommand',
@@ -161,7 +163,9 @@ function validateDecodedInvocation(command, flags, positionals) {
   if (command !== 'start') return;
   validateJobRequest({
     task: flags.task ?? positionals.join(' '),
+    mode: flags.mode,
     ownedPaths: decodedFlag(flags, 'ownedPaths', undefined),
+    inputFiles: decodedFlag(flags, 'inputFiles', undefined),
     acceptanceCriteria: decodedFlag(flags, 'acceptanceCriteria', []),
     relevantPaths: decodedFlag(flags, 'relevantPaths', []),
     testCommand: flags.testCommand,
@@ -179,9 +183,9 @@ function validateDecodedInvocation(command, flags, positionals) {
           }
         : undefined,
     ),
-    allowNetwork: bool(flags.allowNetwork),
-    unsafePolicyOnlyVerifier: bool(flags['unsafe-policy-only-verifier']),
-    extraWritable: decodedFlag(flags, 'extraWritable', []),
+    ...(flags.allowNetwork !== undefined ? { allowNetwork: bool(flags.allowNetwork) } : {}),
+    ...(flags['unsafe-policy-only-verifier'] !== undefined ? { unsafePolicyOnlyVerifier: bool(flags['unsafe-policy-only-verifier']) } : {}),
+    ...(flags.extraWritable !== undefined ? { extraWritable: decodedFlag(flags, 'extraWritable', []) } : {}),
     repoPath: flags.repoPath,
   });
 }
@@ -341,7 +345,9 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
     } else if (command === 'start') {
       const input = {
         task: flags.task || positionals.join(' '),
+        mode: flags.mode,
         ownedPaths: decode(flags.ownedPaths, undefined),
+        inputFiles: decode(flags.inputFiles, undefined),
         acceptanceCriteria: decode(flags.acceptanceCriteria, []),
         relevantPaths: decode(flags.relevantPaths, []),
         testCommand: flags.testCommand,
@@ -358,9 +364,11 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
               }
             : undefined,
         ),
-        allowNetwork: bool(flags.allowNetwork),
-        unsafePolicyOnlyVerifier: bool(flags['unsafe-policy-only-verifier']),
-        extraWritable: decode(flags.extraWritable, []),
+        ...(flags.allowNetwork !== undefined ? { allowNetwork: bool(flags.allowNetwork) } : {}),
+        ...(flags['unsafe-policy-only-verifier'] !== undefined
+          ? { unsafePolicyOnlyVerifier: bool(flags['unsafe-policy-only-verifier']) }
+          : {}),
+        ...(flags.extraWritable !== undefined ? { extraWritable: decode(flags.extraWritable, []) } : {}),
         repoPath: flags.repoPath,
       };
       if (injectedCore || bool(flags.foreground)) result = await core.start(input);

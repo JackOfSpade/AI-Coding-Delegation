@@ -83,18 +83,40 @@ export async function buildSystemPrompt({
   allowNetwork = false,
   allowCommand = true,
   acceptanceCriteria = [],
+  mode = 'write',
+  inputManifest = [],
   conventions,
+  remainingTurns,
 } = {}) {
   const writable = [...(ownedPaths ?? []), ...(extraWritable ?? [])].filter((value) => typeof value === 'string');
   const relevant = (relevantPaths ?? []).filter((value) => typeof value === 'string' && value.length <= 1024).slice(0, 50);
+  const inputs = Array.isArray(inputManifest)
+    ? inputManifest
+        .filter((input) => input && typeof input.path === 'string' && Number.isSafeInteger(input.bytes) && input.bytes >= 0)
+        .slice(0, 32)
+    : [];
+  const reportMode = mode === 'report';
+  // This is deliberately advisory rather than a second budget authority: the
+  // loop enforces its own turn cap.  Only state an actual finite allowance so
+  // an omitted or legacy value cannot turn into misleading worker guidance.
+  const finiteRemainingTurns = Number.isSafeInteger(remainingTurns) && remainingTurns > 0 ? remainingTurns : undefined;
   const rules = [
-    'You are a coding worker. Use tools to inspect and change the local repository.',
-    `You may write only: ${writable.join(', ') || '(none)'}.`,
+    reportMode
+      ? 'You are a read-only analysis worker. Inspect the local repository and return a concise structured report.'
+      : 'You are a coding worker. Use tools to inspect and change the local repository.',
+    reportMode
+      ? 'Do not edit or write any repository file. The supplied external inputs are private read-only copies.'
+      : `You may write only: ${writable.join(', ') || '(none)'}.`,
     `Network access is ${allowNetwork ? 'permitted for this job only when necessary' : 'not permitted for this job'}. Never commit, push, switch branches, reset, stash, clean, or access secrets.`,
     allowCommand
       ? 'Read files before editing them. Keep changes focused. Run relevant tests when possible.'
       : 'Read files before editing them. Keep changes focused. Shell commands are unavailable for this job; report tests that you could not run.',
-    'You must call finish with a concise summary, concerns, and testsRun when the task is complete.',
+    !reportMode && finiteRemainingTurns
+      ? `You have ${finiteRemainingTurns} model turn${finiteRemainingTurns === 1 ? '' : 's'} available. Batch independent reads and lists, then after their required reads make an allowed tool call immediately. Do not emit source code, a plan, progress update, or other narrative outside tool calls; put source only in write_file.content. Prefer read_file, list_dir, glob, and grep for ordinary inspection. When read_file returns [truncated; next offset N], continue that file with exactly offset N. ${allowCommand ? 'Reserve run_command for focused build, test, or diagnostic work after changes. ' : ''}Prefer writing complete final file content with write_file over a write-then-edit sequence. If several new files are needed, write one complete file per tool-call response, then continue with the next file. edit_file requires a fresh read of that file, including after write_file. Reserve time for the configured verifier and the mandatory single finish call.`
+      : '',
+    reportMode
+      ? 'You must call finish with a concise summary and your detailed findings in its report field (up to 256000 characters), plus concerns and testsRun.'
+      : 'You must call finish with a concise summary, concerns, and testsRun when the task is complete.',
   ];
   const local = conventions ?? (await repoConventions(repoPath));
   // `task` intentionally stays out of the system message.  It is sent once
@@ -102,6 +124,9 @@ export async function buildSystemPrompt({
   return [
     rules.join('\n'),
     relevant.length ? `Relevant starting paths:\n${relevant.map((x) => `- ${x}`).join('\n')}` : '',
+    inputs.length
+      ? `Read-only external inputs copied into this private worktree:\n${inputs.map((input) => `- ${input.path} (${input.bytes} bytes)`).join('\n')}`
+      : '',
     acceptanceCriteria.length ? `Acceptance criteria:\n${acceptanceCriteria.map((x) => `- ${x}`).join('\n')}` : '',
     local,
   ]

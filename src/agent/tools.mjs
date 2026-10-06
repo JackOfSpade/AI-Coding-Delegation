@@ -4,12 +4,13 @@ import { constants, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { PathPolicy } from '../policy.mjs';
-import { redactText } from '../redact.mjs';
+import { RedactionProjector, redactText, stripTerminalControls } from '../redact.mjs';
 import { snapshotGitEnv } from '../git-snapshot.mjs';
 
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const MAX_READ_CAP = 256_000;
 const MAX_OUTPUT_CAP = 128_000;
+const MAX_READ_PREFIX_SCAN = 8 * 1024 * 1024;
 const MAX_EDITABLE_BYTES = 8 * 1024 * 1024;
 const MAX_EDIT_ARG_CAP = 64_000;
 const MAX_GREP_FILE_BYTES = 8 * 1024 * 1024;
@@ -25,18 +26,23 @@ const boundedInt = (value, fallback, max, name) => {
   if (!Number.isSafeInteger(value) || value < 0 || value > max) throw new Error(`${name} must be an integer between 0 and ${max}`);
   return value;
 };
-const capText = (value, cap) =>
-  value.length <= cap
-    ? value
-    : `${value.slice(0, Math.floor(cap / 2))}\n…[${value.length - cap} chars omitted]…\n${value.slice(-Math.floor(cap / 2))}`;
+const capText = (value, cap) => {
+  if (value.length <= cap) return value;
+  // Reserve the dynamically sized marker first. In particular, `slice(-0)`
+  // is the whole string, so a small/odd retained budget needs an explicit
+  // zero-tail branch rather than the old head/tail interpolation.
+  const maximumMarker = `\n…[${value.length} chars omitted]…\n`;
+  const kept = Math.max(0, cap - maximumMarker.length);
+  const tailLength = Math.floor(kept / 2);
+  const headLength = kept - tailLength;
+  const omitted = value.length - kept;
+  const marker = `\n…[${omitted} chars omitted]…\n`;
+  const tail = tailLength === 0 ? '' : value.slice(-tailLength);
+  return `${value.slice(0, headLength)}${marker}${tail}`;
+};
 // Tool text crosses the provider boundary. Keep line structure but prevent
 // terminal escapes/control injection and mask common accidental credentials.
-const sanitizeToolText = (value) =>
-  redactText(
-    String(value)
-      .replace(/\x1B(?:\[[0-?]*[ -\/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g, '')
-      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ''),
-  );
+const sanitizeToolText = (value) => redactText(stripTerminalControls(value));
 const asText = (value) => (typeof value === 'string' ? value : JSON.stringify(value));
 const statTimestamp = (details, name) => {
   const nanoseconds = details?.[`${name}Ns`];
@@ -76,10 +82,79 @@ const schema = (name, description, properties, required) =>
 const str = { type: 'string' };
 const EXECUTABLE_TOOL_NAMES = new Set(['read_file', 'list_dir', 'glob', 'grep', 'edit_file', 'write_file', 'run_command']);
 
+const truncationMarker = (offset, size) => (offset < size ? `\n[truncated; next offset ${offset}]` : '');
+
+// A page is selected from source spans rather than from already-rendered text.
+// This keeps the offset authoritative even when a source credential becomes a
+// shorter `[REDACTED]` projection. The producer feeds it from byte zero, so a
+// direct caller cannot bypass redaction by starting inside a credential.
+class ReadPage {
+  constructor({ offset, limit, size, outputCap }) {
+    this.offset = offset;
+    this.limit = limit;
+    this.size = size;
+    this.outputCap = outputCap;
+    this.effectiveStart = undefined;
+    this.target = undefined;
+    this.text = '';
+    this.end = undefined;
+    this.closed = false;
+  }
+  #begin(event) {
+    if (this.effectiveStart !== undefined) return true;
+    if (event.end <= this.offset) return false;
+    // A scalar split by the raw caller offset is skipped (as older read_file
+    // behavior did). A redaction span is different: rendering the whole
+    // replacement is the only safe projection when the offset lands inside it.
+    if (event.start < this.offset && !event.redacted) {
+      this.effectiveStart = event.end;
+      this.target = Math.min(this.size, this.effectiveStart + this.limit);
+      return false;
+    }
+    this.effectiveStart = this.offset;
+    this.target = Math.min(this.size, this.effectiveStart + this.limit);
+    return true;
+  }
+  #append(event) {
+    let rendered = event.text;
+    const sourceEnd = Math.max(this.end ?? 0, event.end);
+    let marker = truncationMarker(sourceEnd, this.size);
+    if (this.text.length + rendered.length + marker.length > this.outputCap && event.redacted) {
+      // Labels are normally short, but a hostile variable/header spelling
+      // must never make a 128-char page unable to advance.
+      rendered = '[REDACTED]';
+      marker = truncationMarker(sourceEnd, this.size);
+    }
+    if (this.text.length + rendered.length + marker.length > this.outputCap) {
+      this.closed = true;
+      return;
+    }
+    this.text += rendered;
+    this.end = sourceEnd;
+  }
+  accept(event) {
+    if (this.closed || event.end <= event.start || !this.#begin(event)) return;
+    const beginsAfterPage = event.start >= this.target;
+    const endsBeforePage = event.end <= this.effectiveStart;
+    if (beginsAfterPage || endsBeforePage) return;
+    // A plain source scalar may extend through the byte limit; preserve it in
+    // full rather than emit malformed UTF-8. Redaction spans deliberately
+    // extend to the credential's true source end for the same reason.
+    this.#append(event);
+  }
+  get needsBoundary() {
+    return this.effectiveStart !== undefined && this.target !== undefined;
+  }
+  result() {
+    if (this.end === undefined) return '';
+    return this.text + truncationMarker(this.end, this.size);
+  }
+}
+
 export const TOOL_DEFINITIONS = Object.freeze([
   schema(
     'read_file',
-    'Read a bounded UTF-8 byte window of a repository file before editing it.',
+    'Read a bounded UTF-8 byte window of a repository file before editing it. If output ends [truncated; next offset N], continue with exactly offset N.',
     { path: str, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: MAX_READ_CAP } },
     ['path'],
   ),
@@ -87,7 +162,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   schema('glob', 'Find repository files matching a glob.', { pattern: { type: 'string', minLength: 1, maxLength: 1024 } }, ['pattern']),
   schema(
     'grep',
-    'Search literal text in readable repository files (not regular expressions).',
+    'Search literal text in a readable repository directory or regular file (not regular expressions).',
     { pattern: { type: 'string', minLength: 1, maxLength: 4096 }, path: str },
     ['pattern'],
   ),
@@ -102,13 +177,15 @@ export const TOOL_DEFINITIONS = Object.freeze([
     },
     ['path', 'old_string', 'new_string'],
   ),
-  schema('write_file', 'Write one owned repository file.', { path: str, content: { type: 'string', maxLength: MAX_READ_CAP } }, [
-    'path',
-    'content',
-  ]),
+  schema(
+    'write_file',
+    'Write one complete owned repository file. Put all source content in content, never in prose.',
+    { path: str, content: { type: 'string', maxLength: MAX_READ_CAP } },
+    ['path', 'content'],
+  ),
   schema(
     'run_command',
-    'Run a command through the configured sandbox runner.',
+    'Run a focused build, test, or diagnostic command through the configured sandbox runner; prefer read_file, list_dir, glob, or grep for routine file inspection.',
     { command: { type: 'string', minLength: 1, maxLength: 8192 }, timeoutSec: { type: 'integer', minimum: 1, maximum: 3600 } },
     ['command'],
   ),
@@ -117,6 +194,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
     'Finish as the sole tool call with a structured report.',
     {
       summary: { type: 'string', minLength: 1, maxLength: 1500 },
+      report: { type: 'string', maxLength: 256_000, description: 'Optional detailed report text, used by read-only report jobs.' },
       concerns: { type: 'array', items: str, maxItems: 100 },
       testsRun: { type: 'array', items: str, maxItems: 100 },
     },
@@ -125,9 +203,14 @@ export const TOOL_DEFINITIONS = Object.freeze([
 ]);
 
 /** Return the exact schemas a particular job can actually execute. */
-export function availableToolDefinitions({ allowCommand = true } = {}) {
-  if (typeof allowCommand !== 'boolean') throw new TypeError('allowCommand must be boolean');
-  return allowCommand ? TOOL_DEFINITIONS : Object.freeze(TOOL_DEFINITIONS.filter((tool) => tool.function.name !== 'run_command'));
+export function availableToolDefinitions({ allowCommand = true, readOnly = false } = {}) {
+  if (typeof allowCommand !== 'boolean' || typeof readOnly !== 'boolean') throw new TypeError('allowCommand and readOnly must be boolean');
+  return Object.freeze(
+    TOOL_DEFINITIONS.filter(
+      (tool) =>
+        (allowCommand || tool.function.name !== 'run_command') && (!readOnly || !['edit_file', 'write_file'].includes(tool.function.name)),
+    ),
+  );
 }
 
 /** PathPolicy is the sole authority for lexical/canonical scope and deny rules. */
@@ -412,24 +495,79 @@ export class LocalTools {
       throw new Error('Refusing invalid UTF-8 file');
     }
   }
-  #decodeWindow(bytes, requestedLength) {
-    let start = 0;
-    // A caller may give a byte offset in the middle of a valid multibyte
-    // scalar. Advance at most three continuation bytes to the next boundary.
-    while (start < bytes.length && start < 3 && (bytes[start] & 0xc0) === 0x80) start++;
-    if (start === 3 && start < bytes.length && (bytes[start] & 0xc0) === 0x80) throw new Error('Refusing invalid UTF-8 file');
-    // Permit a final scalar to extend slightly past the requested byte limit,
-    // rather than emitting a malformed fragment. If extending three bytes
-    // cannot produce valid UTF-8, reject the file rather than corrupting it.
-    const initialEnd = Math.max(Math.min(requestedLength, bytes.length), Math.min(bytes.length, start + 1));
-    for (let end = initialEnd; end <= bytes.length && end <= initialEnd + 3; end++) {
-      try {
-        return { content: this.#decode(bytes.subarray(start, end)), skipped: start, consumed: end };
-      } catch (error) {
-        if (!/invalid UTF-8/.test(error.message)) throw error;
+  async #readProjection(handle, size, offset, limit) {
+    if (offset > MAX_READ_PREFIX_SCAN || limit > MAX_READ_PREFIX_SCAN - offset)
+      throw new Error(`Refusing read: requested offset and limit exceed the ${MAX_READ_PREFIX_SCAN}-byte safe prefix scan cap`);
+    const page = new ReadPage({ offset, limit, size, outputCap: this.outputCap });
+    const projector = new RedactionProjector((span) => page.accept(span));
+    const scanLimit = Math.min(size, MAX_READ_PREFIX_SCAN);
+    const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, scanLimit)));
+    let position = 0;
+    const scalar = Buffer.allocUnsafe(4);
+    let scalarStart = 0;
+    let scalarLength = 0;
+    let scalarSize = 0;
+    let firstScalar = true;
+    // Keep a leading BOM as a real scalar. The default decoder strips it and
+    // would otherwise produce an empty token that the projector rejects.
+    const scalarDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+    const expectedLength = (byte) => {
+      if (byte <= 0x7f) return 1;
+      if (byte >= 0xc2 && byte <= 0xdf) return 2;
+      if (byte >= 0xe0 && byte <= 0xef) return 3;
+      if (byte >= 0xf0 && byte <= 0xf4) return 4;
+      throw new Error('Refusing invalid UTF-8 file');
+    };
+    const pushByte = (byte, start, end) => {
+      if (byte === 0) throw new Error('Refusing binary file');
+      if (scalarLength === 0) {
+        scalarStart = start;
+        scalarLength = expectedLength(byte);
+        scalar[0] = byte;
+        scalarSize = 1;
+      } else {
+        if ((byte & 0xc0) !== 0x80) throw new Error('Refusing invalid UTF-8 file');
+        scalar[scalarSize++] = byte;
       }
+      if (scalarSize !== scalarLength) return false;
+      let char;
+      try {
+        char = scalarLength === 1 ? String.fromCharCode(scalar[0]) : scalarDecoder.decode(scalar.subarray(0, scalarLength));
+      } catch {
+        throw new Error('Refusing invalid UTF-8 file');
+      }
+      scalarLength = 0;
+      scalarSize = 0;
+      // Match the historical full-window decoder: omit only a leading UTF-8
+      // BOM, while still advancing its raw source span. Embedded BOMs remain
+      // ordinary visible Unicode scalars.
+      if (firstScalar && char === '\uFEFF') projector.skip(scalarStart, end);
+      else projector.push(char, scalarStart, end);
+      firstScalar = false;
+      return true;
+    };
+    while (position < scanLimit) {
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, scanLimit - position), position);
+      if (!bytesRead) throw new Error('File changed while being read');
+      for (let index = 0; index < bytesRead; index++) {
+        const start = position + index;
+        const completedScalar = pushByte(buffer[index], start, start + 1);
+        if (page.closed) return page.result();
+        // Limit is a source-byte window, extended only to the end of one UTF-8
+        // scalar or an already-recognized redaction/terminal-control span.
+        if (completedScalar && page.needsBoundary && start + 1 >= page.target) {
+          projector.flushBoundary();
+          if (page.closed) return page.result();
+          if (projector.canStopAtBoundary) return page.result();
+        }
+      }
+      position += bytesRead;
     }
-    throw new Error('Refusing invalid UTF-8 file');
+    if (scanLimit < size)
+      throw new Error(`Refusing read: requested page requires scanning beyond the ${MAX_READ_PREFIX_SCAN}-byte safe prefix scan cap`);
+    if (scalarLength !== 0) throw new Error('Refusing invalid UTF-8 file');
+    projector.finish(size);
+    return page.result();
   }
   async #hashText(handle, size) {
     const digest = createHash('sha256');
@@ -472,10 +610,7 @@ export class LocalTools {
     try {
       const start = boundedInt(offset, 0, size, 'offset');
       const window = boundedInt(limit, this.readCap, this.readCap, 'limit');
-      const bytes = Buffer.allocUnsafe(Math.min(window + 3, Math.max(0, size - start)));
-      const { bytesRead } = bytes.length ? await handle.read(bytes, 0, bytes.length, start) : { bytesRead: 0 };
-      const decoded = this.#decodeWindow(bytes.subarray(0, bytesRead), window);
-      const content = decoded.content;
+      const output = await this.#readProjection(handle, size, start, window);
       // Retain a full content fingerprint only for files we will permit an
       // exact edit on.  It is streamed, never loaded as one unbounded string.
       if (size <= MAX_EDITABLE_BYTES) {
@@ -486,8 +621,7 @@ export class LocalTools {
           throw new Error('File changed while being read');
         this.readHashes.set(canonical, { hash: fingerprint, size, identity: this.#identity(afterHash) });
       } else this.readHashes.set(canonical, { size, tooLarge: true });
-      const end = start + decoded.consumed;
-      return capText(sanitizeToolText(content), this.outputCap) + (end < size ? `\n[truncated; next offset ${end}]` : '');
+      return output;
     } finally {
       await handle.close();
     }
@@ -569,17 +703,11 @@ export class LocalTools {
   async grep({ pattern, path: base = '.' } = {}) {
     if (typeof pattern !== 'string' || !pattern || pattern.length > 4096)
       throw new Error('pattern must be a non-empty string up to 4096 chars');
-    this.#readable(base, { directory: true });
-    const discovered = await this.glob({ pattern: '**' });
-    const discoveryTruncated = discovered.split('\n').some((line) => line.startsWith('[truncated:'));
-    const files = discovered.split('\n').filter((line) => line && !line.startsWith('['));
-    const prefix = base === '.' ? '' : `${String(base).replace(/\/$/, '')}/`;
     const lines = [];
     let skippedLarge = false;
-    for (const file of files) {
-      if (!file.startsWith(prefix)) continue;
+    const searchFile = async (file, suppliedCanonical) => {
       try {
-        const canonical = this.#readable(file);
+        const canonical = suppliedCanonical ?? this.#readable(file);
         const { handle, size } = await this.#openText(canonical, file);
         try {
           const decoder = new TextDecoder('utf-8', { fatal: true });
@@ -634,6 +762,31 @@ export class LocalTools {
       } catch {
         /* unreadable/non-text */
       }
+    };
+    let discoveryTruncated = false;
+    if (base !== '.' && base !== '') {
+      // Authorize the exact file before inspecting its type. This preserves
+      // canonical path and deny-list checks and prevents a file request from
+      // becoming an implicit directory traversal.
+      const canonical = this.#readable(base);
+      const details = await this.fs.lstat(canonical);
+      if (details.isFile()) {
+        await searchFile(base, canonical);
+        return capText(
+          sanitizeToolText(`${lines.join('\n')}${skippedLarge ? '\n[files truncated at 8388608 bytes each]' : ''}`),
+          this.outputCap,
+        );
+      }
+      if (!details.isDirectory()) throw new Error('grep path must be a readable regular file or directory');
+    }
+    this.#readable(base, { directory: true });
+    const discovered = await this.glob({ pattern: '**' });
+    discoveryTruncated = discovered.split('\n').some((line) => line.startsWith('[truncated:'));
+    const files = discovered.split('\n').filter((line) => line && !line.startsWith('['));
+    const prefix = base === '.' || base === '' ? '' : `${String(base).replace(/\/$/, '')}/`;
+    for (const file of files) {
+      if (!file.startsWith(prefix)) continue;
+      await searchFile(file);
     }
     return capText(
       sanitizeToolText(
@@ -733,10 +886,21 @@ export class LocalTools {
         typeof args.summary === 'string' &&
         args.summary.length > 0 &&
         args.summary.length <= 1500 &&
+        (args.report === undefined || (typeof args.report === 'string' && args.report.length <= 256_000)) &&
         list(args.concerns) &&
         list(args.testsRun);
-      if (!valid) throw new Error('finish requires a 1-1500 character summary and up to 100 short string concerns/testsRun entries');
-      return { finish: { summary: args.summary, concerns: args.concerns ?? [], testsRun: args.testsRun ?? [] } };
+      if (!valid)
+        throw new Error(
+          'finish requires a 1-1500 character summary, optional 256000 character report, and up to 100 short string concerns/testsRun entries',
+        );
+      return {
+        finish: {
+          summary: args.summary,
+          ...(args.report !== undefined ? { report: args.report } : {}),
+          concerns: args.concerns ?? [],
+          testsRun: args.testsRun ?? [],
+        },
+      };
     }
     if (!EXECUTABLE_TOOL_NAMES.has(name)) throw new Error(`Unknown tool: ${name}`);
     const fn = this[name];

@@ -1,10 +1,12 @@
 import { realpathSync } from 'node:fs';
-import { isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { compactReport, terminalStatuses } from './report.mjs';
 import { matchesAny, normalizePath, pathsOverlap } from './glob.mjs';
 import { parseKeyRef } from './secrets.mjs';
 import { diffTreeFiles, diffTrees, git as snapshotGit } from './git-snapshot.mjs';
+import { copyReportInputs, prepareReportInputsForCleanup, reportInputRoots, validateReportInputFiles } from './report-inputs.mjs';
+import { redactText } from './redact.mjs';
 
 const allowedEffort = new Set(['normal', 'high']);
 const final = (status) => terminalStatuses.has(status);
@@ -22,9 +24,12 @@ const MAX_PATHS = 128,
   MAX_REPAIR_CHARS = 16_000;
 const MAX_RESULT_TURNS = 1000,
   MAX_RESULT_COST = 10_000,
-  MAX_USAGE = 1_000_000_000;
+  MAX_USAGE = 1_000_000_000,
+  MAX_REPORT_TEXT = 256_000;
 const USAGE_KEYS = ['inputTokens', 'outputTokens', 'cacheHitTokens', 'cacheMissTokens'];
 const finiteCount = (value) => Number.isSafeInteger(value) && value >= 0 && value <= MAX_USAGE;
+const filenameTokenCharacter = '[\\p{L}\\p{N}._-]';
+const escapeRegExp = (value) => value.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&');
 const validGitObjectId = (value) => typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value);
 const validBranchName = (value) => typeof value === 'string' && value.length <= 1024 && !/[\x00-\x1f\x7f]/.test(value);
 /** Durable records, leases, CLI and MCP all share this identifier boundary. */
@@ -44,6 +49,118 @@ const validUsage = (value) =>
   USAGE_KEYS.every((key) => value[key] === undefined || finiteCount(value[key])) &&
   (value.inputTokens === undefined || (value.cacheHitTokens ?? 0) + (value.cacheMissTokens ?? 0) === value.inputTokens);
 const boundedString = (value, cap) => (typeof value === 'string' && value.length <= cap ? value : undefined);
+/** Take a UTF-8 byte prefix without turning a supplementary-plane character
+ * into an unpaired surrogate. Redaction can enlarge short credential values,
+ * so this bound must run after sanitizing and redacting external text. */
+function truncateUtf8(value, maxBytes) {
+  let bytes = 0;
+  let end = 0;
+  for (const codePoint of value) {
+    const size = Buffer.byteLength(codePoint, 'utf8');
+    if (bytes + size > maxBytes) break;
+    bytes += size;
+    end += codePoint.length;
+  }
+  return value.slice(0, end);
+}
+function safeReportString(value, maxChars = MAX_REPORT_TEXT) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > maxChars || Buffer.byteLength(value, 'utf8') > MAX_REPORT_TEXT)
+    return undefined;
+  const sanitized = redactText(
+    value
+      .replace(/\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g, '')
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, ''),
+  );
+  // Lists use their existing 1,500-character contract as a tighter byte
+  // budget; full reports retain the documented global result limit.
+  const bounded = truncateUtf8(sanitized, Math.min(MAX_REPORT_TEXT, maxChars));
+  return bounded || undefined;
+}
+const safeReportText = (value) => safeReportString(value);
+const safeReportError = (value) =>
+  safeReportString(typeof value === 'string' ? value : String(value || ''), 1500) || 'report worker failed';
+const PROVIDER_FAILURE_KINDS = new Set(['request', 'http', 'transport', 'attempt_timeout', 'redirect', 'sse_protocol', 'sse_limit']);
+const PROVIDER_FINISH_REASONS = new Set(['stop', 'length', 'tool_calls', 'function_call', 'content_filter', 'other']);
+const CAPPED_FINISH_RECOVERY_STATES = new Set(['queued', 'consumed', 'settled']);
+const BUDGET_FINISH_RECOVERY_STATES = new Set(['queued', 'consumed']);
+const safeProviderFinishReason = (value) => {
+  if (typeof value !== 'string') return undefined;
+  return PROVIDER_FINISH_REASONS.has(value) ? value : 'other';
+};
+const BUDGET_RESERVATION_PROJECTIONS = new Set(['raw', 'tool-elision', 'deep-tool-elision']);
+const MAX_BUDGET_RESERVATION_NUMBER = 10_000_000_000;
+const safeBudgetReservationNumber = (value) =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= MAX_BUDGET_RESERVATION_NUMBER ? value : undefined;
+// This record deliberately contains arithmetic only.  It is attached to a
+// public job/event, so reject rather than coerce anything that could carry a
+// transcript, path, provider response, or unbounded size.
+const safeBudgetReservation = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const keys = [
+    'conservativeInputTokens',
+    'conservativeInputUsd',
+    'minOutputTokens',
+    'minOutputUsd',
+    'remainingUsd',
+    'requiredUsd',
+    'shortfallUsd',
+    'projection',
+    'elidedToolResults',
+  ];
+  if (Object.keys(value).some((key) => !keys.includes(key))) return undefined;
+  if (
+    !Number.isSafeInteger(value.conservativeInputTokens) ||
+    value.conservativeInputTokens < 0 ||
+    value.conservativeInputTokens > MAX_USAGE ||
+    value.minOutputTokens !== 16 ||
+    !Number.isSafeInteger(value.elidedToolResults) ||
+    value.elidedToolResults < 0 ||
+    value.elidedToolResults > MAX_USAGE ||
+    !BUDGET_RESERVATION_PROJECTIONS.has(value.projection)
+  )
+    return undefined;
+  for (const key of ['conservativeInputUsd', 'minOutputUsd', 'remainingUsd', 'requiredUsd', 'shortfallUsd'])
+    if (safeBudgetReservationNumber(value[key]) === undefined) return undefined;
+  if (
+    Math.abs(value.requiredUsd - (value.conservativeInputUsd + value.minOutputUsd)) > 1e-12 ||
+    Math.abs(value.shortfallUsd - Math.max(0, value.requiredUsd - value.remainingUsd)) > 1e-12
+  )
+    return undefined;
+  return Object.fromEntries(keys.map((key) => [key, value[key]]));
+};
+const safeProviderFailure = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !PROVIDER_FAILURE_KINDS.has(value.kind)) return undefined;
+  const failure = { kind: value.kind };
+  if (Number.isSafeInteger(value.attempts) && value.attempts > 0 && value.attempts <= 16) failure.attempts = value.attempts;
+  if (value.kind === 'http' && Number.isSafeInteger(value.status) && value.status >= 100 && value.status <= 599)
+    failure.status = value.status;
+  if (value.kind === 'attempt_timeout' && Number.isSafeInteger(value.timeoutMs) && value.timeoutMs >= 30_000 && value.timeoutMs <= 600_000)
+    failure.timeoutMs = value.timeoutMs;
+  return failure;
+};
+const providerFailureMessage = (failure) => {
+  switch (failure?.kind) {
+    case 'attempt_timeout':
+      return failure.timeoutMs ? `Provider request timed out after ${Math.floor(failure.timeoutMs / 1000)}s` : 'Provider request timed out';
+    case 'redirect':
+      return 'Provider redirect rejected';
+    case 'http':
+      return failure.status ? `Provider request failed (HTTP ${failure.status})` : 'Provider request failed';
+    case 'sse_protocol':
+      return 'Provider response stream was invalid';
+    case 'sse_limit':
+      return 'Provider response stream exceeded a safety limit';
+    default:
+      return 'Provider request failed';
+  }
+};
+const safeReportList = (value) =>
+  Array.isArray(value)
+    ? value
+        .map((item) => safeReportString(item, 1500))
+        .filter(Boolean)
+        .slice(0, 100)
+    : [];
 const boundedStrings = (value, count = 100, cap = 1500) =>
   Array.isArray(value) ? value.filter((item) => typeof item === 'string' && item.length <= cap).slice(0, count) : undefined;
 function cleanText(value, max) {
@@ -78,7 +195,7 @@ function validPaths(paths, required = true) {
 }
 function validExecutionProfile(value) {
   if (value == null) return true;
-  const permitted = new Set(['type', 'baseUrl', 'keyRef', 'model', 'effort', 'pricing', 'pricingFile']);
+  const permitted = new Set(['type', 'baseUrl', 'keyRef', 'model', 'effort', 'pricing', 'pricingFile', 'attemptTimeoutMs']);
   const cleanProviderText = (text, maximum) =>
     typeof text === 'string' && text.length > 0 && text.length <= maximum && !/[\x00-\x1f\x7f]/.test(text);
   if (
@@ -92,7 +209,9 @@ function validExecutionProfile(value) {
     !cleanText(value.keyRef, 4096) ||
     (value.effort !== undefined && !allowedEffort.has(value.effort)) ||
     (value.pricing !== undefined && !cleanProviderText(value.pricing, 128)) ||
-    (value.pricingFile !== undefined && (!cleanProviderText(value.pricingFile, 4096) || !isAbsolute(value.pricingFile)))
+    (value.pricingFile !== undefined && (!cleanProviderText(value.pricingFile, 4096) || !isAbsolute(value.pricingFile))) ||
+    (value.attemptTimeoutMs !== undefined &&
+      (!Number.isSafeInteger(value.attemptTimeoutMs) || value.attemptTimeoutMs < 30_000 || value.attemptTimeoutMs > 600_000))
   )
     return false;
   try {
@@ -115,8 +234,10 @@ function validExecutionProfile(value) {
 const writeScope = (job) => [...(job.ownedPaths || []), ...(job.extraWritable || [])];
 const JOB_INPUT_KEYS = [
   'task',
+  'mode',
   'acceptanceCriteria',
   'ownedPaths',
+  'inputFiles',
   'relevantPaths',
   'testCommand',
   'testCommandSource',
@@ -180,8 +301,41 @@ export function validateJobRequest(input) {
   if (Object.keys(input).some((key) => !JOB_INPUT_KEYS.includes(key))) throw new Error('job request contains an unknown property');
   if (!input || !cleanText(input.task, MAX_TASK) || !input.task.trim())
     throw new Error('task is required and must be at most 32000 characters');
-  const ownedPaths = canonicalPaths(input.ownedPaths);
-  if (!ownedPaths) throw new Error('ownedPaths must be a non-empty array of relative paths/globs');
+  if (input.mode != null && input.mode !== 'write' && input.mode !== 'report') throw new Error('mode must be write or report');
+  const mode = input.mode || 'write';
+  const ownedPaths = canonicalPaths(input.ownedPaths ?? (mode === 'report' ? [] : undefined), mode !== 'report');
+  if (!ownedPaths)
+    throw new Error(
+      mode === 'report'
+        ? 'ownedPaths must be an array of relative paths/globs'
+        : 'ownedPaths must be a non-empty array of relative paths/globs',
+    );
+  if (mode === 'report' && ownedPaths.length) throw new Error('report jobs must not declare ownedPaths');
+  validateReportInputFiles(input.inputFiles);
+  if (mode !== 'report' && input.inputFiles != null) throw new Error('inputFiles are available only to report jobs');
+  if (mode === 'report' && input.inputFiles?.length) {
+    const durableText = [
+      input.task,
+      ...(Array.isArray(input.acceptanceCriteria) ? input.acceptanceCriteria : []),
+      ...(Array.isArray(input.relevantPaths) ? input.relevantPaths : []),
+      ...(Array.isArray(input.denyRead) ? input.denyRead : []),
+    ];
+    const repeatsRawInput = input.inputFiles.some((path) => {
+      const name = basename(path);
+      const filename = name
+        ? new RegExp(`(?<!${filenameTokenCharacter})${escapeRegExp(name)}(?!${filenameTokenCharacter})`, 'u')
+        : undefined;
+      return durableText.some((text) => typeof text === 'string' && (text.includes(path) || filename?.test(text)));
+    });
+    if (repeatsRawInput)
+      throw new Error('report jobs must not repeat raw inputFiles paths or basenames; use input ordinals or generic private paths');
+  }
+  if (mode === 'report' && input.testCommand != null) throw new Error('report jobs do not run testCommand');
+  if (mode === 'report' && input.extraWritable !== undefined && (!Array.isArray(input.extraWritable) || input.extraWritable.length))
+    throw new Error('report jobs must not declare writable paths');
+  if (mode === 'report' && Object.hasOwn(input, 'allowNetwork')) throw new Error('report jobs do not allow network access');
+  if (mode === 'report' && (Object.hasOwn(input, 'requireSandbox') || Object.hasOwn(input, 'unsafePolicyOnlyVerifier')))
+    throw new Error('report jobs do not use verifier sandbox options');
   if (
     input.acceptanceCriteria != null &&
     (!Array.isArray(input.acceptanceCriteria) ||
@@ -342,6 +496,7 @@ export class JobManager {
   async #cleanupWorkspace(job) {
     if (!this.isolated || !job?.workspacePath || typeof this.config.isolation.cleanup !== 'function') return true;
     try {
+      if (job.mode === 'report') await prepareReportInputsForCleanup(job.workspacePath);
       const result = await this.config.isolation.cleanup({ repoPath: job.repoPath, workspacePath: job.workspacePath });
       // A helper may explicitly report a retained/failed private root. A
       // resolved promise alone is not proof that retryable cleanup happened.
@@ -365,6 +520,7 @@ export class JobManager {
         finalStatus: status,
         ...(releaseOwnerNonce ? { leaseOwnerNonce: releaseOwnerNonce } : {}),
       };
+      if (job.mode === 'report' && Object.hasOwn(changes, 'error')) changes.error = safeReportError(changes.error);
       if (expectedIdentity) {
         if (typeof this.store.updateOperationalIf === 'function')
           staged = await this.store.updateOperationalIf(job.id, expectedIdentity, changes);
@@ -427,7 +583,7 @@ export class JobManager {
         ...(finalStatus === 'FAILED' && error ? { error } : {}),
       },
       ownerNonce,
-      { requireLeaseRelease: true, expectedIdentity: this.#recoveryIdentity(job) },
+      { requireLeaseRelease: writeScope(job).length > 0, expectedIdentity: this.#recoveryIdentity(job) },
     );
     return this.public(settled || this.validatePersisted(await this.store.get(id)));
   }
@@ -625,6 +781,62 @@ export class JobManager {
     } catch {}
     return cleaned;
   }
+  /**
+   * A queued budget-finish recovery is the sole crash state that can safely
+   * resume a worker here. It is distinct from capped implementation recovery:
+   * its AgentLoop request is a fixed finish-only projection, authorized by
+   * the authenticated lifecycle marker; ordinary queued jobs remain
+   * deliberately non-resumable here.
+   */
+  async #recoverQueuedBudgetFinish(job, get) {
+    const scope = writeScope(job);
+    const ownerNonce = randomUUID();
+    let acquired = false;
+    if (scope.length) {
+      // A write-capable restart must own a fresh lease before it changes the
+      // durable owner tuple. Missing/unavailable lease authority is a defer,
+      // not permission to publish a terminal result or clean a workspace.
+      if (typeof this.leases.acquire !== 'function') return false;
+      try {
+        if (this.leases.acquire.length >= 2) await this.leases.acquire(job.id, scope, { pid: process.pid, ownerNonce });
+        else await this.leases.acquire({ jobId: job.id, repoPath: job.repoPath, ownedPaths: scope, pid: process.pid, ownerNonce });
+        acquired = true;
+      } catch {
+        return false;
+      }
+    }
+    let claimed;
+    try {
+      const changes = {
+        // Keep the active lifecycle status. The private handoff marker is
+        // intentionally not a generic QUEUED/CHILD_ASSIGNED state.
+        handoffState: 'BUDGET_FINISH_RECOVERY',
+        leaseOwnerNonce: ownerNonce,
+        runnerPid: process.pid,
+        runnerHeartbeatAt: this.now().toISOString(),
+      };
+      if (typeof this.store.updateOperationalIf === 'function')
+        claimed = await this.store.updateOperationalIf(job.id, this.#recoveryIdentity(job), changes);
+      else {
+        const current = await get(job.id);
+        claimed = this.#sameRecoveryIdentity(job, current) ? await this.store.update(job.id, changes) : null;
+      }
+    } catch {
+      claimed = null;
+    }
+    if (!claimed) {
+      // This process acquired only N. A conditional-claim loser must never
+      // release/clean the new owner, or touch the stale owner's workspace.
+      if (acquired) {
+        try {
+          await this.leases.release?.(job.id, { ownerNonce });
+        } catch {}
+      }
+      return false;
+    }
+    this._launch(job.id, job.status === 'REPAIRING' || job.pendingDefects ? 'repair' : 'start', job.pendingDefects, claimed);
+    return true;
+  }
   #recoveryIdentity(job) {
     // These durable fields jointly identify the lifecycle owner a recovery
     // pass observed. In particular, leaseOwnerNonce and handoffState separate
@@ -696,6 +908,10 @@ export class JobManager {
     // public request would either weaken the raw boundary or reject every
     // legitimate persisted job.
     this.validate(jobInput(job));
+    if (job.cappedFinishRecovery !== undefined && !CAPPED_FINISH_RECOVERY_STATES.has(job.cappedFinishRecovery))
+      throw new Error('stored job has invalid capped implementation recovery state');
+    if (job.budgetFinishRecovery !== undefined && !BUDGET_FINISH_RECOVERY_STATES.has(job.budgetFinishRecovery))
+      throw new Error('stored job has invalid budget finish recovery state');
     // A configured Core store authenticates the entire durable record before
     // any of its endpoint, credential-reference, policy, budget, or lifecycle
     // fields can be consumed.  Plain injected stores intentionally remain
@@ -752,7 +968,8 @@ export class JobManager {
     // differently by leases, local tools, Git pathspecs, and sandbox rules.
     input = {
       ...input,
-      ownedPaths: canonicalPaths(input.ownedPaths),
+      mode: input.mode || 'write',
+      ownedPaths: canonicalPaths(input.ownedPaths ?? (input.mode === 'report' ? [] : undefined), input.mode !== 'report'),
       ...(input.relevantPaths != null ? { relevantPaths: canonicalPaths(input.relevantPaths, false) } : {}),
       ...(input.extraWritable != null ? { extraWritable: canonicalPaths(input.extraWritable, false) } : {}),
       ...(input.denyRead != null ? { denyRead: canonicalPaths(input.denyRead, false) } : {}),
@@ -776,6 +993,7 @@ export class JobManager {
     if (this.repoPath && !sameRepositoryPath(repoPath, this.repoPath)) throw new Error('repoPath does not match this manager');
     this.repoPath ||= repoPath;
     if (this.config.disabled) throw new Error('offload is disabled for this repository');
+    if (input.mode === 'report' && !this.isolated) throw new Error('report jobs require an isolated private worktree');
     if (input.profile && this.config.profiles && !this.config.profiles[input.profile]) throw new Error(`unknown profile: ${input.profile}`);
     const branch = this.config.git ? await this.config.git.branch(repoPath) : git(repoPath, ['branch', '--show-current']);
     const head = this.config.git ? await this.config.git.head(repoPath) : git(repoPath, ['rev-parse', 'HEAD']);
@@ -800,13 +1018,26 @@ export class JobManager {
         workspace = await this.config.isolation.create({ repoPath, baselineTree: before });
         if (!workspace?.path || typeof workspace.path !== 'string') throw new Error('could not create an isolated workspace');
       }
+      const inputManifest =
+        input.mode === 'report' && input.inputFiles?.length
+          ? await copyReportInputs({
+              inputFiles: input.inputFiles,
+              workspacePath: workspace?.path,
+              roots: await reportInputRoots(this.config.reportInputRoots || []),
+            })
+          : [];
       const leaseOwnerNonce = randomUUID();
+      // Input paths name caller-controlled scratch locations. Recovery needs
+      // only the private manifest after copying, never those host paths.
+      const persistedInput = jobInput(input);
+      if (input.mode === 'report') delete persistedInput.inputFiles;
       job = await this.store.create({
-        ...jobInput(input),
+        ...persistedInput,
         repoPath,
         branch,
         head,
         before,
+        ...(inputManifest.length ? { inputManifest } : {}),
         ...(workspace ? { workspacePath: workspace.path, workspaceBaseline: before, workspaceSeed: before, primaryIndexBefore } : {}),
         writePaths,
         concurrentScopes,
@@ -821,13 +1052,16 @@ export class JobManager {
         runnerHeartbeatAt: this.now().toISOString(),
         handoffState: launch ? 'LOCAL' : 'PARENT_QUEUED',
       });
-      if (workspace) await this.#pinTrees(job, { before });
-      if (this.leases.acquire) {
+      // Report jobs never diff, integrate, repair, or revert. Their live
+      // isolated-worktree pins cover cleanup; a durable per-job tree pin
+      // would retain an otherwise unreachable snapshot indefinitely.
+      if (workspace && input.mode !== 'report') await this.#pinTrees(job, { before });
+      if (writePaths.length && this.leases.acquire) {
         if (this.leases.acquire.length >= 2) await this.leases.acquire(job.id, writePaths, { ownerNonce: leaseOwnerNonce });
         else await this.leases.acquire({ jobId: job.id, repoPath, ownedPaths: writePaths });
       }
       if (this.leases.bind) await this.leases.bind(job.id);
-      await this.store.event(job.id, { type: 'started' });
+      await this.store.event(job.id, { type: 'started', reason: 'start', round: 0, status: job.status });
       if (launch) this._launch(job.id, 'start', undefined, job);
       return this.public(job);
     } catch (error) {
@@ -835,6 +1069,11 @@ export class JobManager {
       let cleanupFailure;
       if (workspace && !job) {
         try {
+          // Report inputs are deliberately copied into a non-writable
+          // directory. A failure before durable record creation has no job
+          // lifecycle to perform the ordinary cleanup, so restore only that
+          // private directory before asking Git to remove the worktree.
+          if (input.mode === 'report') await prepareReportInputsForCleanup(workspace.path);
           await workspace.cleanup?.();
         } catch (cleanupError) {
           cleanupFailure = cleanupError;
@@ -859,7 +1098,7 @@ export class JobManager {
     try {
       // The CLI parent transfers the live lease to this child before it can
       // launch. Fallback acquisition supports custom/older lease adapters.
-      if (!this.leases.transfer && this.leases.acquire) {
+      if (writeScope(job).length && !this.leases.transfer && this.leases.acquire) {
         if (this.leases.release) await this.leases.release(id, { ownerNonce: job.leaseOwnerNonce });
         if (this.leases.acquire.length >= 2) await this.leases.acquire(id, writeScope(job), { ownerNonce: job.leaseOwnerNonce });
         else await this.leases.acquire({ jobId: id, repoPath: job.repoPath, ownedPaths: writeScope(job) });
@@ -930,6 +1169,7 @@ export class JobManager {
         }
         launchClaimed = true;
         job = this.validatePersisted(job);
+        await this.store.event(id, { type: 'run_started', reason, round: job.rounds || 0, status: job.status });
         workspace = this.#workspace(job);
         const cancelledAfterLaunch = await this.store.cancelRequested?.(id);
         if (controller.signal.aborted || cancelledAfterLaunch) {
@@ -937,7 +1177,7 @@ export class JobManager {
             job = await this.store.update(id, { status: 'FINALIZING', finalStatus: 'CANCELLED', handoffState: 'CANCELLED' });
           throw new Error('job cancelled before worker launch');
         }
-        {
+        if (writeScope(job).length) {
           const every = Number.isFinite(this.leases.heartbeatIntervalMs) ? this.leases.heartbeatIntervalMs : 30_000;
           const beat = () =>
             Promise.resolve(this.leases.heartbeat?.(id, { ownerNonce }))
@@ -965,11 +1205,51 @@ export class JobManager {
         cancellationWatch.unref?.();
         try {
           if (!this.worker?.run) throw new Error('no worker configured');
+          // A stored assistant reasoning trace is provider protocol state, not
+          // display text.  If durability redacted it, only the live process
+          // that still holds the original context may continue; a resumed or
+          // repair worker must never replay the placeholder as though it were
+          // the provider's original reasoning.  Older records did not carry
+          // the positive marker, so fail closed only when they actually have
+          // reasoning to replay.
+          if (job.mode !== 'report') {
+            const transcript = await this.store.readMessages?.(id);
+            const hasReasoning = Array.isArray(transcript)
+              ? transcript.some((message) => message?.role === 'assistant' && Object.hasOwn(message, 'reasoning_content'))
+              : false;
+            if (job.transcriptReplayable === false || (job.transcriptReplayable !== true && hasReasoning))
+              throw new Error('durable transcript reasoning is unavailable for safe provider replay; start a fresh job');
+          }
+          // Keep lifecycle transitions in this worker claim rather than
+          // deriving them from arbitrary transcript prose. `store.update` is
+          // authenticated for real Core stores and awaited before AgentLoop is
+          // allowed to cross the provider POST boundary.
+          let cappedFinishRecoveryState = job.cappedFinishRecovery;
+          let budgetFinishRecoveryState = job.budgetFinishRecovery;
           const result = await this.worker.run(job, {
             signal: controller.signal,
             defects,
             progress: async (event) => {
               const progress = {};
+              if (Object.hasOwn(event || {}, 'cappedFinishRecovery')) {
+                const requested = event.cappedFinishRecovery;
+                const permitted =
+                  (cappedFinishRecoveryState === undefined && requested === 'queued') ||
+                  (cappedFinishRecoveryState === 'queued' && requested === 'consumed') ||
+                  (cappedFinishRecoveryState === 'consumed' && requested === 'settled');
+                if (!permitted) throw new Error('invalid capped implementation recovery state transition');
+                progress.cappedFinishRecovery = requested;
+                cappedFinishRecoveryState = requested;
+              }
+              if (Object.hasOwn(event || {}, 'budgetFinishRecovery')) {
+                const requested = event.budgetFinishRecovery;
+                const permitted =
+                  (budgetFinishRecoveryState === undefined && requested === 'queued') ||
+                  (budgetFinishRecoveryState === 'queued' && requested === 'consumed');
+                if (!permitted) throw new Error('invalid budget finish recovery state transition');
+                progress.budgetFinishRecovery = requested;
+                budgetFinishRecoveryState = requested;
+              }
               if (
                 Number.isSafeInteger(event?.turn) &&
                 event.turn >= 0 &&
@@ -993,6 +1273,18 @@ export class JobManager {
                 (job.costUsd || 0) + event.costUsd <= MAX_RESULT_COST
               )
                 progress.costUsd = (job.costUsd || 0) + event.costUsd;
+              // Only the documented pending-request event shape may clear a
+              // previous diagnostic. A bare null is not accepted as state,
+              // and null itself is never persisted.
+              const clearsProviderFinishReason =
+                event?.action === 'provider_request_pending' &&
+                Object.hasOwn(event, 'providerFinishReason') &&
+                event.providerFinishReason === null;
+              const providerFinishReason = safeProviderFinishReason(event?.providerFinishReason);
+              if (clearsProviderFinishReason) progress.providerFinishReason = undefined;
+              else if (providerFinishReason !== undefined) progress.providerFinishReason = providerFinishReason;
+              const budgetReservation = safeBudgetReservation(event?.budgetReservation);
+              if (budgetReservation) progress.budgetReservation = budgetReservation;
               if (Array.isArray(event?.recentActions))
                 progress.recentActions = event.recentActions
                   .filter((value) => typeof value === 'string')
@@ -1005,24 +1297,44 @@ export class JobManager {
                   .map((value) => value.slice(0, 300));
               else if (typeof event?.action === 'string') progress.recentActions = [event.action.slice(0, 300)];
               await this.store.update(id, progress);
-              await this.store.event(id, { type: 'progress', ...progress });
+              // Keep an explicit reset in the append-only event history while
+              // omitting it from the durable/public job state above.
+              await this.store.event(id, {
+                type: 'progress',
+                round: job.rounds || 0,
+                status: job.status,
+                ...progress,
+                ...(clearsProviderFinishReason ? { providerFinishReason: null } : {}),
+              });
             },
-            appendMessage: (m) => this.store.messages(id, m),
-            appendMessages: (messages) => this.store.messagesBatch(id, messages),
+            // Report transcripts can contain bodies returned from untrusted
+            // external inputs. Custom/injected workers receive harmless no-op
+            // callbacks too, so they cannot bypass the configured worker's
+            // ephemeral AgentContext policy.
+            ...(job.mode === 'report'
+              ? { appendMessage: async () => {}, appendMessages: async () => {} }
+              : {
+                  appendMessage: (m) => this.store.messages(id, m),
+                  appendMessages: (messages) => this.store.messagesBatch(id, messages),
+                }),
           });
           const allowedWorkerStatuses = new Set(['DONE', 'FAILED', 'TIMEOUT', 'BUDGET', 'CANCELLED']);
           const malformedResult = !result || typeof result !== 'object' || Array.isArray(result);
           const requestedStatus = malformedResult ? 'FAILED' : (result.status ?? 'DONE');
           const invalidStatus = !allowedWorkerStatuses.has(requestedStatus);
+          const reportText = safeReportText(result?.report ?? result?.finish?.report);
+          const missingReport = job.mode === 'report' && requestedStatus === 'DONE' && !reportText;
           let workerStatus = leaseLost
             ? 'FAILED'
             : controller.signal.aborted
               ? 'CANCELLED'
               : invalidStatus
                 ? 'FAILED'
-                : requestedStatus === 'DONE'
-                  ? 'WORKER_DONE'
-                  : requestedStatus;
+                : missingReport
+                  ? 'FAILED'
+                  : requestedStatus === 'DONE'
+                    ? 'WORKER_DONE'
+                    : requestedStatus;
           const badUsage = result?.usage != null && !validUsage(result.usage);
           const resultTurns = result?.turns ?? result?.turn ?? 0;
           const badResult =
@@ -1035,6 +1347,15 @@ export class JobManager {
             (result?.costUsd ?? 0) > MAX_RESULT_COST ||
             badUsage;
           const safeUsage = badUsage ? {} : result?.usage || {};
+          const providerFailure = safeProviderFailure(result?.providerFailure);
+          const providerFinishReason = safeProviderFinishReason(result?.providerFinishReason);
+          const budgetReservation = safeBudgetReservation(result?.budgetReservation);
+          // A structured provider failure is terminal worker evidence, not a
+          // warning a custom worker can attach to an otherwise successful
+          // result. Cancellation keeps precedence below because it reflects
+          // the caller's outer control signal rather than provider ownership.
+          if (providerFailure && workerStatus === 'WORKER_DONE')
+            workerStatus = providerFailure.kind === 'attempt_timeout' ? 'TIMEOUT' : 'FAILED';
           const candidateUsage = Object.fromEntries(USAGE_KEYS.map((key) => [key, (job.usage?.[key] || 0) + (safeUsage[key] || 0)]));
           const badAccounting =
             badResult ||
@@ -1059,27 +1380,45 @@ export class JobManager {
           job = await this.store.update(id, {
             status: workerStatus === 'WORKER_DONE' ? 'WORKER_DONE' : 'FINALIZING',
             finalStatus: workerStatus === 'WORKER_DONE' ? undefined : workerStatus,
-            summary: boundedString(result?.summary ?? result?.finish?.summary, 1500) ?? job.summary,
-            concerns: boundedStrings(result?.concerns ?? result?.finish?.concerns) ?? job.concerns,
+            summary:
+              (job.mode === 'report'
+                ? safeReportString(result?.summary ?? result?.finish?.summary, 1500)
+                : boundedString(result?.summary ?? result?.finish?.summary, 1500)) ?? job.summary,
+            ...(job.mode === 'report' ? { reportText: reportText ?? job.reportText } : {}),
+            concerns:
+              (job.mode === 'report'
+                ? safeReportList(result?.concerns ?? result?.finish?.concerns)
+                : boundedStrings(result?.concerns ?? result?.finish?.concerns)) ?? job.concerns,
+            testsRun:
+              (job.mode === 'report'
+                ? safeReportList(result?.testsRun ?? result?.finish?.testsRun)
+                : boundedStrings(result?.testsRun ?? result?.finish?.testsRun)) ?? job.testsRun,
             turns: (job.turns || 0) + (badAccounting ? 0 : resultTurns),
             usage,
             costUsd: (job.costUsd || 0) + (badAccounting ? 0 : result?.costUsd || 0),
             model: boundedString(result?.model, 128),
             responseModel: boundedString(result?.responseModel, 128),
+            providerFinishReason,
+            ...(budgetReservation ? { budgetReservation } : {}),
             pricingKnown: typeof result?.pricingKnown === 'boolean' ? result.pricingKnown : undefined,
+            ...(providerFailure ? { providerFailure } : {}),
             ...(leaseLost
               ? { error: `lease lost: ${leaseLost}` }
-              : invalidStatus || badAccounting
+              : invalidStatus || badAccounting || missingReport
                 ? {
                     error: invalidStatus
                       ? `worker returned invalid status: ${String(requestedStatus)}`
-                      : 'worker returned invalid result or accounting data',
+                      : missingReport
+                        ? 'report worker completed without a detailed report'
+                        : 'worker returned invalid result or accounting data',
                   }
                 : budgetExceeded
                   ? { error: 'worker exceeded cumulative job budget' }
-                  : result?.error && workerStatus !== 'WORKER_DONE'
-                    ? { error: String(result.error).slice(0, 1500) }
-                    : {}),
+                  : providerFailure
+                    ? { error: providerFailureMessage(providerFailure) }
+                    : result?.error && workerStatus !== 'WORKER_DONE'
+                      ? { error: job.mode === 'report' ? safeReportError(result.error) : String(result.error).slice(0, 1500) }
+                      : {}),
           });
           job = this.validatePersisted(job);
           if (!workspace && this.snapshots.create && this.snapshots.diff && job.before) {
@@ -1091,7 +1430,7 @@ export class JobManager {
             // become another author of it. Capture a durable pre-verifier tree
             // before invoking a command that may have write access for normal
             // build/test scratch activity.
-            if (workspace) {
+            if (workspace && job.mode !== 'report') {
               const workerAfter = workspace.snapshot();
               job = await this.store.update(id, { workerAfter });
               await this.#pinTrees(job, { before: job.before, workerAfter });
@@ -1100,10 +1439,19 @@ export class JobManager {
           }
         } catch (error) {
           const aborted = controller.signal.aborted;
+          const providerFailure = safeProviderFailure(error);
           job = await this.store.update(id, {
             status: 'FINALIZING',
-            finalStatus: leaseLost ? 'FAILED' : aborted ? 'CANCELLED' : error?.code === 'ETIMEDOUT' ? 'TIMEOUT' : 'FAILED',
-            error: leaseLost ? `lease lost: ${leaseLost}` : String(error.message || error),
+            finalStatus: leaseLost ? 'FAILED' : aborted ? 'CANCELLED' : providerFailure?.kind === 'attempt_timeout' ? 'TIMEOUT' : 'FAILED',
+            ...(providerFailure ? { providerFailure } : {}),
+            error:
+              job.mode === 'report'
+                ? safeReportError(leaseLost ? `lease lost: ${leaseLost}` : error.message || error)
+                : leaseLost
+                  ? `lease lost: ${leaseLost}`
+                  : providerFailure
+                    ? providerFailureMessage(providerFailure)
+                    : String(error.message || error),
           });
         } finally {
           if (cancellationWatch) clearInterval(cancellationWatch);
@@ -1115,7 +1463,7 @@ export class JobManager {
             // so that finalization cannot accidentally publish DONE.
             if ((await this.store.cancelRequested?.(id)) && !final(job.status))
               job = await this.store.update(id, { status: 'FINALIZING', finalStatus: 'CANCELLED' });
-            if (workspace) {
+            if (workspace && job.mode !== 'report') {
               const workspaceAfter = await workspace.snapshot();
               const audited = await this.#classifyIsolatedWorkspace(job, workspace, workspaceAfter);
               await this.store.writeArtifact(id, 'patch.diff', audited.allPatch);
@@ -1261,7 +1609,7 @@ export class JobManager {
                   }
                 }
               }
-            } else if (this.snapshots.create && this.snapshots.diff && job.before) {
+            } else if (job.mode !== 'report' && this.snapshots.create && this.snapshots.diff && job.before) {
               const after = await this.snapshots.create(job.repoPath);
               const allPatch = await this.snapshots.diff(job.repoPath, job.before, after);
               const all = this.snapshots.files ? await this.snapshots.files(job.repoPath, job.before, after) : changedFiles(allPatch);
@@ -1380,7 +1728,19 @@ export class JobManager {
               terminalCleanupComplete = true;
             }
             await this.store.writeArtifact(id, 'report.md', this.report(done));
-            await this.store.event(id, { type: 'finished', status: done.status });
+            // Persist only the closed safe provider-failure shape in the log:
+            // kind/status/attempts, never remote error text or an endpoint.
+            const providerFailure = safeProviderFailure(done.providerFailure);
+            const providerFinishReason = safeProviderFinishReason(done.providerFinishReason);
+            const budgetReservation = safeBudgetReservation(done.budgetReservation);
+            await this.store.event(id, {
+              type: 'finished',
+              status: done.status,
+              round: done.rounds || 0,
+              ...(providerFailure ? { providerFailure } : {}),
+              ...(providerFinishReason ? { providerFinishReason } : {}),
+              ...(budgetReservation ? { budgetReservation } : {}),
+            });
             if (prePublish.status === 'FINALIZING')
               await this.store.update(id, { status: done.status, finishedAt: done.finishedAt, finalizedAt: done.finalizedAt });
           } catch (publicationError) {
@@ -1444,6 +1804,8 @@ export class JobManager {
                         leaseOwnerNonce,
                         handoffState: 'LOCAL',
                         autoRepairScheduled: false,
+                        providerFinishReason: undefined,
+                        budgetReservation: undefined,
                       })
                     : this.#sameRecoveryIdentity(current, await this.store.get(id))
                       ? await this.store.update(id, {
@@ -1453,6 +1815,8 @@ export class JobManager {
                           leaseOwnerNonce,
                           handoffState: 'LOCAL',
                           autoRepairScheduled: false,
+                          providerFinishReason: undefined,
+                          budgetReservation: undefined,
                         })
                       : null;
                 if (!queued) return;
@@ -1534,7 +1898,12 @@ export class JobManager {
     return task;
   }
   async _verify(job) {
-    job = this.validatePersisted(job);
+    // Progress callbacks can durably advance a safety lifecycle while the
+    // worker is running.  The object supplied by the caller predates those
+    // callbacks, so verification must use the authenticated current record
+    // rather than accidentally queueing another worker round from stale
+    // state.
+    job = this.validatePersisted(await this.store.get(job.id));
     if (!job.testCommand) return this.store.update(job.id, { status: 'FINALIZING', finalStatus: 'DONE_UNVERIFIED' });
     const executionPath = job.workspacePath || job.repoPath;
     const verify = await this.runner.verify(job.testCommand, {
@@ -1546,6 +1915,11 @@ export class JobManager {
       allowNetwork: !!job.allowNetwork,
       denyRead: job.denyRead || [],
       writablePaths: writeScope(job).map((p) => join(executionPath, p)),
+      // A verifier of an isolated job can only traverse the authenticated
+      // server-created worktree parent. It never receives this extra read
+      // capability for a primary/non-isolated checkout, and it has no write
+      // permission outside its declared scope.
+      ...(this.isolated && job.workspacePath === executionPath ? { readablePaths: [dirname(executionPath)] } : {}),
       requireSandbox: job.requireSandbox === true,
     });
     const sandboxed = verifierUsedMacosSandbox(verify);
@@ -1556,7 +1930,20 @@ export class JobManager {
     // A policy-only verifier can report a verified result only after the
     // caller explicitly opted into it, but can never authorize another model
     // turn. Unknown/missing result.sandbox fails closed for repair as well.
-    const canRepair = verify.verdict !== 'PASS' && !sandboxRequirementFailed && sandboxed && (job.rounds || 0) < (job.maxRepairRounds ?? 2);
+    // A queued recovery has a deliberately constrained transcript; a consumed
+    // recovery may already have issued a billable implementation-continuation
+    // request. Neither state is safe to reopen automatically after
+    // verification. A settled recovery has durably recorded its complete
+    // response transaction and is ordinary resolved history.
+    const cappedFinishRecoveryUnresolved = job.cappedFinishRecovery === 'queued' || job.cappedFinishRecovery === 'consumed';
+    const budgetFinishRecoveryUnresolved = job.budgetFinishRecovery !== undefined;
+    const finishRecoveryUnresolved = cappedFinishRecoveryUnresolved || budgetFinishRecoveryUnresolved;
+    const canRepair =
+      verify.verdict !== 'PASS' &&
+      !sandboxRequirementFailed &&
+      !finishRecoveryUnresolved &&
+      sandboxed &&
+      (job.rounds || 0) < (job.maxRepairRounds ?? 2);
     const status = sandboxRequirementFailed
       ? 'VERIFY_FAILED'
       : verify.verdict === 'PASS'
@@ -1564,7 +1951,18 @@ export class JobManager {
         : canRepair
           ? 'REPAIR_QUEUED'
           : 'VERIFY_FAILED';
-    return this.store.update(job.id, { status: 'FINALIZING', finalStatus: status, verify });
+    return this.store.update(job.id, {
+      status: 'FINALIZING',
+      finalStatus: status,
+      verify,
+      ...(finishRecoveryUnresolved && verify.verdict !== 'PASS'
+        ? {
+            error: cappedFinishRecoveryUnresolved
+              ? 'automatic repair suppressed: unresolved capped implementation recovery; start a fresh job'
+              : 'automatic repair suppressed: unresolved budget finish recovery; start a fresh job',
+          }
+        : {}),
+    });
   }
   public(job) {
     return {
@@ -1574,6 +1972,17 @@ export class JobManager {
       head: job.head,
       profile: job.profile,
       status: job.status,
+      ...(job.mode === 'report'
+        ? {
+            mode: 'report',
+            reportResult: {
+              text: safeReportText(job.reportText) || safeReportString(job.summary, 1500) || '',
+              concerns: safeReportList(job.concerns),
+              testsRun: safeReportList(job.testsRun),
+              inputs: Array.isArray(job.inputManifest) ? job.inputManifest.map(({ path, bytes }) => ({ path, bytes })) : [],
+            },
+          }
+        : {}),
       ...(job.unsafePolicyOnlyVerifier === true ? { unsafePolicyOnlyVerifier: true } : {}),
       // Cleanup status is operationally significant once a job reaches a
       // terminal result. Expose only the bounded persisted diagnosis, never
@@ -1583,6 +1992,11 @@ export class JobManager {
         ? { workspaceCleanupError: job.workspaceCleanupError }
         : {}),
       ...(job.workspaceCleanupRequired === true ? { workspaceCleanupRequired: true } : {}),
+      ...(safeProviderFailure(job.providerFailure) ? { providerFailure: safeProviderFailure(job.providerFailure) } : {}),
+      ...(safeProviderFinishReason(job.providerFinishReason)
+        ? { providerFinishReason: safeProviderFinishReason(job.providerFinishReason) }
+        : {}),
+      ...(safeBudgetReservation(job.budgetReservation) ? { budgetReservation: safeBudgetReservation(job.budgetReservation) } : {}),
     };
   }
   async wait(id, { timeoutSec = 40, signal } = {}) {
@@ -1639,12 +2053,12 @@ export class JobManager {
     const before = await get(id);
     if (!final(before.status)) await this.store.requestCancel?.(id);
     const controller = this.controllers.get(id);
-    if (controller) {
-      controller.abort();
-      await this.running.get(id);
-    }
+    // Local cancellation is deliberately marker-first and asynchronous. The
+    // owner task publishes the terminal state only after its normal cleanup;
+    // waiting here would make a control-plane cancel block on an uncooperative
+    // worker and falsely imply that cancellation is already complete.
+    if (controller) controller.abort();
     let job = await get(id);
-    if (!final(job.status) && controller) job = await this.#finishOwnedTerminal(job, 'CANCELLED');
     // Without a local controller this process is not the worker owner. Keep
     // only the durable cancellation marker written above; a queued detached
     // child may still be between handoff checks, and deleting its workspace
@@ -1663,6 +2077,7 @@ export class JobManager {
     )
       throw new Error('defects must be 1-32 non-empty bounded strings');
     let job = this.validatePersisted(await this.store.get(id));
+    if (job.mode === 'report') throw new Error('report jobs are read-only and cannot be repaired; start a new report job');
     // A terminal durable state can be published just before its owning local
     // task performs final cleanup. Join that task first, then decide whether
     // a manual repair is eligible; otherwise the same request is needlessly
@@ -1672,6 +2087,12 @@ export class JobManager {
       job = this.validatePersisted(await this.store.get(id));
     }
     if (!final(job.status) || this.running.has(id)) throw new Error('job is still running');
+    // A queued recovery has an intentionally constrained transcript and a
+    // consumed recovery may already have issued a billable provider POST.
+    // Never append a repair task to either ambiguity boundary.
+    if (job.cappedFinishRecovery === 'queued' || job.cappedFinishRecovery === 'consumed')
+      throw new Error('job has an unresolved capped implementation recovery; start a fresh job');
+    if (job.budgetFinishRecovery !== undefined) throw new Error('job has an unresolved budget finish recovery; start a fresh job');
     if (job.applied === true) throw new Error('an applied job cannot be repaired; start a new job from the current primary tree');
     if (job.integrationIntent === true || job.revertIntent === true || job.integrationUncertain === true || job.revertUncertain === true)
       throw new Error('a job with an unresolved primary mutation outcome cannot be repaired; inspect the primary tree and start a new job');
@@ -1733,6 +2154,9 @@ export class JobManager {
         runnerPid: process.pid,
         runnerHeartbeatAt: this.now().toISOString(),
         pendingDefects: defects,
+        providerFailure: undefined,
+        providerFinishReason: undefined,
+        budgetReservation: undefined,
         ...(workspace
           ? {
               workspacePath: workspace.path,
@@ -1750,6 +2174,19 @@ export class JobManager {
             ? await this.store.update(id, repairChanges)
             : null;
       if (!next) throw new Error('job lifecycle ownership changed during repair setup');
+      // Record acceptance before launching asynchronously. A worker that
+      // returns without model/tool progress is still distinguishable from a
+      // repair request that was never accepted.
+      await this.store.event(id, { type: 'started', reason: 'repair', round: next.rounds || 0, status: next.status });
+      await this.store.event(id, {
+        type: 'progress',
+        status: next.status,
+        round: next.rounds || 0,
+        turns: next.turns || 0,
+        usage: next.usage || {},
+        costUsd: next.costUsd || 0,
+        recentActions: ['repair_queued'],
+      });
       if (launch) this._launch(id, 'repair', defects, next);
       return this.public(next);
     } catch (error) {
@@ -1776,6 +2213,7 @@ export class JobManager {
     // boolean true may authorize applying a reverse patch.
     if (typeof apply !== 'boolean') throw new Error('apply must be boolean');
     let job = this.validatePersisted(await this.store.get(id));
+    if (job.mode === 'report') throw new Error('report jobs never integrate into the primary checkout and cannot be reverted');
     if (job.revertIntent === true) {
       const reconciliation = await this.#reconcileRevert(job);
       job = this.validatePersisted(await this.store.update(id, reconciliation));
@@ -1995,6 +2433,25 @@ export class JobManager {
       // below it may proceed only after proving this job has no lease.
       const terminalCleanupReservation = job.status === 'FINALIZING' && final(job.recoveryTerminalStatus);
       if (alive && ((!final(job.status) && !terminalCleanupReservation) || hasJournal)) continue;
+      // Do not broaden crash recovery into auto-resume. Only the authenticated
+      // one-shot budget terminalization state can restart, and only while its
+      // owner is absent/dead. A consumed state may already have crossed the
+      // billable POST boundary and must fall through to fail-closed handling.
+      const queuedBudgetFinishRecovery =
+        job.budgetFinishRecovery === 'queued' &&
+        job.cappedFinishRecovery === undefined &&
+        ['RUNNING', 'REPAIRING'].includes(job.status) &&
+        ['RUNNING', 'BUDGET_FINISH_RECOVERY'].includes(job.handoffState) &&
+        Number.isInteger(job.runnerPid) &&
+        job.runnerPid > 0 &&
+        !hasJournal &&
+        !alive;
+      if (queuedBudgetFinishRecovery) {
+        if (await this.#recoverQueuedBudgetFinish(job, get)) recovered += 1;
+        // Lease/CAS failures deliberately defer this narrow recovery. Do not
+        // convert a potentially resumable queued finish into generic failure.
+        continue;
+      }
       // A journal remains authoritative even after another error handler has
       // published a terminal status. Resolve it before generic crash
       // finalization so no record can falsely say the primary was untouched.
@@ -2115,7 +2572,7 @@ export class JobManager {
         error: 'server restarted',
       };
       try {
-        if (job.workspacePath && this.isolated) {
+        if (job.workspacePath && this.isolated && job.mode !== 'report') {
           const workspace = this.#workspace(job);
           const workspaceAfter = workspace.snapshot();
           const audited = await this.#classifyIsolatedWorkspace(job, workspace, workspaceAfter);
@@ -2130,7 +2587,7 @@ export class JobManager {
           finalJob.discardedEphemeralOutputs = audited.discardedEphemeralOutputs;
           finalJob.verifierMutations = audited.verifierMutations;
           await this.#pinTrees(job, { before: job.before, ...(job.workerAfter ? { workerAfter: job.workerAfter } : {}), workspaceAfter });
-        } else if (this.snapshots.create && this.snapshots.diff && job.before) {
+        } else if (job.mode !== 'report' && this.snapshots.create && this.snapshots.diff && job.before) {
           const after = await this.snapshots.create(job.repoPath);
           const patch = await this.snapshots.diff(job.repoPath, job.before, after);
           // Recovery has no trustworthy live-worker attribution. Preserve the
