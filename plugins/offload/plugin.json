@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "offload",
-  "version": "0.1.0+codex.59c1f3a018304ba5",
+  "version": "0.1.0+codex.b2b302ec7fe05adb",
   "description": "Runs only after an explicit /offload slash-command invocation; ordinary prose does not invoke it.",
   "author": {
     "name": "Offload"
