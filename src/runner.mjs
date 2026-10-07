@@ -1,9 +1,21 @@
-import { runCommand } from './sandbox.mjs';
+import { runCommand, sandboxStatus } from './sandbox.mjs';
 
 export class Runner {
-  constructor({ execute = runCommand, defaults = {} } = {}) {
+  constructor({ execute = runCommand, defaults = {}, probeSandbox = sandboxStatus } = {}) {
     this.execute = execute;
     this.defaults = defaults;
+    this.probeSandbox = probeSandbox;
+  }
+  /**
+   * Whether a sandboxed command can run on this host, with the host's reason
+   * when not. It is a preflight only: a command that requires the sandbox still
+   * fails closed in runCommand if its own profile cannot be applied.
+   */
+  sandboxStatus(platform = process.platform) {
+    return this.probeSandbox(platform);
+  }
+  sandboxAvailable(platform = process.platform) {
+    return this.sandboxStatus(platform).available === true;
   }
   async run(command, options = {}) {
     return this.execute(command, { ...this.defaults, ...options });

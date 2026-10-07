@@ -8,6 +8,9 @@ import { AgentContext } from '../../src/agent/context.mjs';
 import { LocalTools, availableToolDefinitions } from '../../src/agent/tools.mjs';
 import { buildSystemPrompt } from '../../src/agent/prompt.mjs';
 import { OpenAIChatProvider, ProviderError } from '../../src/provider/openai-chat.mjs';
+import { JobStore } from '../../src/store.mjs';
+import { FAILURE_ERRORS, continuableFailure } from '../../src/failure.mjs';
+import { cleanup, tempDir } from './helpers.mjs';
 
 const call = (name, argText = '{}', id = 'id') => ({ id, name, arguments: argText });
 const providerFor = (turns) => ({
@@ -18,25 +21,202 @@ const providerFor = (turns) => ({
 const officialDeepSeekProvider = (chat) => {
   const provider = new OpenAIChatProvider({
     baseUrl: 'https://api.deepseek.com',
-    model: 'deepseek-v4-pro',
+    model: 'deepseek-flash',
     retries: 0,
     fetchImpl: async () => assert.fail('test overrides chat before any network request'),
   });
   provider.chat = chat;
   return provider;
 };
-test('finish mixed with a write is rejected before anything executes', async () => {
+// Every assistant tool call is answered, in order, by exactly one tool message, and no tool message is orphaned.
+const assertToolProtocol = (messages) => {
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    assert.notEqual(message.role, 'tool', `orphan tool result at ${index}`);
+    if (message.role !== 'assistant' || !message.tool_calls?.length) continue;
+    const results = messages.slice(index + 1, index + 1 + message.tool_calls.length);
+    assert.deepEqual(
+      results.map((result) => [result.role, result.tool_call_id, result.name]),
+      message.tool_calls.map((entry) => ['tool', entry.id, entry.function.name]),
+      `tool calls at ${index} are answered in order`,
+    );
+    index += message.tool_calls.length;
+  }
+  // The same check the durable store makes when a job is resumed.
+  assert.equal(new AgentContext(messages).trimmedIncomplete, false);
+};
+const FINISH_ALONE =
+  'TOOL_ERROR: finish must be the only tool call in its turn; nothing in this turn was executed; call finish alone (re-issue other calls in a separate turn first if still needed)';
+// A scripted provider that records the conversation each request carried.
+const scripted = (turns, requests = []) => ({
+  async *chat({ messages }) {
+    requests.push(structuredClone(messages));
+    yield { toolCalls: turns.shift() };
+  },
+});
+const finishTools = (invoked) => ({
+  execute: async (name) => {
+    invoked.push(name);
+    return { finish: { summary: 'done', concerns: [], testsRun: [] } };
+  },
+});
+test('finish mixed with a write runs nothing and is corrected once; a repeat fails the round with a continuable kind', async () => {
   const invoked = [];
   const result = await new AgentLoop({
-    provider: providerFor([[call('write_file', '{"path":"x","content":"x"}', 'w'), call('finish', '{"summary":"done"}', 'f')]]),
+    provider: providerFor([
+      [call('write_file', '{"path":"x","content":"x"}', 'w'), call('finish', '{"summary":"done"}', 'f')],
+      [call('write_file', '{"path":"x","content":"x"}', 'w2'), call('finish', '{"summary":"done"}', 'f2')],
+    ]),
+    tools: finishTools(invoked),
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'FAILED');
+  assert.equal(result.failureKind, 'finish-protocol');
+  assert.equal(result.error, 'finish must be the sole valid tool call in a turn');
+  assert.deepEqual(invoked, [], 'neither the write nor either finish was executed');
+});
+test('finish sharing a turn with other calls answers every call without running any, and a clean finish next turn succeeds', async () => {
+  const invoked = [];
+  const requests = [];
+  const progress = [];
+  const context = new AgentContext();
+  const result = await new AgentLoop({
+    provider: scripted(
+      [
+        [
+          call('write_file', '{"path":"x","content":"x"}', 'w'),
+          call('read_file', '{"path":"y"}', 'r'),
+          call('finish', '{"summary":"done"}', 'f'),
+        ],
+        [call('finish', '{"summary":"done"}', 'f2')],
+      ],
+      requests,
+    ),
+    context,
+    tools: finishTools(invoked),
+    progress: (event) => progress.push(event),
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'DONE');
+  assert.equal(result.failureKind, undefined);
+  assert.equal(result.turn, 2, 'the correction turn is a normal turn against the budget');
+  assert.deepEqual(invoked, ['finish'], 'only the clean finish ran: not the write, the read, or the first finish');
+  assert.equal(requests.length, 2);
+  // The retry request carried one corrective result per call, in call order.
+  assert.deepEqual(
+    requests[1].slice(1).map((message) => [message.role, message.tool_call_id, message.name, message.content]),
+    [
+      ['assistant', undefined, undefined, ''],
+      ['tool', 'w', 'write_file', FINISH_ALONE],
+      ['tool', 'r', 'read_file', FINISH_ALONE],
+      ['tool', 'f', 'finish', FINISH_ALONE],
+    ],
+  );
+  assert.deepEqual(
+    requests[1][1].tool_calls.map((entry) => entry.id),
+    ['w', 'r', 'f'],
+  );
+  assert.deepEqual(
+    progress.filter((event) => event.action === 'finish_protocol_recover').map((event) => event.turn),
+    [1],
+  );
+  // The final transcript is replay-valid: the rejected turn and the clean finish are both fully answered.
+  const final = context.snapshot();
+  assertToolProtocol(final);
+  assert.deepEqual(
+    final.filter((message) => message.role === 'tool').map((message) => message.tool_call_id),
+    ['w', 'r', 'f', 'f2'],
+  );
+});
+test('a second finish-protocol violation fails after exactly one correction and persists only the corrected turn', async () => {
+  const invoked = [];
+  const requests = [];
+  const progress = [];
+  const context = new AgentContext();
+  const result = await new AgentLoop({
+    provider: scripted(
+      [
+        [call('edit_file', '{"path":"x"}', 'e'), call('finish', '{"summary":"done"}', 'f')],
+        [call('finish', '{"summary":"done"}', 'f2'), call('read_file', '{"path":"y"}', 'r2')],
+        [call('finish', '{"summary":"done"}', 'never-requested')],
+      ],
+      requests,
+    ),
+    context,
+    tools: finishTools(invoked),
+    progress: (event) => progress.push(event),
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'FAILED');
+  assert.equal(result.failureKind, 'finish-protocol');
+  assert.equal(result.error, FAILURE_ERRORS['finish-protocol']);
+  assert.equal(result.turn, 2);
+  assert.deepEqual(invoked, []);
+  assert.equal(requests.length, 2, 'bounded: no third request is paid for');
+  assert.equal(progress.filter((event) => event.action === 'finish_protocol_recover').length, 1);
+  // Only the first, corrected turn is durable (with its results); the fatal turn is not replayed.
+  const final = context.snapshot();
+  assertToolProtocol(final);
+  assert.deepEqual(
+    final.filter((message) => message.role === 'assistant').map((message) => message.tool_calls.map((entry) => entry.id)),
+    [['e', 'f']],
+  );
+  // The kind is one the continue gate accepts, so the finished work is not stranded.
+  assert.equal(continuableFailure({ status: 'FAILED', failureKind: result.failureKind, error: result.error }), true);
+});
+test('a finish-protocol violation on the last turn has no turn left to correct it, and the correction is spent once per run', async () => {
+  const requests = [];
+  const lastTurn = await new AgentLoop({
+    provider: scripted([[call('write_file', '{"path":"x","content":"x"}', 'w'), call('finish', '{"summary":"done"}', 'f')]], requests),
+    tools: finishTools([]),
+    maxTurns: 1,
+  }).run({ task: 'x' });
+  assert.equal(lastTurn.status, 'FAILED');
+  assert.equal(lastTurn.failureKind, 'finish-protocol');
+  assert.equal(requests.length, 1);
+  // A violation, a clean ordinary turn, then a different violation: the single correction was already used.
+  const invoked = [];
+  const later = await new AgentLoop({
+    provider: providerFor([
+      [call('finish', '{"summary":"done"}', 'a'), call('read_file', '{"path":"y"}', 'b')],
+      [call('read_file', '{"path":"y"}', 'c')],
+      [call('finish', '{"summary":"x"}', 'd'), call('read_file', '{"path":"z"}', 'e')],
+    ]),
     tools: {
       execute: async (name) => {
         invoked.push(name);
+        return 'ok';
       },
     },
   }).run({ task: 'x' });
-  assert.equal(result.status, 'FAILED');
-  assert.deepEqual(invoked, []);
+  assert.equal(later.status, 'FAILED');
+  assert.equal(later.failureKind, 'finish-protocol');
+  assert.equal(later.turn, 3);
+  assert.deepEqual(invoked, ['read_file'], 'only the ordinary turn between the two violations ran');
+});
+test('a finish with invalid arguments is corrected once, with the argument limits, and nothing runs', async () => {
+  const requests = [];
+  const invoked = [];
+  const result = await new AgentLoop({
+    provider: scripted(
+      [[call('finish', JSON.stringify({ summary: 'x'.repeat(1501) }), 'bad')], [call('finish', '{"summary":"short"}', 'ok')]],
+      requests,
+    ),
+    tools: finishTools(invoked),
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'DONE');
+  assert.deepEqual(invoked, ['finish'], 'only the valid finish ran');
+  const answer = requests[1].at(-1);
+  assert.deepEqual([answer.role, answer.tool_call_id, answer.name], ['tool', 'bad', 'finish']);
+  assert.ok(answer.content.startsWith('TOOL_ERROR: finish arguments are invalid: summary is required (1-1500 characters)'), answer.content);
+  assert.ok(!answer.content.includes('xxxxxxxxxx'), 'the rejected arguments are never echoed');
+  // The same fixed text is used when the invalid finish also shares its turn.
+  const both = [];
+  await new AgentLoop({
+    provider: scripted(
+      [[call('finish', '{"summary":""}', 'f'), call('read_file', '{"path":"y"}', 'r')], [call('finish', '{"summary":"ok"}', 'g')]],
+      both,
+    ),
+    tools: finishTools([]),
+  }).run({ task: 'x' });
+  assert.ok(both[1].at(-1).content.startsWith(`${FINISH_ALONE}; also, finish arguments are invalid:`), both[1].at(-1).content);
 });
 test('tool failures and timeout paths do not reflect tool error secrets', async () => {
   const turns = [[call('read_file', '{"path":"x"}', 'read')], [call('finish', '{"summary":"ok"}', 'done')]];
@@ -88,7 +268,11 @@ test('only an actual finish tool result can complete a worker turn', async () =>
     maxTurns: 1,
   }).run({ task: 'x' });
   assert.equal(result.status, 'BUDGET');
+  assert.equal(result.failureKind, undefined);
+  assert.equal(result.toolFailure, undefined);
   assert.equal(result.finish, undefined);
+  assert.equal(result.budgetCap, 'turns');
+  assert.equal(result.error, 'Maximum turns reached');
 });
 test('a rejected context append never elides earlier durable tool output', () => {
   const context = new AgentContext(
@@ -120,6 +304,14 @@ test('loop detects repeated failing calls and wall deadline aborts an in-flight 
     maxTurns: 5,
   }).run({ task: 'x' });
   assert.match(result.error, /repeated 3 times/);
+  // The real failure is kept for the primary, not just the constant text.
+  assert.equal(result.failureKind, 'tool-loop');
+  assert.equal(result.error, 'Loop detected: identical failing tool calls repeated 3 times');
+  assert.deepEqual(
+    { ...result.toolFailure, signature: undefined },
+    { tool: 'read_file', args: '{"path":"x"}', error: 'no', turn: 3, repeats: 3, signature: undefined },
+  );
+  assert.match(result.toolFailure.signature, /^[0-9a-f]{16}$/);
   const stalled = {
     async *chat({ signal }) {
       await new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
@@ -127,6 +319,173 @@ test('loop detects repeated failing calls and wall deadline aborts an in-flight 
   };
   const timed = await new AgentLoop({ provider: stalled, tools: { execute: async () => '' }, timeoutMs: 10 }).run({ task: 'x' });
   assert.equal(timed.status, 'TIMEOUT');
+});
+test('the worker still sees only a generic tool error, the server keeps the real one with paths aliased', async () => {
+  const replays = [];
+  const provider = {
+    async *chat({ messages }) {
+      replays.push(structuredClone(messages));
+      yield { toolCalls: [call('read_file', '{"path":"a.js"}', `r${replays.length}`)] };
+    },
+  };
+  const result = await new AgentLoop({
+    provider,
+    tools: {
+      execute: async () => {
+        throw Object.assign(new Error("ENOENT: no such file or directory, open '/private/tmp/wt-1/a.js' API_KEY=sk-secretsecret"), {
+          code: 'ENOENT',
+        });
+      },
+    },
+    pathAliases: [['/private/tmp/wt-1', '<worktree>']],
+    maxTurns: 5,
+  }).run({ task: 'x' });
+  assert.equal(result.failureKind, 'tool-loop');
+  assert.equal(result.toolFailure.error, "ENOENT: no such file or directory, open '<worktree>/a.js' API_KEY=[REDACTED]");
+  // A missing path gets no hint (it would tell "missing" from "denied"); none of the message reaches the worker.
+  const toolMessage = replays.at(-1).findLast((message) => message.role === 'tool');
+  assert.equal(toolMessage.content, 'TOOL_ERROR: Tool execution failed');
+  assert.doesNotMatch(JSON.stringify(replays), /wt-1|sk-secretsecret/);
+  assert.throws(() => new AgentLoop({ provider, tools: { execute() {} }, pathAliases: [['only-one']] }), /pathAliases/);
+  assert.throws(() => new AgentLoop({ provider, tools: { execute() {} }, pathAliases: 'x' }), /pathAliases/);
+});
+
+test('a failure that is followed by a success resets the loop counter and records no loop', async () => {
+  let turn = 0;
+  const outcomes = ['fail', 'fail', 'ok', 'fail', 'fail'];
+  const provider = {
+    async *chat() {
+      turn++;
+      yield { toolCalls: [call('read_file', '{"path":"x"}', `c${turn}`)] };
+    },
+  };
+  const result = await new AgentLoop({
+    provider,
+    tools: {
+      execute: async () => {
+        if (outcomes[turn - 1] === 'ok') return 'fine';
+        throw new Error('no');
+      },
+    },
+    maxTurns: 5,
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'BUDGET');
+  assert.equal(result.failureKind, undefined);
+  assert.equal(result.toolFailure, undefined);
+});
+
+test('a real tool refusal is reported with a relative path and the worker gets a fixed hint', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-loop-refusal-'));
+  const { writeFile } = await import('node:fs/promises');
+  await writeFile(path.join(dir, 'existing.txt'), 'old\n');
+  const replays = [];
+  let turn = 0;
+  const provider = {
+    async *chat({ messages }) {
+      replays.push(structuredClone(messages));
+      turn++;
+      yield { toolCalls: [call('write_file', '{"path":"existing.txt","content":"new\\n"}', `w${turn}`)] };
+    },
+  };
+  const result = await new AgentLoop({
+    provider,
+    tools: new LocalTools({ repoPath: dir, ownedPaths: ['**'], gitExec: () => ({ status: 1, stdout: '' }) }),
+    pathAliases: [[dir, '<worktree>']],
+    maxTurns: 6,
+  }).run({ task: 'x' });
+  assert.equal(result.failureKind, 'tool-loop');
+  assert.equal(result.toolFailure.tool, 'write_file');
+  assert.equal(result.toolFailure.args, '{"path":"existing.txt","content":"<4 chars>"}');
+  assert.equal(result.toolFailure.error, 'Refusing overwrite without prior complete read: existing.txt');
+  assert.equal(
+    replays.at(-1).findLast((message) => message.role === 'tool').content,
+    'TOOL_ERROR: Tool execution failed (hint: read_file the existing file first, or use edit_file for a small change)',
+  );
+});
+
+test('a worker that over-asks read_file limit three times is told the byte cap and can self-correct', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-loop-read-limit-'));
+  const { writeFile } = await import('node:fs/promises');
+  await writeFile(path.join(dir, 'a.txt'), 'hello\n');
+  const replays = [];
+  let turn = 0;
+  const provider = {
+    async *chat({ messages }) {
+      replays.push(structuredClone(messages));
+      turn++;
+      yield { toolCalls: [call('read_file', '{"path":"a.txt","limit":256000}', `r${turn}`)] };
+    },
+  };
+  const result = await new AgentLoop({
+    provider,
+    tools: new LocalTools({ repoPath: dir, ownedPaths: ['**'], gitExec: () => ({ status: 1, stdout: '' }) }),
+    maxTurns: 6,
+  }).run({ task: 'x' });
+  assert.equal(result.failureKind, 'tool-loop');
+  assert.equal(result.toolFailure.error, 'limit must be an integer between 0 and 64000');
+  const seen = replays.at(-1).findLast((message) => message.role === 'tool').content;
+  assert.equal(
+    seen,
+    'TOOL_ERROR: Tool execution failed (hint: read_file limit is at most 64000 bytes per call; omit limit or pass a smaller one, then continue from the next offset)',
+  );
+  assert.ok(!/secret|a\.txt|256000/.test(seen), 'the hint carries the cap, not the refused call');
+});
+
+test('after a loop FAILED the abandoned tool call is dropped from the durable transcript and a continuation is valid', async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir });
+    const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
+    const persist = { onAppend: (m) => store.messages(job.id, m), onAppendBatch: (m) => store.messagesBatch(job.id, m) };
+    const failing = {
+      async *chat() {
+        yield { toolCalls: [call('read_file', '{"path":"x"}', `c${Math.random()}`)] };
+      },
+    };
+    const first = await new AgentLoop({
+      provider: failing,
+      tools: { execute: async () => Promise.reject(new Error('no')) },
+      context: new AgentContext([], persist),
+      maxTurns: 6,
+    }).run({ system: 'sys', task: 'do it' });
+    assert.equal(first.failureKind, 'tool-loop');
+    const durable = await store.readMessages(job.id);
+    assert.equal(durable.at(-1).role, 'assistant', 'the loop returns before the final call has a result');
+    assert.ok(durable.at(-1).tool_calls);
+
+    let seen;
+    const resumed = await new AgentLoop({
+      provider: {
+        async *chat({ messages }) {
+          seen = structuredClone(messages);
+          yield { toolCalls: [call('finish', '{"summary":"done"}', 'fin')] };
+        },
+      },
+      tools: { execute: async () => ({ finish: { summary: 'done', concerns: [], testsRun: [] } }) },
+      context: new AgentContext(await store.readMessages(job.id), persist),
+    }).run({ task: 'continue differently' });
+    assert.equal(resumed.status, 'DONE');
+    // The orphaned call is gone, and what remains is a replay-valid conversation.
+    assert.equal(seen.at(-1).content, 'continue differently');
+    const replayable = (messages) => {
+      for (const [index, message] of messages.entries())
+        if (message.role === 'assistant' && message.tool_calls)
+          assert.deepEqual(
+            messages.slice(index + 1, index + 1 + message.tool_calls.length).map((m) => m.tool_call_id),
+            message.tool_calls.map((c) => c.id),
+            'every assistant tool call has its results directly after it',
+          );
+    };
+    replayable(seen);
+    replayable(await store.readMessages(job.id));
+    assert.equal(
+      (await store.readMessages(job.id)).filter((m) => m.role === 'assistant' && m.tool_calls?.length).length,
+      3,
+      'two failed rounds plus the finish call survive; the abandoned third failing call does not',
+    );
+  } finally {
+    cleanup(gitDir);
+  }
 });
 test('wall-clock deadline reaches LocalTools and aborts an in-flight command runner', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-loop-command-'));
@@ -172,6 +531,24 @@ test('a preloaded context gets only the new repair turn, never historical duplic
   assert.equal(context.snapshot().filter((m) => m.content === 'original task').length, 1);
   assert.equal(context.snapshot().filter((m) => m.content?.includes('mismatch')).length, 1);
 });
+test('an overspent finite budget names the USD cap, distinct from the turn cap and unpriced responses', async () => {
+  const overspend = await new AgentLoop({
+    provider: {
+      async *chat() {
+        yield { usage: { inputTokens: 10, outputTokens: 20_000 }, toolCalls: [call('read_file', '{"path":"x"}', 'read')] };
+      },
+    },
+    tools: { execute: async () => assert.fail('no tool may run after the cap is exceeded') },
+    model: 'm',
+    pricing: priceTable(['m']),
+    maxUsd: 0.01,
+    maxTurns: 5,
+  }).run({ task: 'x' });
+  assert.equal(overspend.status, 'BUDGET');
+  assert.equal(overspend.budgetCap, 'usd');
+  assert.ok(overspend.costUsd > 0.01);
+  assert.equal(overspend.turn, 1, 'stopped by money long before the turn cap');
+});
 test('a finite zero or unknown-price budget makes no provider request', async () => {
   let calls = 0;
   const provider = {
@@ -183,9 +560,11 @@ test('a finite zero or unknown-price budget makes no provider request', async ()
   const tools = { execute: async () => ({ finish: { summary: 'unexpected', concerns: [], testsRun: [] } }) };
   const zero = await new AgentLoop({ provider, tools, maxUsd: 0 }).run({ task: 'x' });
   assert.equal(zero.status, 'BUDGET');
+  assert.equal(zero.budgetCap, 'other');
   assert.equal(calls, 0);
   const unknown = await new AgentLoop({ provider, tools, maxUsd: 1 }).run({ task: 'x' });
   assert.equal(unknown.status, 'BUDGET');
+  assert.equal(unknown.budgetCap, 'other');
   assert.equal(calls, 0);
 });
 const priceTable = (names) => ({
@@ -313,6 +692,7 @@ test('finite budgets reject substituted models before tools but allow declared a
     maxUsd: 1,
   }).run({ task: 'x' });
   assert.equal(rejected.status, 'BUDGET');
+  assert.equal(rejected.budgetCap, 'other');
   assert.match(rejected.error, /not authorized/);
   assert.equal(rejected.costUsd, 1);
   assert.equal(executed, 0);
@@ -519,9 +899,17 @@ test('invalid or duplicate tool calls are not persisted into a repair transcript
   };
   const failed = await new AgentLoop({ provider: invalid, context, tools: { execute: async () => '' } }).run({ task: 'first' });
   assert.equal(failed.status, 'FAILED');
-  assert.equal(
-    context.snapshot().some((m) => m.role === 'assistant'),
-    false,
+  assert.equal(failed.failureKind, 'finish-protocol');
+  // The first invalid finish was corrected and is durable only together with its result; the fatal repeat is not persisted.
+  assert.deepEqual(
+    context.snapshot().map((m) => [m.role, m.tool_call_id ?? m.tool_calls?.[0].id]),
+    [
+      ['system', undefined],
+      ['user', undefined],
+      ['user', undefined],
+      ['assistant', 'bad'],
+      ['tool', 'bad'],
+    ],
   );
   let replay;
   const repaired = {
@@ -536,9 +924,10 @@ test('invalid or duplicate tool calls are not persisted into a repair transcript
     tools: { execute: async () => ({ finish: { summary: 'ok', concerns: [], testsRun: [] } }) },
   }).run({ task: 'repair' });
   assert.deepEqual(
-    replay.map((m) => m.content),
-    ['s', 'old', 'first', 'repair'],
+    replay.map((m) => m.role),
+    ['system', 'user', 'user', 'assistant', 'tool', 'user'],
   );
+  assert.equal(replay.at(-1).content, 'repair');
   const duplicate = {
     async *chat() {
       yield { toolCalls: [call('read_file', '{"path":"a"}', 'same'), call('read_file', '{"path":"b"}', 'same')] };
@@ -553,6 +942,7 @@ test('invalid or duplicate tool calls are not persisted into a repair transcript
   };
   const hostileResult = await new AgentLoop({ provider: hostile, tools: { execute: async () => '' } }).run({ task: 'x' });
   assert.equal(hostileResult.error, 'Invalid tool arguments');
+  assert.equal(hostileResult.failureKind, undefined, 'a provider protocol fault is never a continuable worker failure');
   assert.doesNotMatch(hostileResult.error, /secret-value/);
 });
 test('incoming transcript messages precede the one new task and reject a reordered system turn', async () => {
@@ -1039,8 +1429,8 @@ test('official DeepSeek focus requires a tool call without narrowing the job sch
       };
     }),
     maxTurns: 6,
-    model: 'deepseek-v4-pro',
-    pricing: priceTable(['deepseek-v4-pro']),
+    model: 'deepseek-flash',
+    pricing: priceTable(['deepseek-flash']),
     maxUsd: 1,
     tools: { execute: async (name) => (name === 'finish' ? { finish: { summary: 'done', concerns: [], testsRun: [] } } : 'ok') },
   }).run({ task: 'implement x' });
@@ -1168,7 +1558,7 @@ test('raw OpenAI SSE replays reasoning text when a later tool delta carries a nu
   const provider = new OpenAIChatProvider({
     baseUrl: 'https://api.deepseek.com',
     apiKey: 'test',
-    model: 'deepseek-v4-pro',
+    model: 'deepseek-flash',
     retries: 0,
     fetchImpl: async (_url, init) => {
       requests.push(JSON.parse(init.body));
@@ -1177,7 +1567,7 @@ test('raw OpenAI SSE replays reasoning text when a later tool delta carries a nu
   });
   const result = await new AgentLoop({
     provider,
-    model: 'deepseek-v4-pro',
+    model: 'deepseek-flash',
     tools: { execute: async (name) => (name === 'finish' ? { finish: { summary: 'done', concerns: [], testsRun: [] } } : 'README') },
   }).run({ task: 'x' });
   assert.equal(result.status, 'DONE');
@@ -1208,7 +1598,7 @@ test('official DeepSeek implementation focus overrides enabled constructor think
   const provider = new OpenAIChatProvider({
     baseUrl: 'https://api.deepseek.com',
     apiKey: 'test',
-    model: 'deepseek-v4-pro',
+    model: 'deepseek-flash',
     thinking: { type: 'enabled' },
     reasoningEffort: 'high',
     retries: 0,
@@ -1219,8 +1609,8 @@ test('official DeepSeek implementation focus overrides enabled constructor think
   });
   const result = await new AgentLoop({
     provider,
-    model: 'deepseek-v4-pro',
-    pricing: priceTable(['deepseek-v4-pro']),
+    model: 'deepseek-flash',
+    pricing: priceTable(['deepseek-flash']),
     maxUsd: 1,
     maxTurns: 6,
     tools: { execute: async (name) => (name === 'finish' ? { finish: { summary: 'done', concerns: [], testsRun: [] } } : 'ok') },
@@ -1267,8 +1657,8 @@ test('official DeepSeek resumes an unreasoned tool transcript in normal non-thin
     }),
     context: new AgentContext(persisted),
     maxTurns: 2,
-    model: 'deepseek-v4-pro',
-    pricing: priceTable(['deepseek-v4-pro']),
+    model: 'deepseek-flash',
+    pricing: priceTable(['deepseek-flash']),
     maxUsd: 1,
     tools: { execute: async () => ({ finish: { summary: 'done', concerns: [], testsRun: [] } }) },
   }).run({ task: 'complete the existing implementation' });
@@ -1307,8 +1697,8 @@ test('official DeepSeek preserves configured thinking after replayable reasoning
     }),
     context: new AgentContext(persisted),
     maxTurns: 2,
-    model: 'deepseek-v4-pro',
-    pricing: priceTable(['deepseek-v4-pro']),
+    model: 'deepseek-flash',
+    pricing: priceTable(['deepseek-flash']),
     maxUsd: 1,
     tools: { execute: async () => ({ finish: { summary: 'done', concerns: [], testsRun: [] } }) },
   }).run({ task: 'complete the existing implementation' });
@@ -1334,8 +1724,8 @@ test('official DeepSeek focus permits a late required read before implementation
       yield { usage: { inputTokens: 0, outputTokens: 0 }, toolCalls: turns.shift() };
     }),
     maxTurns: 6,
-    model: 'deepseek-v4-pro',
-    pricing: priceTable(['deepseek-v4-pro']),
+    model: 'deepseek-flash',
+    pricing: priceTable(['deepseek-flash']),
     maxUsd: 1,
     tools: {
       execute: async (name) => (
@@ -1375,8 +1765,8 @@ test('a capped official DeepSeek focus retains its required complete schema for 
       else yield { usage: { inputTokens: 0, outputTokens: 0 }, toolCalls: [call('finish', '{"summary":"done"}', 'done')] };
     }),
     maxTurns: 6,
-    model: 'deepseek-v4-pro',
-    pricing: priceTable(['deepseek-v4-pro']),
+    model: 'deepseek-flash',
+    pricing: priceTable(['deepseek-flash']),
     maxUsd: 1,
     tools: { execute: async (name) => (name === 'finish' ? { finish: { summary: 'done', concerns: [], testsRun: [] } } : 'ok') },
   }).run({ task: 'implement x' });
@@ -1430,8 +1820,8 @@ test('a long finite DeepSeek write job focuses after two reads and recovers one 
       else yield { toolCalls: [call('finish', '{"summary":"done"}', 'finish')], usage: { inputTokens: 0, outputTokens: 1 } };
     }),
     tools: { execute: async (name) => (name === 'finish' ? { finish: { summary: 'done', concerns: [], testsRun: [] } } : 'ok') },
-    model: 'deepseek-v4-pro',
-    pricing: priceTable(['deepseek-v4-pro']),
+    model: 'deepseek-flash',
+    pricing: priceTable(['deepseek-flash']),
     maxUsd: 1,
     maxTurns: 18,
   }).run({ task: 'implement x' });
@@ -1518,6 +1908,43 @@ test('a successful direct write suppresses the implementation checkpoint for the
   assert.ok(!progress.some((event) => event.action === 'implementation_checkpoint'));
 });
 
+test('a configured server verifier gives one post-write completion checkpoint instead of letting a write job keep exploring', async () => {
+  const turns = [
+    [call('write_file', '{"path":"src/a.mjs","content":"x"}', 'write')],
+    [call('list_dir', '{"path":"src"}', 'last-essential-check')],
+    [call('finish', '{"summary":"done"}', 'done')],
+  ];
+  const requests = [];
+  const progress = [];
+  const result = await new AgentLoop({
+    provider: {
+      async *chat({ messages, tools }) {
+        requests.push({ messages: structuredClone(messages), tools: structuredClone(tools) });
+        yield { toolCalls: turns.shift() };
+      },
+    },
+    maxTurns: 4,
+    serverVerifierConfigured: true,
+    progress: async (event) => progress.push(event),
+    tools: { execute: async (name) => (name === 'finish' ? { finish: { summary: 'done', concerns: [], testsRun: [] } } : 'ok') },
+  }).run({ task: 'implement x' });
+
+  assert.equal(result.status, 'DONE');
+  assert.equal(
+    requests[1].messages.at(-1).content,
+    'Completion checkpoint: 3 model turns remain. A focused server verifier will run after finish. Do not continue exploring or rerun the verifier. If the required in-scope changes are complete, call finish now as the sole tool call. Use another tool only for an essential remaining edit or diagnosis.',
+  );
+  assert.ok(
+    requests[1].tools.some((tool) => tool.function.name === 'finish'),
+    'the checkpoint never removes a necessary finish call',
+  );
+  assert.equal(progress.filter((event) => event.action === 'verifier_completion_checkpoint').length, 1);
+  assert.ok(
+    !progress.some((event) => event.action === 'implementation_checkpoint'),
+    'a successful write still suppresses the discovery checkpoint',
+  );
+});
+
 test('implementation checkpoint requires write capability and at least four turns', async () => {
   const run = async ({ maxTurns, toolDefinitions }) => {
     const turns = [
@@ -1568,6 +1995,7 @@ test('implementation focus rejects a genuinely unadvertised tool without persist
   }).run({ task: 'implement x' });
   assert.equal(result.status, 'FAILED');
   assert.equal(result.error, 'Provider requested an unadvertised tool');
+  assert.equal(result.failureKind, undefined);
   assert.deepEqual(executed, ['read_file', 'list_dir']);
   assert.ok(progress.some((event) => event.action === 'implementation_focus'));
   assert.ok(progress.some((event) => event.action === 'provider_unadvertised_tool_recover:unknown'));
@@ -2003,6 +2431,7 @@ test('finite reservation exhaustion exposes only the cheapest numeric projection
     progress.filter((event) => event.action === 'budget_reservation_exhausted').map((event) => event.budgetReservation),
     [result.budgetReservation],
   );
+  assert.equal(result.budgetCap, 'reservation');
   assert.equal(result.budgetReservation.minOutputTokens, 16);
   assert.ok(Math.abs(result.budgetReservation.requiredUsd - Math.min(...required)) < 1e-12);
   assert.ok(Math.abs(result.budgetReservation.shortfallUsd - 0.000001) < 1e-12);
@@ -2361,6 +2790,24 @@ test('a recovery durability failure prevents a third provider request', async ()
   assert.equal(context.snapshot().length, 3, 'the failed recovery batch is not visible to a later request');
 });
 
+test('a content-filter stop with no tool call is FAILED without a continuable kind', async () => {
+  const result = await new AgentLoop({
+    provider: {
+      async *chat() {
+        yield { text: 'I cannot help with that', providerFinishReason: 'content_filter', usage: { inputTokens: 0, outputTokens: 1 } };
+      },
+    },
+    tools: { execute: async () => assert.fail('no tool may execute') },
+    model: 'm',
+    pricing: priceTable(['m']),
+    maxUsd: 1,
+    maxTurns: 3,
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'FAILED');
+  assert.equal(result.providerFinishReason, 'content_filter');
+  assert.equal(result.failureKind, undefined, 're-sending the same conversation would hit the same filter');
+});
+
 test('a missing-tool recovery is one-shot and final turns do not receive it', async () => {
   const run = async ({ maxTurns = 3 } = {}) => {
     let requests = 0;
@@ -2386,6 +2833,7 @@ test('a missing-tool recovery is one-shot and final turns do not receive it', as
   const once = await run();
   assert.equal(once.result.status, 'FAILED');
   assert.equal(once.result.error, 'Worker ended without mandatory finish call');
+  assert.equal(once.result.failureKind, 'no-finish');
   assert.equal(once.requests, 3);
   assert.deepEqual(
     once.progress.filter((event) => event.action === 'provider_missing_tool_recover').map((event) => event.action),
@@ -2497,10 +2945,12 @@ test('capped reasoning continuation is one-shot and requires a conclusive provid
   const twice = await capped(2);
   assert.equal(twice.status, 'FAILED');
   assert.equal(twice.error, 'Worker exhausted output-cap recovery without an allowed tool call');
+  assert.equal(twice.failureKind, 'output-cap');
 
   const absentReason = await capped(1, { providerFinishReason: 'stop' });
   assert.equal(absentReason.status, 'FAILED');
   assert.equal(absentReason.error, 'Worker ended without mandatory finish call');
+  assert.equal(absentReason.failureKind, 'no-finish');
 
   const finalTurn = await capped(1, { maxTurns: 1 });
   assert.equal(finalTurn.status, 'FAILED');
@@ -2534,8 +2984,8 @@ test('a direct DeepSeek write followed by a capped response gets one durable ful
       else yield { toolCalls: [call('finish', '{"summary":"done"}', 'finish')], usage: { inputTokens: 0, outputTokens: 1 } };
     }),
     tools: { execute: async (name) => (name === 'finish' ? { finish: { summary: 'done', concerns: [], testsRun: [] } } : 'written') },
-    model: 'deepseek-v4-pro',
-    pricing: priceTable(['deepseek-v4-pro']),
+    model: 'deepseek-flash',
+    pricing: priceTable(['deepseek-flash']),
     maxUsd: 1,
     maxTurns: 4,
     progress: async (event) => progress.push(event),
@@ -2619,8 +3069,8 @@ test('a durable queued capped implementation recovery resumes once with the full
     }),
     context: new AgentContext(transcript),
     tools: { execute: async () => ({ finish: { summary: 'done', concerns: [], testsRun: [] } }) },
-    model: 'deepseek-v4-pro',
-    pricing: priceTable(['deepseek-v4-pro']),
+    model: 'deepseek-flash',
+    pricing: priceTable(['deepseek-flash']),
     maxUsd: 1,
     maxTurns: 2,
     cappedFinishRecovery: 'queued',
@@ -3076,8 +3526,8 @@ test('queued and consumed budget-finish recoveries are one-shot and fail closed 
       { role: 'assistant', content: 'UNTRUSTED_OFFICIAL_RESUME'.repeat(3_000) },
     ]),
     tools: { execute: async () => ({ finish: { summary: 'done', concerns: [], testsRun: [] } }) },
-    model: 'deepseek-v4-pro',
-    pricing: priceTable(['deepseek-v4-pro']),
+    model: 'deepseek-flash',
+    pricing: priceTable(['deepseek-flash']),
     maxUsd: 0.01,
     maxTurns: 1,
     budgetFinishRecovery: 'queued',
@@ -3567,4 +4017,131 @@ test('resume trims only a trailing incomplete tool transaction and rejects inter
       }),
     /invalid assistant tool calls/,
   );
+});
+test('a tool phase marker precedes execution, names the command timeout, and the batch reports per-call timings', async () => {
+  const order = [];
+  let clock = 1_000;
+  const turns = [
+    [call('read_file', '{"path":"a"}', 'r'), call('run_command', '{"command":"npm test","timeoutSec":120}', 'c')],
+    [call('run_command', '{"command":"npm test"}', 'd')],
+    [call('read_file', '{"path":"b"}', 'e')],
+    [call('finish', '{"summary":"ok"}', 'f')],
+  ];
+  const provider = {
+    async *chat() {
+      yield { usage: { inputTokens: 1, outputTokens: 1 }, toolCalls: turns.shift() };
+    },
+  };
+  const spent = { read_file: 250, run_command: 4000 };
+  const result = await new AgentLoop({
+    provider,
+    model: 'm',
+    pricing: priceTable(['m']),
+    maxUsd: 1,
+    now: () => clock,
+    progress: (event) => order.push({ event }),
+    tools: {
+      execute: async (name) => {
+        order.push({ executed: name });
+        if (name === 'finish') return { finish: { summary: 'ok', concerns: [], testsRun: [] } };
+        clock += spent[name];
+        return 'ok';
+      },
+    },
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'DONE');
+  const markers = order.filter((entry) => entry.event?.phase === 'tool');
+  assert.equal(markers.length, 3, 'one marker per tool batch, none for finish');
+  assert.deepEqual(markers[0].event, { turn: 1, phase: 'tool', tools: ['read_file', 'run_command'], commandTimeoutSec: 120 });
+  assert.deepEqual(
+    markers[1].event,
+    { turn: 2, phase: 'tool', tools: ['run_command'], commandTimeoutSec: 60 },
+    'an absent timeout is the default',
+  );
+  assert.deepEqual(markers[2].event, { turn: 3, phase: 'tool', tools: ['read_file'] }, 'no command, no command timeout key');
+  for (const { event } of markers)
+    assert.equal('action' in event || 'actions' in event, false, 'a marker must not overwrite recent actions');
+  // The marker is emitted before the first tool of its batch runs.
+  const firstMarker = order.indexOf(markers[0]);
+  assert.ok(firstMarker >= 0 && order.findIndex((entry) => entry.executed === 'read_file') > firstMarker);
+  const finishTurn = order.find((entry) => entry.event?.actions?.includes('finish'));
+  assert.ok(finishTurn, 'the finish turn reports its actions');
+  assert.deepEqual(finishTurn.event.toolTimings, [], 'finish is not tool time');
+  const after = order.filter((entry) => entry.event?.actions?.includes('read_file') && entry.event.toolTimings);
+  assert.deepEqual(after[0].event.toolTimings, [
+    { name: 'read_file', ms: 250 },
+    { name: 'run_command', ms: 4000 },
+  ]);
+});
+test('the tool marker carries the sum of every command timeout in the batch, and the cap applies to the sum', async () => {
+  const markers = [];
+  const turns = [
+    [
+      call('run_command', '{"command":"a","timeoutSec":60}', 'a'),
+      call('read_file', '{"path":"x"}', 'x'),
+      call('run_command', '{"command":"b","timeoutSec":600}', 'b'),
+      call('run_command', '{"command":"c"}', 'c'),
+    ],
+    Array.from({ length: 64 }, (_, i) => call('run_command', `{"command":"n${i}","timeoutSec":900}`, `m${i}`)),
+    [call('run_command', '{"command":"d","timeoutSec":99999}', 'd'), call('run_command', '{"command":"e","timeoutSec":0}', 'e')],
+    [call('finish', '{"summary":"ok"}', 'f')],
+  ];
+  const provider = {
+    async *chat() {
+      yield { usage: { inputTokens: 1, outputTokens: 1 }, toolCalls: turns.shift() };
+    },
+  };
+  await new AgentLoop({
+    provider,
+    model: 'm',
+    pricing: priceTable(['m']),
+    maxUsd: 1,
+    progress: (event) => event.phase === 'tool' && markers.push(event.commandTimeoutSec),
+    tools: { execute: async (name) => (name === 'finish' ? { finish: { summary: 'ok', concerns: [], testsRun: [] } } : 'ok') },
+  }).run({ task: 'x' });
+  assert.deepEqual(markers, [
+    60 + 600 + 60, // the default (60 s) stands in where a command names none
+    57_600, // 64 x 900 s, the largest batch there can be
+    900 + 1, // an oversized timeout is clamped to 900 s and a too-small one to 1 s, as the tool clamps them
+  ]);
+});
+test('a fractional clock still yields whole-millisecond tool timings', async () => {
+  let clock = 1000.25;
+  const turns = [[call('run_command', '{"command":"a"}', 'a')], [call('finish', '{"summary":"ok"}', 'f')]];
+  const provider = {
+    async *chat() {
+      yield { usage: { inputTokens: 1, outputTokens: 1 }, toolCalls: turns.shift() };
+    },
+  };
+  const events = [];
+  await new AgentLoop({
+    provider,
+    model: 'm',
+    pricing: priceTable(['m']),
+    maxUsd: 1,
+    now: () => clock,
+    progress: (event) => events.push(event),
+    tools: {
+      execute: async (name) => {
+        if (name === 'finish') return { finish: { summary: 'ok', concerns: [], testsRun: [] } };
+        clock += 1500.4;
+        return 'ok';
+      },
+    },
+  }).run({ task: 'x' });
+  const batch = events.find((event) => event.toolTimings?.length);
+  assert.deepEqual(batch.toolTimings, [{ name: 'run_command', ms: 1500 }]);
+});
+test('a provider timing-free tool batch still reports one timing per call, in completion order', async () => {
+  const events = [];
+  const provider = providerFor([[call('list_dir', '{}', 'a')], [call('finish', '{"summary":"ok"}', 'f')]]);
+  await new AgentLoop({
+    provider,
+    progress: (event) => events.push(event),
+    tools: { execute: async (name) => (name === 'finish' ? { finish: { summary: 'ok', concerns: [], testsRun: [] } } : 'ok') },
+  }).run({ task: 'x' });
+  const batch = events.find((event) => event.actions?.[0] === 'list_dir');
+  assert.equal(batch.toolTimings.length, 1);
+  assert.equal(batch.toolTimings[0].name, 'list_dir');
+  assert.ok(Number.isInteger(batch.toolTimings[0].ms) && batch.toolTimings[0].ms >= 0);
 });

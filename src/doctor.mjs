@@ -11,6 +11,7 @@ import { loadPricing } from './pricing-registry.mjs';
 import { priceUsage, resolveModel, samePricedModel, validatePricingTable } from './pricing.mjs';
 import { snapshotGitEnv } from './git-snapshot.mjs';
 import { readRegularFileSync } from './regular-file.mjs';
+import { skillCopyStatus, skillFileHash } from './skill-health.mjs';
 
 const MAX_PRICING_BYTES = 1024 * 1024;
 const read = (file) => {
@@ -179,29 +180,30 @@ function codexRegistration(toml, bin) {
     else return false;
     if (values[key] === undefined) return false;
   }
-  // Codex may execute individual write-capable tools only after its own
-  // approval workflow. Treat this managed setting as part of the registration
-  // contract so `doctor` does not claim a weakened or manually altered entry
-  // is healthy.
+  // The installer supports its conservative write-prompt default and an
+  // explicit Offload-only autonomous approval mode. Both are managed,
+  // supported registrations; any other value is an altered entry.
   return (
     values.command === process.execPath &&
     exactArgs(values.args, bin) &&
     values.startup_timeout_sec === 15 &&
     values.tool_timeout_sec === 60 &&
-    values.default_tools_approval_mode === 'writes'
+    ['writes', 'approve'].includes(values.default_tools_approval_mode)
   );
 }
 function registrations(home, root, platform, env) {
   const bin = (platform === 'win32' ? win32 : { join }).join(root, 'bin', 'offload.mjs');
   const claudeRegistration = (file) => {
     const entry = parsed(file)?.mcpServers?.offload;
+    const expectedEnvironment =
+      plainRecord(entry?.env) &&
+      (Object.keys(entry.env).length === 0 || (Object.keys(entry.env).length === 1 && entry.env.OFFLOAD_MCP_APPROVAL_MODE === 'approve'));
     return (
       plainRecord(entry) &&
       entry.type === 'stdio' &&
       entry.command === process.execPath &&
       exactArgs(entry.args, bin) &&
-      plainRecord(entry.env) &&
-      Object.keys(entry.env).length === 0
+      expectedEnvironment
     );
   };
   const cursorRegistration = (file) => {
@@ -214,6 +216,36 @@ function registrations(home, root, platform, env) {
     claude: claudeRegistration(paths.claudeState),
     cursor: cursorRegistration(paths.cursorConfig),
   };
+}
+
+// The installed skill is a copy of the packaged one. A copy that differs means
+// the agent follows protocol rules the running server no longer implements (or
+// the reverse), so report it instead of letting the preflight fail obscurely.
+// A missing copy is normal (client not installed, or a plugin supplies it).
+// Health (offload_job) reaches the same verdict for the same file through
+// skillCopyStatus, so the hook banner and `server.skill` cannot disagree.
+function skillStatus(paths, root, path) {
+  const packaged = skillFileHash(path.join(root, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md'));
+  const status = (file) => {
+    const { status: state } = skillCopyStatus(file, packaged.hash);
+    return state === 'unreadable' ? 'missing' : state;
+  };
+  return { claude: status(paths.claudeSkill), codex: status(paths.codexSkill) };
+}
+// Session hooks from another Offload install root print a second, possibly
+// older runtime banner at every start. Installer ownership rules mean it will
+// not remove them, so surface them here.
+function otherDoctorHooks(paths, root, path) {
+  const own = path.join(root, 'install.mjs');
+  const found = new Set();
+  const entries = parsed(paths.claudeSettings)?.hooks?.SessionStart;
+  if (!Array.isArray(entries)) return [];
+  for (const entry of entries)
+    for (const hook of Array.isArray(entry?.hooks) ? entry.hooks : []) {
+      const matched = typeof hook?.command === 'string' && /(['"])([^'"\r\n]*install\.mjs)\1 --doctor-hook$/.exec(hook.command);
+      if (matched && matched[2] !== own) found.add(matched[2]);
+    }
+  return [...found];
 }
 
 /** Local-only diagnostic. It never makes an HTTP request or prints a key. */
@@ -229,7 +261,8 @@ export function doctor({
 } = {}) {
   // HOME is commonly present in Windows shells (Git Bash, CI) but client
   // registrations belong under the native user profile, as does the installer.
-  home = resolveClientPaths({ home, env, platform }).home;
+  const clientPaths = resolveClientPaths({ home, env, platform });
+  home = clientPaths.home;
   const path = platform === 'win32' ? win32 : { resolve, join };
   const node = process.versions.node.split('.').map(Number);
   const git = gitProbe(['--version'], { env, platform, spawnProcess });
@@ -279,6 +312,8 @@ export function doctor({
     config,
     key,
     registration: registrations(home, rootPath, platform, env),
+    skill: skillStatus(clientPaths, rootPath, path),
+    otherDoctorHooks: otherDoctorHooks(clientPaths, rootPath, path),
   };
 }
 

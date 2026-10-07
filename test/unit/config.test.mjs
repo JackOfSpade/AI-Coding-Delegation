@@ -16,11 +16,11 @@ import {
 import { cleanup, tempDir } from './helpers.mjs';
 
 test('config merges nested defaults and validates profile references', () => {
-  assert.equal(DEFAULT_CONFIG.default, 'pro');
-  assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles).sort(), ['flash', 'pro']);
+  assert.equal(DEFAULT_CONFIG.default, 'flash');
+  assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles), ['flash']);
   assert.equal(DEFAULT_CONFIG.providers.deepseek.keyRef, 'keychain:offload-deepseek');
   assert.equal(DEFAULT_CONFIG.providers.deepseek.attemptTimeoutMs, 300_000);
-  assert.equal(DEFAULT_CONFIG.profiles.pro.model, 'deepseek-v4-pro');
+  assert.equal(DEFAULT_CONFIG.profiles.flash.model, 'deepseek-flash');
   const merged = deepMerge(DEFAULT_CONFIG, {
     limits: { maxTurns: 4 },
     providers: { x: { type: 'openai-chat', baseUrl: 'https://x.example.test', keyRef: 'env:X' } },
@@ -102,7 +102,7 @@ test('missing config receives the documented DeepSeek profiles', () => {
   const dir = tempDir();
   try {
     const result = loadConfig({ configPath: join(dir, 'absent.json') });
-    assert.equal(result.config.default, 'pro');
+    assert.equal(result.config.default, 'flash');
     assert.equal(result.config.profiles.flash.model, 'deepseek-flash');
   } finally {
     cleanup(dir);
@@ -259,3 +259,33 @@ test(
     }
   },
 );
+
+test('verifier.interpreterRoots is an optional bounded allowlist of absolute directories', async () => {
+  const withRoots = (interpreterRoots) => deepMerge(DEFAULT_CONFIG, { verifier: { interpreterRoots } });
+  assert.equal(validateConfig(structuredClone(DEFAULT_CONFIG)).verifier, undefined, 'absent by default: no restriction');
+  assert.deepEqual(validateConfig(withRoots(['/Users/me/.venvs', '/opt/py'])).verifier.interpreterRoots, ['/Users/me/.venvs', '/opt/py']);
+  assert.deepEqual(validateConfig(withRoots([])).verifier.interpreterRoots, [], 'empty is the shipped example and means unrestricted');
+  assert.deepEqual(validateConfig(deepMerge(DEFAULT_CONFIG, { verifier: {} })).verifier, {});
+  for (const bad of [
+    ['relative'],
+    ['/a/../b'],
+    ['/a\\..\\b'],
+    [''],
+    [3],
+    ['/a\nb'],
+    'not-an-array',
+    Array.from({ length: 33 }, (_, index) => `/r${index}`),
+  ])
+    assert.throws(
+      () => validateConfig(withRoots(bad)),
+      (error) => error.code === 'E_CONFIG_VERIFIER',
+      JSON.stringify(bad).slice(0, 40),
+    );
+  assert.throws(() => validateConfig(deepMerge(DEFAULT_CONFIG, { verifier: { interpreters: [] } })), /unknown key/);
+  assert.throws(() => validateConfig(deepMerge(DEFAULT_CONFIG, { verifier: [] })), /Config\.verifier must be an object/);
+  // The shipped example config stays valid.
+  const { readFile } = await import('node:fs/promises');
+  const example = JSON.parse(await readFile(new URL('../../config.example.json', import.meta.url), 'utf8'));
+  assert.deepEqual(example.verifier, { interpreterRoots: [] });
+  assert.doesNotThrow(() => validateConfig(deepMerge(DEFAULT_CONFIG, example)));
+});

@@ -321,6 +321,145 @@ test('numeric reservation exhaustion propagates to progress, terminal event, pub
   assert.equal(repaired.budgetReservation, undefined);
   assert.equal((await m.store.get(started.jobId)).budgetReservation, undefined);
 });
+const budgetStopLines = (report) => report.split('\n').filter((line) => line.startsWith('budget stop:'));
+test('a BUDGET stop records which cap tripped with the spend so far and publishes it in the report, event and public view', async () => {
+  const cases = [
+    {
+      name: 'turn cap',
+      result: { turns: 3, costUsd: 0.08, error: 'Maximum turns reached', budgetCap: 'turns' },
+      budget: { maxTurns: 3, maxUsd: 2 },
+      stop: { cap: 'turns', turns: 3, maxTurns: 3, costUsd: 0.08, maxUsd: 2 },
+      line: 'budget stop: TURN cap reached (3/3 turns; $0.08 of $2.00 spent, $1.92 left). Turns, not USD, stopped it: offload_continue with extraTurns only.',
+    },
+    {
+      name: 'usd cap',
+      result: { turns: 2, costUsd: 1.01, budgetCap: 'usd' },
+      budget: { maxTurns: 10, maxUsd: 1 },
+      stop: { cap: 'usd', turns: 2, maxTurns: 10, costUsd: 1.01, maxUsd: 1 },
+      line: 'budget stop: USD cap reached ($1.01 of $1.00; 2/10 turns used). Continue with extraUsd.',
+    },
+    {
+      name: 'reservation',
+      result: { turns: 4, costUsd: 0.9, budgetCap: 'reservation' },
+      budget: { maxTurns: 10, maxUsd: 1 },
+      stop: { cap: 'reservation', turns: 4, maxTurns: 10, costUsd: 0.9, maxUsd: 1 },
+      line: 'budget stop: the remaining $0.10 cannot fund the next request (4/10 turns, $0.90 of $1.00); continue with extraUsd.',
+    },
+    {
+      name: 'no label, turns exhausted',
+      result: { turns: 5, costUsd: 0.2 },
+      budget: { maxTurns: 5, maxUsd: 1 },
+      stop: { cap: 'turns', turns: 5, maxTurns: 5, costUsd: 0.2, maxUsd: 1 },
+      line: 'budget stop: TURN cap reached (5/5 turns; $0.20 of $1.00 spent, $0.80 left). Turns, not USD, stopped it: offload_continue with extraTurns only.',
+    },
+    {
+      name: 'no label, money exhausted',
+      result: { turns: 2, costUsd: 1.5 },
+      budget: { maxTurns: 5, maxUsd: 1 },
+      stop: { cap: 'usd', turns: 2, maxTurns: 5, costUsd: 1.5, maxUsd: 1 },
+      line: 'budget stop: USD cap reached ($1.50 of $1.00; 2/5 turns used). Continue with extraUsd.',
+    },
+    {
+      name: 'forged label falls back to the totals',
+      result: { turns: 5, costUsd: 0.2, budgetCap: 'bogus' },
+      budget: { maxTurns: 5, maxUsd: 1 },
+      stop: { cap: 'turns', turns: 5, maxTurns: 5, costUsd: 0.2, maxUsd: 1 },
+      line: 'budget stop: TURN cap reached (5/5 turns; $0.20 of $1.00 spent, $0.80 left). Turns, not USD, stopped it: offload_continue with extraTurns only.',
+    },
+    {
+      name: 'forged label with neither cap reached',
+      result: { turns: 2, costUsd: 0.2, budgetCap: 'bogus' },
+      budget: { maxTurns: 5, maxUsd: 1 },
+      stop: { cap: 'other', turns: 2, maxTurns: 5, costUsd: 0.2, maxUsd: 1 },
+      line: 'budget stop: 2/5 turns, $0.20 of $1.00.',
+    },
+    {
+      name: 'other',
+      result: { turns: 0, costUsd: 0, budgetCap: 'other', error: 'Pricing is unknown for a finite budget' },
+      budget: { maxTurns: 5, maxUsd: 1 },
+      stop: { cap: 'other', turns: 0, maxTurns: 5, costUsd: 0, maxUsd: 1 },
+      line: 'budget stop: 0/5 turns, $0.00 of $1.00.',
+    },
+  ];
+  for (const { name, result, budget, stop, line } of cases) {
+    const m = await manager({ run: async () => ({ status: 'BUDGET', ...result }) });
+    const started = await m.start({ task: 'budget stop', ownedPaths: ['src/**'], repoPath: process.cwd(), budget });
+    const done = await m.wait(started.jobId, { timeoutSec: 1 });
+    assert.equal(done.status, 'BUDGET', name);
+    assert.deepEqual((await m.store.get(started.jobId)).budgetStop, stop, name);
+    assert.deepEqual(done.budgetStop, stop, name);
+    assert.deepEqual(budgetStopLines(done.report), [line], name);
+    const events = (await m.store.readArtifact(started.jobId, 'events.jsonl'))
+      .trim()
+      .split('\n')
+      .map((row) => JSON.parse(row));
+    assert.deepEqual(events.find((event) => event.type === 'finished')?.budgetStop, stop, name);
+  }
+});
+test('only a BUDGET job reports a budget stop, and public views drop a malformed stop or sizing record', async () => {
+  const m = await manager({ run: async () => ({ status: 'DONE', turns: 1 }) });
+  const started = await m.start({ task: 'fine', ownedPaths: ['src/**'], repoPath: process.cwd(), budget: { maxTurns: 5, maxUsd: 1 } });
+  const done = await m.wait(started.jobId, { timeoutSec: 1 });
+  assert.equal(done.budgetStop, undefined);
+  assert.deepEqual(budgetStopLines(done.report), []);
+
+  const bare = new JobManager({ store: {} });
+  const stop = { cap: 'turns', turns: 3, maxTurns: 3, costUsd: 0.08, maxUsd: 2 };
+  assert.deepEqual(bare.public({ id: 'x', status: 'BUDGET', budgetStop: { ...stop, secret: '/private/path' } }).budgetStop, stop);
+  assert.equal(
+    bare.public({ id: 'x', status: 'VERIFY_FAILED', budgetStop: stop }).budgetStop,
+    undefined,
+    'a stale stop is not a current fact',
+  );
+  for (const bad of [
+    { ...stop, cap: 'bogus' },
+    { ...stop, turns: Number.NaN },
+    { ...stop, costUsd: -1 },
+    { ...stop, maxUsd: Number.POSITIVE_INFINITY },
+    { ...stop, maxTurns: 1.5 },
+    'turns',
+    null,
+  ])
+    assert.equal(bare.public({ id: 'x', status: 'BUDGET', budgetStop: bad }).budgetStop, undefined, JSON.stringify(bad));
+  const sizing = { maxTurns: 54, turnsSource: 'scaled', turnPolicy: 'auto', recommendedTurns: 54, files: [], warnings: [] };
+  assert.deepEqual(bare.public({ id: 'x', status: 'RUNNING', budgetSizing: { ...sizing, token: 'secret' } }).budgetSizing, sizing);
+  assert.equal(bare.public({ id: 'x', status: 'RUNNING', budgetSizing: { ...sizing, maxTurns: Number.NaN } }).budgetSizing, undefined);
+});
+test('relevantPaths accept :START-END ranges at the raw and persisted boundaries and reject malformed ones', async () => {
+  for (const relevantPaths of [['src/a.mjs:1-5'], ['src/a.mjs:1-5', 'src/a.mjs:10-20', 'src/a.mjs'], ['a/b.js:7-7']])
+    assert.doesNotThrow(() => validateJobRequest({ task: 'x', ownedPaths: ['src/**'], relevantPaths }), JSON.stringify(relevantPaths));
+  for (const relevantPaths of [
+    ['src/a.mjs:5-1'],
+    ['src/a.mjs:0-5'],
+    ['src/a.mjs:01-5'],
+    ['src/a.mjs:1-5', 'src/a.mjs:1-5'],
+    ['../a.mjs:1-5'],
+    ['/abs.mjs:1-5'],
+    ['src\\a.mjs:1-5'],
+    ['./src/a.mjs:1-5'],
+    ['x'.repeat(1030) + ':1-2'],
+  ])
+    assert.throws(
+      () => validateJobRequest({ task: 'x', ownedPaths: ['src/**'], relevantPaths }),
+      /relevantPaths must be relative paths\/globs, optionally suffixed :START-END/,
+      JSON.stringify(relevantPaths),
+    );
+  // extraWritable keeps its strict scope grammar (no ranges, no duplicates).
+  assert.throws(() => validateJobRequest({ task: 'x', ownedPaths: ['src/**'], extraWritable: ['tmp/a', 'tmp/a'] }), /extraWritable/);
+
+  const m = await manager({ run: async () => ({ status: 'DONE' }) });
+  const started = await m.start({
+    task: 'ranges',
+    ownedPaths: ['src/**'],
+    relevantPaths: ['src/a.mjs:1-5', 'src/b.mjs'],
+    repoPath: process.cwd(),
+  });
+  await m.wait(started.jobId, { timeoutSec: 1 });
+  const stored = await m.store.get(started.jobId);
+  assert.deepEqual(stored.relevantPaths, ['src/a.mjs:1-5', 'src/b.mjs']);
+  assert.doesNotThrow(() => m.validatePersisted(stored));
+  assert.throws(() => m.validatePersisted({ ...stored, relevantPaths: ['src/a.mjs:5-1'] }), /relevantPaths/);
+});
 test('a pending provider request clears the prior finish reason before the next response arrives', async () => {
   let enteredPending;
   const pending = new Promise((resolve) => {
@@ -595,6 +734,54 @@ test('isolated lifecycle keeps primary unchanged until verified integration and 
     assert.equal(existsSync(join(repo, 'src', 'owned.txt')), false);
   } finally {
     cleanup(repo);
+  }
+});
+test('an isolated verifier is granted only the primary node_modules read root, and the job records the dependency state', async () => {
+  for (const withDependencies of [true, false]) {
+    const repo = makeRepo(),
+      gitDir = await mkdtemp(`${tmpdir()}/offload-isolated-deps-`);
+    let verifierOptions, workerSawLink;
+    try {
+      write(join(repo, '.gitignore'), 'node_modules/\n');
+      git(repo, ['add', '.gitignore']);
+      git(repo, ['commit', '-m', 'ignore deps']);
+      if (withDependencies) write(join(repo, 'node_modules', 'dep-pkg', 'index.js'), 'module.exports = 1;\n');
+      const m = new JobManager({
+        store: new JobStore({ gitDir }),
+        snapshots: gitSnapshots(),
+        worker: {
+          run: async (job) => {
+            workerSawLink = existsSync(join(dirname(job.workspacePath), 'node_modules'));
+            write(join(job.workspacePath, 'src', 'owned.txt'), 'worker\n');
+            return { status: 'DONE' };
+          },
+        },
+        runner: {
+          verify: async (_command, options) => {
+            verifierOptions = options;
+            return { command: 'verify', verdict: 'PASS', result: { code: 0, sandbox: 'macos' } };
+          },
+        },
+        config: {
+          repoPath: repo,
+          git: { branch: async (path) => git(path, ['branch', '--show-current']), head: async (path) => git(path, ['rev-parse', 'HEAD']) },
+          applyPatch: gitPatchApplier,
+          isolation: { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree },
+        },
+      });
+      const started = await m.start({ task: 'deps', ownedPaths: ['src/**'], repoPath: repo, testCommand: 'verify' });
+      const done = await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC });
+      assert.equal(done.status, 'DONE_VERIFIED');
+      const job = await m.store.get(started.jobId);
+      assert.equal(job.workspaceDependencies, withDependencies ? 'linked' : 'absent');
+      assert.equal(workerSawLink, withDependencies);
+      const parent = verifierOptions.readablePaths[0];
+      assert.equal(verifierOptions.readablePaths.length, withDependencies ? 2 : 1);
+      if (withDependencies) assert.equal(verifierOptions.readablePaths[1], await realpath(join(repo, 'node_modules')));
+      assert.match(parent, /offload-worktree-/);
+    } finally {
+      cleanup(repo);
+    }
   }
 });
 test('report jobs copy allowlisted scratch inputs read-only, return structured findings, and never integrate', async () => {
@@ -1555,6 +1742,16 @@ test('start rejects path aliases and non-boolean capability flags before creatin
       }),
     /executionProfile/,
   );
+  for (const unreachable of [
+    { baseUrl: 'https://api.deepseek.com', model: 'deepseek-v4-pro' },
+    { baseUrl: 'https://api.deepseek.com', model: 'deepseek-reasoner' },
+    { baseUrl: 'https://provider.example.test/v1', model: 'DeepSeek_V4_Pro-0813' },
+  ])
+    await assert.rejects(
+      () => m.start({ task: 'x', ownedPaths: ['src/**'], executionProfile: { ...profile, ...unreachable }, repoPath: process.cwd() }),
+      /executionProfile/,
+      'a persisted execution snapshot can never name a Pro model',
+    );
   const accepted = await m.start(
     {
       task: 'x',

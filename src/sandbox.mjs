@@ -1,6 +1,6 @@
 /** Dependency-free, scrubbed command execution with best-effort OS sandboxing. */
 import { spawn, spawnSync } from 'node:child_process';
-import { realpathSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep, relative, isAbsolute } from 'node:path';
@@ -19,11 +19,12 @@ const CAP = 256 * 1024;
 // PATH, which an untrusted repository command environment can influence.
 const SANDBOX_EXECUTABLE = '/usr/bin/sandbox-exec';
 const MACOS_SHELL_SELECTOR = '/private/var/select/sh';
+const COMMAND_LINE_TOOLS = '/Library/Developer/CommandLineTools';
 // `/usr/local` and `/opt/homebrew` are broadly readable for interpreters and
 // libraries.  Their etc trees are host configuration, however, and `/Library`
 // includes machine credentials and management policy.  These denies appear
 // after the broad toolchain reads in the generated profile intentionally.
-const MACOS_HOST_CONFIG_DENY = Object.freeze([
+export const MACOS_HOST_CONFIG_DENY = Object.freeze([
   '/usr/local/etc',
   '/opt/homebrew/etc',
   '/Library/Keychains',
@@ -49,6 +50,25 @@ export function scrubEnv(env = process.env, { home, temp, platform = process.pla
   result.TMPDIR = result.TMP = result.TEMP = temp || safeHome;
   result.NO_COLOR = '1';
   return result;
+}
+/**
+ * Extra environment for tools that cannot otherwise start under the macOS
+ * profile. It is applied only after a real sandbox was applied, and never
+ * widens the profile: both variables below just stop a tool from reading a path
+ * the profile already denies.
+ */
+export function sandboxToolEnv({ exists = existsSync } = {}) {
+  return {
+    // /etc is unreadable in the profile: without these, git dies on
+    // "unable to access '/etc/gitconfig'".
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_ATTR_NOSYSTEM: '1',
+    // /usr/bin/{git,python3} are xcode-select shims that read
+    // /var/select/developer_dir, which is denied. A fixed /Library path (already
+    // readable) skips that lookup. It is never taken from the caller's
+    // environment: scrubEnv drops DEVELOPER_DIR.
+    ...(exists(`${COMMAND_LINE_TOOLS}/usr/bin/git`) ? { DEVELOPER_DIR: COMMAND_LINE_TOOLS } : {}),
+  };
 }
 const SANDBOX_PROBE_COMMAND = `${SANDBOX_EXECUTABLE} -p <generated-offload-profile> /usr/bin/true`;
 const SANDBOX_PROBE_OUTPUT_CAP = 4 * 1024;
@@ -253,6 +273,20 @@ function denyFilter(kind, repoPath, pattern) {
   // are too, and `.ENV`/`ID_RSA` should not become readable on a Linux volume.
   return `(deny file-${kind}* (regex #"^${root}[/]${seatbeltString(source)}$"))`;
 }
+// Extra read roots (a worktree's linked dependency directory) sit outside the
+// repository root, so the root-anchored DEFAULT_DENY_READ regexes never see
+// them. Re-anchor the credential conventions at each such root. Directories
+// named `credentials` are ordinary module code in dependencies (for example
+// aws-sdk's lib/credentials), so only their credential-shaped *files* stay
+// denied. Dependency caches are denied too: they are rebuildable, read-only
+// here anyway, and can embed environment values.
+const EXTRA_READ_ROOT_DENY = Object.freeze([
+  ...DEFAULT_DENY_READ.filter((pattern) => !/(?:^|\/)credentials(?:\/\*\*)?$/.test(pattern)),
+  '.cache',
+  '.cache/**',
+  '**/.cache',
+  '**/.cache/**',
+]);
 export function macosProfile({
   repoPath,
   gitDir = join(repoPath, '.git'),
@@ -262,15 +296,16 @@ export function macosProfile({
   denyWrite = DEFAULT_DENY_WRITE,
   tempPath,
   cachePaths = [],
+  interpreterPaths = [],
   allowNetwork = false,
 }) {
   if (!Array.isArray(denyRead) || denyRead.some((path) => typeof path !== 'string'))
     throw new TypeError('denyRead must be relative glob strings');
   if (!Array.isArray(denyWrite) || denyWrite.some((path) => typeof path !== 'string'))
     throw new TypeError('denyWrite must be relative glob strings');
-  if (!Array.isArray(writablePaths) || !Array.isArray(readablePaths) || !Array.isArray(cachePaths))
-    throw new TypeError('sandbox writable/readable/cache paths must be arrays');
-  for (const value of [repoPath, gitDir, tempPath, ...writablePaths, ...readablePaths, ...cachePaths].filter(
+  if (!Array.isArray(writablePaths) || !Array.isArray(readablePaths) || !Array.isArray(cachePaths) || !Array.isArray(interpreterPaths))
+    throw new TypeError('sandbox writable/readable/cache/interpreter paths must be arrays');
+  for (const value of [repoPath, gitDir, tempPath, ...writablePaths, ...readablePaths, ...cachePaths, ...interpreterPaths].filter(
     (value) => value !== undefined,
   ))
     seatbeltPath(value);
@@ -294,6 +329,15 @@ export function macosProfile({
   // never add it to `write`.
   const resolvedReadable = readablePaths.map((value) => (isAbsolute(value) ? resolve(value) : resolve(root, value)));
   const resolvedCache = cachePaths.map((value) => (isAbsolute(value) ? resolve(value) : resolve(root, value)));
+  // A caller-declared interpreter or virtualenv, and the installation it was
+  // built from, are the one external tree a verifier may read AND execute. The
+  // server authenticates and canonicalizes these roots before they get here
+  // (see verify-interpreter.mjs); like every read root they are never added to
+  // `write`, and the credential conventions are re-anchored at each of them.
+  const resolvedInterpreter = interpreterPaths.map((value) => {
+    if (!isAbsolute(value)) throw new TypeError('sandbox interpreter paths must be absolute');
+    return resolve(value);
+  });
   // Exact metadata on each server-controlled path ancestor permits path
   // traversal/getcwd without granting directory contents. This matters when
   // macOS presents a lexical `/var` path physically under `/private/var`.
@@ -302,8 +346,20 @@ export function macosProfile({
   // libraries; this grants no child data (and /opt/homebrew/etc remains
   // explicitly denied below).
   const traversalMetadata = new Set(['/opt']);
-  for (const path of [root, resolvedTemp, ...resolvedReadable, ...resolvedCache, dirname(MACOS_SHELL_SELECTOR)].filter(Boolean))
+  for (const path of [
+    root,
+    resolvedTemp,
+    ...resolvedReadable,
+    ...resolvedCache,
+    ...resolvedInterpreter,
+    dirname(MACOS_SHELL_SELECTOR),
+  ].filter(Boolean))
     for (let parent = dirname(path); parent !== sep; parent = dirname(parent)) traversalMetadata.add(parent);
+  // CPython resolves its own executable with realpath(3), which stats every
+  // component starting at `/`: without the exact root node an interpreter dies
+  // at startup ("realpath: ...: Operation not permitted"), even a system one.
+  // This is metadata of the single directory node, never its contents.
+  if (resolvedInterpreter.length) traversalMetadata.add(sep);
   const read = [
     root,
     '/System',
@@ -317,6 +373,7 @@ export function macosProfile({
     resolvedTemp,
     ...resolvedReadable,
     ...resolvedCache,
+    ...resolvedInterpreter,
   ].filter(Boolean);
   const write = [resolvedTemp, ...resolvedCache].filter(Boolean);
   // Denies follow broad workspace/temp permits. Seatbelt evaluates deny rules
@@ -346,6 +403,9 @@ export function macosProfile({
     // root as data too, so the shell can enter its physical cwd without
     // broadening access to any descendant beyond the paired subpath rule.
     ...read.flatMap((path) => [`(allow file-read-data (literal ${q(path)}))`, `(allow file-read* (subpath ${q(path)}))`]),
+    // `process*` above already permits exec; naming it for the declared roots
+    // keeps their grant (read and exec, never write) legible in the profile.
+    ...resolvedInterpreter.map((path) => `(allow process-exec (subpath ${q(path)}))`),
     // `subpath` does not include the directory node. Pair exact and
     // descendant denies so broad toolchain/cache grants cannot rename, remove,
     // or inspect a protected Git/config directory itself.
@@ -356,6 +416,8 @@ export function macosProfile({
     ...protectedGitPaths.flatMap((path) => denyPath('write', path)),
     ...denyWrite.map((pattern) => denyFilter('write', root, pattern)),
     ...protectedRead.map((pattern) => denyFilter('read', root, pattern)),
+    ...resolvedReadable.flatMap((readable) => EXTRA_READ_ROOT_DENY.map((pattern) => denyFilter('read', readable, pattern))),
+    ...resolvedInterpreter.flatMap((interpreter) => EXTRA_READ_ROOT_DENY.map((pattern) => denyFilter('read', interpreter, pattern))),
     ...(allowNetwork ? ['(allow network*)'] : []),
   ].join('\n');
 }
@@ -469,6 +531,7 @@ export async function runCommand(command, options = {}) {
     throw new TypeError('requireSandbox must be boolean');
   if (options.sandboxProbe !== undefined && typeof options.sandboxProbe !== 'function')
     throw new TypeError('sandboxProbe must be a function');
+  if (options.onOutput !== undefined && typeof options.onOutput !== 'function') throw new TypeError('onOutput must be a function');
   const profileInput = {
     repoPath: cwd,
     gitDir: options.gitDir,
@@ -478,6 +541,7 @@ export async function runCommand(command, options = {}) {
     denyWrite: options.denyWrite || DEFAULT_DENY_WRITE,
     tempPath: options.tempPath || tmpdir(),
     cachePaths: options.cachePaths || [],
+    interpreterPaths: options.interpreterPaths || [],
     allowNetwork: options.allowNetwork === true,
   };
   const probeProfile = options.sandbox !== false && platform === 'darwin' ? macosProfile(profileInput) : undefined;
@@ -510,6 +574,16 @@ export async function runCommand(command, options = {}) {
         }),
       )
     : options.readablePaths || [];
+  // Declared interpreter roots are canonicalized like the read roots above, and
+  // a root that vanished fails before execution instead of granting nothing.
+  const sandboxInterpreterPaths = canSandbox
+    ? await Promise.all(
+        (options.interpreterPaths || []).map(async (value) => {
+          if (typeof value !== 'string' || !isAbsolute(value)) throw new TypeError('sandbox interpreter paths must be absolute');
+          return realpath(value);
+        }),
+      )
+    : options.interpreterPaths || [];
   const sandboxCachePaths = (options.cachePaths || []).map(sandboxPath);
   const sandboxGitDir = sandboxPath(options.gitDir);
   if (canSandbox) {
@@ -532,6 +606,13 @@ export async function runCommand(command, options = {}) {
   try {
     await writeFile(scriptPath, commandScript(command, platform), { mode: 0o700 });
     const environment = {
+      // TMPDIR/TMP/TEMP/HOME name the one physical, per-command, disposable
+      // directory the profile can write. Node's os.tmpdir(), `mktemp -t`,
+      // `getconf DARWIN_USER_TEMP_DIR` and Python's tempfile all honor it. A
+      // hard-coded /tmp, or a child spawned with an environment that drops
+      // these variables, is denied by design and is deliberately not widened
+      // here. A directory shared across a job's commands is rejected on purpose:
+      // it would carry worker-written state into the verifier.
       // Seatbelt evaluates the physical path. Using the lexical `/var` alias
       // here causes Node's os.tmpdir()/mkdtemp to target a path the profile
       // has not granted on macOS. Keep policy-only behavior unchanged.
@@ -545,7 +626,10 @@ export async function runCommand(command, options = {}) {
     // Homebrew Node may otherwise load its host OpenSSL configuration before
     // the command starts. Never inherit a caller-selected configuration path:
     // use the inert null device only after a real macOS sandbox was applied.
-    if (sandbox === 'macos') environment.OPENSSL_CONF = '/dev/null';
+    if (sandbox === 'macos') {
+      environment.OPENSSL_CONF = '/dev/null';
+      Object.assign(environment, sandboxToolEnv());
+    }
     const sandboxProfile =
       sandbox === 'macos'
         ? macosProfile({
@@ -560,6 +644,7 @@ export async function runCommand(command, options = {}) {
             // an explicit cache capability rather than replacing that root.
             tempPath: sandboxTempPath,
             cachePaths: [...sandboxCachePaths, ...(options.tempPath ? [sandboxPath(options.tempPath)] : [])],
+            interpreterPaths: sandboxInterpreterPaths,
             allowNetwork: options.allowNetwork === true,
           })
         : undefined;
@@ -618,8 +703,16 @@ export async function runCommand(command, options = {}) {
       if (sandbox === 'macos') child = spawnProcess(SANDBOX_EXECUTABLE, ['-p', sandboxProfile, '/bin/sh', scriptName], spawnOptions);
       else if (platform === 'win32') child = spawnProcess('cmd.exe', ['/d', '/s', '/c', scriptName], spawnOptions);
       else child = spawnProcess('/bin/sh', [scriptName], spawnOptions);
-      child.stdout.on('data', (value) => stdout.add(value));
-      child.stderr.on('data', (value) => stderr.add(value));
+      // A caller's output hook (the baseline-diff verifier's streaming failure
+      // parser) can never change the retained capture or the exit result.
+      const observe = (stream) => (value) => {
+        (stream === 'stdout' ? stdout : stderr).add(value);
+        try {
+          options.onOutput?.(value, stream);
+        } catch {}
+      };
+      child.stdout.on('data', observe('stdout'));
+      child.stderr.on('data', observe('stderr'));
       timer = setTimeout(() => terminate('timeout'), timeoutMs);
       options.signal?.addEventListener('abort', abort, { once: true });
       if (options.signal?.aborted) abort();
@@ -651,4 +744,98 @@ export async function assertWithin(path, root) {
   const rel = relative(base, target);
   if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error(`path escapes repository: ${path}`);
   return target;
+}
+
+const TEMP_PROBE_SCRIPT = [
+  'd=$(mktemp -d "${TMPDIR:-/nonexistent}/offload-probe.XXXXXX" 2>/dev/null) && echo tmpdir=ok || echo tmpdir=denied',
+  's=$(mktemp -d /tmp/offload-probe.XXXXXX 2>/dev/null) && { rmdir "$s"; echo system-tmp=writable; } || echo system-tmp=denied',
+  'if [ -n "$d" ] && git init -q "$d/g" >/dev/null 2>&1; then echo git-init=ok; else echo git-init=failed; fi',
+].join('\n');
+const probeKey = (stdout, key, values) => {
+  for (const line of String(stdout).split(/\r?\n/)) {
+    const match = new RegExp(`^${key}=(${values.join('|')})$`).exec(line);
+    if (match) return match[1];
+  }
+  return undefined;
+};
+// A closed-vocabulary token (an errno name or a fixed label), never message
+// text: exception and sandboxed-stderr text can carry host paths.
+const errorToken = (value, fallback = 'unknown') =>
+  String(value ?? '')
+    .replace(/[^A-Za-z0-9_-]/g, '')
+    .slice(0, 40) || fallback;
+const tempProbe = (status, reason, extra = {}) => ({
+  status,
+  reason,
+  systemTmp: 'unknown',
+  gitInit: 'unknown',
+  note: '',
+  ...extra,
+});
+
+/**
+ * Exercise the verifier's temp-directory contract the way a verifier sees it,
+ * so health can say whether a testCommand can create temp directories at all.
+ *
+ * On macOS this runs a tiny script through the real sandboxed `runCommand`
+ * path (same profile, same environment): it creates a directory under the
+ * per-run TMPDIR, checks that a hard-coded /tmp is still denied (the expected,
+ * safe answer), and runs `git init` there. Without a macOS sandbox it can only
+ * check the host's os.tmpdir(). The result is bounded and never carries a path: an `error` is an errno name or a fixed label.
+ */
+export async function probeVerifierTemp({
+  platform = process.platform,
+  run = runCommand,
+  mkdtemp = mkdtempSync,
+  rm = rmSync,
+  tmp = tmpdir,
+  timeoutSec = 10,
+} = {}) {
+  let scratch;
+  try {
+    scratch = mkdtemp(join(tmp(), 'offload-probe-'));
+  } catch (error) {
+    // Only the error code: a message can carry the (host-specific) path.
+    return tempProbe('unwritable', 'host-tmpdir-unwritable', {
+      error: errorToken(error?.code),
+      note: "the server's os.tmpdir() is not writable, so a verifier cannot create its per-run temp directory",
+    });
+  }
+  try {
+    if (platform !== 'darwin')
+      return tempProbe('writable', 'policy-only-host-tmpdir-writable', {
+        note: 'no macOS sandbox on this host; only the host os.tmpdir() could be checked',
+      });
+    let result;
+    try {
+      result = await run(TEMP_PROBE_SCRIPT, { cwd: scratch, requireSandbox: true, timeoutSec });
+    } catch (error) {
+      if (/Required macOS sandbox is unavailable/.test(String(error?.message))) return tempProbe('not-probed', 'sandbox-unavailable');
+      return tempProbe('unknown', 'probe-failed', { error: errorToken(error?.code, 'exception') });
+    }
+    if (result?.timedOut) return tempProbe('unknown', 'probe-timed-out');
+    const tmpdirState = probeKey(result?.stdout, 'tmpdir', ['ok', 'denied']);
+    if (!tmpdirState)
+      return tempProbe('unknown', 'probe-failed', { error: Number.isInteger(result?.code) ? `exit-${result.code}` : 'no-output' });
+    const systemTmp = probeKey(result?.stdout, 'system-tmp', ['writable', 'denied']) ?? 'unknown';
+    const gitInit = probeKey(result?.stdout, 'git-init', ['ok', 'failed']) ?? 'unknown';
+    const common = {
+      systemTmp,
+      gitInit,
+      ...(systemTmp === 'writable' ? { warning: 'system temp is writable inside the verifier; the sandbox profile has regressed' } : {}),
+    };
+    return tmpdirState === 'ok'
+      ? tempProbe('writable', 'per-run-tmpdir-writable', {
+          ...common,
+          note: 'a verifier can create temp dirs under its per-run TMPDIR; a hard-coded /tmp is denied by design',
+        })
+      : tempProbe('unwritable', 'per-run-tmpdir-denied', {
+          ...common,
+          note: 'the verifier sandbox could not create a temp directory under its own per-run TMPDIR',
+        });
+  } finally {
+    try {
+      rm(scratch, { recursive: true, force: true });
+    } catch {}
+  }
 }

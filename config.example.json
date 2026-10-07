@@ -9,9 +9,9 @@
     }
   },
   "profiles": {
-    "pro": { "provider": "deepseek", "model": "deepseek-v4-pro", "effort": "high" },
     "flash": { "provider": "deepseek", "model": "deepseek-flash" }
   },
-  "default": "pro",
-  "limits": { "maxTurns": 80, "timeoutMinutes": 30, "maxUsd": 2 }
+  "default": "flash",
+  "limits": { "maxTurns": 80, "timeoutMinutes": 30, "maxUsd": 2 },
+  "verifier": { "interpreterRoots": [] }
 }

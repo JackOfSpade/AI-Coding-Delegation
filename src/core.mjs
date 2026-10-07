@@ -1,15 +1,38 @@
 import { execFileSync } from 'node:child_process';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { LeaseManager, getGitDir } from './lease.mjs';
 import { JobStore } from './store.mjs';
 import { Runner } from './runner.mjs';
-import { JobManager, validateExplicitRepoPath, validateJobId, validateJobRequest } from './job-manager.mjs';
-import { sandboxAvailable, sandboxStatus } from './sandbox.mjs';
-import { healthIdentity } from './identity.mjs';
+import { JobManager, mergeListings, validateExplicitRepoPath, validateJobId, validateJobRequest } from './job-manager.mjs';
+import { probeVerifierTemp, sandboxAvailable, sandboxStatus } from './sandbox.mjs';
+import { healthIdentity, runtimeIdentity } from './identity.mjs';
+import { assertStartRuntimeCurrent, installedSkillHealth, withSkillHealth } from './skill-health.mjs';
+import {
+  normalizeInterpreterDeclaration,
+  probeVerifierInterpreter,
+  pythonProjectMarkers,
+  resolveVerifierInterpreters,
+  verifierPythonStatus,
+} from './verify-interpreter.mjs';
 import { snapshotWorkingTree, diffTrees, diffTreeFiles, git as snapshotGit, snapshotGitEnv } from './git-snapshot.mjs';
-import { createIsolatedWorktree, openIsolatedWorktree, cleanupIsolatedWorktree, pinJobTrees, releaseJobTrees } from './worktree.mjs';
+import {
+  createIsolatedWorktree,
+  openIsolatedWorktree,
+  cleanupIsolatedWorktree,
+  isolatedDependencyReadPaths,
+  verifierDependencyStatus,
+  workingTreeStatus,
+  integrateRecordedTree,
+  pinJobTrees,
+  releaseJobTrees,
+} from './worktree.mjs';
+import { resolveLogWindow } from './diagnostics.mjs';
+import { MAX_RETROSPECTIVE_JOBS, buildRetrospective } from './retrospective.mjs';
+import { createRetrospectiveLog } from './retrospective-log.mjs';
 import { defaultConfigPath, loadConfig, resolveConfigRelativePath } from './config.mjs';
 import { WINDOWS_INTEGRITY_ROOT_CREDENTIAL, readWindowsCredential, resolveKeyRef, storeWindowsCredential } from './secrets.mjs';
 import {
@@ -26,8 +49,9 @@ import { PathPolicy } from './policy.mjs';
 import { LocalTools, availableToolDefinitions } from './agent/tools.mjs';
 import { AgentLoop } from './agent/loop.mjs';
 import { AgentContext } from './agent/context.mjs';
-import { buildSystemPrompt } from './agent/prompt.mjs';
+import { annotateRelevantPaths, buildSystemPrompt } from './agent/prompt.mjs';
 import { loadPricing } from './pricing-registry.mjs';
+import { assertModelAllowed } from './model-policy.mjs';
 import { validatePricingTable } from './pricing.mjs';
 import { readRegularFileSync } from './regular-file.mjs';
 
@@ -35,6 +59,8 @@ import { readRegularFileSync } from './regular-file.mjs';
 // redirects, filters, hooks, or fsmonitor helpers to a repository command.
 const command = (repo, args) => snapshotGit(repo, args).trim();
 const MAX_PRICING_BYTES = 1024 * 1024;
+// The Offload checkout this server runs from: the one a maintainer prompt names.
+const PACKAGE_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const parentHandoff = (job) => job?.status === 'QUEUED' && job.handoffState === 'PARENT_QUEUED';
 const handoffIdentity = (job) => ({
   status: job?.status,
@@ -50,13 +76,35 @@ export function insidePath(path, parent, { relativePath = relative, isAbsolutePa
   return !isAbsolutePath(part) && (part === '' || (part !== '..' && !part.startsWith(`..${platform === 'win32' ? '\\' : '/'}`)));
 }
 /**
+ * What the loop guard may call each absolute prefix when it records a failing
+ * call for the primary. Both the lexical and the resolved form are listed
+ * (macOS temp dirs resolve through /private), longest prefix wins.
+ */
+export function failurePathAliases(executionPath, repoPath, home = homedir()) {
+  const real = (path) => {
+    try {
+      return realpathSync(path);
+    } catch {
+      return path;
+    }
+  };
+  const pairs = [];
+  for (const [path, label] of [
+    [executionPath, '<worktree>'],
+    [repoPath, '<repo>'],
+    [home, '~'],
+  ])
+    if (typeof path === 'string' && path) for (const variant of new Set([path, real(path)])) pairs.push([variant, label]);
+  return pairs.slice(0, 16);
+}
+/**
  * The only external read root a worker command may receive is the direct
  * parent of its authenticated isolated worktree. This is needed for macOS
  * cwd resolution; it intentionally grants no parent to primary checkouts.
  */
 export function isolatedWorkspaceReadablePaths(job, executionPath) {
   return typeof job?.workspacePath === 'string' && isAbsolute(job.workspacePath) && job.workspacePath === executionPath
-    ? [dirname(executionPath)]
+    ? [dirname(executionPath), ...isolatedDependencyReadPaths(executionPath, job.repoPath)]
     : [];
 }
 export function defaultIntegrityStatePath({ platform = process.platform, env = process.env, home } = {}) {
@@ -171,7 +219,16 @@ export function gitPatchApplier(repoPath, patch, { reverse, check }) {
     });
   return { dryRun: !!check, applied: !check };
 }
-export function createCore({ store, runner, worker, snapshots, leases, config = {}, now } = {}) {
+export function createCore({ store, runner, worker, snapshots, leases, config = {}, now, sessionStartedAt } = {}) {
+  // The no-argument job list is scoped to this server session. The wall clock
+  // is used on purpose (not the injectable `now`): real stores stamp real time.
+  // `new Date(null|0|false|true)` is a valid epoch instant that would make the
+  // filter match every job, so only a Date or a non-empty string is accepted.
+  const sessionStartValid =
+    sessionStartedAt === undefined || sessionStartedAt instanceof Date || (typeof sessionStartedAt === 'string' && sessionStartedAt !== '');
+  const sessionStart = sessionStartedAt === undefined ? new Date() : sessionStartValid ? new Date(sessionStartedAt) : new Date(NaN);
+  if (Number.isNaN(sessionStart.getTime())) throw new Error('sessionStartedAt must be an ISO timestamp');
+  const sessionStartIso = sessionStart.toISOString();
   const resolvedRunner = runner || new Runner({ defaults: { sandbox: true } });
   const resolvedSnapshots = snapshots || gitSnapshots();
   const nowMs = () => {
@@ -253,6 +310,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         const profile = execution ? { model: execution.model, effort: execution.effort } : configured;
         const providerConfig = execution || loaded.config.providers[configured.provider];
         if (providerConfig?.type !== 'openai-chat') throw new Error(`unsupported provider type: ${providerConfig?.type || 'missing'}`);
+        assertModelAllowed({ baseUrl: providerConfig.baseUrl, model: profile.model });
         let key;
         try {
           key = state.integrity ? await state.integrity.authenticate(job) : (config.resolveKey || resolveKeyRef)(providerConfig.keyRef);
@@ -340,7 +398,14 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           [job.startedAt, job.wallStartedAt, job.createdAt].map((value) => Date.parse(value || '')).find(Number.isFinite) ?? nowMs();
         const remainingTimeoutMs = totalTimeoutMs - Math.max(0, nowMs() - activeRunStartedAt);
         if (remainingTurns < 1 || remainingUsd <= 0)
-          return { status: 'BUDGET', turn: 0, costUsd: 0, usage: {}, error: 'Cumulative job budget exhausted' };
+          return {
+            status: 'BUDGET',
+            turn: 0,
+            costUsd: 0,
+            usage: {},
+            error: 'Cumulative job budget exhausted',
+            budgetCap: remainingTurns < 1 ? 'turns' : 'usd',
+          };
         if (remainingTimeoutMs < 1) return { status: 'TIMEOUT', turn: 0, costUsd: 0, usage: {}, error: 'Cumulative job timeout exhausted' };
         const loop = new AgentLoop({
           provider,
@@ -359,6 +424,8 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           persistBudgetFinishRecovery: api.progress,
           cappedFinishRecovery: job.cappedFinishRecovery,
           budgetFinishRecovery: job.budgetFinishRecovery,
+          serverVerifierConfigured: job.mode !== 'report' && typeof job.testCommand === 'string' && job.testCommand.trim().length > 0,
+          pathAliases: failurePathAliases(executionPath, job.repoPath),
         });
         // The initial prompt is durable conversation state. A repair appends only
         // its defect user turn; it never repeats system/task/history prefixes.
@@ -373,9 +440,12 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
               : {
                   system: await buildSystemPrompt({
                     ...job,
+                    relevantPaths: await annotateRelevantPaths(tools, job.relevantPaths),
                     repoPath: executionPath,
                     allowCommand: !!runCommand,
                     remainingTurns,
+                    serverVerifierConfigured:
+                      job.mode !== 'report' && typeof job.testCommand === 'string' && job.testCommand.trim().length > 0,
                   }),
                   task: job.task,
                 },
@@ -409,13 +479,59 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       return false;
     }
   };
+  // The verifier sandbox can read no interpreter or virtualenv unless the
+  // caller declares one (verifierInterpreter), so a Python project's readiness
+  // is its own report, and `verifierDeps` (a JavaScript notion) mirrors it
+  // rather than claiming `not-applicable`.
+  const interpreterAllowlist = (root) => {
+    try {
+      const loaded = config.loaded || loadConfig({ configPath: config.configPath, repoPath: root });
+      return loaded.config.verifier?.interpreterRoots ?? [];
+    } catch {
+      return [];
+    }
+  };
+  const pythonDeps = (deps, python) =>
+    deps.verifierDeps === 'not-applicable' && python.status !== 'not-applicable'
+      ? { verifierDeps: python.status, reason: python.reason }
+      : {};
+  const skillHealth = () => {
+    try {
+      return withSkillHealth(
+        (config.runtimeHealth || healthIdentity)(),
+        (config.skillHealth || installedSkillHealth)({ expectedHash: runtimeIdentity().skillHash }),
+      );
+    } catch {
+      // Whether a client's skill copy is current must never fail health.
+      return withSkillHealth(healthIdentity(), { stale: false, state: 'unknown', reason: 'skill-check-failed', installedHash: null });
+    }
+  };
   // Keep the legacy `sandbox` mode stable while exposing why a policy-only
   // host cannot apply Seatbelt. This is returned by offload_job with no id,
   // where an orchestrator needs to decide whether verification is possible.
-  const sandboxHealth = () => {
+  // The probe runs a real sandboxed command, so its (promise) answer is shared
+  // by concurrent health calls and reused for a minute.
+  const VERIFIER_TMP_TTL_MS = 60_000;
+  let tempProbe;
+  const verifierTmpHealth = () => {
+    if (!tempProbe || nowMs() - tempProbe.at > VERIFIER_TMP_TTL_MS)
+      tempProbe = {
+        at: nowMs(),
+        value: Promise.resolve()
+          .then(() => (config.probeVerifierTemp || probeVerifierTemp)())
+          .catch(() => ({ status: 'unknown', reason: 'probe-failed', systemTmp: 'unknown', gitInit: 'unknown', note: '' })),
+      };
+    return tempProbe.value;
+  };
+  const sandboxHealth = async () => {
     const status = sandboxStatus();
+    const skill = skillHealth();
     return {
-      server: healthIdentity(),
+      server: skill.server,
+      // Plain flags for the preflight: a stale installed skill is handled like a stale server.
+      staleSkill: skill.staleSkill,
+      restartRequired: skill.restartRequired,
+      ...(skill.restartAction ? { restartAction: skill.restartAction } : {}),
       sandbox: status.available ? 'macos' : 'policy-only',
       sandboxReason: status.reason,
       sandboxStatus: {
@@ -429,6 +545,8 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       ...(status.error ? { sandboxProbeError: status.error } : {}),
       ...(status.exitCode != null ? { sandboxProbeExitCode: status.exitCode } : {}),
       ...(status.signal ? { sandboxProbeSignal: status.signal } : {}),
+      // Whether a sandboxed verifier can create temp directories at all.
+      verifierTmp: await verifierTmpHealth(),
     };
   };
   const repoHints = (hint) =>
@@ -506,10 +624,12 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
             config: {
               ...config,
               repoPath: root,
+              sessionStartedAt: sessionStartIso,
               isolation:
                 worker || snapshots
                   ? config.isolation
                   : config.isolation || {
+                      integrateRecorded: integrateRecordedTree,
                       create: createIsolatedWorktree,
                       open: openIsolatedWorktree,
                       cleanup: cleanupIsolatedWorktree,
@@ -517,7 +637,21 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
                       releasePins: releaseJobTrees,
                     },
               applyPatch: config.applyPatch || gitPatchApplier,
-              health: config.health || (async () => ({ ...sandboxHealth(), worker: workerHealth(root), repo: root })),
+              health:
+                config.health ||
+                (async () => {
+                  const deps = verifierDependencyStatus(root);
+                  const python = verifierPythonStatus(root, { allowlist: interpreterAllowlist(root) });
+                  return {
+                    ...(await sandboxHealth()),
+                    worker: workerHealth(root),
+                    repo: root,
+                    ...deps,
+                    ...pythonDeps(deps, python),
+                    verifierPython: python,
+                    workingTree: workingTreeStatus(root),
+                  };
+                }),
             },
           });
           states.set(root, created);
@@ -567,10 +701,45 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
     await get(state);
     return state;
   };
-  const healthWithoutRepo = async () => ({
-    jobs: (await Promise.all([...states.values()].map((state) => state.manager.list()))).flat(),
-    health: { ...sandboxHealth(), worker: false, repositories: [...states.keys()] },
-  });
+  // A user-level MCP process is often launched from the offload clone, not
+  // the client project. Do not bind that incidental cwd for a no-id list.
+  const contextualRepoHint = (opts) =>
+    opts.repoPath ||
+    mcpRepoHint ||
+    config.repoPath ||
+    process.env.CLAUDE_PROJECT_DIR ||
+    process.env.CODEX_PROJECT_DIR ||
+    process.env.CURSOR_PROJECT_DIR;
+  let retrospectiveLog;
+  const retrospectiveHistory = () =>
+    (retrospectiveLog ||= config.retrospectiveLog || createRetrospectiveLog({ dir: config.retrospectiveLogDir }));
+  const healthWithoutRepo = async (opts = {}) => {
+    const listings = await Promise.all(
+      [...states.values()].map((state) =>
+        state.manager.listing({
+          ...(opts.all !== undefined ? { all: opts.all } : {}),
+          ...(opts.maxJobs !== undefined ? { maxJobs: opts.maxJobs } : {}),
+        }),
+      ),
+    );
+    if (!listings.length) {
+      // Same validation as a bound repository, with nothing to list.
+      if (opts.all !== undefined && typeof opts.all !== 'boolean') throw new Error('all must be a boolean');
+      if (opts.maxJobs !== undefined && (!Number.isInteger(opts.maxJobs) || opts.maxJobs < 1 || opts.maxJobs > 100))
+        throw new Error('maxJobs must be an integer from 1 to 100');
+    }
+    const merged = mergeListings(listings, opts.maxJobs !== undefined ? { maxJobs: opts.maxJobs } : {});
+    const scoped = opts.all !== true;
+    return {
+      jobs: merged.jobs,
+      listing: {
+        scope: scoped ? 'session' : 'all',
+        ...(scoped ? { sessionStartedAt: sessionStartIso } : {}),
+        ...merged.totals,
+      },
+      health: { ...(await sandboxHealth()), worker: false, repositories: [...states.keys()] },
+    };
+  };
   const pricingMetadata = (providerConfig, loaded) => {
     let table = config.pricingTable || loadPricing(providerConfig.pricing);
     let identifier = providerConfig.pricing;
@@ -608,6 +777,10 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       // repository's durable store, integrity root, or recovery machinery.
       // JobManager repeats this after Core has added trusted config snapshots.
       validateJobRequest(input);
+      // Health remains visible through offload_job, but stale runtime/skill
+      // state is a hard boundary here: a client must not spend budget simply
+      // because it skipped or overlooked the preflight response.
+      assertStartRuntimeCurrent(skillHealth(), { requireCurrentSkill: config.enforceInstalledSkillPreflight === true });
       const state = await makeState(input?.repoPath);
       if (closing) throw new Error('offload core is shutting down');
       const loaded = config.loaded || loadConfig({ configPath: config.configPath, repoPath: state.repoPath });
@@ -617,6 +790,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       const profile = loaded.config.profiles[profileName];
       const providerConfig = loaded.config.providers[profile.provider];
       if (providerConfig?.type !== 'openai-chat') throw new Error(`unsupported provider type: ${providerConfig?.type || 'missing'}`);
+      assertModelAllowed({ baseUrl: providerConfig.baseUrl, model: profile.model });
       // Resolve before snapshotting or acquiring a lease so a missing key can
       // never leave an executable but unsigned durable job behind.
       if (state.integrity) {
@@ -652,6 +826,20 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       const testCommand = reportMode ? undefined : (input.testCommand ?? repoTest);
       const unsafePolicyOnlyVerifier = input.unsafePolicyOnlyVerifier === true;
       if (unsafePolicyOnlyVerifier && !callerTest) throw new Error('unsafePolicyOnlyVerifier requires a caller-supplied testCommand');
+      if (input.verifierMode === 'baseline-diff' && !testCommand)
+        throw new Error('baseline-diff verification requires a testCommand (supply one or configure the repository testCommand)');
+      // A declared interpreter/virtualenv is resolved here, before any snapshot,
+      // lease or spend: a rejected declaration creates no job. The stored roots
+      // are server-derived, never the caller's input.
+      const interpreter =
+        input.verifierInterpreter !== undefined && !reportMode
+          ? resolveVerifierInterpreters(input.verifierInterpreter, {
+              repoPath: state.repoPath,
+              writeScope: [...(input.ownedPaths || []), ...(input.extraWritable || [])],
+              denyRead: [...(input.denyRead || []), ...(loaded.repoConfig.denyRead || [])],
+              allowlist: loaded.config.verifier?.interpreterRoots ?? [],
+            })
+          : undefined;
       const requireSandbox = reportMode
         ? false
         : input.requireSandbox === true || (!!testCommand && (!callerTest || !unsafePolicyOnlyVerifier));
@@ -660,8 +848,13 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       // required verifier. A profile-specific failure still fails closed in
       // Runner at verification time.
       if (!worker && requireSandbox && !sandboxAvailable()) throw new Error('Required macOS sandbox is unavailable for this verifier');
+      // The caller's turn cap (if any) and policy are resolved against the file
+      // sizes by JobManager. `turnPolicy` is deliberately not part of the stored
+      // budget; USD remains the ceiling a server-scaled turn cap leans on.
+      const requestedTurns = input.budget?.maxTurns;
+      const turnPolicy = input.budget?.turnPolicy ?? (requestedTurns === undefined ? 'auto' : 'fixed');
       const budget = {
-        maxTurns: input.budget?.maxTurns ?? loaded.config.limits.maxTurns,
+        maxTurns: requestedTurns ?? loaded.config.limits.maxTurns,
         maxUsd: input.budget?.maxUsd ?? loaded.config.limits.maxUsd,
         timeoutMinutes: input.budget?.timeoutMinutes ?? loaded.config.limits.timeoutMinutes,
       };
@@ -680,18 +873,39 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
                 extraWritable: [...(input.extraWritable || [])],
               }),
           denyRead: [...new Set([...(input.denyRead || []), ...(loaded.repoConfig.denyRead || [])])],
+          verifierInterpreter: interpreter?.declared,
+          verifierInterpreterRoots: interpreter?.roots,
           sandboxMode: sandboxAvailable() ? 'macos' : 'policy-only',
           configuredModel: profile.model,
           executionProfile,
           ...pricingMetadata(providerConfig, loaded),
         },
-        { launch },
+        {
+          launch,
+          turnBudget: {
+            requested: requestedTurns,
+            configured: loaded.config.limits.maxTurns,
+            policy: turnPolicy,
+            timeoutScalable: input.budget?.timeoutMinutes === undefined,
+          },
+        },
       );
       if (closing) {
         await state.manager.cancel(result.jobId);
         throw new Error('offload core is shutting down');
       }
-      return result;
+      // A Python project has no JavaScript dependencies to report, so its start
+      // echo carries the interpreter readiness instead of `not-applicable`.
+      if (reportMode || result.verifierDeps !== 'not-applicable' || !pythonProjectMarkers(state.repoPath).length) return result;
+      const python = interpreter
+        ? { status: 'ok', reason: 'interpreter-declared' }
+        : verifierPythonStatus(state.repoPath, { allowlist: loaded.config.verifier?.interpreterRoots ?? [] });
+      return {
+        ...result,
+        verifierDeps: python.status,
+        verifierDepsReason: python.reason,
+        ...(interpreter ? {} : { verifierPython: python }),
+      };
     },
     async assignWorkerPid(id, pid, repoPath) {
       validateJobId(id);
@@ -851,7 +1065,11 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       for (;;) {
         await state.manager.running.get(id);
         const current = await state.store.get(id);
-        if (['DONE_VERIFIED', 'DONE_UNVERIFIED', 'VERIFY_FAILED', 'FAILED', 'TIMEOUT', 'BUDGET', 'CANCELLED'].includes(current.status))
+        if (
+          ['DONE_VERIFIED', 'DONE_UNVERIFIED', 'VERIFY_FAILED', 'VERIFY_ENV_FAILED', 'FAILED', 'TIMEOUT', 'BUDGET', 'CANCELLED'].includes(
+            current.status,
+          )
+        )
           return state.manager.job(id);
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
@@ -864,28 +1082,115 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
     },
     async job(id, opts = {}) {
       validateExplicitRepoPath(opts.repoPath);
+      if (id !== undefined && (opts.all !== undefined || opts.maxJobs !== undefined))
+        throw new Error('all and maxJobs apply only to the job list; omit jobId');
+      if (opts.verifierInterpreter !== undefined) {
+        if (id !== undefined) throw new Error('verifierInterpreter applies only to the health call; omit jobId');
+        normalizeInterpreterDeclaration(opts.verifierInterpreter);
+      }
+      if (id === undefined && (opts.tail !== undefined || opts.limit !== undefined)) {
+        // Same order as JobManager.job: bad values are named before misuse.
+        resolveLogWindow({ tail: opts.tail, limit: opts.limit });
+        throw new Error('tail and limit require a jobId and include "log"');
+      }
       if (id !== undefined) {
         validateJobId(id);
         const state = await knownStateForJob(id, opts.repoPath);
         return state.manager.job(id, opts);
       }
-      // A user-level MCP process is often launched from the offload clone, not
-      // the client project. Do not bind that incidental cwd for a no-id list.
-      const contextualHint =
-        opts.repoPath ||
-        mcpRepoHint ||
-        config.repoPath ||
-        process.env.CLAUDE_PROJECT_DIR ||
-        process.env.CODEX_PROJECT_DIR ||
-        process.env.CURSOR_PROJECT_DIR;
-      if (!contextualHint) return healthWithoutRepo();
+      const contextualHint = contextualRepoHint(opts);
+      const listOptions = {
+        ...(opts.all !== undefined ? { all: opts.all } : {}),
+        ...(opts.maxJobs !== undefined ? { maxJobs: opts.maxJobs } : {}),
+      };
+      // `verifierInterpreter` makes health actually run the declared interpreter
+      // inside the verifier sandbox, so the primary learns before spending a job.
+      const probed = async (listing, root) => {
+        if (opts.verifierInterpreter === undefined) return listing;
+        const probe = await probeVerifierInterpreter(opts.verifierInterpreter, {
+          repoPath: root,
+          allowlist: interpreterAllowlist(root),
+          ...(config.runVerifierProbe ? { run: config.runVerifierProbe } : {}),
+        });
+        const mirror = root && pythonProjectMarkers(root).length ? pythonDeps(verifierDependencyStatus(root), probe) : {};
+        return { ...listing, health: { ...listing.health, ...mirror, verifierPython: probe } };
+      };
+      if (!contextualHint) return probed(await healthWithoutRepo(listOptions));
       try {
         const state = await makeState(contextualHint);
-        return state.manager.job();
+        return probed(await state.manager.job(undefined, listOptions), state.repoPath);
       } catch (error) {
-        if (/repoPath must be inside/.test(error.message || '')) return healthWithoutRepo();
+        if (/repoPath must be inside/.test(error.message || '')) return probed(await healthWithoutRepo(listOptions));
         throw error;
       }
+    },
+    /**
+     * The evidence digest and prompt skeleton for an `/offload` run (see
+     * retrospective.mjs): the jobs of this server session, the named
+     * `jobIds`, or the newest `last` of the store. Read-only apart from one
+     * bounded local history line, which `persist: false` skips.
+     */
+    async retrospective(opts = {}) {
+      validateExplicitRepoPath(opts.repoPath);
+      const ids = opts.jobIds;
+      if (ids !== undefined) {
+        if (!Array.isArray(ids) || !ids.length || ids.length > MAX_RETROSPECTIVE_JOBS || new Set(ids).size !== ids.length)
+          throw new Error(`jobIds must be 1-${MAX_RETROSPECTIVE_JOBS} distinct job ids`);
+        ids.forEach(validateJobId);
+        if (opts.last !== undefined) throw new Error('last applies only without jobIds');
+      }
+      if (opts.last !== undefined && (!Number.isInteger(opts.last) || opts.last < 1 || opts.last > MAX_RETROSPECTIVE_JOBS))
+        throw new Error(`last must be an integer from 1 to ${MAX_RETROSPECTIVE_JOBS}`);
+      let sources;
+      if (ids) {
+        const byState = new Map();
+        for (const id of ids) {
+          const state = await knownStateForJob(id, opts.repoPath, { operational: true });
+          byState.set(state, [...(byState.get(state) || []), id]);
+        }
+        sources = [...byState].map(([state, list]) => [state, state.manager.retrospectiveSource({ ids: list })]);
+      } else {
+        const hint = contextualRepoHint(opts);
+        let bound = [...states.values()];
+        if (hint) {
+          try {
+            bound = [await makeState(hint)];
+          } catch (error) {
+            if (!/repoPath must be inside/.test(error.message || '')) throw error;
+          }
+        }
+        sources = bound.map((state) => [
+          state,
+          state.manager.retrospectiveSource({ ...(opts.last !== undefined ? { last: opts.last } : {}) }),
+        ]);
+      }
+      const resolved = await Promise.all(sources.map(async ([state, source]) => ({ state, source: await source })));
+      const jobs = resolved.flatMap(({ source }) => source.jobs).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+      const shown = jobs.slice(0, opts.last ?? MAX_RETROSPECTIVE_JOBS);
+      const health = resolved.length
+        ? await Promise.resolve(resolved[0].state.manager.config.health?.()).catch(() => ({}))
+        : await sandboxHealth().catch(() => ({}));
+      const result = buildRetrospective({
+        jobs: shown,
+        health,
+        nowMs: nowMs(),
+        scope: ids ? 'jobs' : opts.last !== undefined ? 'recent' : 'session',
+        maintainerRoot: config.maintainerRoot || PACKAGE_ROOT,
+        secrets: resolved.flatMap(({ source }) => source.secrets),
+        omittedJobs:
+          opts.last !== undefined ? 0 : resolved.reduce((total, { source }) => total + source.omitted, 0) + jobs.length - shown.length,
+      });
+      if (opts.persist !== false)
+        try {
+          retrospectiveHistory().append(result);
+        } catch {
+          // The history is an aid; the digest is what was asked for.
+        }
+      return result;
+    },
+    /** What earlier retrospectives recorded locally and which signals keep coming back. */
+    async retrospectiveHistory(opts = {}) {
+      return retrospectiveHistory().history(opts);
     },
     async repair(id, defects, opts = {}) {
       if (closing) throw new Error('offload core is shutting down');
@@ -893,6 +1198,37 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       validateExplicitRepoPath(opts.repoPath);
       const state = await knownStateForJob(id, opts.repoPath);
       return state.manager.repair(id, defects, { launch: opts.launch !== false });
+    },
+    async continue(id, opts = {}) {
+      if (closing) throw new Error('offload core is shutting down');
+      validateJobId(id);
+      validateExplicitRepoPath(opts.repoPath);
+      const state = await knownStateForJob(id, opts.repoPath);
+      return state.manager.continue(id, {
+        extraTurns: opts.extraTurns,
+        extraUsd: opts.extraUsd,
+        note: opts.note,
+        launch: opts.launch !== false,
+      });
+    },
+    async apply(id, opts = {}) {
+      if (closing) throw new Error('offload core is shutting down');
+      validateJobId(id);
+      validateExplicitRepoPath(opts.repoPath);
+      const state = await knownStateForJob(id, opts.repoPath);
+      return state.manager.apply(id, {
+        apply: opts.apply ?? false,
+        verifiedBy: opts.verifiedBy,
+        // Only with a command, so a plain apply reaches the manager exactly as before.
+        ...(opts.applyThenVerify !== undefined
+          ? {
+              applyThenVerify: opts.applyThenVerify,
+              ...(opts.applyThenVerifyTimeoutSec !== undefined ? { applyThenVerifyTimeoutSec: opts.applyThenVerifyTimeoutSec } : {}),
+              ...(opts.unsafePolicyOnlyVerifier !== undefined ? { unsafePolicyOnlyVerifier: opts.unsafePolicyOnlyVerifier } : {}),
+              ...(opts.signal ? { signal: opts.signal } : {}),
+            }
+          : {}),
+      });
     },
     async cancel(id, opts = {}) {
       validateJobId(id);

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Writable } from 'node:stream';
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, win32 } from 'node:path';
 import { doctor, doctorLive } from '../../src/doctor.mjs';
@@ -149,8 +149,16 @@ test('doctor rejects non-canonical launch commands and arguments', async () => {
   await writeFile(codexPath, codexRegistration(bin, { args: [bin] }));
   assert.equal(registration().codex, false);
   await writeGood();
+  await writeFile(codexPath, codexRegistration(bin, { approvalMode: 'approve' }));
+  assert.equal(registration().codex, true);
+  await writeGood();
   await writeFile(codexPath, codexRegistration(bin, { approvalMode: 'always' }));
   assert.equal(registration().codex, false);
+  await writeGood();
+  await writeFile(claudePath, JSON.stringify(claudeRegistration(bin, { env: { OFFLOAD_MCP_APPROVAL_MODE: 'approve' } })));
+  assert.equal(registration().claude, true);
+  await writeFile(claudePath, JSON.stringify(claudeRegistration(bin, { env: { UNRELATED: 'value' } })));
+  assert.equal(registration().claude, false);
 });
 test('doctor rejects an invalid Claude type and unsafe Codex table variants', async () => {
   const home = await mkdtemp(join(tmpdir(), 'offload-doctor-home-'));
@@ -426,4 +434,39 @@ test('explicit false doctor flags do not enable a live request or hook-only outp
   const result = JSON.parse(out.text());
   assert.equal(result.live, undefined);
   assert.equal(typeof result.nodeOk, 'boolean');
+});
+
+test('doctor reports a stale installed skill and another Offload hook root without treating a missing skill as drift', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'offload-doctor-drift-'));
+  const root = process.cwd();
+  const claudeDir = join(home, '.claude');
+  await mkdir(join(claudeDir, 'skills', 'offload'), { recursive: true });
+  const spawnProcess = (_command, args) => ({
+    status: 0,
+    stdout: args.includes('--show-toplevel') ? `${root}\n` : 'git version test',
+  });
+  const run = () => doctor({ root, repoPath: root, home, spawnProcess, env: { HOME: home } });
+  // Nothing installed: a missing copy is normal and not drift.
+  assert.deepEqual(run().skill, { claude: 'missing', codex: 'missing' });
+  assert.deepEqual(run().otherDoctorHooks, []);
+
+  const packaged = await readFile(join(root, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md'), 'utf8');
+  await writeFile(join(claudeDir, 'skills', 'offload', 'SKILL.md'), packaged);
+  assert.equal(run().skill.claude, 'current');
+  await writeFile(join(claudeDir, 'skills', 'offload', 'SKILL.md'), `${packaged}\nolder protocol\n`);
+  assert.equal(run().skill.claude, 'stale');
+
+  const hook = (installer) => ({ type: 'command', command: `'/usr/bin/node' '${installer}' --doctor-hook` });
+  await writeFile(
+    join(claudeDir, 'settings.json'),
+    JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { matcher: 'startup', hooks: [hook(join(root, 'install.mjs')), { type: 'command', command: 'echo unrelated' }] },
+          { matcher: 'startup', hooks: [hook('/old/global/offload/install.mjs'), hook('/old/global/offload/install.mjs')] },
+        ],
+      },
+    }),
+  );
+  assert.deepEqual(run().otherDoctorHooks, ['/old/global/offload/install.mjs']);
 });

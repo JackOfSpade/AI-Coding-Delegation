@@ -14,13 +14,6 @@ const DEEPSEEK_2026_10_01 = deepFreeze({
     days: ['Mon-Fri'],
   },
   models: {
-    'deepseek-v4-pro': {
-      usd_per_1m: {
-        input_cache_hit: { off_peak: 0.022, peak: 0.044 },
-        input_cache_miss: { off_peak: 0.66, peak: 1.32 },
-        output: { off_peak: 1.98, peak: 3.96 },
-      },
-    },
     'deepseek-flash': {
       usd_per_1m: {
         input_cache_hit: { off_peak: 0.003, peak: 0.006 },

@@ -1,4 +1,5 @@
 import { sseJson } from './sse.mjs';
+import { assertModelAllowed, modelPolicyViolation } from '../model-policy.mjs';
 
 export const DEFAULT_ATTEMPT_TIMEOUT_MS = 300_000;
 
@@ -67,7 +68,7 @@ const validModel = (value) => typeof value === 'string' && value.length > 0 && v
 // name prefix.  The focused-write override depends on DeepSeek's documented
 // thinking/tool-choice interaction, so a proxy or a future, unknown model
 // must retain the ordinary provider contract.
-const OFFICIAL_DEEPSEEK_FOCUS_MODELS = new Set(['deepseek-v4-pro', 'deepseek-flash', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp']);
+const OFFICIAL_DEEPSEEK_FOCUS_MODELS = new Set(['deepseek-flash']);
 const supportsForcedImplementationFocus = (parsed, model) =>
   parsed.protocol === 'https:' &&
   parsed.hostname.toLowerCase() === 'api.deepseek.com' &&
@@ -246,6 +247,7 @@ export class OpenAIChatProvider {
     if (parsed.username || parsed.password || parsed.search || parsed.hash)
       throw new TypeError('baseUrl must not contain credentials, query, or fragment');
     if (!validModel(model)) throw new TypeError('model is required and must be a short control-free string');
+    assertModelAllowed({ baseUrl: parsed.href, model });
     if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
     if (apiKey !== undefined && typeof apiKey !== 'string') throw new TypeError('apiKey must be a string');
     if (!headers || typeof headers !== 'object' || Array.isArray(headers)) throw new TypeError('headers must be an object');
@@ -357,6 +359,8 @@ export class OpenAIChatProvider {
       throw new ProviderError('stream options are controlled by the provider adapter');
     const requestModel = requestOptions.model ?? this.model;
     if (!validModel(requestModel)) throw new ProviderError('Invalid request model');
+    const modelViolation = modelPolicyViolation({ baseUrl: this.baseUrl, model: requestModel });
+    if (modelViolation) throw new ProviderError(`Offload model policy: ${modelViolation}`, { kind: 'model-policy' });
     const thinking = requestedThinking ?? this.thinking;
     const reasoningEffort = requestOptions.reasoning_effort ?? this.reasoningEffort;
     if (thinking?.type === 'enabled' && (options.tool_choice === 'required' || typeof options.tool_choice === 'object'))

@@ -45,7 +45,13 @@ function fakeClaudeCli({ statePath, calls, mutate = true } = {}) {
       current.mcpServers ||= {};
       if (current.mcpServers.offload) return { status: 1, stderr: 'offload already exists' };
       const divider = args.indexOf('--');
-      current.mcpServers.offload = { type: 'stdio', command: args[divider + 1], args: args.slice(divider + 2), env: {} };
+      const env = {};
+      for (let index = 0; index < divider; index++)
+        if (args[index] === '--env') {
+          const [name, value] = String(args[++index]).split('=', 2);
+          env[name] = value;
+        }
+      current.mcpServers.offload = { type: 'stdio', command: args[divider + 1], args: args.slice(divider + 2), env };
       mkdirSync(dirname(statePath), { recursive: true });
       writeFileSync(statePath, JSON.stringify(current));
       return { status: 0, stdout: '' };
@@ -82,7 +88,8 @@ test('installer main-module detection resolves symlinks and Windows casing witho
   const result = spawnSync(process.execPath, [link, '--doctor-hook'], { cwd: process.cwd(), encoding: 'utf8', timeout: 5_000 });
   assert.ok([0, 2].includes(result.status), result.stderr);
   assert.match(result.stdout, /^offload: node /);
-  assert.match(result.stdout, /schema 1 · report\/inputFiles yes · restart the MCP client after updates/);
+  // Host drift warnings (stale skill, other hook roots) may sit before the suffix.
+  assert.match(result.stdout, /schema 2 · report\/inputFiles yes(?: · [^\n]*)? · restart the MCP client after updates/);
 });
 test('installer CLI grammar rejects dangerous typos before any install mutation or prompt', async () => {
   assert.deepEqual(parseInstallerArgs(['--skip-key', '--clients', 'claude,codex']), {
@@ -91,6 +98,7 @@ test('installer CLI grammar rejects dangerous typos before any install mutation 
     replaceKey: false,
     clients: 'claude,codex',
     doctorHook: false,
+    approvalMode: undefined,
   });
   assert.deepEqual(parseInstallerArgs(['--doctor-hook']), {
     uninstall: false,
@@ -98,6 +106,7 @@ test('installer CLI grammar rejects dangerous typos before any install mutation 
     replaceKey: false,
     clients: 'detected',
     doctorHook: true,
+    approvalMode: undefined,
   });
   for (const args of [
     ['--uninstal'],
@@ -107,6 +116,8 @@ test('installer CLI grammar rejects dangerous typos before any install mutation 
     ['--skip-key', '--skip-key'],
     ['--uninstall', '--replace-key'],
     ['--uninstall', '--skip-key'],
+    ['--uninstall', '--approval-mode=approve'],
+    ['--approval-mode=unsafe'],
     ['--doctor-hook', '--skip-key'],
     ['unexpected-positional'],
   ])
@@ -139,6 +150,35 @@ test('installer CLI grammar rejects dangerous typos before any install mutation 
     await assert.rejects(access(join(home, '.codex', 'AGENTS.md')), /ENOENT/);
   }
 });
+test('installer CLI forwards explicit approval mode into the client configuration', async () => {
+  const home = await mkdtemp(`${tmpdir()}/offload-cli-approval-home-`);
+  const configHome = join(home, 'config');
+  const env = {
+    ...process.env,
+    HOME: home,
+    USERPROFILE: home,
+    XDG_CONFIG_HOME: configHome,
+    CODEX_HOME: join(home, '.codex'),
+    CLAUDE_CONFIG_DIR: join(home, '.claude'),
+    // Keep the test independent from whichever clients happen to be installed
+    // on the machine running it.
+    PATH: '',
+  };
+  const result = spawnSync(process.execPath, ['install.mjs', '--skip-key', '--clients=codex', '--approval-mode=approve'], {
+    cwd: process.cwd(),
+    env,
+    encoding: 'utf8',
+    timeout: 10_000,
+  });
+  // The deliberately empty PATH makes the post-install doctor report Git as
+  // unavailable (exit 2); the installer itself has completed before that
+  // health result is emitted.
+  assert.ok([0, 2].includes(result.status), result.stderr);
+  const codex = await readFile(join(home, '.codex', 'config.toml'), 'utf8');
+  assert.match(codex, /default_tools_approval_mode = "approve"/);
+  const manifest = JSON.parse(await readFile(join(configHome, 'offload', 'installer-state.json'), 'utf8'));
+  assert.equal(manifest.approvalMode, 'approve');
+});
 test('installer is idempotent and removes only managed routing blocks', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-home-`);
   const root = process.cwd();
@@ -151,9 +191,9 @@ test('installer is idempotent and removes only managed routing blocks', async ()
   const doc = await readFile(join(home, '.codex', 'AGENTS.md'), 'utf8');
   assert.equal((doc.match(/BEGIN offload/g) || []).length, 1);
   assert.match(afterFirstInstall, /Use Offload only when the user invokes `\/offload` as a slash command/);
-  assert.match(afterFirstInstall, /configured profile `pro`/);
-  assert.match(afterFirstInstall, /provider-maintained current DeepSeek Pro route/);
-  assert.match(afterFirstInstall, /Never invent a generic “latest Pro” model name/);
+  assert.match(afterFirstInstall, /configured profile `flash`/);
+  assert.match(afterFirstInstall, /provider-maintained current DeepSeek V4\.1 Flash route/);
+  assert.match(afterFirstInstall, /Never invent a generic “latest Flash” model name/);
   assert.match(afterFirstInstall, /on policy-only hosts they also have no worker shell/);
   assert.match(afterFirstInstall, /edit permitted private-worktree files with file tools/);
   assert.match(
@@ -558,6 +598,51 @@ test('installer uses the official Claude CLI for manifest-owned registration and
   assert.equal(preserved.args.at(-1), '--user-edit');
   await install({ root, home, configHome, clients: ['claude'], uninstall: true, env, commandExists, runCommand });
   assert.equal(JSON.parse(await readFile(join(home, '.claude.json'), 'utf8')).mcpServers.offload.args.at(-1), '--user-edit');
+});
+test('installer approval mode can opt only Offload tools into unattended Claude and Codex calls', async () => {
+  const home = await mkdtemp(`${tmpdir()}/offload-approval-home-`);
+  const root = process.cwd();
+  const configHome = join(home, 'config');
+  const executable = join(home, 'bin', 'claude');
+  const statePath = join(home, '.claude.json');
+  const calls = [];
+  const options = {
+    root,
+    home,
+    configHome,
+    clients: ['claude', 'codex'],
+    approvalMode: 'approve',
+    env: { PATH: dirname(executable) },
+    commandExists: async (path) => path === executable,
+    runCommand: fakeClaudeCli({ statePath, calls }),
+  };
+  await install(options);
+  const claude = JSON.parse(await readFile(statePath, 'utf8')).mcpServers.offload;
+  assert.deepEqual(claude.env, { OFFLOAD_MCP_APPROVAL_MODE: 'approve' });
+  assert.ok(calls[0].args.includes('OFFLOAD_MCP_APPROVAL_MODE=approve'));
+  const settings = JSON.parse(await readFile(join(home, '.claude', 'settings.json'), 'utf8'));
+  for (const rule of [
+    'mcp__offload__offload_start',
+    'mcp__offload__offload_repair',
+    'mcp__offload__offload_continue',
+    'mcp__offload__offload_apply',
+    'mcp__offload__offload_revert',
+    'mcp__offload__offload_cancel',
+  ])
+    assert.ok(settings.permissions.allow.includes(rule), rule);
+  const codex = await readFile(join(home, '.codex', 'config.toml'), 'utf8');
+  assert.match(codex, /default_tools_approval_mode = "approve"/);
+  const manifest = JSON.parse(await readFile(join(configHome, 'offload', 'installer-state.json'), 'utf8'));
+  assert.equal(manifest.approvalMode, 'approve');
+
+  calls.length = 0;
+  await install({ ...options, approvalMode: 'prompt' });
+  const restoredClaude = JSON.parse(await readFile(statePath, 'utf8')).mcpServers.offload;
+  assert.deepEqual(restoredClaude.env, {});
+  const restoredSettings = JSON.parse(await readFile(join(home, '.claude', 'settings.json'), 'utf8'));
+  assert.ok(!restoredSettings.permissions.allow.includes('mcp__offload__offload_cancel'));
+  const restoredCodex = await readFile(join(home, '.codex', 'config.toml'), 'utf8');
+  assert.match(restoredCodex, /default_tools_approval_mode = "writes"/);
 });
 test('installer never rewrites opaque Claude auth-shaped state when registering through the CLI', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-home-`);
@@ -1928,4 +2013,29 @@ test('Claude migrates its owned startup health hook to resume and fork without r
     settings.hooks.SessionStart.some((entry) => entry.matcher === 'startup' && entry.hooks.some((hook) => hook.command === command)),
     true,
   );
+});
+test('doctor hook banner names a stale skill and a foreign hook root with the fix', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'offload-banner-home-'));
+  const claudeDir = join(home, '.claude');
+  await mkdir(join(claudeDir, 'skills', 'offload'), { recursive: true });
+  await writeFile(join(claudeDir, 'skills', 'offload', 'SKILL.md'), 'older skill\n');
+  await writeFile(
+    join(claudeDir, 'settings.json'),
+    JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { matcher: 'startup', hooks: [{ type: 'command', command: `'/usr/bin/node' '/old/offload/install.mjs' --doctor-hook` }] },
+        ],
+      },
+    }),
+  );
+  const result = spawnSync(process.execPath, [join(process.cwd(), 'install.mjs'), '--doctor-hook'], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    timeout: 10_000,
+    env: { ...process.env, HOME: home, USERPROFILE: home },
+  });
+  assert.match(result.stdout, /installed claude skill is STALE: run node install\.mjs from .* then restart/);
+  assert.match(result.stdout, /another offload hook root is registered: \/old\/offload\/install\.mjs/);
+  assert.match(result.stdout, / · restart the MCP client after updates\n$/);
 });

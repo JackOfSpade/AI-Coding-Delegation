@@ -5,8 +5,23 @@ import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readRegularFileSync } from './regular-file.mjs';
 
-export const IDENTITY_SCHEMA_REVISION = 1;
-export const RUNTIME_CAPABILITIES = Object.freeze({ reportMode: true, inputFiles: true });
+export const IDENTITY_SCHEMA_REVISION = 2;
+export const RUNTIME_CAPABILITIES = Object.freeze({
+  reportMode: true,
+  inputFiles: true,
+  continueJob: true,
+  lateApply: true,
+  failedApply: true,
+  compactReports: true,
+  verifierDeps: true,
+  baselineVerifier: true,
+  applyThenVerify: true,
+  budgetSizing: true,
+  failureDiagnostics: true,
+  timingBreakdown: true,
+  verifierInterpreter: true,
+  retrospective: true,
+});
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
 const packageRoot = dirname(moduleDirectory);
@@ -23,6 +38,9 @@ const hash = (parts) => {
   }
   return `sha256:${digest.digest('hex')}`;
 };
+const SKILL_ENTRY = 'plugins/offload/skills/offload/SKILL.md';
+/** The identity hash of one skill file's bytes: what a runtime expects an installed copy to hash to. */
+export const skillHashOf = (bytes) => hash([[SKILL_ENTRY, bytes]]);
 const sameDirectory = (left, right) => left.dev === right.dev && left.ino === right.ino && left.ctimeNs === right.ctimeNs;
 const checkedDirectory = (path) => {
   const stat = lstatSync(path, { bigint: true });
@@ -118,7 +136,7 @@ export function runtimeIdentityFor(root = packageRoot) {
     name: 'offload',
     version: metadata.version,
     buildHash: hash(buildParts),
-    skillHash: hash([['plugins/offload/skills/offload/SKILL.md', skill]]),
+    skillHash: skillHashOf(skill),
     schemaRevision: IDENTITY_SCHEMA_REVISION,
     capabilities: RUNTIME_CAPABILITIES,
   });

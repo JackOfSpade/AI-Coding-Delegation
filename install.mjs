@@ -45,7 +45,7 @@ export function isMainModule({
 /** Parse the intentionally small installer CLI before any filesystem or keychain work. */
 export function parseInstallerArgs(argv) {
   if (!Array.isArray(argv) || argv.some((value) => typeof value !== 'string')) throw new TypeError('installer arguments must be strings');
-  const parsed = { uninstall: false, skipKey: false, replaceKey: false, clients: 'detected', doctorHook: false };
+  const parsed = { uninstall: false, skipKey: false, replaceKey: false, clients: 'detected', doctorHook: false, approvalMode: undefined };
   const seen = new Set();
   const once = (flag) => {
     if (seen.has(flag)) throw new Error(`duplicate installer option: ${flag}`);
@@ -80,6 +80,13 @@ export function parseInstallerArgs(argv) {
       parsed.clients = clients;
       continue;
     }
+    if (value === '--approval-mode' || value.startsWith('--approval-mode=')) {
+      once('--approval-mode');
+      const approvalMode = value === '--approval-mode' ? argv[++index] : value.slice('--approval-mode='.length);
+      if (!['prompt', 'approve'].includes(approvalMode)) throw new Error('--approval-mode requires prompt or approve');
+      parsed.approvalMode = approvalMode;
+      continue;
+    }
     if (value.startsWith('-')) throw new Error(`unknown installer option: ${value}`);
     throw new Error(`unexpected installer argument: ${value}`);
   }
@@ -89,6 +96,7 @@ export function parseInstallerArgs(argv) {
   }
   if (parsed.uninstall && parsed.replaceKey) throw new Error('--replace-key cannot be used with --uninstall');
   if (parsed.uninstall && parsed.skipKey) throw new Error('--skip-key cannot be used with --uninstall');
+  if (parsed.uninstall && parsed.approvalMode !== undefined) throw new Error('--approval-mode cannot be used with --uninstall');
   return parsed;
 }
 const exists = async (p) =>
@@ -280,6 +288,7 @@ async function readManifest(path) {
     !safeRecord(parsed.registrations) ||
     !safeRecord(parsed.files) ||
     (parsed.plugins !== undefined && !safeRecord(parsed.plugins)) ||
+    (parsed.approvalMode !== undefined && !['prompt', 'approve'].includes(parsed.approvalMode)) ||
     (parsed.runtime !== undefined &&
       (!safeRecord(parsed.runtime) ||
         typeof parsed.runtime.version !== 'string' ||
@@ -860,8 +869,13 @@ async function inspectClaudeMcp(path) {
     return { ambiguous: true };
   }
 }
-async function manageClaudeMcp({ root, home, uninstall, env, platform, commandExists, runCommand, manifest, statePath }) {
-  const desired = { type: 'stdio', command: process.execPath, args: [join(root, 'bin', 'offload.mjs'), 'mcp'], env: {} };
+async function manageClaudeMcp({ root, home, uninstall, env, platform, commandExists, runCommand, manifest, statePath, approvalMode }) {
+  const desired = {
+    type: 'stdio',
+    command: process.execPath,
+    args: [join(root, 'bin', 'offload.mjs'), 'mcp'],
+    env: approvalMode === 'approve' ? { OFFLOAD_MCP_APPROVAL_MODE: 'approve' } : {},
+  };
   const executable = await findClaudeExecutable(env, platform, commandExists);
   if (!executable)
     return claudeMcpStatus(
@@ -882,7 +896,19 @@ async function manageClaudeMcp({ root, home, uninstall, env, platform, commandEx
       return { status: undefined };
     }
   };
-  const add = () => invoke(['mcp', 'add', '--scope', 'user', 'offload', '--', process.execPath, join(root, 'bin', 'offload.mjs'), 'mcp']);
+  const add = () =>
+    invoke([
+      'mcp',
+      'add',
+      '--scope',
+      'user',
+      'offload',
+      ...(approvalMode === 'approve' ? ['--env', 'OFFLOAD_MCP_APPROVAL_MODE=approve'] : []),
+      '--',
+      process.execPath,
+      join(root, 'bin', 'offload.mjs'),
+      'mcp',
+    ]);
   const remove = () => invoke(['mcp', 'remove', '--scope', 'user', 'offload']);
   const confirmAdded = async (status, action) => {
     const observed = await inspectClaudeMcp(statePath);
@@ -1393,7 +1419,7 @@ async function manageCodexPlugin({
   sourceState.version = desiredVersion;
   return { active: true };
 }
-function mcpToml(root, eol = '\n') {
+function mcpToml(root, eol = '\n', approvalMode = 'prompt') {
   return [
     '# offload managed MCP',
     '[mcp_servers.offload]',
@@ -1401,7 +1427,7 @@ function mcpToml(root, eol = '\n') {
     `args = [${JSON.stringify(join(root, 'bin', 'offload.mjs'))}, "mcp"]`,
     'startup_timeout_sec = 15',
     'tool_timeout_sec = 60',
-    'default_tools_approval_mode = "writes"',
+    `default_tools_approval_mode = ${JSON.stringify(approvalMode === 'approve' ? 'approve' : 'writes')}`,
   ].join(eol);
 }
 const horizontal = (character) => character === ' ' || character === '\t';
@@ -1622,8 +1648,12 @@ export async function install({
   runCommand = (command, args, options) => spawnSync(command, args, options),
   clients = 'detected',
   replaceKey = false,
+  approvalMode,
 } = {}) {
   if (Number(process.versions.node.split('.')[0]) < 20) throw new Error('Node.js 20 or newer is required');
+  if (approvalMode !== undefined && !['prompt', 'approve'].includes(approvalMode))
+    throw new Error('approvalMode must be prompt or approve');
+  if (uninstall && approvalMode !== undefined) throw new Error('approvalMode cannot be used with uninstall');
   const clientPaths = resolveClientPaths({ home, env, platform });
   home = clientPaths.home;
   configHome ||= env.XDG_CONFIG_HOME || (platform === 'win32' ? env.APPDATA || join(home, 'AppData', 'Roaming') : join(home, '.config'));
@@ -1661,6 +1691,7 @@ export async function install({
     );
   const manifestPath = join(configHome, 'offload', 'installer-state.json');
   const manifest = await readManifest(manifestPath);
+  const effectiveApprovalMode = approvalMode ?? manifest.approvalMode ?? 'prompt';
   const previousRuntime = manifest.runtime;
   const hadManagedInstallation =
     Object.keys(manifest.registrations).length > 0 ||
@@ -1710,7 +1741,7 @@ export async function install({
   if (selected.has('codex')) {
     const eol = currentToml.includes('\r\n') ? '\r\n' : '\n';
     const current = codexTables[0];
-    const desired = mcpToml(root, eol);
+    const desired = mcpToml(root, eol, effectiveApprovalMode);
     if (!uninstall && !current) {
       const separator = currentToml && !currentToml.endsWith('\n') ? eol : '';
       await atomic(codexConfig, `${currentToml}${separator}${desired}${eol}`);
@@ -1850,11 +1881,12 @@ export async function install({
         runCommand,
         manifest,
         statePath: clientPaths.claudeState,
+        approvalMode: effectiveApprovalMode,
       })
     : claudeMcpStatus('not-selected', 'Claude was not selected for this installer run.');
-  // Claude permissions are least-privilege: reverting a patch remains an
-  // interactive decision. These literal entries are idempotent and unrelated
-  // settings are retained verbatim by JSON parse/stringify semantics.
+  // Claude receives only read permissions by default. An explicit approve
+  // installation is intentionally narrow: it approves Offload's own write
+  // tools, not Claude's general file/shell/tool permissions.
   if (selected.has('claude') && !uninstall) {
     try {
       const settings = claudeSettingsState || {};
@@ -1862,15 +1894,19 @@ export async function install({
       settings.permissions.allow ||= [];
       settings.hooks ||= {};
       settings.hooks.SessionStart ||= [];
-      const rules = ['mcp__offload__offload_wait', 'mcp__offload__offload_job'];
-      const oldMutatingRules = new Set([
+      const readRules = ['mcp__offload__offload_wait', 'mcp__offload__offload_job'];
+      const mutatingRules = [
         'mcp__offload__offload_start',
         'mcp__offload__offload_repair',
+        'mcp__offload__offload_continue',
+        'mcp__offload__offload_apply',
         'mcp__offload__offload_cancel',
         'mcp__offload__offload_revert',
-      ]);
+      ];
+      const offloadRules = new Set([...readRules, ...mutatingRules]);
+      const rules = effectiveApprovalMode === 'approve' ? [...readRules, ...mutatingRules] : readRules;
       const formerlyOwned = new Set(manifest.claudeSettings?.rules || []);
-      const staleOwned = [...oldMutatingRules].filter((rule) => formerlyOwned.has(rule));
+      const staleOwned = [...formerlyOwned].filter((rule) => offloadRules.has(rule) && !rules.includes(rule));
       if (staleOwned.length) settings.permissions.allow = settings.permissions.allow.filter((rule) => !staleOwned.includes(rule));
       const missing = rules.filter((rule) => !settings.permissions.allow.includes(rule));
       const hookCommand = `${shellQuote(process.execPath, platform)} ${shellQuote(join(root, 'install.mjs'), platform)} --doctor-hook`;
@@ -1921,7 +1957,7 @@ export async function install({
           hookCommand,
           hookMatcher,
           hookOwned: ownsCurrent,
-          rules: [...new Set([...(manifest.claudeSettings?.rules || []).filter((rule) => !oldMutatingRules.has(rule)), ...missing])],
+          rules: [...new Set([...(manifest.claudeSettings?.rules || []).filter((rule) => !mutatingRules.includes(rule)), ...missing])],
         };
       }
     } catch {
@@ -1999,6 +2035,8 @@ export async function install({
               macosInteractive: platform === 'darwin' && keyPrompt === promptNoEcho && stdin.isTTY,
             });
   }
+  if (!uninstall) manifest.approvalMode = effectiveApprovalMode;
+  else delete manifest.approvalMode;
   if (
     uninstall &&
     !Object.keys(manifest.registrations).length &&
@@ -2043,13 +2081,25 @@ export async function install({
     restart,
   };
 }
+// Drift between the installed skill, the running server and other hook roots
+// is what makes a preflight fail in confusing ways, so the session banner
+// names it and the fix.
+function doctorHookWarnings(result) {
+  const warnings = [];
+  const stale = Object.entries(result.skill || {})
+    .filter(([, status]) => status === 'stale')
+    .map(([client]) => client);
+  if (stale.length) warnings.push(`installed ${stale.join('/')} skill is STALE: run node install.mjs from ${result.root}, then restart`);
+  if (result.otherDoctorHooks?.length) warnings.push(`another offload hook root is registered: ${result.otherDoctorHooks.join(', ')}`);
+  return warnings.map((warning) => ` · ${warning}`).join('');
+}
 export { doctor, doctorLive };
 if (isMainModule()) {
   const args = parseInstallerArgs(process.argv.slice(2));
   if (args.doctorHook) {
     const result = doctor({ root: here });
     console.log(
-      `offload: node ${result.nodeOk ? 'ok' : 'bad'} · git ${result.git ? 'ok' : 'missing'} · key ${result.key.ok ? 'ok' : 'missing'} · sandbox ${result.sandboxReason} · runtime ${result.server.version} ${result.server.buildHash.slice(0, 19)} schema ${result.server.schemaRevision} · report/inputFiles ${result.server.capabilities.reportMode && result.server.capabilities.inputFiles ? 'yes' : 'no'} · restart the MCP client after updates`,
+      `offload: node ${result.nodeOk ? 'ok' : 'bad'} · git ${result.git ? 'ok' : 'missing'} · key ${result.key.ok ? 'ok' : 'missing'} · sandbox ${result.sandboxReason} · runtime ${result.server.version} ${result.server.buildHash.slice(0, 19)} schema ${result.server.schemaRevision} · report/inputFiles ${result.server.capabilities.reportMode && result.server.capabilities.inputFiles ? 'yes' : 'no'}${doctorHookWarnings(result)} · restart the MCP client after updates`,
     );
     process.exitCode = result.nodeOk && result.git ? 0 : 2;
   } else {
@@ -2058,6 +2108,7 @@ if (isMainModule()) {
       keyPrompt: args.skipKey ? undefined : promptNoEcho,
       clients: args.clients,
       replaceKey: args.replaceKey,
+      approvalMode: args.approvalMode,
     });
     const checked = doctor({ root: here });
     console.log(JSON.stringify({ ...result, doctor: checked }, null, 2));

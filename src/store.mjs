@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { redact as foundationRedact, redactText, safeTokenAccountingValue } from './redact.mjs';
+import { redact as foundationRedact, redactText, redactTokenShapes, safeTokenAccountingValue } from './redact.mjs';
 import { validJobId } from './job-manager.mjs';
 
 // Keep the accounting exception shared with the foundation redactor. A
@@ -14,6 +14,7 @@ const secretKey = (key, value) =>
   !safeTokenAccountingValue(key, value) &&
   /(?:api[_-]?key|authorization|secret|password|credential|bearer|(?:access|refresh|auth|session|id)?[_-]?token)/i.test(key);
 const MAX_TRANSCRIPT_BYTES = 4 * 1024 * 1024;
+const MAX_PROGRESS_LOG_BYTES = 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const MAX_JOB_BYTES = 1024 * 1024;
 const MAX_RECORDS = 20_000;
@@ -132,7 +133,7 @@ export function redact(value) {
   if (Array.isArray(value)) return value.map(redact);
   if (value && typeof value === 'object')
     return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, secretKey(k, v) ? '[REDACTED]' : redact(v)]));
-  if (typeof value === 'string') return value.replace(/\b(?:sk|rk|key|bearer)[-_A-Za-z0-9]{12,}\b/gi, '[REDACTED]');
+  if (typeof value === 'string') return redactTokenShapes(value);
   return value;
 }
 function validStoredReadStat(details, cap) {
@@ -517,7 +518,22 @@ export class JobStore {
     // last so an event payload cannot forge when the durable transition was
     // recorded.
     const line = JSON.stringify(foundationRedact(redact({ ...event, at: this.now().toISOString() }, this.secrets))) + '\n';
-    return this.#withJobLock(id, () => this.#serial(() => this.#appendBounded(join(directory, 'events.jsonl'), line)));
+    return this.#withJobLock(id, () =>
+      this.#serial(async () => {
+        const path = join(directory, 'events.jsonl');
+        // Progress is the only unbounded event type. Past the soft cap it is
+        // dropped (with one marker) so lifecycle and failure events always keep
+        // room under the hard cap instead of the append throwing mid-run.
+        if (event?.type === 'progress') {
+          const size = (await lstat(path).catch(() => null))?.size || 0;
+          if (size > MAX_PROGRESS_LOG_BYTES) {
+            if (size > MAX_PROGRESS_LOG_BYTES + 1024) return;
+            return this.#appendBounded(path, JSON.stringify({ type: 'progress-truncated', at: this.now().toISOString() }) + '\n');
+          }
+        }
+        return this.#appendBounded(path, line);
+      }),
+    );
   }
   async messages(id, message) {
     return this.messagesBatch(id, [message]);

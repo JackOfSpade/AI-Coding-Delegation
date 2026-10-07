@@ -7,7 +7,8 @@ import { tmpdir } from 'node:os';
 import { PassThrough, Writable } from 'node:stream';
 import { spawn } from 'node:child_process';
 import { createMcpServer, parseSkillFrontmatter, readSkillRegularUtf8 } from '../../src/mcp.mjs';
-import { runtimeIdentity } from '../../src/identity.mjs';
+import { runCli } from '../../src/cli.mjs';
+import { IDENTITY_SCHEMA_REVISION, RUNTIME_CAPABILITIES, runtimeIdentity } from '../../src/identity.mjs';
 const skillUri = 'skill://offload/offload/SKILL.md';
 const serverMeta = { _meta: { 'io.modelcontextprotocol/serverInfo': runtimeIdentity() } };
 const currentMeta = {
@@ -47,8 +48,23 @@ test('MCP lists exact tools, initializes, pings and dispatches', async () => {
   assert.match(wire, /"id":3/);
   const initialized = values.find((value) => value.id === 1).result.serverInfo;
   assert.deepEqual(initialized, runtimeIdentity());
-  assert.equal(initialized.schemaRevision, 1);
-  assert.deepEqual(initialized.capabilities, { reportMode: true, inputFiles: true });
+  assert.equal(initialized.schemaRevision, 2);
+  assert.deepEqual(initialized.capabilities, {
+    reportMode: true,
+    inputFiles: true,
+    continueJob: true,
+    lateApply: true,
+    failedApply: true,
+    compactReports: true,
+    verifierDeps: true,
+    baselineVerifier: true,
+    applyThenVerify: true,
+    budgetSizing: true,
+    failureDiagnostics: true,
+    timingBreakdown: true,
+    verifierInterpreter: true,
+    retrospective: true,
+  });
   assert.ok(
     values.some((value) => value.id === null && value.result?.tools),
     'an explicit null id is a request, not a notification',
@@ -70,7 +86,7 @@ test('MCP enforces advertised input schemas and maps only public operation optio
   output.on('data', (value) => {
     wire += value;
   });
-  const calls = { start: [], wait: [], job: [], repair: [], revert: [], cancel: [] };
+  const calls = { start: [], wait: [], job: [], repair: [], revert: [], cancel: [], continue: [], apply: [] };
   const server = createMcpServer(
     {
       start: async (value) => {
@@ -91,6 +107,14 @@ test('MCP enforces advertised input schemas and maps only public operation optio
       },
       revert: async (...value) => {
         calls.revert.push(value);
+        return {};
+      },
+      continue: async (...value) => {
+        calls.continue.push(value);
+        return {};
+      },
+      apply: async (...value) => {
+        calls.apply.push(value);
         return {};
       },
       cancel: async (...value) => {
@@ -139,9 +163,23 @@ test('MCP enforces advertised input schemas and maps only public operation optio
     task: 'review /tmp/customer-秘密-export.json',
     inputFiles: ['/tmp/customer-秘密-export.json'],
   });
+  call(29, 'offload_continue', { jobId: 'j', extraTurns: 30, extraUsd: 0.5, note: 'finish the tests', repoPath: '/repo' });
+  call(30, 'offload_continue', { jobId: 'j' });
+  call(31, 'offload_continue', { jobId: 'j', extraTurns: 0 });
+  call(32, 'offload_continue', { jobId: 'j', extraUsd: 0 });
+  call(33, 'offload_continue', { jobId: 'j', extraTurns: 501 });
+  call(34, 'offload_continue', { jobId: 'j', launch: false });
+  call(35, 'offload_apply', { jobId: 'j' });
+  call(36, 'offload_apply', { jobId: 'j', apply: true, verifiedBy: 'ran npm test in the primary: all green', repoPath: '/repo' });
+  call(37, 'offload_apply', { jobId: 'j', apply: 'true', verifiedBy: 'ran npm test in the primary' });
+  call(38, 'offload_apply', { jobId: 'j', apply: true, verifiedBy: 'short' });
+  call(39, 'offload_wait', { jobId: 'j', detail: 'full' });
+  call(40, 'offload_job', { jobId: 'j', include: 'diff', detail: 'compact' });
+  call(41, 'offload_wait', { jobId: 'j', detail: 'verbose' });
+  call(42, 'offload_wait', { jobId: 'j', timeoutSec: 600 });
   await new Promise((resolve) => setTimeout(resolve, 20));
   const responses = wire.trim().split('\n').map(JSON.parse);
-  for (const id of [1, 2, 3, 4, 5, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 25, 27, 28])
+  for (const id of [1, 2, 3, 4, 5, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 25, 27, 28, 31, 32, 33, 34, 37, 38, 41, 42])
     assert.equal(responses.find((value) => value.id === id).result.isError, true);
   assert.equal(calls.revert.length, 2, 'invalid apply values must never reach a potentially applying reverter');
   assert.equal(calls.repair.length, 1, 'hidden launch:false must never reach core.repair');
@@ -160,6 +198,257 @@ test('MCP enforces advertised input schemas and maps only public operation optio
   assert.deepEqual(calls.revert[0], ['j', { repoPath: '/repo', apply: true }]);
   assert.deepEqual(calls.revert[1], ['dry-run', { repoPath: undefined, apply: false }], 'omitted apply must be an explicit dry run');
   assert.deepEqual(calls.cancel[0], ['j', { repoPath: '/repo' }]);
+  assert.deepEqual(calls.continue, [
+    ['j', { repoPath: '/repo', extraTurns: 30, extraUsd: 0.5, note: 'finish the tests' }],
+    ['j', { repoPath: undefined }],
+  ]);
+  assert.deepEqual(calls.apply, [
+    ['j', { repoPath: undefined, apply: false }],
+    ['j', { repoPath: '/repo', apply: true, verifiedBy: 'ran npm test in the primary: all green' }],
+  ]);
+  assert.equal(calls.wait[1][1].detail, 'full');
+  assert.equal(calls.wait.length, 2, 'an invalid detail or oversized timeout must never reach core.wait');
+  assert.match(JSON.stringify(responses.find((value) => value.id === 42)), /timeoutSec exceeds its maximum of 55/);
+  assert.deepEqual(calls.job[1], ['j', { repoPath: undefined, include: 'diff', detail: 'compact' }]);
+  await server.close();
+});
+test('MCP exposes the baseline-diff verifier options, forwards only supplied values, and rejects misuse before dispatch', async () => {
+  const input = new PassThrough(),
+    output = new PassThrough();
+  let wire = '';
+  output.on('data', (value) => {
+    wire += value;
+  });
+  const started = [];
+  const server = createMcpServer(
+    {
+      start: async (value) => {
+        started.push(value);
+        return {};
+      },
+    },
+    { input, output },
+  );
+  const call = (id, arguments_) =>
+    input.write(
+      `${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'offload_start', arguments: arguments_ } })}\n`,
+    );
+  input.write('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}\n');
+  input.write('{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n');
+  const write = { task: 'implement', ownedPaths: ['src/**'], testCommand: 'node --test test/*.test.mjs' };
+  call(2, { ...write, verifierMode: 'baseline-diff', verifierTimeoutSec: 120 });
+  call(3, write);
+  call(4, { ...write, verifierMode: 'strict' });
+  call(5, { ...write, verifierTimeoutSec: 4 });
+  call(6, { ...write, verifierTimeoutSec: 1801 });
+  call(7, { ...write, verifierTimeoutSec: 60.5 });
+  call(8, { mode: 'report', task: 'analyze', verifierMode: 'baseline-diff' });
+  call(9, { mode: 'report', task: 'analyze', verifierTimeoutSec: 60 });
+  call(10, { ...write, verifierMode: 'baseline-diff', unsafePolicyOnlyVerifier: true });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const values = responseValues(wire);
+  const properties = values.find((value) => value.id === 1).result.tools.find((tool) => tool.name === 'offload_start')
+    .inputSchema.properties;
+  assert.deepEqual(properties.verifierMode.enum, ['standard', 'baseline-diff']);
+  assert.equal(properties.verifierTimeoutSec.type, 'integer');
+  assert.equal(properties.verifierTimeoutSec.minimum, 5);
+  assert.equal(properties.verifierTimeoutSec.maximum, 1800);
+  assert.equal(started.length, 2, 'only the two valid calls reach core.start');
+  assert.equal(started[0].verifierMode, 'baseline-diff');
+  assert.equal(started[0].verifierTimeoutSec, 120);
+  assert.equal(Object.hasOwn(started[1], 'verifierMode'), false, 'an omitted option is absent, not undefined');
+  assert.equal(Object.hasOwn(started[1], 'verifierTimeoutSec'), false);
+  for (const id of [4, 5, 6, 7, 8, 9, 10]) assert.equal(values.find((value) => value.id === id).result.isError, true, `call ${id}`);
+  assert.match(JSON.stringify(values.find((value) => value.id === 8)), /report jobs do not run verifiers/);
+  assert.match(JSON.stringify(values.find((value) => value.id === 10)), /cannot use unsafePolicyOnlyVerifier/);
+  await server.close();
+});
+test('MCP exposes the turn policy and line-range hint, keeps the 1000-turn schema ceiling, and rejects a bad policy before dispatch', async () => {
+  const input = new PassThrough(),
+    output = new PassThrough();
+  let wire = '';
+  output.on('data', (value) => {
+    wire += value;
+  });
+  const started = [];
+  const server = createMcpServer(
+    {
+      start: async (value) => {
+        started.push(value);
+        return {};
+      },
+    },
+    { input, output },
+  );
+  const call = (id, arguments_) =>
+    input.write(
+      `${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'offload_start', arguments: arguments_ } })}\n`,
+    );
+  input.write('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}\n');
+  input.write('{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n');
+  const write = { task: 'implement', ownedPaths: ['src/**'] };
+  call(2, { ...write, budget: { maxUsd: 2, turnPolicy: 'auto' }, relevantPaths: ['src/a.mjs:10-20'] });
+  call(3, { ...write, budget: { turnPolicy: 'x' } });
+  call(4, { ...write, budget: { maxTurns: 1001 } });
+  call(5, { ...write, relevantPaths: ['src/a.mjs:20-10'] });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const values = responseValues(wire);
+  const tool = values.find((value) => value.id === 1).result.tools.find((candidate) => candidate.name === 'offload_start');
+  const { budget, relevantPaths } = tool.inputSchema.properties;
+  assert.deepEqual(budget.properties.turnPolicy.enum, ['auto', 'fixed']);
+  assert.equal(budget.properties.maxTurns.maximum, 1000);
+  assert.match(relevantPaths.description, /path:START-END/);
+  assert.match(tool.description, /budgetSizing/);
+  assert.equal(started.length, 1, 'only the valid call reaches core.start');
+  assert.deepEqual(started[0].budget, { maxUsd: 2, turnPolicy: 'auto' });
+  assert.deepEqual(started[0].relevantPaths, ['src/a.mjs:10-20']);
+  for (const id of [3, 4, 5]) assert.equal(values.find((value) => value.id === id).result.isError, true, `call ${id}`);
+  assert.match(JSON.stringify(values.find((value) => value.id === 5)), /START-END/);
+  await server.close();
+});
+test('MCP exposes applyThenVerify, forwards it with the request signal only when supplied, and rejects misuse before dispatch', async () => {
+  const input = new PassThrough(),
+    output = new PassThrough();
+  let wire = '';
+  output.on('data', (value) => {
+    wire += value;
+  });
+  const applied = [];
+  const server = createMcpServer(
+    {
+      apply: async (...value) => {
+        applied.push(value);
+        return {};
+      },
+    },
+    { input, output },
+  );
+  const call = (id, arguments_) =>
+    input.write(
+      `${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'offload_apply', arguments: arguments_ } })}\n`,
+    );
+  input.write('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}\n');
+  input.write('{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n');
+  call(2, { jobId: 'j', apply: true, applyThenVerify: 'npm test' });
+  call(3, {
+    jobId: 'j',
+    apply: true,
+    applyThenVerify: 'npm test',
+    applyThenVerifyTimeoutSec: 30,
+    unsafePolicyOnlyVerifier: true,
+    repoPath: '/repo',
+  });
+  call(4, { jobId: 'j', apply: true, verifiedBy: 'ran npm test in the primary', applyThenVerify: 'npm test' });
+  call(5, { jobId: 'j', apply: true, verifiedBy: 'ran npm test in the primary' });
+  for (const [id, extra] of [
+    [6, { applyThenVerify: '' }],
+    [7, { applyThenVerify: 'x'.repeat(8193) }],
+    [8, { applyThenVerify: 'npm test', applyThenVerifyTimeoutSec: 4 }],
+    [9, { applyThenVerify: 'npm test', applyThenVerifyTimeoutSec: 901 }],
+    [10, { applyThenVerify: 'npm test', applyThenVerifyTimeoutSec: '30' }],
+    [11, { applyThenVerify: 'npm test', applyThenVerifyTimeoutSec: 1.5 }],
+    [12, { applyThenVerify: 'npm test', unsafePolicyOnlyVerifier: 'yes' }],
+    [13, { applyThenVerifyTimeoutSec: 30 }],
+    [14, { unsafePolicyOnlyVerifier: true }],
+    [15, { applyThenVerify: 42 }],
+  ])
+    call(id, { jobId: 'j', apply: true, ...extra });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const values = responseValues(wire);
+  const tool = values.find((value) => value.id === 1).result.tools.find((candidate) => candidate.name === 'offload_apply');
+  const { properties } = tool.inputSchema;
+  assert.equal(properties.applyThenVerify.type, 'string');
+  assert.equal(properties.applyThenVerify.minLength, 1);
+  assert.equal(properties.applyThenVerify.maxLength, 8192);
+  assert.equal(properties.applyThenVerifyTimeoutSec.type, 'integer');
+  assert.equal(properties.applyThenVerifyTimeoutSec.minimum, 5);
+  assert.equal(properties.applyThenVerifyTimeoutSec.maximum, 900);
+  assert.equal(properties.unsafePolicyOnlyVerifier.type, 'boolean');
+  assert.deepEqual(tool.inputSchema.required, ['jobId']);
+  assert.equal(tool.inputSchema.additionalProperties, false);
+  assert.match(tool.description, /applyThenVerify/);
+  assert.match(tool.description, /`applied` field/);
+  assert.equal(applied.length, 4, 'every misuse is rejected before core.apply');
+  assert.deepEqual(Object.keys(applied[0][1]).sort(), ['apply', 'applyThenVerify', 'repoPath', 'signal']);
+  assert.equal(applied[0][1].applyThenVerify, 'npm test');
+  assert.ok(applied[0][1].signal instanceof AbortSignal, 'the request signal reaches the command so a cancel reverts');
+  assert.deepEqual(Object.keys(applied[1][1]).sort(), [
+    'apply',
+    'applyThenVerify',
+    'applyThenVerifyTimeoutSec',
+    'repoPath',
+    'signal',
+    'unsafePolicyOnlyVerifier',
+  ]);
+  assert.equal(applied[1][1].applyThenVerifyTimeoutSec, 30);
+  assert.equal(applied[1][1].unsafePolicyOnlyVerifier, true);
+  assert.equal(applied[2][1].verifiedBy, 'ran npm test in the primary');
+  assert.equal(applied[2][1].applyThenVerify, 'npm test');
+  assert.deepEqual(
+    applied[3],
+    ['j', { repoPath: undefined, apply: true, verifiedBy: 'ran npm test in the primary' }],
+    'a plain apply keeps its exact option shape',
+  );
+  for (let id = 6; id <= 15; id += 1) assert.equal(values.find((value) => value.id === id).result.isError, true, `call ${id}`);
+  for (const id of [13, 14]) assert.match(JSON.stringify(values.find((value) => value.id === id)), /require applyThenVerify/);
+  await server.close();
+});
+test('MCP exposes the bounded log window on offload_job, forwards it only when supplied, and names FAILED continuation', async () => {
+  const input = new PassThrough(),
+    output = new PassThrough();
+  let wire = '';
+  output.on('data', (value) => {
+    wire += value;
+  });
+  const jobs = [];
+  const server = createMcpServer(
+    {
+      job: async (...value) => {
+        jobs.push(value);
+        return {};
+      },
+    },
+    { input, output },
+  );
+  const call = (id, arguments_) =>
+    input.write(
+      `${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'offload_job', arguments: arguments_ } })}\n`,
+    );
+  input.write('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}\n');
+  input.write('{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n');
+  call(2, { jobId: 'j', include: 'log', tail: 5, limit: 3000 });
+  call(3, { jobId: 'j', include: 'log' });
+  call(4, { jobId: 'j', include: 'log', tail: 0, limit: 2000 });
+  for (const [id, extra] of [
+    [5, { tail: -1 }],
+    [6, { tail: 1001 }],
+    [7, { tail: '5' }],
+    [8, { tail: 1.5 }],
+    [9, { limit: 100 }],
+    [10, { limit: 60001 }],
+    [11, { limit: '3000' }],
+    [12, { lines: 5 }],
+  ])
+    call(id, { jobId: 'j', include: 'log', ...extra });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const values = responseValues(wire);
+  const tools = values.find((value) => value.id === 1).result.tools;
+  const { properties, additionalProperties } = tools.find((candidate) => candidate.name === 'offload_job').inputSchema;
+  assert.deepEqual([properties.tail.type, properties.tail.minimum, properties.tail.maximum], ['integer', 0, 1000]);
+  assert.deepEqual([properties.limit.type, properties.limit.minimum, properties.limit.maximum], ['integer', 2000, 60000]);
+  assert.equal(additionalProperties, false);
+  assert.equal(jobs.length, 3, 'every misuse is rejected before core.job');
+  assert.deepEqual(jobs[0], ['j', { repoPath: undefined, include: 'log', tail: 5, limit: 3000 }]);
+  assert.deepEqual(jobs[1], ['j', { repoPath: undefined, include: 'log' }], 'an omitted window is not passed as undefined');
+  assert.deepEqual(jobs[2], ['j', { repoPath: undefined, include: 'log', tail: 0, limit: 2000 }], 'zero is a real request');
+  for (let id = 5; id <= 12; id += 1) assert.equal(values.find((value) => value.id === id).result.isError, true, `call ${id}`);
+  const description = tools.find((candidate) => candidate.name === 'offload_continue').description;
+  assert.match(
+    description,
+    /FAILED in a worker-side way \(a repeated failing tool call, ending without finish, exhausting output-cap recovery, or putting finish in a turn with other tool calls twice\)/,
+  );
+  assert.match(description, /Refused for provider or protocol failures, scope violations/);
+  assert.match(tools.find((candidate) => candidate.name === 'offload_job').description, /`toolFailure`/);
   await server.close();
 });
 test('MCP revert defaults an omitted apply flag to a dry run in legacy and current envelopes', async () => {
@@ -270,9 +559,9 @@ test('MCP keeps current requests stateless and legacy initialize envelopes separ
     assert.match(discovery.instructions, /skill:\/\/offload\/offload\/SKILL\.md/);
     assert.match(discovery.instructions, /repoPath/);
     assert.match(discovery.instructions, /native Claude subagents/);
-    assert.match(discovery.instructions, /profile "pro"/);
+    assert.match(discovery.instructions, /profile "flash"/);
     assert.match(discovery.instructions, /policy-only/);
-    assert.match(discovery.instructions, /Do not invent a “latest Pro” model/);
+    assert.match(discovery.instructions, /Do not invent a “latest Flash” model/);
     assert.match(discovery.instructions, /policy-only hosts workers edit permitted private-worktree files, no shell/);
     assert.ok(discovery.instructions.length < 512);
   }
@@ -315,11 +604,11 @@ test('MCP keeps current requests stateless and legacy initialize envelopes separ
   assert.match(list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.allowNetwork.description, /only/);
   assert.match(
     list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.profile.description,
-    /provider-maintained DeepSeek Pro\/high/,
+    /provider-maintained DeepSeek V4\.1 Flash route/,
   );
   assert.match(
     list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.profile.description,
-    /explicitly selected supported profile overrides/,
+    /explicitly selected configured profile overrides/,
   );
   assert.match(
     list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.effort.description,
@@ -441,11 +730,11 @@ test('MCP exposes the canonical static skill with exact resources and safe reque
   assert.match(expectedText, /including Sonnet ultracode\/native-agent workflows/);
   assert.match(
     expectedText,
-    /A mention, quotation, negation, or discussion of `\/offload`, offload, delegation, \*\*DeepSeek\*\* \/ \*\*DeepSeek-V4-Pro\*\*, a provider, or a model does not select Offload/,
+    /A mention, quotation, negation, or discussion of `\/offload`, offload, delegation, \*\*DeepSeek\*\* \/ \*\*DeepSeek-V4\.1-Flash\*\*, a provider, or a model does not select Offload/,
   );
   assert.match(expectedText, /A standalone instruction not to use native subagents does not trigger Offload/);
   assert.match(expectedText, /For a `\/offload` command invocation, end every final answer/);
-  assert.match(expectedText, /explicitly set `profile: "pro"`/);
+  assert.match(expectedText, /explicitly set `profile: "flash"`/);
   assert.match(expectedText, /omit `effort`/);
   assert.match(expectedText, /explicitly selects a supported profile name within a `\/offload` command invocation/);
   assert.match(expectedText, /provider or model name never triggers Offload or permits inferring, overriding, or inventing a profile/);
@@ -957,4 +1246,345 @@ test('MCP subprocess completes a handshake and shuts down on EOF', async () => {
   });
   assert.equal(code, 0);
   assert.match(stdout, /offload/);
+});
+test('MCP explicit unattended mode omits Claude forced-approval metadata', async () => {
+  const child = spawn(process.execPath, ['bin/offload.mjs', 'mcp'], {
+    cwd: process.cwd(),
+    env: { ...process.env, OFFLOAD_MCP_APPROVAL_MODE: 'approve' },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let stdout = '',
+    stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (value) => {
+    stdout += value;
+  });
+  child.stderr.on('data', (value) => {
+    stderr += value;
+  });
+  child.stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n');
+  child.stdin.write('{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n');
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`MCP tool list timed out: ${stderr}`)), 3_000);
+    const watch = () => {
+      if (stdout.includes('"id":2')) {
+        clearTimeout(timer);
+        child.stdout.removeListener('data', watch);
+        resolve();
+      }
+    };
+    child.stdout.on('data', watch);
+  });
+  child.stdin.end();
+  const code = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error('MCP did not exit after EOF'));
+    }, 3_000);
+    child.once('exit', (value) => {
+      clearTimeout(timer);
+      resolve(value);
+    });
+  });
+  assert.equal(code, 0);
+  const tools = responseValues(stdout).find((value) => value.id === 2).result.tools;
+  for (const name of ['offload_start', 'offload_repair', 'offload_continue', 'offload_apply', 'offload_revert', 'offload_cancel'])
+    assert.equal(
+      Object.hasOwn(
+        tools.find((tool) => tool.name === name),
+        '_meta',
+      ),
+      false,
+      `${name} must not force a Claude approval`,
+    );
+});
+
+test('MCP records every tool call, including failures, in the diagnostic log', async () => {
+  const input = new PassThrough(),
+    output = new PassThrough();
+  output.resume();
+  const records = [];
+  createMcpServer(
+    {
+      start: async () => ({ jobId: 'oj-1' }),
+      wait: async () => {
+        throw Object.assign(new Error('wait exploded'), { code: 'E_TEST' });
+      },
+    },
+    { input, output, log: { record: (entry) => records.push(entry) } },
+  );
+  const call = (id, name, args) =>
+    input.write(`${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } })}\n`);
+  input.write('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}\n');
+  call(1, 'offload_start', { task: 'secret task text', mode: 'report' });
+  call(2, 'offload_wait', { jobId: 'oj-1' });
+  await new Promise((r) => setTimeout(r, 50));
+  const ok = records.find((r) => r.tool === 'offload_start');
+  assert.equal(ok.ok, true);
+  assert.equal(ok.jobId, 'oj-1');
+  assert.ok(ok.argKeys.includes('task'));
+  assert.doesNotMatch(JSON.stringify(records), /secret task text/);
+  const failed = records.find((r) => r.tool === 'offload_wait');
+  assert.equal(failed.ok, false);
+  assert.equal(failed.error.message, 'wait exploded');
+  assert.equal(failed.error.code, 'E_TEST');
+  assert.match(failed.runtime, /node v/);
+  input.end();
+});
+test('MCP exposes the job list options, forwards only supplied values, and keeps them away from a single-job read', async () => {
+  const input = new PassThrough(),
+    output = new PassThrough();
+  let wire = '';
+  output.on('data', (value) => {
+    wire += value;
+  });
+  const jobs = [];
+  const server = createMcpServer(
+    {
+      job: async (...value) => {
+        jobs.push(value);
+        return {};
+      },
+    },
+    { input, output },
+  );
+  const call = (id, arguments_) =>
+    input.write(
+      `${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'offload_job', arguments: arguments_ } })}\n`,
+    );
+  input.write('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}\n');
+  input.write('{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n');
+  call(60, { all: true, maxJobs: 5 });
+  call(61, {});
+  call(62, { all: false });
+  call(63, { all: 'true' });
+  call(64, { maxJobs: 0 });
+  call(65, { maxJobs: 101 });
+  call(66, { maxJobs: 1.5 });
+  call(67, { jobId: 'j', all: true });
+  call(68, { jobId: 'j', maxJobs: 5 });
+  call(69, { jobId: 'j', all: false });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const values = responseValues(wire);
+  const tool = values.find((value) => value.id === 1).result.tools.find((candidate) => candidate.name === 'offload_job');
+  assert.deepEqual(tool.inputSchema.properties.all, { type: 'boolean' });
+  assert.deepEqual(tool.inputSchema.properties.maxJobs, { type: 'integer', minimum: 1, maximum: 100 });
+  assert.equal(tool.inputSchema.required?.includes('all') ?? false, false);
+  assert.match(tool.description, /workingTree/);
+  assert.match(tool.description, /all:true/);
+  assert.match(tool.description, /totalCostUsd/);
+  assert.deepEqual(jobs, [
+    [undefined, { repoPath: undefined, include: undefined, all: true, maxJobs: 5 }],
+    [undefined, { repoPath: undefined, include: undefined }],
+    [undefined, { repoPath: undefined, include: undefined, all: false }],
+  ]);
+  for (const id of [63, 64, 65, 66, 67, 68, 69]) assert.equal(values.find((value) => value.id === id).result.isError, true, `call ${id}`);
+  assert.match(JSON.stringify(values.find((value) => value.id === 67)), /apply only when jobId is omitted/);
+  assert.match(JSON.stringify(values.find((value) => value.id === 69)), /apply only when jobId is omitted/);
+  await server.close();
+});
+test('MCP routes include "retrospective" to the digest, forwards only the jobs asked for, and refuses what has no meaning for it', async () => {
+  const input = new PassThrough(),
+    output = new PassThrough();
+  let wire = '';
+  output.on('data', (value) => {
+    wire += value;
+  });
+  const seen = [];
+  const server = createMcpServer(
+    {
+      retrospective: async (options) => (seen.push(['retrospective', options]), { maintainerPromptWarranted: false }),
+      job: async (...value) => (seen.push(['job', ...value]), {}),
+    },
+    { input, output },
+  );
+  const call = (id, arguments_) =>
+    input.write(
+      `${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'offload_job', arguments: arguments_ } })}\n`,
+    );
+  input.write('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}\n');
+  input.write('{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n');
+  call(70, { include: 'retrospective' });
+  call(71, { include: 'retrospective', jobIds: ['oj-1', 'oj-2'], repoPath: '/repo' });
+  call(72, { include: 'summary' });
+  const refused = [
+    { include: 'retrospective', jobId: 'oj-1' },
+    { include: 'retrospective', all: true },
+    { include: 'retrospective', maxJobs: 5 },
+    { include: 'retrospective', tail: 5 },
+    { include: 'retrospective', limit: 2000 },
+    { include: 'retrospective', verifierInterpreter: ['/opt/venv'] },
+    { jobIds: ['oj-1'] },
+    { jobId: 'oj-1', include: 'diff', jobIds: ['oj-1'] },
+    { include: 'retrospective', jobIds: [] },
+    { include: 'retrospective', jobIds: Array.from({ length: 17 }, (_, index) => `oj-${index}`) },
+    { include: 'retrospective', jobIds: ['bad id'] },
+    { include: 'retrospective', jobIds: 'oj-1' },
+    { include: 'retro' },
+  ];
+  refused.forEach((arguments_, index) => call(80 + index, arguments_));
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  const values = responseValues(wire);
+  const tool = values.find((value) => value.id === 1).result.tools.find((candidate) => candidate.name === 'offload_job');
+  assert.deepEqual(tool.inputSchema.properties.include.enum, ['summary', 'diff', 'files', 'log', 'retrospective']);
+  assert.equal(tool.inputSchema.properties.jobIds.maxItems, 16);
+  assert.equal(tool.inputSchema.properties.jobIds.items.pattern, '^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$');
+  assert.equal(tool.annotations.readOnlyHint, true, 'a digest changes no job, so it needs no approval');
+  assert.match(tool.description, /include "retrospective"/);
+  assert.match(tool.description, /maintainerPromptSkeleton/);
+  assert.deepEqual(seen, [
+    ['retrospective', { repoPath: undefined }],
+    ['retrospective', { repoPath: '/repo', jobIds: ['oj-1', 'oj-2'] }],
+    ['job', undefined, { repoPath: undefined, include: 'summary' }],
+  ]);
+  assert.equal(values.find((value) => value.id === 70).result.isError, false);
+  refused.forEach((arguments_, index) =>
+    assert.equal(values.find((value) => value.id === 80 + index).result.isError, true, JSON.stringify(arguments_)),
+  );
+  assert.match(JSON.stringify(values.find((value) => value.id === 80)), /jobId does not apply to include \\"retrospective\\"/);
+  assert.match(JSON.stringify(values.find((value) => value.id === 86)), /jobIds apply only to include \\"retrospective\\"/);
+  await server.close();
+});
+test('the skill tells the primary to load deferred tools, what the snapshot includes, and how health and the list behave', async () => {
+  const text = await readFile(new URL('../../plugins/offload/skills/offload/SKILL.md', import.meta.url), 'utf8');
+  const section = (from, to) => {
+    const start = text.indexOf(from);
+    const end = text.indexOf(to, start + from.length);
+    assert.ok(start >= 0 && end > start, `${from} .. ${to}`);
+    return text.slice(start, end);
+  };
+  const preflight = section('## 0. Preflight', '## 1. Understand');
+  const tools = ['job', 'start', 'wait', 'continue', 'apply', 'repair', 'revert', 'cancel'].map((name) => `mcp__offload__offload_${name}`);
+  // One ToolSearch select naming every tool, in the first paragraph of the preflight.
+  assert.ok(preflight.includes(`select:${tools.join(',')}`), 'the select query must name all eight tools');
+  assert.ok(
+    preflight.indexOf('ToolSearch') < preflight.indexOf('Call `offload_job` with no arguments'),
+    'loading comes before the first call',
+  );
+  assert.match(preflight, /A tool that is merely not loaded is not unavailable/);
+  assert.match(preflight, /^- `workingTree`: `clean`, counts \(`changed`, `staged`, `modified`, `untracked`, `conflicted`/m);
+  assert.match(preflight, /^- `verifierTmp` \(`status`, `reason`, `systemTmp`, `gitInit`\)/m);
+  assert.match(preflight, /`offload_job` with `all: true`/);
+  assert.match(preflight, /`listing\.totalCostUsd`/);
+  const intro = section('# Offload protocol', '## Routing contract');
+  assert.match(intro, /staged and unstaged tracked changes, deletions, and untracked files that are not gitignored/);
+  assert.match(intro, /Gitignored files are not copied/);
+  assert.match(intro, /never contains your own uncommitted edits/);
+  assert.match(section('## 4. Review', '## 5. Fix loop'), /a `spend across N jobs touched this session:` line/);
+});
+test('the skill names exactly the capabilities, tools, parameters and CLI flags the server provides', async () => {
+  const text = await readFile(new URL('../../plugins/offload/skills/offload/SKILL.md', import.meta.url), 'utf8');
+  const input = new PassThrough(),
+    output = new PassThrough();
+  let wire = '';
+  output.on('data', (value) => {
+    wire += value;
+  });
+  const server = createMcpServer({}, { input, output });
+  input.write('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}\n');
+  input.write('{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n');
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const tools = new Map(
+    responseValues(wire)
+      .find((value) => value.id === 1)
+      .result.tools.map((tool) => [tool.name, tool.inputSchema.properties]),
+  );
+  await server.close();
+
+  // Capabilities: the stale-server list is the five the preflight requires, every capability the skill
+  // mentions is one the server reports, and every reported one is documented.
+  const required = text.slice(text.indexOf('Health must expose'), text.indexOf('If any is missing'));
+  assert.deepEqual([...required.matchAll(/server\.capabilities\.(\w+): true/g)].map((match) => match[1]).sort(), [
+    'compactReports',
+    'continueJob',
+    'inputFiles',
+    'lateApply',
+    'reportMode',
+  ]);
+  const gated = [...text.matchAll(/server\.capabilities\.(\w+)/g)].map((match) => match[1]);
+  for (const [name, value] of Object.entries(RUNTIME_CAPABILITIES)) {
+    assert.equal(value, true, name);
+    assert.ok(text.includes(`\`${name}\``) || text.includes(`server.capabilities.${name}`), `the skill never mentions capability ${name}`);
+  }
+  for (const name of gated) assert.equal(RUNTIME_CAPABILITIES[name], true, `the skill gates on ${name}, which the server does not report`);
+  assert.ok(text.includes(`\`server.schemaRevision: ${IDENTITY_SCHEMA_REVISION}\``), 'the skill pins the revision the server reports');
+
+  // Tools: the ToolSearch query names every tool the server lists, no more.
+  const query = /`select:([^`]+)`/.exec(text)[1].split(',');
+  assert.deepEqual(query.map((name) => name.replace('mcp__offload__', '')).sort(), [...tools.keys()].sort());
+
+  // Parameters the skill tells the primary to pass are in the advertised schemas.
+  const params = {
+    offload_start: ['verifierMode', 'verifierTimeoutSec', 'verifierInterpreter', 'relevantPaths', 'budget'],
+    offload_wait: ['timeoutSec', 'detail'],
+    offload_job: ['include', 'jobIds', 'tail', 'limit', 'all', 'maxJobs', 'detail', 'verifierInterpreter'],
+    offload_continue: ['extraTurns', 'extraUsd', 'note'],
+    offload_apply: ['apply', 'verifiedBy', 'applyThenVerify', 'applyThenVerifyTimeoutSec', 'unsafePolicyOnlyVerifier'],
+  };
+  for (const [tool, names] of Object.entries(params))
+    for (const name of names) {
+      assert.ok(name in tools.get(tool), `${tool} does not accept ${name}`);
+      assert.ok(text.includes(`\`${name}`), `the skill never mentions ${name}`);
+    }
+  for (const name of ['maxUsd', 'maxTurns', 'turnPolicy', 'timeoutMinutes']) assert.ok(text.includes(`budget.${name}`), `budget.${name}`);
+  const budget = tools.get('offload_start').budget.properties;
+  for (const name of ['maxUsd', 'maxTurns', 'turnPolicy', 'timeoutMinutes']) assert.ok(name in budget, `budget.${name}`);
+
+  // CLI flags the skill documents are accepted, and an invented one is not.
+  const run = async (argv) => {
+    let stderr = '';
+    const code = await runCli(argv, {
+      core: {
+        job: async () => ({}),
+        start: async () => ({}),
+        wait: async () => ({}),
+        retrospective: async () => ({ maintainerPromptSkeleton: 'Improve Offload' }),
+        retrospectiveHistory: async () => ({
+          path: 'retrospectives.jsonl',
+          records: [],
+          aggregate: { retrospectives: 0, warranted: 0, signals: [] },
+        }),
+      },
+      stdout: { write() {} },
+      stderr: { write: (chunk) => (stderr += chunk) },
+    });
+    return { code, stderr };
+  };
+  for (const flag of ['--verifierMode', '--verifierTimeoutSec', '--verifierInterpreter'])
+    assert.ok(text.includes(`\`${flag}\``), `the skill documents ${flag}`);
+  assert.equal(
+    (await run(['start', '--task', 'x', '--ownedPaths', '["a/**"]', '--verifierMode', 'baseline-diff', '--verifierTimeoutSec', '60'])).code,
+    0,
+  );
+  assert.equal((await run(['start', '--task', 'x', '--ownedPaths', '["a/**"]', '--verifierInterpreter', '/opt/py/venv'])).code, 0);
+  assert.equal(
+    (await run(['start', '--task', 'x', '--ownedPaths', '["a/**"]', '--verifierInterpreter', '["/opt/py/a","/opt/py/b"]'])).code,
+    0,
+  );
+  assert.equal((await run(['start', '--task', 'x', '--ownedPaths', '["a/**"]', '--verifierInterpreter', 'relative/venv'])).code, 2);
+  assert.equal((await run(['job', '--verifierInterpreter', '/opt/py/venv'])).code, 0);
+  assert.equal((await run(['job', 'oj-1', '--verifierInterpreter', '/opt/py/venv'])).code, 2, 'a job id and a health probe are exclusive');
+  assert.ok(text.includes('--tail N --limit N'));
+  assert.equal((await run(['job', 'oj-1', '--include', 'log', '--tail', '5', '--limit', '2000'])).code, 0);
+  assert.equal((await run(['job', 'oj-1', '--include', 'log', '--tail', '5', '--bogus', '1'])).code, 2);
+  // The retrospective: an include value of offload_job, a CLI command, and a step of the Completion gate.
+  assert.ok(tools.get('offload_job').include.enum.includes('retrospective'));
+  const gate = text.slice(text.indexOf('## 6. Completion gate'), text.indexOf('## Rules that do not bend'));
+  assert.ok(
+    gate.includes('`include: "retrospective"`') && gate.includes('`jobIds`'),
+    'the gate fetches the digest for the jobs it started',
+  );
+  assert.ok(gate.includes('Maintainer prompt (paste into the Claude Code session that maintains Offload)'));
+  assert.ok(gate.includes('`Offload retrospective: nothing to improve`'));
+  assert.match(gate, /never edit the Offload repo, config or skill because of it/);
+  assert.ok(gate.indexOf('Offload retrospective') < gate.indexOf('`Offload: N jobs`'), 'the routing line stays last');
+  assert.ok(text.includes('cancel|retrospective` exist as shell subcommands'));
+  assert.equal((await run(['retrospective'])).code, 0);
+  assert.equal((await run(['retrospective', '--jobs', 'oj-1,oj-2'])).code, 0);
+  assert.equal((await run(['retrospective', 'list'])).code, 0);
+  assert.equal((await run(['retrospective', 'export', '--last', '5'])).code, 0);
+  assert.equal((await run(['retrospective', '--bogus', '1'])).code, 2);
+  assert.ok(text.includes('--detail compact'));
+  assert.equal((await run(['wait', 'oj-1', '--detail', 'compact'])).code, 0);
 });

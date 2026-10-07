@@ -9,7 +9,18 @@ import { snapshotGitEnv } from '../git-snapshot.mjs';
 
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const MAX_READ_CAP = 256_000;
+// The byte window a worker may request with read_file's `limit`. It is what the
+// tool enforces (readCap) and what its schema and the worker brief advertise.
+export const DEFAULT_READ_CAP = 64_000;
 const MAX_OUTPUT_CAP = 128_000;
+// One read_file page is closed at this many rendered characters, so it (not the
+// larger readCap byte window) is the real segment a worker scans a file with.
+// Turn-budget sizing is derived from it.
+export const DEFAULT_OUTPUT_CAP = 24_000;
+// One worker command may not consume a whole round's wall clock (30 minutes by
+// default) for almost no spend; the loop deadline still aborts it sooner.
+export const DEFAULT_COMMAND_TIMEOUT_SEC = 60;
+export const MAX_COMMAND_TIMEOUT_SEC = 900;
 const MAX_READ_PREFIX_SCAN = 8 * 1024 * 1024;
 const MAX_EDITABLE_BYTES = 8 * 1024 * 1024;
 const MAX_EDIT_ARG_CAP = 64_000;
@@ -154,8 +165,8 @@ class ReadPage {
 export const TOOL_DEFINITIONS = Object.freeze([
   schema(
     'read_file',
-    'Read a bounded UTF-8 byte window of a repository file before editing it. If output ends [truncated; next offset N], continue with exactly offset N.',
-    { path: str, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: MAX_READ_CAP } },
+    `Read a bounded UTF-8 byte window of a repository file before editing it. limit is a byte count of at most ${DEFAULT_READ_CAP} per call (omit it for the default). If output ends [truncated; next offset N], continue with exactly offset N.`,
+    { path: str, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: DEFAULT_READ_CAP } },
     ['path'],
   ),
   schema('list_dir', 'List a repository directory.', { path: str }, []),
@@ -186,7 +197,10 @@ export const TOOL_DEFINITIONS = Object.freeze([
   schema(
     'run_command',
     'Run a focused build, test, or diagnostic command through the configured sandbox runner; prefer read_file, list_dir, glob, or grep for routine file inspection.',
-    { command: { type: 'string', minLength: 1, maxLength: 8192 }, timeoutSec: { type: 'integer', minimum: 1, maximum: 3600 } },
+    {
+      command: { type: 'string', minLength: 1, maxLength: 8192 },
+      timeoutSec: { type: 'integer', minimum: 1, maximum: MAX_COMMAND_TIMEOUT_SEC },
+    },
     ['command'],
   ),
   schema(
@@ -222,8 +236,8 @@ export class LocalTools {
     denyRead = [],
     policy,
     runCommand,
-    readCap = 64_000,
-    outputCap = 24_000,
+    readCap = DEFAULT_READ_CAP,
+    outputCap = DEFAULT_OUTPUT_CAP,
     fileSystem = fs,
     gitExec = execFileAsync,
   } = {}) {
@@ -626,6 +640,50 @@ export class LocalTools {
       await handle.close();
     }
   }
+  /**
+   * Server-only (deliberately absent from the advertised tool definitions):
+   * translate a 1-based inclusive line range into the byte offset and length
+   * read_file needs, so the worker prompt can say where to start instead of
+   * scanning from byte zero. Applies read_file's own path, deny and symlink
+   * checks and never returns file content. Null when the range starts past the
+   * end of the file or beyond what read_file can address.
+   */
+  async lineByteWindow({ path: file, startLine, endLine } = {}) {
+    if (!Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || startLine < 1 || endLine < startLine)
+      throw new Error('startLine and endLine must be integers with 1 <= startLine <= endLine');
+    const canonical = this.#readable(file);
+    const { handle, size } = await this.#openText(canonical, file);
+    try {
+      const scanLimit = Math.min(size, MAX_READ_PREFIX_SCAN);
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, scanLimit)));
+      let offset = startLine === 1 ? 0 : undefined;
+      let end;
+      let newlines = 0;
+      for (let position = 0; position < scanLimit && end === undefined;) {
+        const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, scanLimit - position), position);
+        if (!bytesRead) throw new Error('File changed while being read');
+        for (let index = 0; index < bytesRead; index++) {
+          const byte = buffer[index];
+          if (byte === 0) throw new Error('Refusing binary file');
+          if (byte !== 0x0a) continue;
+          newlines += 1;
+          if (newlines === startLine - 1) offset = position + index + 1;
+          if (newlines === endLine) {
+            end = position + index + 1;
+            break;
+          }
+        }
+        position += bytesRead;
+      }
+      // A start on or after the end of the data (including the empty line after
+      // a trailing newline) addresses nothing, and read_file refuses pages whose
+      // window reaches past its prefix-scan cap.
+      if (offset === undefined || offset >= size || offset > MAX_READ_PREFIX_SCAN - this.readCap) return null;
+      return { offset, bytes: (end ?? scanLimit) - offset };
+    } finally {
+      await handle.close();
+    }
+  }
   async list_dir({ path: dir = '.' } = {}) {
     const canonical = this.#readable(dir, { directory: true });
     const safe = [];
@@ -864,10 +922,18 @@ export class LocalTools {
     this.readHashes.delete(canonical);
     return `Wrote ${this.#relative(canonical)} (${content.length} chars).`;
   }
-  async run_command({ command, timeoutSec = 60 } = {}, { signal } = {}) {
+  async run_command({ command, timeoutSec = DEFAULT_COMMAND_TIMEOUT_SEC } = {}, { signal } = {}) {
     if (typeof command !== 'string' || !command || command.length > 8192)
       throw new Error('command must be a non-empty string up to 8192 chars');
-    const timeout = boundedInt(timeoutSec, 60, 3600, 'timeoutSec');
+    // An over-long request is clamped, as the loop's batch limit already does,
+    // rather than rejected: the rejection has no hint, so a worker re-sending
+    // the same call would trip the loop guard and end FAILED.
+    const timeout = boundedInt(
+      Number.isSafeInteger(timeoutSec) && timeoutSec > MAX_COMMAND_TIMEOUT_SEC ? MAX_COMMAND_TIMEOUT_SEC : timeoutSec,
+      DEFAULT_COMMAND_TIMEOUT_SEC,
+      MAX_COMMAND_TIMEOUT_SEC,
+      'timeoutSec',
+    );
     if (typeof this.runner !== 'function') throw new Error('run_command requires a configured sandbox runner');
     // The loop's single deadline signal is deliberately forwarded rather than
     // manufacturing a per-tool timeout.  The runner owns process-group

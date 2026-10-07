@@ -17,7 +17,7 @@ const MAX_SKILL_FILES = 100,
   MAX_SKILL_MD_BYTES = 262_144,
   MAX_SKILL_TOTAL_BYTES = 5_242_880;
 const SERVER_INSTRUCTIONS =
-  'Offload skill: opt-in only. A conversational client may call offload_start only for an actual `/offload <task>` slash command. Prose, mentions, quotes, or negations of Offload, delegation, DeepSeek, providers, or models never authorize it. Read skill://offload/offload/SKILL.md. /offload: no native Claude subagents; profile "pro". Do not invent a “latest Pro” model. On policy-only hosts workers edit permitted private-worktree files, no shell. Supply repoPath if ambiguous.';
+  'Offload skill: opt-in only. A conversational client may call offload_start only for an actual `/offload <task>` slash command. Prose, mentions, quotes, or negations of Offload, delegation, DeepSeek, providers, or models never authorize it. Read skill://offload/offload/SKILL.md. /offload: no native Claude subagents; profile "flash". Do not invent a “latest Flash” model. On policy-only hosts workers edit permitted private-worktree files, no shell. Supply repoPath if ambiguous.';
 const SKILLS_EXTENSION = { 'io.modelcontextprotocol/skills': {} };
 const startProps = {
   task: { type: 'string', minLength: 1, maxLength: 32_000 },
@@ -42,7 +42,13 @@ const startProps = {
     description:
       'Report-mode only: absolute regular files under the server OS temp root; macOS also accepts /private/tmp (and its /tmp alias). Configured server scratch roots may also apply. Files are size-limited, copied read-only into the private worktree, and returned only by private relative paths in reportResult. A rejected call reports canonical allowed roots before any job is created.',
   },
-  relevantPaths: { type: 'array', maxItems: 128, items: { type: 'string', minLength: 1, maxLength: 1_024 } },
+  relevantPaths: {
+    type: 'array',
+    maxItems: 128,
+    items: { type: 'string', minLength: 1, maxLength: 1_024 },
+    description:
+      'Files to read first. Optionally path:START-END (1-based inclusive line range, START <= END) so the worker reads only that region. Prefer ranges for files over about 1000 lines (read_file returns 24,000 characters per call). Do not paste file contents.',
+  },
   testCommand: {
     type: 'string',
     minLength: 1,
@@ -55,25 +61,56 @@ const startProps = {
     description:
       'High-friction consent for this caller-supplied testCommand to run policy-only when no macOS sandbox can be applied. A policy-only result can never trigger repair.',
   },
+  verifierMode: {
+    enum: ['standard', 'baseline-diff'],
+    description:
+      'Omit or use standard for the existing pass/fail verifier. baseline-diff is for a repo whose suite already has environment-sensitive or failing tests: if the testCommand fails on the result, it is run once more on an untouched copy of the start snapshot (dirty state included) and DONE_VERIFIED means "no new failing tests", not a green suite. Needs a testCommand with node:test/TAP/jest/pytest/go/cargo output and the macOS sandbox; a comparison that cannot be made (unparseable, truncated or crashed output, a timed-out snapshot run, a runner that stopped early) is inconclusive and ends VERIFY_FAILED with no repair round; a timed-out result run skips the baseline and takes the ordinary repair path. Use only when health reports baselineVerifier.',
+  },
+  verifierInterpreter: {
+    type: 'array',
+    maxItems: 4,
+    items: { type: 'string', minLength: 1, maxLength: 4_096 },
+    description:
+      'Python verifier: absolute path(s) of a virtualenv root or interpreter your testCommand runs (for example ["/Users/me/.venv"]). The sandbox otherwise cannot read or execute anything outside the worktree, so an undeclared venv fails with "Operation not permitted". The verifier (not the worker\'s run_command) gets READ and EXEC of that root and its base Python installation, never write. Rejected with an error, and no job, if the path is missing, not an interpreter/venv, a script or shim, inside the job\'s writable scope, or in a credential/home/host-config area (or outside a configured verifier.interpreterRoots). Call it by absolute path in testCommand (the worktree has no venv); the response echoes verifierInterpreter.accepted. Use only when health reports verifierInterpreter; offload_job with verifierInterpreter proves it runs first.',
+  },
+  verifierTimeoutSec: {
+    type: 'integer',
+    minimum: 5,
+    maximum: 1_800,
+    description:
+      'Wall-clock limit for EACH verifier run (the result run, and the snapshot run in baseline-diff mode). Default 60 for the standard verifier and 300 for baseline-diff.',
+  },
   profile: {
     type: 'string',
     minLength: 1,
     maxLength: 128,
     description:
-      'Explicit configured profile. Default "pro" uses the current provider-maintained DeepSeek Pro/high route; an explicitly selected supported profile overrides. Never infer a generic latest model from task prose.',
+      'Explicit configured profile. Default "flash" uses the current provider-maintained DeepSeek V4.1 Flash route; an explicitly selected configured profile overrides. Never infer a generic latest model from task prose.',
   },
   effort: {
     enum: ['normal', 'high'],
     description:
-      'Optional configuration override. Omit it to retain the selected profile\'s configured effort, including default profile "pro" high effort.',
+      'Optional configuration override. Omit it to retain the selected profile\'s configured effort, including default profile "flash".',
   },
   maxRepairRounds: { type: 'integer', minimum: 0, maximum: 4 },
   budget: {
     type: 'object',
-    description: 'Hard cumulative provider-spend and execution limits for this job.',
+    description:
+      'Hard cumulative provider-spend and execution limits for this job. maxUsd is the primary ceiling: omit maxTurns and the server sizes the turn cap from the files in relevantPaths and literal ownedPaths (see budgetSizing in the response).',
     properties: {
       maxUsd: { type: 'number', minimum: 0, maximum: 10_000 },
-      maxTurns: { type: 'integer', minimum: 1, maximum: 1_000 },
+      maxTurns: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 1_000,
+        description:
+          'Explicit turn cap, honored exactly unless turnPolicy is auto; a cap below the recommendation is warned about in budgetSizing and can stop the job on BUDGET. Omit it for a server-scaled cap.',
+      },
+      turnPolicy: {
+        enum: ['auto', 'fixed'],
+        description:
+          'auto (default when maxTurns is omitted): the server scales the turn cap to the size of relevantPaths/ownedPaths files, never below the configured default and up to 200; with an explicit maxTurns it makes that value a floor. fixed (default when maxTurns is given): the cap is honored exactly; maxUsd remains the ceiling.',
+      },
       timeoutMinutes: { type: 'number', minimum: 1, maximum: 1_440 },
     },
     additionalProperties: false,
@@ -97,12 +134,15 @@ const repoHint = {
 };
 // Must mirror the persisted/lease job identifier boundary.  Keeping this in
 // the advertised schema makes malformed IDs fail before core state routing.
+const detail = { enum: ['compact', 'full'] };
 const jobId = { type: 'string', minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$' };
 const toolAnnotations = {
   offload_start: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   offload_wait: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   offload_job: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   offload_repair: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  offload_continue: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  offload_apply: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   offload_revert: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   // Cancelling preserves artifacts and is safe to repeat, but still changes job state.
   offload_cancel: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -111,24 +151,59 @@ const toolAnnotations = {
 // every state-changing call even if the session normally auto-approves MCP
 // tools. Other hosts ignore unknown tool metadata and still receive the
 // portable annotations above. Reading job state remains approval-free.
-const requiresUserInteraction = new Set(['offload_start', 'offload_repair', 'offload_revert', 'offload_cancel']);
+const requiresUserInteraction = new Set([
+  'offload_start',
+  'offload_repair',
+  'offload_continue',
+  'offload_apply',
+  'offload_revert',
+  'offload_cancel',
+]);
+// Claude Code treats this vendor flag as an absolute manual-approval
+// requirement, even when its settings explicitly allow a tool. The installer
+// sets this environment value only for a user's deliberate approve choice.
+const requiresClaudeInteraction = process.env.OFFLOAD_MCP_APPROVAL_MODE !== 'approve';
 const TOOLS = [
   [
     'offload_start',
-    'A conversational client may use this tool only to fulfill an actual `/offload <task>` slash command; do not infer authorization from ordinary prose or mentions, quotes, or negations of Offload, delegation, DeepSeek, providers, or models. Start a bounded write job or explicit read-only report/analysis job; both spend provider budget. Reports never integrate and return reportResult text/JSON. Default DeepSeek delegation uses configured profile "pro"; an explicitly selected supported profile overrides. Never use a native Claude subagent.',
+    'A conversational client may use this tool only to fulfill an actual `/offload <task>` slash command; do not infer authorization from ordinary prose or mentions, quotes, or negations of Offload, delegation, DeepSeek, providers, or models. Start a bounded write job or explicit read-only report/analysis job; both spend provider budget. Reports never integrate and return reportResult text/JSON. This call refuses a stale installed skill or server runtime before creating a job: run `node install.mjs` from the Offload checkout and restart the MCP client when health says restartRequired. Default DeepSeek delegation uses configured profile "flash"; an explicitly selected supported profile overrides. Never use a native Claude subagent. Set budget.maxUsd as the ceiling and omit budget.maxTurns: the server sizes the turn cap from relevantPaths/ownedPaths file sizes and the response echoes budgetSizing (effective maxTurns, source, recommendation, warnings).',
     startProps,
     ['task'],
   ],
   [
     'offload_wait',
-    'Read local progress or the verified report for a delegated job.',
-    { jobId, timeoutSec: { type: 'number', minimum: 0, maximum: 55 }, ...repoHint },
+    'Read local progress or the report for a delegated job. `timeoutSec` is 0-55; to wait longer, call again (an unchanged running job returns a few-token `unchanged` marker). Compact by default (status, cost, scope, one verify line with a short failure tail, next actions). Pass detail "full" for the complete report. A running job whose provider request, tool call, queue wait, workspace setup or wall-clock use is abnormal carries `progress.stall` (a new or worse stall is returned once, then `unchanged: true` with `progress.stalledSec`); a terminal report includes a one-line `time:` breakdown (queue, provider, tools, verify, finalize), and detail "full" adds per-round lines and a `timing` object.',
+    { jobId, timeoutSec: { type: 'number', minimum: 0, maximum: 55 }, detail, ...repoHint },
     ['jobId'],
   ],
   [
     'offload_job',
-    'Read local job status, report, diff, files, or event log for review.',
-    { jobId, include: { enum: ['summary', 'diff', 'files', 'log'] }, ...repoHint },
+    'Read local job status, report, diff, files, or event log for review. With no jobId it returns a job list and health. The list holds active jobs plus jobs created or touched in this server session, newest first (each row has createdAt, rounds, a redacted one-line `task` summary of at most 100 characters, the `startedAt` of its latest round, `finishedAt` (terminal jobs only) and `durationSec` (elapsed so far, with `running: true`, while active), and its cumulative costUsd); a `listing` block counts what was hidden (omitted, omittedByScope, omittedByLimit) and gives `totalCostUsd` (the sum of the costUsd of the rows returned, none of the hidden ones) and `storeCostUsd` for every stored job in the repository. An active job costUsd is its spend so far (0 before any usage); an unknown cost (a malformed or never-recorded value on a finished job) is `null`, never 0, and counted in `listing.costUnknownJobs`. Without a repo hint across several loaded repositories the rows merge newest first and maxJobs caps the merged list. Pass all:true to list older jobs too and maxJobs (1-100, default 20; active jobs are never cut) to raise the cap; both apply only without a jobId. Health includes `server.skill` {installedHash, expectedHash, stale, state, reason} with top-level `staleSkill` and `restartRequired`/`restartAction` (the installed skill the client reads differs from this server: run node install.mjs and restart the client, then start no job), `workingTree` (whether the primary checkout is clean or dirty: clean, changed, staged, modified, untracked, conflicted counts and a short sample of non-secret paths; clean is null when git status failed), `verifierDeps` (ok|partial|missing|not-applicable; mirrors `verifierPython` for a Python project) for the repository, `verifierPython` {status ok|missing|partial|not-applicable, reason, interpreter?} (the verifier sandbox of a Python project cannot read a virtualenv unless offload_start declares verifierInterpreter; pass verifierInterpreter here to run it inside the sandbox before spending a job) and `verifierTmp` (status writable|unwritable|not-probed|unknown, reason, systemTmp, gitInit): whether a sandboxed verifier can create temp dirs under its per-run TMPDIR (a hard-coded /tmp is denied by design). include "diff"/"files"/"log" returns only that artifact (no report repeated); the default summary is compact, and detail "full" returns the complete report (and a `timing` object). An active job carries `stall` when it is past its own limits (see offload_wait). A FAILED job also carries `failureKind` and, for a loop, `toolFailure` (the last failing call and its redacted error). include "log" is bounded: by default the newest 60 events within 16000 characters, behind a digest that includes the failing call, with `logInfo` saying what was left out; pass `tail` (0-1000 events) and/or `limit` (2000-60000 characters) for more. Consecutive progress events that differ only in turn, usage, cost and latency (the identical turns of a looping worker) are folded first into one `progress-repeat` line with a count and time span, so `tail` counts folded lines and `logInfo.rawLines` is the stored count. tail/limit apply only to include "log". include "retrospective" (no jobId; optional jobIds, at most 16, default every job of this server session) returns one bounded, redacted evidence digest for improving Offload: per job its status, failureKind, spend, timing, apply path and a redacted task summary, the repository health facts, server-derived `signals` (stable codes such as protocol-failure-finish or verify-env-failed:<kind>, each with a one-line evidence string), `maintainerPromptWarranted` with `reasons`, and a `maintainerPromptSkeleton` the primary may edit into a prompt for the user to paste into the session that maintains Offload. It never holds source, diffs or a brief, and appends one redacted line to a bounded local history file.',
+    {
+      jobId,
+      include: { enum: ['summary', 'diff', 'files', 'log', 'retrospective'] },
+      jobIds: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 16,
+        items: jobId,
+        description:
+          'include "retrospective" only (omit jobId): the jobs to cover. Omit it for every job of this server session. Distinct ids, at most 16.',
+      },
+      tail: { type: 'integer', minimum: 0, maximum: 1000 },
+      limit: { type: 'integer', minimum: 2000, maximum: 60000 },
+      all: { type: 'boolean' },
+      maxJobs: { type: 'integer', minimum: 1, maximum: 100 },
+      detail,
+      verifierInterpreter: {
+        type: 'array',
+        maxItems: 4,
+        items: { type: 'string', minLength: 1, maxLength: 4_096 },
+        description:
+          'Health only (omit jobId): absolute path(s) of the virtualenv root or interpreter you would pass to offload_start. Health runs `<interpreter> -c "import sys; print(sys.version)"` inside the verifier sandbox with that declaration applied and reports the outcome as verifierPython, before any job is spent.',
+      },
+      ...repoHint,
+    },
     [],
   ],
   [
@@ -140,6 +215,47 @@ const TOOLS = [
       ...repoHint,
     },
     ['jobId', 'defects'],
+  ],
+  [
+    'offload_continue',
+    'Resume a job that stopped on BUDGET or TIMEOUT, or that FAILED in a worker-side way (a repeated failing tool call, ending without finish, exhausting output-cap recovery, or putting finish in a turn with other tool calls twice), with in-scope changes, keeping its work and conversation instead of discarding it. Raises the cumulative caps by extraTurns/extraUsd (bounded; pass the one that stopped a BUDGET job; a FAILED continuation needs no increase unless the cumulative budget is spent), consumes one repair round, and spends provider budget. A FAILED continuation tells the worker which call failed (or, for finish-protocol, to call finish alone). Refused for provider or protocol failures, scope violations and every other FAILED cause, and when the same call looped again after an earlier round (use offload_repair or a fresh job then).',
+    {
+      jobId,
+      extraTurns: { type: 'integer', minimum: 1, maximum: 500 },
+      extraUsd: { type: 'number', minimum: 0.01, maximum: 50 },
+      note: { type: 'string', minLength: 1, maxLength: 3_600 },
+      ...repoHint,
+    },
+    ['jobId'],
+  ],
+  [
+    'offload_apply',
+    'Integrate the reviewed diff of a job that was not auto-integrated (VERIFY_ENV_FAILED, VERIFY_FAILED, BUDGET, TIMEOUT, or FAILED for any cause when its retained in-scope diff is intact: non-empty, matching the recorded snapshots, no scope violations, no cleanup or integration state outstanding; the dry run returns the failure kind and reason; never CANCELLED or report jobs) into the primary checkout. Default is a dry run (conflict check, file list). apply=true requires verifiedBy (the check you ran yourself in the primary checkout) or applyThenVerify (a command the server runs in the primary right after applying; if it fails, times out, is cancelled or cannot start, the diff is reverted automatically and the result says applied:false with the failing output, so check the `applied` field). Either way the job ends DONE_UNVERIFIED: the check is yours, never server-verified. Same primary-conflict, branch/index, and lease checks as automatic integration; offload_revert undoes it. Use applyThenVerify only when health reports applyThenVerify.',
+    {
+      jobId,
+      apply: { type: 'boolean' },
+      verifiedBy: { type: 'string', minLength: 8, maxLength: 1_000 },
+      applyThenVerify: {
+        type: 'string',
+        minLength: 1,
+        maxLength: 8_192,
+        description:
+          "Alternative to verifiedBy (one of the two is required with apply=true). The command runs in the PRIMARY checkout inside the macOS sandbox with the checkout read-only (writes only to a per-run temp dir; never any network, whatever the job's allowNetwork; .git and secret files unreadable), so a suite that writes into the repo tree or shells out to git fails there. Exit 0 leaves the job DONE_UNVERIFIED with the command, exit status and output tail recorded as your check. Any other result auto-reverts the diff. The call blocks until the command ends, so the host's own tool timeout (60 s on the managed Codex config) bounds it: a client-side cancel aborts the command and reverts the diff, so a check longer than the host allows can never pass; keep it short, or verify by hand with verifiedBy. A call that was abandoned can be followed with offload_wait (progress.applyThenVerify while it runs) or offload_job (a top-level applyThenVerify.phase and a RUNNING report line while it runs, the final report after). Another process's offload_cancel also stops the run and reverts the diff. Refused on a policy-only host unless unsafePolicyOnlyVerifier is true. Do not edit the job's paths while it runs.",
+      },
+      applyThenVerifyTimeoutSec: {
+        type: 'integer',
+        minimum: 5,
+        maximum: 900,
+        description: "applyThenVerify command timeout; default 300. The host's tool timeout may be shorter (see applyThenVerify).",
+      },
+      unsafePolicyOnlyVerifier: {
+        type: 'boolean',
+        description:
+          'High-friction consent to run applyThenVerify WITHOUT the OS sandbox in the primary checkout on a policy-only host. Pass it only when the user specifically authorized the policy-only exception.',
+      },
+      ...repoHint,
+    },
+    ['jobId'],
   ],
   [
     'offload_revert',
@@ -158,7 +274,7 @@ const TOOLS = [
   description,
   inputSchema: { type: 'object', properties, required, additionalProperties: false },
   annotations: toolAnnotations[name],
-  ...(requiresUserInteraction.has(name) ? { _meta: { 'anthropic/requiresUserInteraction': true } } : {}),
+  ...(requiresClaudeInteraction && requiresUserInteraction.has(name) ? { _meta: { 'anthropic/requiresUserInteraction': true } } : {}),
 }));
 const TOOL_BY_NAME = new Map(TOOLS.map((tool) => [tool.name, tool]));
 const protocol = '2025-06-18';
@@ -167,6 +283,7 @@ const modernProtocol = '2026-07-28';
 // fingerprints let a client distinguish a live-but-old stdio process from the
 // package it just installed without treating the package version as unique.
 const serverInfo = runtimeIdentity();
+const runtimeSummary = `${serverInfo.version} ${String(serverInfo.buildHash).slice(0, 19)} node ${process.version} ${process.platform}`;
 function skillFailure(message) {
   const error = new Error(`offload skill artifact unavailable: ${message}`);
   error.code = 'E_SKILL_ARTIFACT';
@@ -280,7 +397,7 @@ async function loadSkillCatalog() {
 }
 export function createMcpServer(
   core,
-  { input = process.stdin, output = process.stdout, maxFrameBytes = 1_000_000, maxPendingRequests = 64 } = {},
+  { input = process.stdin, output = process.stdout, maxFrameBytes = 1_000_000, maxPendingRequests = 64, log = { record() {} } } = {},
 ) {
   if (!Number.isSafeInteger(maxFrameBytes) || maxFrameBytes < 1024 || maxFrameBytes > 16_000_000)
     throw new TypeError('maxFrameBytes must be an integer between 1024 and 16000000');
@@ -465,7 +582,7 @@ export function createMcpServer(
     if ((schema.type === 'number' || schema.type === 'integer') && schema.minimum !== undefined && value < schema.minimum)
       throw new Error(`${label} is below its minimum`);
     if ((schema.type === 'number' || schema.type === 'integer') && schema.maximum !== undefined && value > schema.maximum)
-      throw new Error(`${label} exceeds its maximum`);
+      throw new Error(`${label} exceeds its maximum of ${schema.maximum}`);
     if (schema.minLength !== undefined && value.length < schema.minLength) throw new Error(`${label} is too short`);
     if (schema.maxLength !== undefined && value.length > schema.maxLength) throw new Error(`${label} is too long`);
     if (schema.pattern !== undefined && (typeof schema.pattern !== 'string' || !new RegExp(schema.pattern).test(value)))
@@ -488,12 +605,37 @@ export function createMcpServer(
         throw new Error('report jobs must not declare writable paths');
       if (
         mode === 'report' &&
-        (args.testCommand !== undefined || Object.hasOwn(args, 'unsafePolicyOnlyVerifier') || Object.hasOwn(args, 'allowNetwork'))
+        (args.testCommand !== undefined ||
+          Object.hasOwn(args, 'unsafePolicyOnlyVerifier') ||
+          Object.hasOwn(args, 'allowNetwork') ||
+          args.verifierMode !== undefined ||
+          args.verifierTimeoutSec !== undefined ||
+          args.verifierInterpreter !== undefined)
       )
         throw new Error('report jobs do not run verifiers or allow network access');
       // Keep MCP's raw boundary aligned with Core/CLI before dispatching to a
       // potentially injected Core implementation.
       validateJobRequest(args);
+    }
+    if (name === 'offload_job' && args.jobId !== undefined && (args.all !== undefined || args.maxJobs !== undefined))
+      throw new Error('all and maxJobs apply only when jobId is omitted');
+    if (name === 'offload_job' && args.jobId !== undefined && args.verifierInterpreter !== undefined)
+      throw new Error('verifierInterpreter applies only when jobId is omitted');
+    if (name === 'offload_job' && args.include === 'retrospective') {
+      // One digest over several jobs: a single job id, a window or a log option has no meaning here.
+      for (const key of ['jobId', 'all', 'maxJobs', 'tail', 'limit', 'verifierInterpreter'])
+        if (args[key] !== undefined) throw new Error(`${key} does not apply to include "retrospective"; pass jobIds to choose jobs`);
+    }
+    if (name === 'offload_job' && args.jobIds !== undefined && args.include !== 'retrospective')
+      throw new Error('jobIds apply only to include "retrospective"');
+    if (name === 'offload_apply') {
+      // Raised at the protocol boundary so a dangling consent or timeout never
+      // reaches Core; "verifiedBy or applyThenVerify" stays in JobManager.
+      if (
+        args.applyThenVerify === undefined &&
+        (args.applyThenVerifyTimeoutSec !== undefined || args.unsafePolicyOnlyVerifier !== undefined)
+      )
+        throw new Error('applyThenVerifyTimeoutSec and unsafePolicyOnlyVerifier require applyThenVerify');
     }
     return args;
   };
@@ -510,6 +652,9 @@ export function createMcpServer(
           relevantPaths: args.relevantPaths,
           testCommand: args.testCommand,
           ...(args.unsafePolicyOnlyVerifier !== undefined ? { unsafePolicyOnlyVerifier: args.unsafePolicyOnlyVerifier } : {}),
+          ...(args.verifierMode !== undefined ? { verifierMode: args.verifierMode } : {}),
+          ...(args.verifierTimeoutSec !== undefined ? { verifierTimeoutSec: args.verifierTimeoutSec } : {}),
+          ...(args.verifierInterpreter !== undefined ? { verifierInterpreter: args.verifierInterpreter } : {}),
           profile: args.profile,
           effort: args.effort,
           maxRepairRounds: args.maxRepairRounds,
@@ -518,12 +663,55 @@ export function createMcpServer(
           ...(args.extraWritable !== undefined ? { extraWritable: args.extraWritable } : {}),
           repoPath: args.repoPath,
         }),
-      offload_wait: () => core.wait(args.jobId, { repoPath: args.repoPath, timeoutSec: args.timeoutSec, signal }),
-      offload_job: () => core.job(args.jobId, { repoPath: args.repoPath, include: args.include }),
+      offload_wait: () =>
+        core.wait(args.jobId, {
+          repoPath: args.repoPath,
+          timeoutSec: args.timeoutSec,
+          signal,
+          ...(args.detail !== undefined ? { detail: args.detail } : {}),
+        }),
+      offload_job: () =>
+        args.include === 'retrospective'
+          ? core.retrospective({ repoPath: args.repoPath, ...(args.jobIds !== undefined ? { jobIds: args.jobIds } : {}) })
+          : core.job(args.jobId, {
+              repoPath: args.repoPath,
+              include: args.include,
+              ...(args.detail !== undefined ? { detail: args.detail } : {}),
+              // Never an explicit undefined: JobManager treats a present key as a request.
+              ...(args.tail !== undefined ? { tail: args.tail } : {}),
+              ...(args.limit !== undefined ? { limit: args.limit } : {}),
+              ...(args.all !== undefined ? { all: args.all } : {}),
+              ...(args.maxJobs !== undefined ? { maxJobs: args.maxJobs } : {}),
+              ...(args.verifierInterpreter !== undefined ? { verifierInterpreter: args.verifierInterpreter } : {}),
+            }),
       offload_repair: () => core.repair(args.jobId, args.defects, { repoPath: args.repoPath }),
       // `apply` is optional and defaults to a dry run. Passing an explicit
       // undefined property defeats JobManager's destructuring default, so
       // normalize it at the protocol boundary.
+      offload_continue: () =>
+        core.continue(args.jobId, {
+          repoPath: args.repoPath,
+          ...(args.extraTurns !== undefined ? { extraTurns: args.extraTurns } : {}),
+          ...(args.extraUsd !== undefined ? { extraUsd: args.extraUsd } : {}),
+          ...(args.note !== undefined ? { note: args.note } : {}),
+        }),
+      offload_apply: () =>
+        core.apply(args.jobId, {
+          repoPath: args.repoPath,
+          apply: args.apply ?? false,
+          ...(args.verifiedBy !== undefined ? { verifiedBy: args.verifiedBy } : {}),
+          // The request's own abort signal stops the command (and so reverts the
+          // diff); it is passed only with a command so every other call keeps
+          // its exact option shape.
+          ...(args.applyThenVerify !== undefined
+            ? {
+                applyThenVerify: args.applyThenVerify,
+                ...(args.applyThenVerifyTimeoutSec !== undefined ? { applyThenVerifyTimeoutSec: args.applyThenVerifyTimeoutSec } : {}),
+                ...(args.unsafePolicyOnlyVerifier !== undefined ? { unsafePolicyOnlyVerifier: args.unsafePolicyOnlyVerifier } : {}),
+                signal,
+              }
+            : {}),
+        }),
       offload_revert: () => core.revert(args.jobId, { repoPath: args.repoPath, apply: args.apply ?? false }),
       offload_cancel: () => core.cancel(args.jobId, { repoPath: args.repoPath }),
     };
@@ -702,8 +890,20 @@ export function createMcpServer(
       (request.params.arguments != null && !plainObject(request.params.arguments))
     )
       return error(request.id, -32602, 'invalid params');
+    const startedMs = Date.now();
+    const logCall = (ok, extra) =>
+      log.record({
+        tool: request.params.name,
+        ok,
+        ms: Date.now() - startedMs,
+        argKeys: Object.keys(request.params.arguments || {}).slice(0, 20),
+        ...(request.params.arguments?.jobId ? { jobId: String(request.params.arguments.jobId).slice(0, 64) } : {}),
+        runtime: runtimeSummary,
+        ...extra,
+      });
     try {
       const rawValue = await invoke(request.params.name, request.params.arguments || {}, pending.get(request.id)?.signal);
+      logCall(true, rawValue?.jobId ? { jobId: String(rawValue.jobId).slice(0, 64) } : {});
       // `structuredContent` is optional.  Omit it for undefined handler
       // results instead of serializing undefined away in only some envelopes
       // or emitting null, which is not accepted by legacy object-only clients.
@@ -736,6 +936,10 @@ export function createMcpServer(
               },
         );
     } catch (cause) {
+      logCall(false, {
+        ...(cancelled.has(request.id) ? { cancelled: true } : {}),
+        error: { message: String(cause?.message || cause), stack: cause?.stack, code: cause?.code },
+      });
       if (!cancelled.has(request.id))
         response(
           request.id,

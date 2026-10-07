@@ -1,6 +1,7 @@
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, posix, resolve, win32 } from 'node:path';
+import { modelPolicyViolation } from './model-policy.mjs';
 
 export const DEFAULT_CONFIG = Object.freeze({
   providers: {
@@ -13,10 +14,9 @@ export const DEFAULT_CONFIG = Object.freeze({
     },
   },
   profiles: {
-    pro: { provider: 'deepseek', model: 'deepseek-v4-pro', effort: 'high' },
     flash: { provider: 'deepseek', model: 'deepseek-flash' },
   },
-  default: 'pro',
+  default: 'flash',
   limits: { maxTurns: 80, timeoutMinutes: 30, maxUsd: 2 },
 });
 const MAX_CONFIG_BYTES = 1024 * 1024;
@@ -24,6 +24,7 @@ const MAX_PROVIDERS = 64;
 const MAX_PROFILES = 128;
 const MAX_NAME = 128;
 const MAX_PATH_TEXT = 4096;
+const MAX_INTERPRETER_ROOTS = 32;
 const BIGINT_STAT_OPTIONS = Object.freeze({ bigint: true });
 
 export class ConfigError extends Error {
@@ -125,7 +126,7 @@ export function parseJsonFile(filePath, label = 'config', { rejectSymlink = fals
 export function validateConfig(config) {
   if (!isPlainObject(config)) throw new ConfigError('Config must be a JSON object');
   assertSafeKeys(config);
-  assertAllowedKeys(config, ['providers', 'profiles', 'default', 'limits'], 'Config');
+  assertAllowedKeys(config, ['providers', 'profiles', 'default', 'limits', 'verifier'], 'Config');
   for (const key of ['providers', 'profiles']) if (!isPlainObject(config[key])) throw new ConfigError(`Config.${key} must be an object`);
   assertSafeKeys(config.providers);
   assertSafeKeys(config.profiles);
@@ -139,6 +140,28 @@ export function validateConfig(config) {
   numeric(config.limits.maxTurns, 'limits.maxTurns', 1, 1000, true);
   numeric(config.limits.timeoutMinutes, 'limits.timeoutMinutes', 1, 1440);
   numeric(config.limits.maxUsd, 'limits.maxUsd', 0, 10000);
+  if (config.verifier !== undefined) {
+    if (!isPlainObject(config.verifier)) throw new ConfigError('Config.verifier must be an object');
+    assertSafeKeys(config.verifier);
+    assertAllowedKeys(config.verifier, ['interpreterRoots'], 'Config.verifier');
+    const roots = config.verifier.interpreterRoots;
+    // An allowlist of directories a caller may declare as `verifierInterpreter`
+    // (a virtualenv or interpreter the sandbox may then read and execute). Empty
+    // or absent means no restriction beyond the built-in protections.
+    if (
+      roots !== undefined &&
+      (!Array.isArray(roots) ||
+        roots.length > MAX_INTERPRETER_ROOTS ||
+        roots.some(
+          (root) =>
+            !boundedText(root, MAX_PATH_TEXT) || !isAbsolute(root) || /[\x00-\x1f\x7f]/.test(root) || root.split(/[\\/]/).includes('..'),
+        ))
+    )
+      throw new ConfigError(
+        `Config.verifier.interpreterRoots must be at most ${MAX_INTERPRETER_ROOTS} absolute paths without ".." segments`,
+        'E_CONFIG_VERIFIER',
+      );
+  }
   for (const [name, provider] of Object.entries(config.providers)) {
     if (
       !boundedText(name, MAX_NAME) ||
@@ -173,6 +196,8 @@ export function validateConfig(config) {
     if (!config.providers[profile.provider]) throw new ConfigError(`Profile ${name} refers to unknown provider: ${profile.provider}`);
     if (profile.effort !== undefined && !['normal', 'high'].includes(profile.effort))
       throw new ConfigError(`Profile ${name}.effort must be normal or high`);
+    const violation = modelPolicyViolation({ baseUrl: config.providers[profile.provider].baseUrl, model: profile.model });
+    if (violation) throw new ConfigError(`Profile ${name}: ${violation}`, 'E_CONFIG_MODEL_POLICY');
   }
   return config;
 }

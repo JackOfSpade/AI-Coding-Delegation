@@ -27,6 +27,9 @@ test('tool definitions have stable names and read/edit protects concurrent write
     ['read_file', 'list_dir', 'glob', 'grep', 'edit_file', 'write_file', 'run_command', 'finish'],
   );
   assert.match(TOOL_DEFINITIONS[0].function.description, /\[truncated; next offset N\].*exactly offset N/);
+  // The advertised bound is the enforced one: a schema-valid limit must never be refused by the tool.
+  assert.equal(TOOL_DEFINITIONS[0].function.parameters.properties.limit.maximum, 64_000);
+  assert.match(TOOL_DEFINITIONS[0].function.description, /limit is a byte count of at most 64000 per call/);
   assert.match(TOOL_DEFINITIONS[5].function.description, /one complete owned repository file/);
   assert.match(TOOL_DEFINITIONS[5].function.description, /Put all source content in content, never in prose/);
   const { dir, tools } = await fixture();
@@ -666,4 +669,90 @@ test('directory traversal is bounded and reports incomplete listings', async () 
   assert.match(await tools.list_dir({ path: '.' }), /\[truncated after 500 entries\]/);
   assert.match(await tools.glob({ pattern: 'many-*.txt' }), /\[truncated: result, traversal, or depth limit reached\]/);
   assert.match(await tools.grep({ pattern: 'not-present' }), /\[file discovery truncated before all files were searched\]/);
+});
+
+test('lineByteWindow returns exact byte windows for a line range and is not a worker tool', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-window-'));
+  await writeFile(path.join(dir, 'a.txt'), 'one\ntwo\nthree\n');
+  await writeFile(path.join(dir, 'crlf.txt'), 'one\r\ntwo\r\nthree');
+  await writeFile(path.join(dir, 'multi.txt'), 'é€\nnext\n');
+  await writeFile(path.join(dir, 'bin.txt'), Buffer.from([0x61, 0x0a, 0x00, 0x0a]));
+  await writeFile(path.join(dir, '.env'), 'A=1\n');
+  await writeFile(path.join(dir, 'empty.txt'), '');
+  const tools = new LocalTools({ repoPath: dir, ownedPaths: ['*.txt'] });
+  assert.deepEqual(await tools.lineByteWindow({ path: 'a.txt', startLine: 1, endLine: 1 }), { offset: 0, bytes: 4 });
+  assert.deepEqual(await tools.lineByteWindow({ path: 'a.txt', startLine: 2, endLine: 3 }), { offset: 4, bytes: 10 });
+  assert.deepEqual(await tools.lineByteWindow({ path: 'a.txt', startLine: 2, endLine: 99 }), { offset: 4, bytes: 10 });
+  assert.equal(
+    await tools.lineByteWindow({ path: 'a.txt', startLine: 4, endLine: 5 }),
+    null,
+    'the empty line after a trailing newline is past the end',
+  );
+  assert.equal(await tools.lineByteWindow({ path: 'a.txt', startLine: 50, endLine: 60 }), null);
+  assert.deepEqual(await tools.lineByteWindow({ path: 'crlf.txt', startLine: 2, endLine: 3 }), { offset: 5, bytes: 10 });
+  assert.deepEqual(await tools.lineByteWindow({ path: 'multi.txt', startLine: 2, endLine: 2 }), { offset: 6, bytes: 5 });
+  assert.equal(await tools.lineByteWindow({ path: 'empty.txt', startLine: 1, endLine: 1 }), null);
+  await assert.rejects(() => tools.lineByteWindow({ path: 'a.txt', startLine: 0, endLine: 1 }), /startLine and endLine/);
+  await assert.rejects(() => tools.lineByteWindow({ path: 'a.txt', startLine: 3, endLine: 2 }), /startLine and endLine/);
+  await assert.rejects(() => tools.lineByteWindow({ path: '.env', startLine: 1, endLine: 1 }), /denied/);
+  await assert.rejects(() => tools.lineByteWindow({ path: 'bin.txt', startLine: 1, endLine: 3 }), /binary/);
+  await assert.rejects(() => tools.lineByteWindow({ path: 'missing.txt', startLine: 1, endLine: 1 }));
+  // The window agrees with read_file: reading at the offset starts on the requested line.
+  const { offset } = await tools.lineByteWindow({ path: 'a.txt', startLine: 3, endLine: 3 });
+  assert.equal(await tools.read_file({ path: 'a.txt', offset }), 'three\n');
+  // A window offset never reveals what a whole-file read would redact: read_file scans from byte zero
+  // whatever the offset, so a page starting after a secret-bearing line is the same text as that tail of the full read.
+  await writeFile(
+    path.join(dir, 'secrets.txt'),
+    'intro\napi_token=sk-live-abcdef0123456789\nAuthorization: Bearer abcdef.ghijkl.mnopqr\nplain tail\n',
+  );
+  const full = await tools.read_file({ path: 'secrets.txt' });
+  assert.match(full, /\[REDACTED\]/);
+  assert.doesNotMatch(full, /abcdef0123456789|ghijkl/);
+  for (const startLine of [2, 3, 4]) {
+    const window = await tools.lineByteWindow({ path: 'secrets.txt', startLine, endLine: startLine });
+    const paged = await tools.read_file({ path: 'secrets.txt', offset: window.offset });
+    assert.doesNotMatch(paged, /abcdef0123456789|ghijkl/, `line ${startLine}`);
+    assert.ok(full.endsWith(paged), `line ${startLine} reads as the tail of the full read`);
+  }
+  // Server-only: the worker is never offered it.
+  for (const options of [{}, { allowCommand: false, readOnly: true }])
+    assert.equal(
+      availableToolDefinitions(options).some((tool) => tool.function.name === 'lineByteWindow'),
+      false,
+    );
+});
+test('run_command timeouts are capped at 900 s, in the schema and at execution', async () => {
+  const definition = TOOL_DEFINITIONS.find((tool) => tool.function.name === 'run_command');
+  assert.equal(definition.function.parameters.properties.timeoutSec.maximum, 900);
+  const seen = [];
+  const tools = new LocalTools({
+    repoPath: (await fixture()).dir,
+    ownedPaths: ['**'],
+    runCommand: async (args) => {
+      seen.push(args.timeoutSec);
+      return 'ok';
+    },
+  });
+  await tools.run_command({ command: 'x' });
+  await tools.run_command({ command: 'x', timeoutSec: 900 });
+  assert.deepEqual(seen, [60, 900], 'the default is a minute and 900 is accepted as given');
+  // Over-long requests are clamped, not rejected: the old rejection carried no
+  // hint, so a worker re-sending it looped until the loop guard failed the job.
+  await tools.run_command({ command: 'x', timeoutSec: 901 });
+  await tools.run_command({ command: 'x', timeoutSec: 3600 });
+  assert.deepEqual(seen, [60, 900, 900, 900], 'timeouts above the cap run at the cap');
+  for (const bad of [-1, 1.5, '60'])
+    await assert.rejects(() => tools.run_command({ command: 'x', timeoutSec: bad }), /timeoutSec must be an integer between 0 and 900/);
+  assert.deepEqual(seen, [60, 900, 900, 900], 'a malformed timeout never reaches the runner');
+});
+
+test('read_file accepts its advertised maximum limit and refuses anything above it with the bound named', async () => {
+  const { dir } = await fixture();
+  await writeFile(path.join(dir, 'big.txt'), 'a'.repeat(100_000));
+  const tools = new LocalTools({ repoPath: dir, ownedPaths: ['**'], gitExec: () => ({ status: 1, stdout: '' }) });
+  const advertised = TOOL_DEFINITIONS[0].function.parameters.properties.limit.maximum;
+  assert.match(await tools.read_file({ path: 'big.txt', limit: advertised }), /\[truncated; next offset \d+\]$/);
+  await assert.rejects(() => tools.read_file({ path: 'big.txt', limit: advertised + 1 }), /limit must be an integer between 0 and 64000/);
+  await assert.rejects(() => tools.read_file({ path: 'big.txt', limit: 256_000 }), /limit must be an integer between 0 and 64000/);
 });

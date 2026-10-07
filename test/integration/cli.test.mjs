@@ -390,3 +390,218 @@ test('ordinary doctor shuts down only the core it created', async () => {
   });
   assert.equal(injectedShutdowns, 0);
 });
+test('CLI maps the verifier options, and omits them entirely when absent', async () => {
+  let seen;
+  const run = (extra) =>
+    runCli(['start', '--task', 'x', '--ownedPaths', '["src/**"]', '--testCommand', 'node --test', ...extra], {
+      core: { start: async (value) => (seen = value) },
+      stdout: sink().stream,
+      stderr: sink().stream,
+    });
+  assert.equal(await run(['--verifierMode', 'baseline-diff', '--verifierTimeoutSec', '120']), 0);
+  assert.equal(seen.verifierMode, 'baseline-diff');
+  assert.equal(seen.verifierTimeoutSec, 120);
+  assert.equal(await run([]), 0);
+  assert.equal(Object.hasOwn(seen, 'verifierMode'), false);
+  assert.equal(Object.hasOwn(seen, 'verifierTimeoutSec'), false);
+});
+test('CLI maps --turnPolicy into the budget and rejects a bad value or a --budget conflict before any core call', async () => {
+  let seen;
+  const run = (extra, core = { start: async (value) => (seen = value) }, err = sink()) =>
+    runCli(['start', '--task', 'x', '--ownedPaths', '["src/**"]', ...extra], { core, stdout: sink().stream, stderr: err.stream });
+  assert.equal(await run(['--turnPolicy', 'auto']), 0);
+  assert.deepEqual(seen.budget, { turnPolicy: 'auto' });
+  assert.equal(await run(['--turnPolicy', 'fixed', '--maxTurns', '30', '--maxUsd', '2']), 0);
+  assert.deepEqual(seen.budget, { maxUsd: 2, maxTurns: 30, turnPolicy: 'fixed' });
+  assert.equal(await run([]), 0);
+  assert.equal(seen.budget, undefined);
+  const never = new Proxy(
+    {},
+    {
+      get() {
+        throw new Error('core must not be called');
+      },
+    },
+  );
+  for (const [flags, message] of [
+    [['--turnPolicy', 'x'], /turnPolicy must be auto or fixed/],
+    [['--budget', '{"maxUsd":1}', '--turnPolicy', 'auto'], /cannot be combined with individual budget options/],
+  ]) {
+    const err = sink();
+    assert.equal(await run(flags, never, err), 2, flags.join(' '));
+    assert.match(err.get(), message);
+  }
+});
+test('doctor output carries the verifier temp probe from core health', async () => {
+  const out = sink();
+  const verifierTmp = { status: 'writable', reason: 'per-run-tmpdir-writable', systemTmp: 'denied', gitInit: 'ok', note: 'n' };
+  const status = await runCli(['doctor'], {
+    core: { job: async () => ({ health: { worker: true, sandbox: 'macos', verifierTmp } }) },
+    stdout: out.stream,
+    stderr: sink().stream,
+  });
+  assert.equal(status, 0);
+  assert.deepEqual(JSON.parse(out.get()).verifierTmp, verifierTmp);
+});
+test('CLI rejects invalid verifier options before any core call', async () => {
+  const cases = [
+    [['--verifierTimeoutSec', 'abc'], /verifierTimeoutSec must be an integer from 5 to 1800/],
+    [['--verifierTimeoutSec', '4'], /verifierTimeoutSec must be an integer from 5 to 1800/],
+    [['--verifierTimeoutSec', '1801'], /verifierTimeoutSec must be an integer from 5 to 1800/],
+    [['--verifierTimeoutSec', '60.5'], /verifierTimeoutSec must be an integer from 5 to 1800/],
+    [['--verifierMode', 'bogus'], /verifierMode must be standard or baseline-diff/],
+    [['--verifierMode', 'baseline-diff', '--unsafe-policy-only-verifier'], /cannot use unsafePolicyOnlyVerifier/],
+  ];
+  for (const [flags, message] of cases) {
+    const err = sink();
+    let calls = 0;
+    const status = await runCli(['start', '--task', 'x', '--ownedPaths', '["src/**"]', '--testCommand', 'true', ...flags], {
+      core: new Proxy(
+        {},
+        {
+          get() {
+            calls += 1;
+            throw new Error('core must not be called');
+          },
+        },
+      ),
+      stdout: sink().stream,
+      stderr: err.stream,
+    });
+    assert.equal(status, 2, flags.join(' '));
+    assert.equal(calls, 0);
+    assert.match(err.get(), message);
+  }
+});
+test('CLI forwards a validated log window as numbers and rejects a bad one before any core call', async () => {
+  const seen = [];
+  const core = { job: async (...value) => (seen.push(value), {}) };
+  const ok = await runCli(['job', 'job1', '--include', 'log', '--tail', '5', '--limit', '3000'], {
+    core,
+    stdout: sink().stream,
+    stderr: sink().stream,
+  });
+  assert.equal(ok, 0);
+  assert.deepEqual(seen[0], ['job1', { include: 'log', tail: 5, limit: 3000, detail: 'full', repoPath: undefined }]);
+  const bare = await runCli(['job', 'job1', '--include', 'log'], { core, stdout: sink().stream, stderr: sink().stream });
+  assert.equal(bare, 0);
+  assert.deepEqual(Object.keys(seen[1][1]).sort(), ['detail', 'include', 'repoPath'], 'no window flags, none forwarded');
+  const zero = await runCli(['job', 'job1', '--include', 'log', '--tail', '0'], { core, stdout: sink().stream, stderr: sink().stream });
+  assert.equal(zero, 0);
+  assert.equal(seen[2][1].tail, 0);
+  assert.equal(seen.length, 3);
+
+  const bad = [
+    [['job', 'job1', '--tail', '5'], /job --tail\/--limit require --include log/],
+    [['job', 'job1', '--include', 'diff', '--limit', '3000'], /job --tail\/--limit require --include log/],
+    [['job', 'job1', '--include', 'log', '--tail', 'abc'], /tail must be an integer from 0 to 1000/],
+    [['job', 'job1', '--include', 'log', '--tail', '1001'], /tail must be an integer from 0 to 1000/],
+    [['job', 'job1', '--include', 'log', '--tail', '1.5'], /tail must be an integer from 0 to 1000/],
+    [['job', 'job1', '--include', 'log', '--limit', '10'], /limit must be an integer from 2000 to 60000/],
+    [['job', 'job1', '--include', 'log', '--limit', '60001'], /limit must be an integer from 2000 to 60000/],
+    [['job', '--include', 'log', '--tail', '5'], /job --include requires a job id/],
+  ];
+  for (const [argv, message] of bad) {
+    const err = sink();
+    const code = await runCli(argv, { core, stdout: sink().stream, stderr: err.stream });
+    assert.equal(code, 2, argv.join(' '));
+    assert.match(err.get(), message, argv.join(' '));
+  }
+  assert.equal(seen.length, 3, 'a rejected request never reaches core');
+});
+test('CLI lists every job by default, forwards --all and --maxJobs, and rejects misuse before any core call', async () => {
+  assert.deepEqual(parseArgs(['job', '--all']), { command: 'job', positionals: [], flags: { all: true } });
+  assert.deepEqual(parseArgs(['job', '--maxJobs', '5']).flags, { maxJobs: '5' });
+  const seen = [];
+  const core = { job: async (...value) => (seen.push(value), {}) };
+  const run = (argv) => runCli(argv, { core, stdout: sink().stream, stderr: sink().stream });
+  assert.equal(await run(['job']), 0);
+  // A fresh CLI process has no "session", so the terminal list is complete unless asked otherwise.
+  assert.deepEqual(seen[0], [undefined, { include: undefined, detail: 'full', all: true, repoPath: process.cwd() }]);
+  assert.equal(await run(['job', '--all=false']), 0);
+  assert.equal(seen[1][1].all, false);
+  assert.equal(await run(['job', '--maxJobs', '7']), 0);
+  assert.equal(seen[2][1].maxJobs, 7);
+  assert.equal(seen[2][1].all, true);
+  assert.equal(await run(['job', 'job1']), 0);
+  assert.deepEqual(Object.keys(seen[3][1]).sort(), ['detail', 'include', 'repoPath'], 'a single-job read forwards no list option');
+  assert.equal(seen.length, 4);
+  const bad = [
+    [['job', 'job1', '--all'], /job --all and --maxJobs apply only to the job list/],
+    [['job', 'job1', '--maxJobs', '5'], /job --all and --maxJobs apply only to the job list/],
+    [['job', '--maxJobs', '0'], /maxJobs/],
+    [['job', '--maxJobs', '101'], /maxJobs/],
+    [['job', '--maxJobs', 'abc'], /maxJobs/],
+    [['job', '--maxJobs', '1.5'], /maxJobs/],
+    [['job', '--all', 'false'], /boolean text/],
+  ];
+  for (const [argv, message] of bad) {
+    const err = sink();
+    const code = await runCli(argv, { core, stdout: sink().stream, stderr: err.stream });
+    assert.equal(code, 2, argv.join(' '));
+    assert.match(err.get(), message, argv.join(' '));
+  }
+  assert.equal(seen.length, 4, 'a rejected request never reaches core');
+});
+
+test('CLI retrospective reads the newest jobs or the named ones, prints the digest then the skeleton, and records nothing itself', async () => {
+  const seen = [];
+  const digest = {
+    v: 1,
+    totals: { jobs: 2 },
+    maintainerPromptWarranted: true,
+    maintainerPromptSkeleton: 'Improve Offload based on one real session',
+  };
+  const core = {
+    retrospective: async (options) => (seen.push(['digest', options]), digest),
+    retrospectiveHistory: async (options) => (
+      seen.push(['history', options]),
+      { path: '/state/retrospectives.jsonl', records: [{ v: 1 }], aggregate: { retrospectives: 1, warranted: 1, signals: [] } }
+    ),
+  };
+  const run = async (argv) => {
+    const out = sink(),
+      err = sink();
+    const code = await runCli(argv, { core, stdout: out.stream, stderr: err.stream });
+    return { code, out: out.get(), err: err.get() };
+  };
+  const newest = await run(['retrospective']);
+  assert.equal(newest.code, 0, newest.err);
+  // A fresh CLI process has no session, so it reads the newest jobs of the working repository, and never persists.
+  assert.deepEqual(seen[0], ['digest', { last: 5, repoPath: process.cwd(), persist: false }]);
+  const [json, skeleton] = newest.out.split('\n\n--- maintainer prompt skeleton (edit before pasting) ---\n');
+  assert.deepEqual(JSON.parse(json), { v: 1, totals: { jobs: 2 }, maintainerPromptWarranted: true });
+  assert.equal(skeleton, 'Improve Offload based on one real session\n');
+  assert.equal((await run(['retrospective', '--last', '3', '--repoPath', '/repo'])).code, 0);
+  assert.deepEqual(seen[1], ['digest', { last: 3, repoPath: '/repo', persist: false }]);
+  assert.equal((await run(['retrospective', '--jobs', 'oj-1,oj-2'])).code, 0);
+  assert.deepEqual(seen[2], ['digest', { jobIds: ['oj-1', 'oj-2'], repoPath: process.cwd(), persist: false }]);
+
+  const list = await run(['retrospective', 'list', '--last', '20']);
+  assert.deepEqual(JSON.parse(list.out), { path: '/state/retrospectives.jsonl', retrospectives: 1, warranted: 1, signals: [] });
+  assert.deepEqual(seen[3], ['history', { limit: 20 }]);
+  assert.deepEqual(JSON.parse((await run(['retrospective', 'export'])).out), { path: '/state/retrospectives.jsonl', records: [{ v: 1 }] });
+  assert.deepEqual(seen[4], ['history', {}]);
+
+  const bad = [
+    [['retrospective', 'dump'], /retrospective accepts only list or export/],
+    [['retrospective', 'list', 'export'], /accepts at most one argument/],
+    [['retrospective', '--jobs', 'oj-1', '--last', '2'], /--jobs cannot be combined/],
+    [['retrospective', 'list', '--jobs', 'oj-1'], /--jobs cannot be combined/],
+    [['retrospective', '--jobs', 'oj-1,oj-1'], /distinct valid job ids/],
+    [['retrospective', '--jobs', 'bad id'], /distinct valid job ids/],
+    [['retrospective', '--jobs', Array.from({ length: 17 }, (_, index) => `oj-${index}`).join(',')], /distinct valid job ids/],
+    [['retrospective', '--last', '0'], /--last/],
+    [['retrospective', '--last', '17'], /--last/],
+    [['retrospective', 'list', '--last', '1001'], /--last/],
+    [['retrospective', 'list', '--repoPath', '/repo'], /takes no --repoPath/],
+    [['retrospective', '--bogus', '1'], /unknown option --bogus for retrospective/],
+    [['job', 'oj-1', '--include', 'retrospective'], /job --include must be/],
+  ];
+  for (const [argv, message] of bad) {
+    const result = await run(argv);
+    assert.equal(result.code, 2, argv.join(' '));
+    assert.match(result.err, message, argv.join(' '));
+  }
+  assert.equal(seen.length, 5, 'a rejected request never reaches core');
+});

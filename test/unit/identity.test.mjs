@@ -47,3 +47,45 @@ test('runtime identity rejects a final symlink and oversized package artifact', 
     await Promise.all([rm(linked, { recursive: true, force: true }), rm(oversized, { recursive: true, force: true })]);
   }
 });
+
+test('runtime identity advertises the baseline verifier without a schema revision bump', () => {
+  const identity = runtimeIdentity();
+  assert.equal(identity.capabilities.baselineVerifier, true);
+  assert.equal(identity.schemaRevision, 2, 'an additive opt-in feature must not invalidate existing skill preflights');
+});
+
+test('runtime identity advertises applyThenVerify as an additive capability', () => {
+  const identity = runtimeIdentity();
+  assert.equal(identity.capabilities.applyThenVerify, true);
+  assert.equal(identity.schemaRevision, 2, 'new offload_apply properties are additive: no schema revision bump');
+});
+
+test('runtime identity advertises applying a FAILED job as an additive capability', () => {
+  const identity = runtimeIdentity();
+  assert.equal(identity.capabilities.failedApply, true);
+  assert.equal(identity.schemaRevision, 2, 'offload_apply on a FAILED job is additive: no schema revision bump');
+});
+
+test('runtime identity advertises failure diagnostics as an additive capability', () => {
+  const identity = runtimeIdentity();
+  assert.equal(identity.capabilities.failureDiagnostics, true);
+  assert.equal(identity.schemaRevision, 2, 'tail/limit and continue-on-FAILED are additive: no schema revision bump');
+});
+
+test('runtime identity advertises the timing breakdown as an additive capability', () => {
+  const identity = runtimeIdentity();
+  assert.equal(identity.capabilities.timingBreakdown, true);
+  assert.equal(identity.schemaRevision, 2, 'timing fields and progress.stall are additive: no schema revision bump');
+});
+
+test('runtime identity advertises verifierInterpreter as an additive capability', () => {
+  const identity = runtimeIdentity();
+  assert.equal(identity.capabilities.verifierInterpreter, true);
+  assert.equal(identity.schemaRevision, 2, 'a new optional start/health parameter is additive: no schema revision bump');
+});
+
+test('runtime identity advertises the retrospective digest as an additive capability', () => {
+  const identity = runtimeIdentity();
+  assert.equal(identity.capabilities.retrospective, true);
+  assert.equal(identity.schemaRevision, 2, 'include "retrospective" and jobIds are additive: no schema revision bump');
+});

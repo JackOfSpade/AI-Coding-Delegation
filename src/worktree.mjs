@@ -1,8 +1,11 @@
-import { chmodSync, lstatSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdtempSync, readlinkSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { diffTreeFiles, diffTrees, git, snapshotGitEnv, snapshotWorkingTree } from './git-snapshot.mjs';
+import { matchesAny, normalizePath } from './glob.mjs';
+import { DEFAULT_DENY_READ } from './policy.mjs';
+import { redactText, stripTerminalControls } from './redact.mjs';
 
 const TREE_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 const nativeRealpath = realpathSync.native || realpathSync;
@@ -59,8 +62,19 @@ export function createIsolatedWorktree({
     if (error instanceof WorktreeIsolationError) throw error;
     throw new WorktreeIsolationError('Could not create isolated worktree', 'E_WORKTREE_CREATE');
   }
+  // Best effort and never fatal: a job without dependencies is still a valid
+  // job, and its report states why the verifier could not import them.
+  const linked = linkPrimaryNodeModules(primaryPath, privateRoot);
+  const dependencies = {
+    ...linked,
+    // Same answer a primary gets from health before starting, recorded with the
+    // job so its start response cannot disagree with it.
+    verifierDeps:
+      linked.nodeModules === 'link-failed' ? { verifierDeps: 'missing', reason: 'link-failed' } : verifierDependencyStatus(primaryPath),
+  };
 
   return isolatedHandle({
+    dependencies,
     primaryPath,
     workspacePath,
     baselineTree,
@@ -93,6 +107,7 @@ export function openIsolatedWorktree({ repoPath, workspacePath, baselineTree, se
     throw new WorktreeIsolationError('workspacePath does not share the primary repository object database', 'E_WORKTREE_RECOVERY');
   assertPinnedTrees(primaryPath, location.privateRoot, baselineTree, seedTree);
   return isolatedHandle({
+    dependencies: { nodeModules: isolatedDependencyReadPaths(location.workspacePath, primaryPath).length ? 'linked' : 'not-linked' },
     primaryPath,
     workspacePath: location.workspacePath,
     baselineTree,
@@ -130,6 +145,7 @@ export function cleanupIsolatedWorktree({ repoPath, workspacePath, tempRoot = tm
 }
 
 function isolatedHandle({
+  dependencies = { nodeModules: 'not-linked' },
   primaryPath,
   workspacePath,
   baselineTree,
@@ -144,33 +160,15 @@ function isolatedHandle({
   const ensureOpen = () => {
     if (closed) throw new WorktreeIsolationError('Worktree has already been cleaned up', 'E_WORKTREE_CLOSED');
   };
-  const assertWorkspaceTree = (tree) => {
-    assertTree(tree);
-    assertTreeExists(primaryPath, tree, 'E_WORKTREE_TREE');
-    return tree;
-  };
-  const changesFor = (afterTree, paths) => {
-    assertWorkspaceTree(afterTree);
-    const allFiles = diffTreeFiles(primaryPath, baselineTree, afterTree);
-    const files = selectChangedFiles(allFiles, paths);
-    return {
-      baselineTree,
-      afterTree,
-      files,
-      patch:
-        paths === undefined
-          ? diffTrees(primaryPath, baselineTree, afterTree)
-          : files.length
-            ? diffTrees(primaryPath, baselineTree, afterTree, { paths: files.map((file) => file.path), literalPaths: true })
-            : Buffer.alloc(0),
-    };
-  };
+  const changesFor = (afterTree, paths) => treeChanges(primaryPath, baselineTree, afterTree, paths);
 
   const api = {
     repoPath: primaryPath,
     path: workspacePath,
     baselineTree,
     seedTree,
+    /** `{ nodeModules }` outcome of the read-only dependency link made at creation. */
+    dependencies,
 
     /** Snapshot all non-ignored workspace files without modifying its index. */
     snapshot() {
@@ -215,28 +213,7 @@ function isolatedHandle({
      */
     verifyPrimary(afterTree, { paths: requestedPaths } = {}) {
       ensureOpen();
-      let change;
-      try {
-        change = changesFor(afterTree, requestedPaths);
-      } catch (error) {
-        if (error instanceof WorktreeIsolationError) throw error;
-        throw new WorktreeIsolationError('Could not inspect changed paths', 'E_WORKTREE_DIFF');
-      }
-      const paths = change.files.map((file) => file.path);
-      let primaryTree;
-      try {
-        primaryTree = snapshotWorkingTree(primaryPath);
-      } catch {
-        throw new WorktreeIsolationError('Could not snapshot primary working tree', 'E_WORKTREE_PRIMARY_SNAPSHOT');
-      }
-      if (paths.length === 0) return { ok: true, baselineTree, primaryTree, conflicts: [] };
-      let conflictFiles;
-      try {
-        conflictFiles = diffTreeFilesForPaths(primaryPath, baselineTree, primaryTree, paths);
-      } catch {
-        throw new WorktreeIsolationError('Could not compare primary working tree', 'E_WORKTREE_VERIFY');
-      }
-      return { ok: conflictFiles.length === 0, baselineTree, primaryTree, conflicts: conflictFiles };
+      return verifyPrimaryTree(primaryPath, baselineTree, afterTree, requestedPaths);
     },
 
     /**
@@ -245,37 +222,7 @@ function isolatedHandle({
      */
     integrate(afterTree, { paths: requestedPaths } = {}) {
       ensureOpen();
-      const verification = api.verifyPrimary(afterTree, { paths: requestedPaths });
-      if (!verification.ok) {
-        throw new WorktreeIsolationError(
-          `Primary working tree changed on ${verification.conflicts.length} worker-touched path(s)`,
-          'E_WORKTREE_CONFLICT',
-        );
-      }
-      let change;
-      try {
-        // Finish every fallible diff calculation before mutating the primary
-        // checkout.  A caller can then treat a successful `git apply` as the
-        // sole primary-write boundary and journal it without a later
-        // best-effort computation obscuring whether the patch landed.
-        change = changesFor(afterTree, requestedPaths);
-      } catch (error) {
-        if (error instanceof WorktreeIsolationError) throw error;
-        throw new WorktreeIsolationError('Could not create integration patch', 'E_WORKTREE_DIFF');
-      }
-      const { patch } = change;
-      if (patch.length === 0) return { applied: false, dryRun: true, files: [] };
-      try {
-        // Feed both Git operations the exact generated bytes. A private file
-        // still leaves a check/apply TOCTOU window if it is opened twice.
-        // `--check` remains a separate required gate before mutation.
-        run(primaryPath, ['apply', '--check', '--whitespace=nowarn'], 'E_WORKTREE_APPLY_CHECK', { input: patch });
-        run(primaryPath, ['apply', '--whitespace=nowarn'], 'E_WORKTREE_APPLY', { input: patch });
-      } catch (error) {
-        if (error instanceof WorktreeIsolationError) throw error;
-        throw new WorktreeIsolationError('Could not integrate isolated worktree patch', 'E_WORKTREE_APPLY');
-      }
-      return { applied: true, dryRun: false, files: change.files, primaryBefore: verification.primaryTree };
+      return integrateTree(primaryPath, baselineTree, afterTree, requestedPaths);
     },
 
     /** Remove this private linked worktree and prune stale Git administration. */
@@ -289,6 +236,314 @@ function isolatedHandle({
     },
   };
   return Object.freeze(api);
+}
+
+function treeChanges(primaryPath, baselineTree, afterTree, paths) {
+  assertTree(afterTree, 'afterTree');
+  assertTreeExists(primaryPath, afterTree, 'E_WORKTREE_TREE');
+  const allFiles = diffTreeFiles(primaryPath, baselineTree, afterTree);
+  const files = selectChangedFiles(allFiles, paths);
+  return {
+    baselineTree,
+    afterTree,
+    files,
+    patch:
+      paths === undefined
+        ? diffTrees(primaryPath, baselineTree, afterTree)
+        : files.length
+          ? diffTrees(primaryPath, baselineTree, afterTree, { paths: files.map((file) => file.path), literalPaths: true })
+          : Buffer.alloc(0),
+  };
+}
+
+/**
+ * Ensure the primary working tree still equals the baseline on every path the
+ * patch would touch. Unrelated primary edits deliberately pass.
+ */
+function verifyPrimaryTree(primaryPath, baselineTree, afterTree, requestedPaths) {
+  let change;
+  try {
+    change = treeChanges(primaryPath, baselineTree, afterTree, requestedPaths);
+  } catch (error) {
+    if (error instanceof WorktreeIsolationError) throw error;
+    throw new WorktreeIsolationError('Could not inspect changed paths', 'E_WORKTREE_DIFF');
+  }
+  const paths = change.files.map((file) => file.path);
+  let primaryTree;
+  try {
+    primaryTree = snapshotWorkingTree(primaryPath);
+  } catch {
+    throw new WorktreeIsolationError('Could not snapshot primary working tree', 'E_WORKTREE_PRIMARY_SNAPSHOT');
+  }
+  if (paths.length === 0) return { ok: true, baselineTree, primaryTree, conflicts: [] };
+  let conflictFiles;
+  try {
+    conflictFiles = diffTreeFilesForPaths(primaryPath, baselineTree, primaryTree, paths);
+  } catch {
+    throw new WorktreeIsolationError('Could not compare primary working tree', 'E_WORKTREE_VERIFY');
+  }
+  return { ok: conflictFiles.length === 0, baselineTree, primaryTree, conflicts: conflictFiles };
+}
+
+function integrateTree(primaryPath, baselineTree, afterTree, requestedPaths, { dryRun = false } = {}) {
+  const verification = verifyPrimaryTree(primaryPath, baselineTree, afterTree, requestedPaths);
+  if (!verification.ok) {
+    throw new WorktreeIsolationError(
+      `Primary working tree changed on ${verification.conflicts.length} worker-touched path(s)`,
+      'E_WORKTREE_CONFLICT',
+    );
+  }
+  let change;
+  try {
+    // Finish every fallible diff calculation before mutating the primary
+    // checkout.  A caller can then treat a successful `git apply` as the
+    // sole primary-write boundary and journal it without a later
+    // best-effort computation obscuring whether the patch landed.
+    change = treeChanges(primaryPath, baselineTree, afterTree, requestedPaths);
+  } catch (error) {
+    if (error instanceof WorktreeIsolationError) throw error;
+    throw new WorktreeIsolationError('Could not create integration patch', 'E_WORKTREE_DIFF');
+  }
+  const { patch } = change;
+  if (patch.length === 0) return { applied: false, dryRun: true, files: [] };
+  try {
+    // Feed both Git operations the exact generated bytes. A private file
+    // still leaves a check/apply TOCTOU window if it is opened twice.
+    // `--check` remains a separate required gate before mutation.
+    run(primaryPath, ['apply', '--check', '--whitespace=nowarn'], 'E_WORKTREE_APPLY_CHECK', { input: patch });
+    if (dryRun) return { applied: false, dryRun: true, files: change.files };
+    run(primaryPath, ['apply', '--whitespace=nowarn'], 'E_WORKTREE_APPLY', { input: patch });
+  } catch (error) {
+    if (error instanceof WorktreeIsolationError) throw error;
+    throw new WorktreeIsolationError('Could not integrate isolated worktree patch', 'E_WORKTREE_APPLY');
+  }
+  return { applied: true, dryRun: false, files: change.files, primaryBefore: verification.primaryTree };
+}
+
+/**
+ * Integrate a previously recorded result tree into the primary checkout
+ * without a worktree. This is the late-integration path (a job whose private
+ * worktree was already removed): identical conflict check, dry-run, and
+ * exact-bytes `git apply` as an in-job integration, anchored to the job's
+ * original baseline tree. `paths` is required: only job-owned paths may land.
+ */
+export function integrateRecordedTree({ repoPath, baselineTree, afterTree, paths, dryRun = false } = {}) {
+  const primaryPath = canonicalRepo(repoPath);
+  assertTree(baselineTree);
+  assertTree(afterTree, 'afterTree');
+  assertTreeExists(primaryPath, baselineTree, 'E_WORKTREE_TREE');
+  if (!Array.isArray(paths) || !paths.length) throw new WorktreeIsolationError('integration paths are required', 'E_WORKTREE_PATHS');
+  return integrateTree(primaryPath, baselineTree, afterTree, paths, { dryRun: dryRun === true });
+}
+
+/**
+ * Make the primary checkout's installed `node_modules` resolvable from a
+ * private worktree without putting it inside that worktree.
+ *
+ * A Git worktree contains only tracked/non-ignored files, so a gitignored
+ * `node_modules` is absent and a verifier cannot import its dependencies (and
+ * the worker has no network to install them). Node and most bundlers resolve
+ * packages by walking *up* from the importing file, so a symlink in the
+ * server-owned private root, the workspace's parent, is found without touching
+ * the workspace tree, its index, snapshots, scope checks, or ignored-output
+ * accounting. The command sandbox separately grants read-only access to the
+ * link's exact target (see isolatedDependencyReadPaths); the worker can neither
+ * write the private root nor retarget the link.
+ *
+ * Only a real, current-user-owned, untracked `<repo>/node_modules` directory
+ * is linked. Anything else is skipped with a stable reason.
+ */
+export function linkPrimaryNodeModules(primaryPath, privateRoot) {
+  const source = primaryNodeModules(primaryPath);
+  if (source.reason) return { nodeModules: source.reason };
+  try {
+    symlinkSync(source.path, join(privateRoot, 'node_modules'), 'dir');
+  } catch {
+    return { nodeModules: 'link-failed' };
+  }
+  return { nodeModules: 'linked' };
+}
+
+/**
+ * The single canonical directory a command in this worktree may additionally
+ * read for dependency resolution: the target of the server-created
+ * `<privateRoot>/node_modules` link, and only when it still points at the
+ * primary repository's own `node_modules`. Returns an empty list otherwise, so
+ * a missing, replaced, or retargeted link grants nothing.
+ */
+export function isolatedDependencyReadPaths(workspacePath, repoPath) {
+  try {
+    if (typeof workspacePath !== 'string' || !isAbsolute(workspacePath) || typeof repoPath !== 'string' || !isAbsolute(repoPath)) return [];
+    const link = join(dirname(workspacePath), 'node_modules');
+    if (!lstatSync(link).isSymbolicLink()) return [];
+    const target = nativeRealpath(resolve(dirname(link), readlinkSync(link)));
+    const expected = primaryNodeModules(nativeRealpath(repoPath));
+    return !expected.reason && samePath(target, expected.path) ? [expected.path] : [];
+  } catch {
+    return [];
+  }
+}
+
+function primaryNodeModules(primaryPath) {
+  const candidate = join(primaryPath, 'node_modules');
+  let details;
+  try {
+    details = lstatSync(candidate);
+  } catch {
+    return { reason: 'absent' };
+  }
+  // A symlinked node_modules (pnpm/workspace layouts, or a hostile checkout)
+  // could point anywhere on the host: never extend read access through it.
+  if (details.isSymbolicLink() || !details.isDirectory()) return { reason: 'not-a-directory' };
+  if (typeof process.getuid === 'function' && details.uid !== process.getuid()) return { reason: 'wrong-owner' };
+  let canonical;
+  try {
+    canonical = nativeRealpath(candidate);
+  } catch {
+    return { reason: 'unresolvable' };
+  }
+  if (!samePath(canonical, candidate)) return { reason: 'not-canonical' };
+  // Tracked dependencies are ordinary repository content that the worktree
+  // already has; a read-only mirror would shadow them.
+  try {
+    if (run(primaryPath, ['ls-files', '-z', '--', 'node_modules'], 'E_WORKTREE_DEPS').length) return { reason: 'tracked' };
+  } catch {
+    return { reason: 'unresolvable' };
+  }
+  return { path: canonical };
+}
+
+const MAX_NESTED_REPORTED = 20;
+
+/**
+ * Whether a verifier running in a private worktree of this repository can
+ * resolve its installed JavaScript dependencies, decided from the primary
+ * checkout alone (no job or worktree needed) so a primary can check before it
+ * spends budget.
+ *
+ *   ok              the primary has a linkable node_modules and nothing else is
+ *                   needed (or dependencies are tracked in the repository)
+ *   partial         the root node_modules links, but nested node_modules (for
+ *                   example workspace sub-packages) exist and are NOT mounted:
+ *                   a test importing a package installed only there cannot pass
+ *   missing         a node_modules was expected but cannot be linked; `reason`
+ *                   says why (absent, not-a-directory, wrong-owner, ...)
+ *   not-applicable  no package.json: not a JavaScript project
+ */
+export function verifierDependencyStatus(repoPath) {
+  let primaryPath;
+  try {
+    primaryPath = canonicalRepo(repoPath);
+  } catch {
+    return { verifierDeps: 'missing', reason: 'unresolvable' };
+  }
+  const root = primaryNodeModules(primaryPath);
+  if (root.reason === 'tracked') return { verifierDeps: 'ok' };
+  if (root.reason === 'absent') {
+    let hasManifest = false;
+    try {
+      hasManifest = lstatSync(join(primaryPath, 'package.json')).isFile();
+    } catch {
+      /* no manifest */
+    }
+    return hasManifest ? { verifierDeps: 'missing', reason: 'absent' } : { verifierDeps: 'not-applicable' };
+  }
+  if (root.reason) return { verifierDeps: 'missing', reason: root.reason };
+  let nested = [];
+  try {
+    nested = run(primaryPath, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], 'E_WORKTREE_DEPS')
+      .split('\0')
+      .filter((entry) => /(?:^|\/)node_modules\/$/.test(entry) && entry !== 'node_modules/')
+      .map((entry) => entry.slice(0, -1));
+  } catch {
+    /* an unreadable listing must not turn a working link into a failure */
+  }
+  return nested.length
+    ? { verifierDeps: 'partial', reason: 'nested-node-modules', nested: nested.slice(0, MAX_NESTED_REPORTED), nestedCount: nested.length }
+    : { verifierDeps: 'ok' };
+}
+
+const WORKING_TREE_SAMPLE_MAX = 5;
+const WORKING_TREE_PATH_MAX = 160;
+const WORKING_TREE_TIMEOUT_MS = 5_000;
+const WORKING_TREE_MAX_BUFFER = 4 * 1024 * 1024;
+// Health must answer quickly even in a huge or unhealthy checkout, so this one
+// call is bounded much tighter than the 30 s / 64 MiB snapshot defaults. The
+// clamp wraps whichever execFile is in use, so it also holds for an injected one.
+const bounded = (execFile) => (file, args, options) =>
+  execFile(file, args, {
+    ...options,
+    timeout: Math.min(options?.timeout ?? WORKING_TREE_TIMEOUT_MS, WORKING_TREE_TIMEOUT_MS),
+    maxBuffer: Math.min(options?.maxBuffer ?? WORKING_TREE_MAX_BUFFER, WORKING_TREE_MAX_BUFFER),
+  });
+const denyShapedPath = (path) => {
+  try {
+    return matchesAny(normalizePath(path.replace(/\/+$/, '')), DEFAULT_DENY_READ, { platform: process.platform, caseInsensitive: true });
+  } catch {
+    // An unnormalizable name (control bytes) is never worth echoing.
+    return true;
+  }
+};
+
+/**
+ * Whether the primary checkout is clean, as a bounded read-only summary for
+ * health. The snapshot a job starts from is the primary as it is right now
+ * (staged, unstaged, deleted and non-ignored untracked files), so this tells a
+ * caller what dirty state the worker will inherit.
+ *
+ *   { clean, changed, staged, modified, untracked, conflicted, sample }
+ *
+ * `changed` counts status entries: a wholly untracked directory is one entry
+ * and a rename is one entry. `sample` holds at most five `XY path` strings
+ * with control characters stripped and secret-shaped names (the policy's
+ * default read-deny list) left out; the counts still include those files.
+ * File contents are never read. `{ clean: null, reason }` means the state
+ * could not be determined (never an exception: health must not fail on it).
+ * `--no-optional-locks` keeps this from refreshing the primary's index.
+ */
+export function workingTreeStatus(repoPath, { execFile = execFileSync } = {}) {
+  let primaryPath;
+  try {
+    primaryPath = canonicalRepo(repoPath);
+  } catch {
+    return { clean: null, reason: 'unresolvable' };
+  }
+  let raw;
+  try {
+    raw = git(
+      primaryPath,
+      ['--no-optional-locks', 'status', '--porcelain=v1', '-z', '--untracked-files=normal', '--ignore-submodules=dirty'],
+      {},
+      { output: 'buffer', execFile: bounded(execFile) },
+    );
+  } catch {
+    return { clean: null, reason: 'git-status-failed' };
+  }
+  const fields = Buffer.from(raw).toString('utf8').split('\0');
+  const tally = { changed: 0, staged: 0, modified: 0, untracked: 0, conflicted: 0 };
+  const sample = [];
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index];
+    if (field.length < 4 || field[2] !== ' ') continue;
+    const x = field[0],
+      y = field[1],
+      path = field.slice(3);
+    // A rename or copy is followed by its original path as a separate field.
+    if (x === 'R' || x === 'C' || y === 'R' || y === 'C') index += 1;
+    tally.changed += 1;
+    // An unmerged path is neither staged nor an ordinary modification: it
+    // counts only as conflicted. (A file staged and then edited again, MM,
+    // still counts in both staged and modified.)
+    if (x === '?' && y === '?') tally.untracked += 1;
+    else if (x === 'U' || y === 'U' || x + y === 'AA' || x + y === 'DD') tally.conflicted += 1;
+    else {
+      if (!' ?!'.includes(x)) tally.staged += 1;
+      if (!' ?!'.includes(y)) tally.modified += 1;
+    }
+    if (sample.length < WORKING_TREE_SAMPLE_MAX && !denyShapedPath(path))
+      sample.push(redactText(stripTerminalControls(`${x}${y} ${path}`)).slice(0, WORKING_TREE_PATH_MAX));
+  }
+  return { clean: tally.changed === 0, ...tally, sample };
 }
 
 /** Convenience for the normal JobManager baseline capture path. */

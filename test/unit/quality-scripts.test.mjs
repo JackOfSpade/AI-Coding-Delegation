@@ -110,6 +110,14 @@ test('strict test runner parses TAP skips and rejects every skip outside the rev
   ]);
   const result = analyzeStrictSkips(tap);
   assert.equal(result.loopbackSkips.length, 1);
+  // Every conditional skip of the real-sandbox baseline-diff test is reviewed.
+  const baselineE2e = (reason) =>
+    analyzeStrictSkips(
+      `ok 1 - end to end with the real sandboxed runner: node:test output flows through the streaming parser # SKIP ${reason}`,
+    );
+  assert.deepEqual(baselineE2e('requires a Homebrew Node on macOS').unapprovedSkips, []);
+  assert.deepEqual(baselineE2e('requires an available macOS sandbox').unapprovedSkips, []);
+  assert.equal(baselineE2e('some other reason').unapprovedSkips.length, 1);
   assert.deepEqual(result.unapprovedSkips, [{ number: 4, name: 'newly skipped regression', reason: 'oops' }]);
 });
 

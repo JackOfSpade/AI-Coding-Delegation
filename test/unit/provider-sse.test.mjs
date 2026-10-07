@@ -222,7 +222,7 @@ test('official DeepSeek capability is exact and a per-call required-tool focus d
   let body;
   const provider = new OpenAIChatProvider({
     baseUrl: 'https://api.deepseek.com',
-    model: 'deepseek-v4-pro',
+    model: 'deepseek-flash',
     reasoningEffort: 'high',
     thinking: { type: 'enabled' },
     retries: 0,
@@ -231,9 +231,9 @@ test('official DeepSeek capability is exact and a per-call required-tool focus d
       return new Response('data: [DONE]\n\n', { status: 200 });
     },
   });
-  assert.equal(provider.supportsForcedImplementationFocusFor('deepseek-v4-pro'), true);
+  assert.equal(provider.supportsForcedImplementationFocusFor('deepseek-flash'), true);
   assert.equal(
-    provider.supportsForcedImplementationFocusFor('deepseek-flash'),
+    provider.supportsForcedImplementationFocusFor('deepseek-v4-flash'),
     false,
     'request model must match the configured official model',
   );
@@ -248,28 +248,25 @@ test('official DeepSeek capability is exact and a per-call required-tool focus d
   assert.deepEqual(body.thinking, { type: 'disabled' });
   assert.equal(body.reasoning_effort, 'none');
   assert.equal(body.tool_choice, 'required');
-  assert.equal(
-    new OpenAIChatProvider({
-      baseUrl: 'https://api.deepseek.com',
-      model: 'unrecognized-deepseek-model',
-    }).supportsForcedImplementationFocusFor('unrecognized-deepseek-model'),
-    false,
+  assert.throws(
+    () => new OpenAIChatProvider({ baseUrl: 'https://api.deepseek.com', model: 'unrecognized-deepseek-model' }),
+    (error) => error.code === 'E_MODEL_POLICY',
   );
   assert.equal(
-    new OpenAIChatProvider({ baseUrl: 'https://proxy.example.test', model: 'deepseek-v4-pro' }).supportsForcedImplementationFocusFor(
-      'deepseek-v4-pro',
+    new OpenAIChatProvider({ baseUrl: 'https://proxy.example.test', model: 'deepseek-flash' }).supportsForcedImplementationFocusFor(
+      'deepseek-flash',
     ),
     false,
   );
   assert.equal(
-    new OpenAIChatProvider({ baseUrl: 'https://api.deepseek.com:8443', model: 'deepseek-v4-pro' }).supportsForcedImplementationFocusFor(
-      'deepseek-v4-pro',
+    new OpenAIChatProvider({ baseUrl: 'https://api.deepseek.com:8443', model: 'deepseek-flash' }).supportsForcedImplementationFocusFor(
+      'deepseek-flash',
     ),
     false,
   );
   assert.equal(
-    new OpenAIChatProvider({ baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-v4-pro' }).supportsForcedImplementationFocusFor(
-      'deepseek-v4-pro',
+    new OpenAIChatProvider({ baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash' }).supportsForcedImplementationFocusFor(
+      'deepseek-flash',
     ),
     false,
   );
@@ -439,7 +436,7 @@ test('provider replays a nullable non-thinking tool response without adding a fo
   let body;
   const provider = new OpenAIChatProvider({
     baseUrl: 'https://api.deepseek.com',
-    model: 'deepseek-v4-pro',
+    model: 'deepseek-flash',
     thinking: { type: 'enabled' },
     reasoningEffort: 'high',
     retries: 0,
@@ -760,4 +757,42 @@ test('non-OK response bodies are cancelled without being read', async () => {
     }
   }, /401/);
   assert.equal(cancelled, 1);
+});
+test('a keep-alive drip cannot stretch one attempt past its timeout', async () => {
+  let fetches = 0;
+  const encoder = new TextEncoder();
+  const provider = new OpenAIChatProvider({
+    baseUrl: 'http://localhost',
+    model: 'm',
+    timeoutMs: 100,
+    retries: 0,
+    fetchImpl: async (_url, { signal }) => {
+      fetches++;
+      let timer;
+      const body = new ReadableStream({
+        start(controller) {
+          // A comment line every few milliseconds: the stream is never idle, and never ends.
+          timer = setInterval(() => controller.enqueue(encoder.encode(': keep-alive\n\n')), 5);
+          signal.addEventListener('abort', () => {
+            clearInterval(timer);
+            controller.error(new Error('aborted by the attempt timer'));
+          });
+        },
+        cancel() {
+          clearInterval(timer);
+        },
+      });
+      return new Response(body, { status: 200 });
+    },
+  });
+  const started = Date.now();
+  await assert.rejects(
+    async () => {
+      for await (const _ of provider.chat({ messages: [], tools: [] })) {
+      }
+    },
+    (error) => error.kind === 'attempt_timeout' && error.attempts === 1,
+  );
+  assert.ok(Date.now() - started < 1_500, 'the request ended near its 100 ms limit, not when the stream did');
+  assert.equal(fetches, 1);
 });

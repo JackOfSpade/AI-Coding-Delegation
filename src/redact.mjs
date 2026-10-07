@@ -307,6 +307,15 @@ export class RedactionProjector {
 }
 
 /** Redact known literal secrets and common credential-bearing text forms. */
+/**
+ * Bare token-shaped strings (sk-..., rk-..., key..., bearer...) that the
+ * durable store redacts before the key/assignment rules of `redactText` run.
+ * Anything returned to a caller that the store also persists must pass through
+ * both, or the two copies can differ by a credential.
+ */
+export function redactTokenShapes(value) {
+  return String(value).replace(/\b(?:sk|rk|key|bearer)[-_A-Za-z0-9]{12,}\b/gi, '[REDACTED]');
+}
 export function redactText(value, secrets = []) {
   let text = String(value);
   for (const secret of secrets) if (typeof secret === 'string' && secret.length > 0) text = text.split(secret).join('[REDACTED]');
@@ -314,6 +323,38 @@ export function redactText(value, secrets = []) {
     .replace(BEARER, '$1 [REDACTED]')
     .replace(ASSIGNMENT, '$1=[REDACTED]')
     .replace(SENSITIVE_HEADER, (value) => value.replace(/:\s*[\s\S]*/, ': [REDACTED]'));
+}
+
+// A home directory is somebody's account name; `/Users/<name>`, `/home/<name>` and `C:\Users\<name>` read `~`.
+const HOME_PATH = /(?:\/(?:Users|home)\/[^/\s'"`)\]]+|[A-Za-z]:\\Users\\[^\\\s'"`)\]]+)/g;
+/**
+ * `aliases` are `[absolutePrefix, label]` pairs (longest first, ending at a
+ * path boundary) for a known directory such as a checkout; any other home
+ * directory is shortened to `~`.
+ */
+export function relativizePaths(value, aliases = []) {
+  let text = String(value);
+  for (const [prefix, label] of [...aliases].sort((a, b) => String(b?.[0]).length - String(a?.[0]).length))
+    if (typeof prefix === 'string' && prefix.length > 1 && prefix !== '/')
+      text = text.replace(new RegExp(`${prefix.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&')}(?![A-Za-z0-9._-])`, 'g'), () => label);
+  return text.replace(HOME_PATH, '~');
+}
+
+/**
+ * One redacted line of at most `max` characters, for a view that must name a
+ * brief without carrying it. Redaction runs before the clip so a credential is
+ * never cut into something the rules no longer recognise; line structure is
+ * kept until then because the header rule is line-scoped. Undefined for an
+ * empty or non-string value.
+ */
+export function redactedSummary(value, { max = 100, secrets = [], aliases = [] } = {}) {
+  if (typeof value !== 'string') return undefined;
+  const text = relativizePaths(redactText(redactTokenShapes(stripTerminalControls(value)), secrets), aliases)
+    .replace(/[\s\u2028\u2029\u200E\u200F\u202A-\u202E\u2066-\u2069]+/g, ' ')
+    .trim();
+  if (!text) return undefined;
+  const points = [...text];
+  return points.length > max ? `${points.slice(0, Math.max(1, max - 1)).join('')}…` : text;
 }
 
 /** Deep-copy a serializable value while redacting sensitive object fields and strings. */

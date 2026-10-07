@@ -1,18 +1,36 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import {
   cleanupIsolatedWorktree,
   createIsolatedWorktree,
+  integrateRecordedTree,
+  isolatedDependencyReadPaths,
+  verifierDependencyStatus,
   openIsolatedWorktree,
   pinJobTrees,
   releaseJobTrees,
   sameWorktreePath,
   snapshotPrimaryWorkingTree,
+  workingTreeStatus,
 } from '../../src/worktree.mjs';
-import { cleanup, git, makeRepo, write } from './helpers.mjs';
+import { runCommand, sandboxAvailable } from '../../src/sandbox.mjs';
+import { cleanup, git, makeRepo, tempDir, write } from './helpers.mjs';
 
 function primaryMetadata(repo) {
   return {
@@ -567,6 +585,496 @@ test('allocator and recovery cleanup never follow arbitrary paths, but remove a 
   } finally {
     isolated?.cleanup();
     if (target) rmSync(target, { recursive: true, force: true });
+    cleanup(repo);
+  }
+});
+
+// Dependencies live in a gitignored node_modules that a Git worktree never
+// contains. The server links the primary's directory beside (not inside) the
+// worktree so Node's upward resolution finds it.
+function repoWithDependency() {
+  const repo = makeRepo();
+  write(join(repo, '.gitignore'), 'node_modules/\n');
+  git(repo, ['add', '.gitignore']);
+  git(repo, ['commit', '-m', 'ignore deps']);
+  write(join(repo, 'node_modules', 'dep-pkg', 'package.json'), '{"name":"dep-pkg","version":"1.0.0","main":"index.js"}\n');
+  write(join(repo, 'node_modules', 'dep-pkg', 'index.js'), 'module.exports = "from-primary-deps";\n');
+  return repo;
+}
+
+test('a private worktree resolves the primary node_modules through a link beside it, invisible to Git and scope checks', () => {
+  const repo = repoWithDependency();
+  let isolated;
+  try {
+    const baseline = snapshotPrimaryWorkingTree(repo);
+    isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
+    assert.equal(isolated.dependencies.nodeModules, 'linked');
+    const link = join(dirname(isolated.path), 'node_modules');
+    assert.equal(lstatSync(link).isSymbolicLink(), true);
+    assert.equal(realpathSync(link), realpathSync(join(repo, 'node_modules')));
+    assert.equal(existsSync(join(isolated.path, 'node_modules')), false, 'the workspace itself stays free of dependencies');
+    assert.deepEqual(isolatedDependencyReadPaths(isolated.path, repo), [realpathSync(join(repo, 'node_modules'))]);
+    // Neither the snapshot, the changed-file list, nor ignored-output accounting sees the link.
+    assert.deepEqual(isolated.changes(isolated.snapshot()).files, []);
+    assert.deepEqual(isolated.ignoredPaths(), []);
+    // Reopening a persisted worktree reports the same state.
+    assert.equal(
+      openIsolatedWorktree({ repoPath: repo, workspacePath: isolated.path, baselineTree: baseline }).dependencies.nodeModules,
+      'linked',
+    );
+  } finally {
+    isolated?.cleanup();
+    cleanup(repo);
+  }
+});
+
+test('cleanup removes the dependency link without touching the primary node_modules', () => {
+  const repo = repoWithDependency();
+  try {
+    const isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotPrimaryWorkingTree(repo) });
+    const privateRoot = dirname(isolated.path);
+    isolated.cleanup();
+    assert.equal(existsSync(privateRoot), false);
+    assert.equal(readFileSync(join(repo, 'node_modules', 'dep-pkg', 'index.js'), 'utf8'), 'module.exports = "from-primary-deps";\n');
+  } finally {
+    cleanup(repo);
+  }
+});
+
+test('no dependency link is made for an absent, symlinked, or tracked node_modules', () => {
+  for (const [setup, expected] of [
+    [() => {}, 'absent'],
+    [
+      (repo, outside) => {
+        write(join(outside, 'secret.txt'), 'host file\n');
+        symlinkSync(outside, join(repo, 'node_modules'), 'dir');
+      },
+      'not-a-directory',
+    ],
+    [
+      (repo) => {
+        write(join(repo, 'node_modules', 'tracked', 'index.js'), 'x\n');
+        git(repo, ['add', '-f', 'node_modules']);
+        git(repo, ['commit', '-m', 'track deps']);
+      },
+      'tracked',
+    ],
+  ]) {
+    const repo = makeRepo();
+    const outside = tempDir('offload-outside-');
+    let isolated;
+    try {
+      setup(repo, outside);
+      isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotPrimaryWorkingTree(repo) });
+      assert.equal(isolated.dependencies.nodeModules, expected);
+      assert.equal(
+        existsSync(join(dirname(isolated.path), 'node_modules')) &&
+          lstatSync(join(dirname(isolated.path), 'node_modules')).isSymbolicLink(),
+        false,
+      );
+      assert.deepEqual(isolatedDependencyReadPaths(isolated.path, repo), []);
+    } finally {
+      isolated?.cleanup();
+      cleanup(repo);
+      cleanup(outside);
+    }
+  }
+});
+
+test('a retargeted or replaced dependency link grants no read path', () => {
+  const repo = repoWithDependency();
+  const outside = tempDir('offload-outside-');
+  let isolated;
+  try {
+    isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotPrimaryWorkingTree(repo) });
+    const link = join(dirname(isolated.path), 'node_modules');
+    assert.equal(isolatedDependencyReadPaths(isolated.path, repo).length, 1);
+    rmSync(link);
+    symlinkSync(outside, link, 'dir');
+    assert.equal(readlinkSync(link), outside);
+    assert.deepEqual(isolatedDependencyReadPaths(isolated.path, repo), [], 'a link to anything but the primary node_modules is ignored');
+    rmSync(link);
+    assert.deepEqual(isolatedDependencyReadPaths(isolated.path, repo), []);
+    assert.deepEqual(isolatedDependencyReadPaths(isolated.path, join(outside, 'not-a-repo')), []);
+    assert.deepEqual(isolatedDependencyReadPaths('relative/workspace', repo), []);
+  } finally {
+    isolated?.cleanup();
+    cleanup(repo);
+    cleanup(outside);
+  }
+});
+
+test(
+  'a sandboxed command in the worktree imports a primary dependency, read-only, and cannot reach other host files',
+  { skip: process.platform !== 'darwin' || !sandboxAvailable() },
+  async () => {
+    const repo = repoWithDependency();
+    const outside = tempDir('offload-outside-');
+    let isolated;
+    try {
+      write(join(outside, 'host.txt'), 'host secret\n');
+      for (const secret of ['.npmrc', '.env', 'k.pem', '.cache/c.txt', 'nested/.ssh/id_rsa'])
+        write(join(repo, 'node_modules', 'dep-pkg', secret), 'TOKEN=abc\n');
+      write(join(repo, 'node_modules', 'dep-pkg', 'lib', 'credentials', 'index.js'), 'module.exports = "credentials-module";\n');
+      write(join(repo, 'probe.cjs'), 'process.stdout.write(require("dep-pkg"));\n');
+      git(repo, ['add', 'probe.cjs']);
+      git(repo, ['commit', '-m', 'probe']);
+      isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotPrimaryWorkingTree(repo) });
+      const readablePaths = [dirname(isolated.path), ...isolatedDependencyReadPaths(isolated.path, repo)];
+      const options = {
+        cwd: isolated.path,
+        gitDir: join(repo, '.git', 'worktrees', basename(git(isolated.path, ['rev-parse', '--git-dir']))),
+        readablePaths,
+        requireSandbox: true,
+        timeoutSec: 30,
+      };
+      const imported = await runCommand(`${process.execPath} probe.cjs`, options);
+      assert.equal(imported.sandbox, 'macos');
+      assert.equal(imported.code, 0, imported.stderr);
+      assert.equal(imported.stdout, 'from-primary-deps');
+      const writeAttempt = await runCommand(
+        `${process.execPath} -e "require('fs').writeFileSync(require.resolve('dep-pkg'), 'tampered')"`,
+        options,
+      );
+      assert.notEqual(writeAttempt.code, 0, 'dependencies are read-only');
+      assert.equal(readFileSync(join(repo, 'node_modules', 'dep-pkg', 'index.js'), 'utf8'), 'module.exports = "from-primary-deps";\n');
+      const hostRead = await runCommand(`cat ${JSON.stringify(join(outside, 'host.txt'))}`, options);
+      assert.notEqual(hostRead.code, 0, 'the extra read root is only the dependency directory');
+      for (const secret of ['.npmrc', '.env', 'k.pem', '.cache/c.txt', 'nested/.ssh/id_rsa']) {
+        const read = await runCommand(`cat ../node_modules/dep-pkg/${secret}`, options);
+        assert.notEqual(read.code, 0, `credential-shaped dependency file ${secret} must stay unreadable`);
+        assert.doesNotMatch(read.stdout, /TOKEN=abc/);
+      }
+      const credentialsModule = await runCommand(`${process.execPath} -p "require('dep-pkg/lib/credentials')"`, options);
+      assert.equal(credentialsModule.code, 0, credentialsModule.stderr);
+      assert.equal(credentialsModule.stdout.trim(), 'credentials-module', 'a credentials directory of module code remains importable');
+      // Without the grant the very same import fails: this is the bug being fixed.
+      const withoutGrant = await runCommand(`${process.execPath} probe.cjs`, { ...options, readablePaths: [dirname(isolated.path)] });
+      assert.notEqual(withoutGrant.code, 0);
+    } finally {
+      isolated?.cleanup();
+      cleanup(repo);
+      cleanup(outside);
+    }
+  },
+);
+
+test('verifierDependencyStatus tells a primary, before it spends budget, whether a verifier can resolve dependencies', () => {
+  const repo = makeRepo();
+  try {
+    // Not a JavaScript project: nothing to resolve.
+    assert.deepEqual(verifierDependencyStatus(repo), { verifierDeps: 'not-applicable' });
+    // A manifest without installed dependencies cannot pass a test that imports one.
+    write(join(repo, 'package.json'), '{"name":"x"}\n');
+    write(join(repo, '.gitignore'), 'node_modules/\n');
+    git(repo, ['add', '.']);
+    git(repo, ['commit', '-m', 'manifest']);
+    assert.deepEqual(verifierDependencyStatus(repo), { verifierDeps: 'missing', reason: 'absent' });
+    // Installed: linkable.
+    write(join(repo, 'node_modules', 'dep', 'index.js'), 'module.exports = 1;\n');
+    assert.deepEqual(verifierDependencyStatus(repo), { verifierDeps: 'ok' });
+    // Nested node_modules (workspace sub-packages) are NOT mounted: say so rather than claim ok.
+    write(join(repo, 'packages', 'a', 'node_modules', 'only-here', 'index.js'), 'module.exports = 2;\n');
+    write(join(repo, 'packages', 'b', 'node_modules', 'other', 'index.js'), 'module.exports = 3;\n');
+    const partial = verifierDependencyStatus(repo);
+    assert.equal(partial.verifierDeps, 'partial');
+    assert.equal(partial.reason, 'nested-node-modules');
+    assert.deepEqual(partial.nested.sort(), ['packages/a/node_modules', 'packages/b/node_modules']);
+    assert.equal(partial.nestedCount, 2);
+    // Never an arbitrary host path: a symlinked node_modules is refused, not followed.
+    rmSync(join(repo, 'packages'), { recursive: true });
+    const elsewhere = tempDir('offload-deps-target-');
+    try {
+      rmSync(join(repo, 'node_modules'), { recursive: true });
+      symlinkSync(elsewhere, join(repo, 'node_modules'));
+      assert.deepEqual(verifierDependencyStatus(repo), { verifierDeps: 'missing', reason: 'not-a-directory' });
+    } finally {
+      cleanup(elsewhere);
+    }
+    assert.deepEqual(verifierDependencyStatus('/definitely/not/a/repo'), { verifierDeps: 'missing', reason: 'unresolvable' });
+    assert.deepEqual(verifierDependencyStatus('relative'), { verifierDeps: 'missing', reason: 'unresolvable' });
+  } finally {
+    cleanup(repo);
+  }
+});
+
+test('tracked dependencies are already in the worktree and count as resolvable', () => {
+  const repo = makeRepo();
+  try {
+    write(join(repo, 'package.json'), '{"name":"x"}\n');
+    write(join(repo, 'node_modules', 'vendored', 'index.js'), 'module.exports = 1;\n');
+    git(repo, ['add', '-f', '.']);
+    git(repo, ['commit', '-m', 'vendored']);
+    assert.deepEqual(verifierDependencyStatus(repo), { verifierDeps: 'ok' });
+  } finally {
+    cleanup(repo);
+  }
+});
+
+test('integrateRecordedTree applies a recorded result to the primary with the in-job conflict checks', () => {
+  const repo = makeRepo();
+  try {
+    write(join(repo, 'src', 'a.txt'), 'one\n');
+    git(repo, ['add', '.']);
+    git(repo, ['commit', '-m', 'src']);
+    const baselineTree = snapshotPrimaryWorkingTree(repo);
+    const isolated = createIsolatedWorktree({ repoPath: repo, baselineTree });
+    let afterTree;
+    try {
+      write(join(isolated.path, 'src', 'a.txt'), 'two\n');
+      write(join(isolated.path, 'src', 'new.txt'), 'new\n');
+      write(join(isolated.path, 'elsewhere.txt'), 'outside the selected paths\n');
+      afterTree = isolated.snapshot();
+    } finally {
+      isolated.cleanup();
+    }
+    const paths = ['src/a.txt', 'src/new.txt'];
+    // The worktree is gone; the recorded trees are still addressable.
+    const dry = integrateRecordedTree({ repoPath: repo, baselineTree, afterTree, paths, dryRun: true });
+    assert.deepEqual({ applied: dry.applied, dryRun: dry.dryRun }, { applied: false, dryRun: true });
+    assert.deepEqual(dry.files.map((file) => file.path).sort(), paths);
+    assert.equal(readFileSync(join(repo, 'src', 'a.txt'), 'utf8'), 'one\n', 'a dry run changes nothing');
+    assert.equal(existsSync(join(repo, 'src', 'new.txt')), false);
+    // Unrelated primary edits do not conflict; an edit to a touched path does.
+    write(join(repo, 'unrelated.txt'), 'mine\n');
+    write(join(repo, 'src', 'a.txt'), 'primary edit\n');
+    assert.throws(
+      () => integrateRecordedTree({ repoPath: repo, baselineTree, afterTree, paths }),
+      (error) => error.code === 'E_WORKTREE_CONFLICT',
+    );
+    assert.throws(
+      () => integrateRecordedTree({ repoPath: repo, baselineTree, afterTree, paths, dryRun: true }),
+      (error) => error.code === 'E_WORKTREE_CONFLICT',
+    );
+    assert.equal(readFileSync(join(repo, 'src', 'a.txt'), 'utf8'), 'primary edit\n');
+    assert.equal(existsSync(join(repo, 'src', 'new.txt')), false);
+    write(join(repo, 'src', 'a.txt'), 'one\n');
+    const applied = integrateRecordedTree({ repoPath: repo, baselineTree, afterTree, paths });
+    assert.equal(applied.applied, true);
+    assert.equal(readFileSync(join(repo, 'src', 'a.txt'), 'utf8'), 'two\n');
+    assert.equal(readFileSync(join(repo, 'src', 'new.txt'), 'utf8'), 'new\n');
+    assert.equal(existsSync(join(repo, 'elsewhere.txt')), false, 'only the selected paths may land');
+    assert.equal(readFileSync(join(repo, 'unrelated.txt'), 'utf8'), 'mine\n');
+    assert.equal(git(repo, ['diff', '--cached', '--name-only']), '', 'the primary index is never touched');
+  } finally {
+    cleanup(repo);
+  }
+});
+
+test('integrateRecordedTree refuses malformed input before touching the primary', () => {
+  const repo = makeRepo();
+  try {
+    const tree = snapshotPrimaryWorkingTree(repo);
+    for (const input of [
+      { repoPath: repo, baselineTree: tree, afterTree: tree },
+      { repoPath: repo, baselineTree: tree, afterTree: tree, paths: [] },
+      { repoPath: repo, baselineTree: 'nope', afterTree: tree, paths: ['a'] },
+      { repoPath: repo, baselineTree: tree, afterTree: 'nope', paths: ['a'] },
+      { repoPath: repo, baselineTree: tree, afterTree: 'f'.repeat(40), paths: ['a'] },
+      { repoPath: 'relative', baselineTree: tree, afterTree: tree, paths: ['a'] },
+      { repoPath: tmpdir(), baselineTree: tree, afterTree: tree, paths: ['a'] },
+    ])
+      assert.throws(() => integrateRecordedTree(input), /E_WORKTREE|must be|required|Git/);
+  } finally {
+    cleanup(repo);
+  }
+});
+
+test('workingTreeStatus reports a clean checkout with exact zero counts', () => {
+  const repo = makeRepo();
+  try {
+    assert.deepEqual(workingTreeStatus(repo), { clean: true, changed: 0, staged: 0, modified: 0, untracked: 0, conflicted: 0, sample: [] });
+  } finally {
+    cleanup(repo);
+  }
+});
+
+test('workingTreeStatus counts staged, modified, untracked, renamed and deleted entries once each and ignores gitignored files', () => {
+  const repo = makeRepo();
+  try {
+    for (const name of ['b.txt', 'c.txt', 'd.txt', 'e.txt', 'f.txt']) write(join(repo, name), `${name}\n`);
+    write(join(repo, '.gitignore'), 'ignored.log\n');
+    git(repo, ['add', '.']);
+    git(repo, ['commit', '-m', 'more files']);
+    write(join(repo, 'tracked.txt'), 'unstaged edit\n'); // modified, unstaged
+    write(join(repo, 'b.txt'), 'staged edit\n');
+    git(repo, ['add', 'b.txt']); // staged
+    git(repo, ['rm', '--cached', 'c.txt']); // staged deletion; the file stays as untracked
+    git(repo, ['mv', 'd.txt', 'd-renamed.txt']); // one rename entry, not two
+    rmSync(join(repo, 'e.txt')); // unstaged deletion
+    write(join(repo, 'new.txt'), 'new\n'); // untracked
+    write(join(repo, 'newdir', 'one.txt'), '1\n'); // a wholly untracked directory is one entry
+    write(join(repo, 'newdir', 'two.txt'), '2\n');
+    write(join(repo, 'newdir', 'three.txt'), '3\n');
+    write(join(repo, 'ignored.log'), 'ignored\n');
+    const status = workingTreeStatus(repo);
+    // tracked.txt M, b.txt staged, c.txt (staged D + untracked) = 2 entries, d rename, e deleted, new.txt, newdir/
+    assert.equal(status.clean, false);
+    assert.equal(status.changed, 8);
+    assert.equal(status.staged, 3, 'b.txt, the c.txt deletion and the rename');
+    assert.equal(status.modified, 2, 'tracked.txt and the deleted e.txt');
+    assert.equal(status.untracked, 3, 'c.txt (left in place), new.txt and newdir/ as one entry');
+    assert.equal(status.conflicted, 0);
+    assert.equal(
+      status.sample.some((line) => line.includes('ignored.log')),
+      false,
+    );
+    // The first five entries in git's order (tracked, then untracked); the rename shows once, by its new path.
+    assert.deepEqual(status.sample, ['M  b.txt', 'D  c.txt', 'R  d-renamed.txt', ' D e.txt', ' M tracked.txt']);
+  } finally {
+    cleanup(repo);
+  }
+});
+
+test('workingTreeStatus counts a merge conflict', { skip: process.platform === 'win32' }, () => {
+  const repo = makeRepo();
+  try {
+    const base = git(repo, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    git(repo, ['checkout', '-b', 'side']);
+    write(join(repo, 'tracked.txt'), 'side\n');
+    git(repo, ['commit', '-am', 'side']);
+    git(repo, ['checkout', base]);
+    write(join(repo, 'tracked.txt'), 'main\n');
+    git(repo, ['commit', '-am', 'main']);
+    assert.throws(() => git(repo, ['merge', 'side']));
+    const status = workingTreeStatus(repo);
+    assert.equal(status.clean, false);
+    assert.equal(status.conflicted, 1);
+    assert.equal(status.changed, 1);
+    // An unmerged path is conflicted only, not also staged or modified.
+    assert.equal(status.staged, 0);
+    assert.equal(status.modified, 0);
+    assert.equal(status.untracked, 0);
+    assert.deepEqual(status.sample, ['UU tracked.txt']);
+  } finally {
+    cleanup(repo);
+  }
+});
+
+test('workingTreeStatus counts secret-shaped files but never names them, and samples at most five paths', () => {
+  const repo = makeRepo();
+  try {
+    write(join(repo, '.env'), 'TOKEN=abc\n');
+    write(join(repo, 'server.pem'), 'pem\n');
+    for (let i = 0; i < 8; i += 1) write(join(repo, `file-${i}.txt`), `${i}\n`);
+    const status = workingTreeStatus(repo);
+    assert.equal(status.untracked, 10, 'secret-shaped files are counted');
+    assert.equal(status.changed, 10);
+    assert.equal(status.sample.length, 5);
+    assert.ok(
+      status.sample.every((line) => /^\?\? file-\d\.txt$/.test(line)),
+      JSON.stringify(status.sample),
+    );
+    const lonely = workingTreeStatus(
+      (() => {
+        for (let i = 0; i < 8; i += 1) rmSync(join(repo, `file-${i}.txt`));
+        return repo;
+      })(),
+    );
+    assert.equal(lonely.changed, 2);
+    assert.deepEqual(lonely.sample, [], 'only secret-shaped names remain, so nothing may be named');
+  } finally {
+    cleanup(repo);
+  }
+});
+
+test('workingTreeStatus keeps unicode and spaced names whole and strips control characters', { skip: process.platform === 'win32' }, () => {
+  const repo = makeRepo();
+  try {
+    write(join(repo, 'dir with space', 'caf\u00e9 \u2713.txt'), 'x\n');
+    write(join(repo, 'new\nline.txt'), 'x\n');
+    const status = workingTreeStatus(repo);
+    assert.equal(status.changed, 2, 'a newline in a name must not split one entry into two');
+    assert.ok(status.sample.includes('?? dir with space/'), JSON.stringify(status.sample));
+    // The newline name cannot be echoed (it is unnormalizable), so only the counts show it.
+    assert.equal(status.sample.length, 1);
+    assert.equal(
+      status.sample.some((line) => /[\x00-\x1f]/.test(line)),
+      false,
+    );
+  } finally {
+    cleanup(repo);
+  }
+});
+
+test('workingTreeStatus degrades to a reason instead of throwing', () => {
+  const dir = tempDir('offload-notrepo-');
+  try {
+    assert.deepEqual(workingTreeStatus(dir), { clean: null, reason: 'unresolvable' });
+    assert.deepEqual(workingTreeStatus('relative/path'), { clean: null, reason: 'unresolvable' });
+    assert.deepEqual(workingTreeStatus(undefined), { clean: null, reason: 'unresolvable' });
+    const repo = makeRepo();
+    try {
+      const calls = [];
+      const failing = (file, args, options) => {
+        calls.push({ args, options });
+        throw Object.assign(new Error('boom'), { status: 128 });
+      };
+      assert.deepEqual(workingTreeStatus(repo, { execFile: failing }), { clean: null, reason: 'git-status-failed' });
+      assert.ok(calls.length > 0);
+    } finally {
+      cleanup(repo);
+    }
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test('workingTreeStatus bounds the git call and passes --no-optional-locks', () => {
+  const repo = makeRepo();
+  try {
+    const calls = [];
+    const status = workingTreeStatus(repo, {
+      execFile: (file, args, options) => {
+        calls.push({ file, args, options });
+        // The filter lookup answers "no filters" (exit 1); the status call answers clean.
+        if (args[0] === 'config') throw Object.assign(new Error('none'), { status: 1 });
+        return Buffer.alloc(0);
+      },
+    });
+    assert.equal(status.clean, true);
+    const statusCall = calls.find((call) => call.args.includes('status'));
+    assert.ok(statusCall, 'git status must be called');
+    assert.ok(statusCall.args.includes('--no-optional-locks'));
+    assert.ok(statusCall.args.includes('--porcelain=v1') && statusCall.args.includes('-z'));
+    assert.ok(statusCall.options.timeout <= 5000, `status timeout ${statusCall.options.timeout}`);
+    assert.ok(statusCall.options.maxBuffer <= 4 * 1024 * 1024);
+  } finally {
+    cleanup(repo);
+  }
+});
+
+test('workingTreeStatus is read-only: a stat-dirty index is not refreshed', () => {
+  const repo = makeRepo();
+  try {
+    // Same content, new mtime: a plain `git status` would rewrite .git/index.
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(join(repo, 'tracked.txt'), later, later);
+    const index = join(repo, '.git', 'index');
+    const before = { bytes: readFileSync(index), mtimeMs: statSync(index).mtimeMs };
+    assert.equal(workingTreeStatus(repo).clean, true);
+    assert.deepEqual(readFileSync(index), before.bytes);
+    assert.equal(statSync(index).mtimeMs, before.mtimeMs);
+  } finally {
+    cleanup(repo);
+  }
+});
+
+test('workingTreeStatus never runs a configured clean filter', { skip: process.platform === 'win32' }, () => {
+  const repo = makeRepo();
+  const marker = join(repo, '..', `${basename(repo)}-filter-ran`);
+  try {
+    write(join(repo, '.gitattributes'), 'tracked.txt filter=probe\n');
+    git(repo, ['add', '.gitattributes']);
+    git(repo, ['commit', '-m', 'attrs']);
+    git(repo, ['config', 'filter.probe.clean', `sh -c 'cat; touch "${marker}"'`]);
+    // A stat-dirty file makes git run the clean filter to compare contents.
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(join(repo, 'tracked.txt'), later, later);
+    assert.equal(workingTreeStatus(repo).clean, true);
+    assert.equal(existsSync(marker), false, 'the clean filter must not run');
+  } finally {
+    rmSync(marker, { force: true });
     cleanup(repo);
   }
 });

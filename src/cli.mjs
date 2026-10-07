@@ -1,10 +1,13 @@
 import { createCore } from './core.mjs';
 import { createMcpServer } from './mcp.mjs';
+import { createDiagnosticLog, resolveLogWindow } from './diagnostics.mjs';
 import { validateExplicitRepoPath, validateJobRequest, validJobId } from './job-manager.mjs';
+import { normalizeInterpreterDeclaration } from './verify-interpreter.mjs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { doctor, doctorLive } from './doctor.mjs';
 import { redactText } from './redact.mjs';
+import { MAX_RETROSPECTIVE_JOBS } from './retrospective.mjs';
 
 const binPath = fileURLToPath(new URL('../bin/offload.mjs', import.meta.url));
 
@@ -21,12 +24,16 @@ const CLI_COMMANDS = Object.freeze({
       'acceptanceCriteria',
       'relevantPaths',
       'testCommand',
+      'verifierMode',
+      'verifierTimeoutSec',
+      'verifierInterpreter',
       'profile',
       'effort',
       'maxRepairRounds',
       'budget',
       'maxUsd',
       'maxTurns',
+      'turnPolicy',
       'timeoutMinutes',
       'extraWritable',
       'repoPath',
@@ -34,8 +41,13 @@ const CLI_COMMANDS = Object.freeze({
     booleanFlags: ['allowNetwork', 'foreground', 'unsafe-policy-only-verifier'],
     positionals: 'task',
   },
-  wait: { valueFlags: ['timeoutSec', 'repoPath'], booleanFlags: [], positionals: 'one' },
-  job: { valueFlags: ['include', 'repoPath'], booleanFlags: [], positionals: 'zero-or-one' },
+  wait: { valueFlags: ['timeoutSec', 'repoPath', 'detail'], booleanFlags: [], positionals: 'one' },
+  job: {
+    valueFlags: ['include', 'repoPath', 'detail', 'tail', 'limit', 'maxJobs', 'verifierInterpreter'],
+    booleanFlags: ['all'],
+    positionals: 'zero-or-one',
+  },
+  retrospective: { valueFlags: ['jobs', 'last', 'repoPath'], booleanFlags: [], positionals: 'zero-or-one' },
   repair: { valueFlags: ['defects', 'repoPath'], booleanFlags: ['foreground'], positionals: 'one' },
   revert: { valueFlags: ['repoPath'], booleanFlags: ['apply'], positionals: 'one' },
   cancel: { valueFlags: ['repoPath'], booleanFlags: [], positionals: 'one' },
@@ -117,6 +129,8 @@ const decode = (value, fallback) => {
   }
 };
 const bool = (value) => value === true || value === 'true';
+// One path, or a JSON array of up to four.
+const interpreterFlag = (value) => (String(value).trimStart().startsWith('[') ? decode(value) : [value]);
 const validId = validJobId;
 const finiteNumber = (value, key, { integer = false, minimum, maximum, exclusiveMinimum = false } = {}) => {
   if (!decimalText(value)) throw new Error(`option --${key} must be a decimal number`);
@@ -169,16 +183,20 @@ function validateDecodedInvocation(command, flags, positionals) {
     acceptanceCriteria: decodedFlag(flags, 'acceptanceCriteria', []),
     relevantPaths: decodedFlag(flags, 'relevantPaths', []),
     testCommand: flags.testCommand,
+    ...(flags.verifierMode !== undefined ? { verifierMode: flags.verifierMode } : {}),
+    ...(flags.verifierTimeoutSec !== undefined ? { verifierTimeoutSec: Number(flags.verifierTimeoutSec) } : {}),
+    ...(flags.verifierInterpreter !== undefined ? { verifierInterpreter: interpreterFlag(flags.verifierInterpreter) } : {}),
     profile: flags.profile,
     effort: flags.effort,
     maxRepairRounds: flags.maxRepairRounds == null ? undefined : Number(flags.maxRepairRounds),
     budget: decodedFlag(
       flags,
       'budget',
-      flags.maxUsd != null || flags.maxTurns != null || flags.timeoutMinutes != null
+      flags.maxUsd != null || flags.maxTurns != null || flags.timeoutMinutes != null || flags.turnPolicy != null
         ? {
             ...(flags.maxUsd != null ? { maxUsd: Number(flags.maxUsd) } : {}),
             ...(flags.maxTurns != null ? { maxTurns: Number(flags.maxTurns) } : {}),
+            ...(flags.turnPolicy != null ? { turnPolicy: flags.turnPolicy } : {}),
             ...(flags.timeoutMinutes != null ? { timeoutMinutes: Number(flags.timeoutMinutes) } : {}),
           }
         : undefined,
@@ -189,14 +207,30 @@ function validateDecodedInvocation(command, flags, positionals) {
     repoPath: flags.repoPath,
   });
 }
+/** `--jobs a,b` as 1-16 distinct valid job ids. */
+function retrospectiveJobIds(value) {
+  const ids = String(value).split(',');
+  if (ids.length > MAX_RETROSPECTIVE_JOBS || new Set(ids).size !== ids.length || !ids.every(validId))
+    throw new Error(`retrospective --jobs must be 1-${MAX_RETROSPECTIVE_JOBS} distinct valid job ids separated by commas`);
+  return ids;
+}
+/** `--tail`/`--limit` as numbers; a non-numeric value stays NaN so the shared bounds check rejects it. */
+function logWindowFlags(flags) {
+  const number = (value) => (String(value).trim() === '' ? NaN : Number(value));
+  return {
+    ...(flags.tail !== undefined ? { tail: number(flags.tail) } : {}),
+    ...(flags.limit !== undefined ? { limit: number(flags.limit) } : {}),
+  };
+}
 function validateInvocation(command, flags, positionals) {
   const shape = CLI_COMMANDS[command];
-  if (!shape) throw new Error('usage: offload <start|wait|job|repair|revert|cancel|doctor|mcp>');
+  if (!shape) throw new Error('usage: offload <start|wait|job|repair|revert|cancel|retrospective|doctor|mcp>');
   const allowed = new Set([...shape.valueFlags, ...shape.booleanFlags]);
   for (const key of Object.keys(flags)) if (!allowed.has(key)) throw new Error(`unknown option --${key} for ${command}`);
   if (shape.positionals === 'none' && positionals.length) throw new Error(`${command} does not accept positional arguments`);
   if (shape.positionals === 'one' && positionals.length !== 1) throw new Error(`${command} requires exactly one job id`);
-  if (shape.positionals === 'zero-or-one' && positionals.length > 1) throw new Error('job accepts at most one job id');
+  if (shape.positionals === 'zero-or-one' && positionals.length > 1)
+    throw new Error(`${command} accepts at most one ${command === 'job' ? 'job id' : 'argument'}`);
   // `start` deliberately accepts free-form positional task text, including
   // values after `--`. Do not silently discard it when --task was also used.
   if (shape.positionals === 'task' && flags.task !== undefined && positionals.length)
@@ -210,16 +244,41 @@ function validateInvocation(command, flags, positionals) {
     if (flags.maxUsd !== undefined) finiteNumber(flags.maxUsd, 'maxUsd', { minimum: 0, exclusiveMinimum: true, maximum: 0.02 });
   }
   if (command === 'start') {
-    if (flags.budget !== undefined && ['maxUsd', 'maxTurns', 'timeoutMinutes'].some((key) => flags[key] !== undefined))
+    if (flags.budget !== undefined && ['maxUsd', 'maxTurns', 'turnPolicy', 'timeoutMinutes'].some((key) => flags[key] !== undefined))
       throw new Error('start --budget cannot be combined with individual budget options');
     if (flags.maxUsd !== undefined) finiteNumber(flags.maxUsd, 'maxUsd', { minimum: 0, maximum: 10_000 });
     if (flags.maxTurns !== undefined) finiteNumber(flags.maxTurns, 'maxTurns', { integer: true, minimum: 1, maximum: 1000 });
+    if (flags.turnPolicy !== undefined && !['auto', 'fixed'].includes(flags.turnPolicy))
+      throw new Error('turnPolicy must be auto or fixed');
     if (flags.timeoutMinutes !== undefined) finiteNumber(flags.timeoutMinutes, 'timeoutMinutes', { minimum: 1, maximum: 1440 });
     if (flags.maxRepairRounds !== undefined)
       finiteNumber(flags.maxRepairRounds, 'maxRepairRounds', { integer: true, minimum: 0, maximum: 4 });
   }
   if (command === 'wait' && flags.timeoutSec !== undefined) finiteNumber(flags.timeoutSec, 'timeoutSec', { minimum: 0 });
+  if (command === 'retrospective') {
+    const history = positionals[0];
+    if (history !== undefined && !['list', 'export'].includes(history)) throw new Error('retrospective accepts only list or export');
+    if (flags.jobs !== undefined && (history || flags.last !== undefined))
+      throw new Error('retrospective --jobs cannot be combined with list, export or --last');
+    // `last` counts jobs for a digest and stored digests for list/export.
+    if (flags.last !== undefined)
+      finiteNumber(flags.last, 'last', { integer: true, minimum: 1, maximum: history ? 1000 : MAX_RETROSPECTIVE_JOBS });
+    if (flags.jobs !== undefined) retrospectiveJobIds(flags.jobs);
+    if (history && flags.repoPath !== undefined)
+      throw new Error(`retrospective ${history} reads the local history and takes no --repoPath`);
+  }
   if (command === 'job' && flags.include !== undefined && positionals.length !== 1) throw new Error('job --include requires a job id');
+  if (command === 'job' && positionals.length === 1 && (flags.all !== undefined || flags.maxJobs !== undefined))
+    throw new Error('job --all and --maxJobs apply only to the job list');
+  if (command === 'job' && flags.maxJobs !== undefined) finiteNumber(flags.maxJobs, 'maxJobs', { integer: true, minimum: 1, maximum: 100 });
+  if (command === 'job' && flags.verifierInterpreter !== undefined) {
+    if (positionals.length === 1) throw new Error('job --verifierInterpreter applies only to the health call (no job id)');
+    normalizeInterpreterDeclaration(interpreterFlag(flags.verifierInterpreter));
+  }
+  if (command === 'job' && (flags.tail !== undefined || flags.limit !== undefined)) {
+    if (flags.include !== 'log') throw new Error('job --tail/--limit require --include log');
+    resolveLogWindow(logWindowFlags(flags));
+  }
 }
 // The detached worker is the trusted process that resolves keyRef. Commands
 // get their own scrubbed environment in Runner, so this must retain env:
@@ -281,7 +340,12 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
   const injectedCore = Object.hasOwn(options, 'core');
   let core;
   try {
-    core = options.core || (options.createCore || createCore)();
+    // The installed skill is a client-side protocol contract only for the
+    // MCP host. Direct CLI use has no loaded skill and must remain independent
+    // of an unrelated Claude/Codex installation in the caller's home.
+    core =
+      options.core ||
+      (options.createCore ? options.createCore() : createCore({ config: { enforceInstalledSkillPreflight: command === 'mcp' } }));
   } catch (error) {
     stderr.write(`offload: ${safeText(error.message || error)}\n`);
     return 2;
@@ -289,7 +353,7 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
   const spawnWorker = options.spawnWorker || spawnDetachedWorker;
   const runLiveDoctor = options.doctorLive || doctorLive;
   if (command === 'mcp') {
-    createMcpServer(core);
+    createMcpServer(core, { log: createDiagnosticLog() });
     return 0;
   }
   if (command === 'doctor') {
@@ -306,7 +370,7 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
       }
       const diagnostic = doctor({ root: fileURLToPath(new URL('..', import.meta.url)), repoPath: flags.repoPath });
       const health = (await core.job()).health;
-      const result = { ...diagnostic, worker: health?.worker, coreSandbox: health?.sandbox };
+      const result = { ...diagnostic, worker: health?.worker, coreSandbox: health?.sandbox, verifierTmp: health?.verifierTmp };
       if (bool(flags.hook)) {
         stdout.write(
           `offload: node ${result.nodeOk ? 'ok' : 'bad'} · git ${result.git ? 'ok' : 'missing'} · key ${result.key.ok ? 'ok' : 'missing'} · sandbox ${result.sandbox}\n`,
@@ -351,15 +415,19 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
         acceptanceCriteria: decode(flags.acceptanceCriteria, []),
         relevantPaths: decode(flags.relevantPaths, []),
         testCommand: flags.testCommand,
+        ...(flags.verifierMode !== undefined ? { verifierMode: flags.verifierMode } : {}),
+        ...(flags.verifierTimeoutSec !== undefined ? { verifierTimeoutSec: Number(flags.verifierTimeoutSec) } : {}),
+        ...(flags.verifierInterpreter !== undefined ? { verifierInterpreter: interpreterFlag(flags.verifierInterpreter) } : {}),
         profile: flags.profile,
         effort: flags.effort,
         maxRepairRounds: flags.maxRepairRounds == null ? undefined : Number(flags.maxRepairRounds),
         budget: decode(
           flags.budget,
-          flags.maxUsd != null || flags.maxTurns != null || flags.timeoutMinutes != null
+          flags.maxUsd != null || flags.maxTurns != null || flags.timeoutMinutes != null || flags.turnPolicy != null
             ? {
                 ...(flags.maxUsd != null ? { maxUsd: Number(flags.maxUsd) } : {}),
                 ...(flags.maxTurns != null ? { maxTurns: Number(flags.maxTurns) } : {}),
+                ...(flags.turnPolicy != null ? { turnPolicy: flags.turnPolicy } : {}),
                 ...(flags.timeoutMinutes != null ? { timeoutMinutes: Number(flags.timeoutMinutes) } : {}),
               }
             : undefined,
@@ -387,13 +455,38 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
       result = await core.wait(positionals[0], {
         timeoutSec: flags.timeoutSec == null ? undefined : Number(flags.timeoutSec),
         repoPath: flags.repoPath,
+        // The terminal user asked for a report; the compact default is for
+        // token-sensitive model clients (MCP).
+        detail: flags.detail ?? 'full',
       });
     } else if (command === 'job') {
       if (positionals[0] != null && !validId(positionals[0])) throw new Error('invalid job id');
       result = await core.job(positionals[0], {
         include: flags.include,
+        ...logWindowFlags(flags),
+        detail: flags.detail ?? 'full',
+        // Each CLI call is a fresh process, so "this session" would hide every
+        // terminal job: the terminal list stays complete unless --all=false.
+        ...(positionals[0] == null ? { all: flags.all === undefined ? true : bool(flags.all) } : {}),
+        ...(flags.maxJobs !== undefined ? { maxJobs: Number(flags.maxJobs) } : {}),
+        ...(flags.verifierInterpreter !== undefined ? { verifierInterpreter: interpreterFlag(flags.verifierInterpreter) } : {}),
         repoPath: flags.repoPath || (positionals[0] == null ? process.cwd() : undefined),
       });
+    } else if (command === 'retrospective') {
+      const history = positionals[0];
+      if (history) {
+        const stored = await core.retrospectiveHistory({ ...(flags.last !== undefined ? { limit: Number(flags.last) } : {}) });
+        result = history === 'list' ? { path: stored.path, ...stored.aggregate } : { path: stored.path, records: stored.records };
+      } else {
+        // A terminal call is its own process: "this session" would be empty, so read the newest jobs (or the named ones).
+        const jobIds = flags.jobs === undefined ? undefined : retrospectiveJobIds(flags.jobs);
+        const { maintainerPromptSkeleton, ...digest } = await core.retrospective({
+          ...(jobIds ? { jobIds } : { last: flags.last === undefined ? 5 : Number(flags.last) }),
+          repoPath: flags.repoPath || process.cwd(),
+          persist: false,
+        });
+        result = `${JSON.stringify(digest, null, 2)}\n\n--- maintainer prompt skeleton (edit before pasting) ---\n${maintainerPromptSkeleton}`;
+      }
     } else if (command === 'repair') {
       if (!validId(positionals[0])) throw new Error('valid job id is required');
       const defects = decode(flags.defects, []);
@@ -414,7 +507,7 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
     } else if (command === 'revert') {
       if (!validId(positionals[0])) throw new Error('valid job id is required');
       result = await core.revert(positionals[0], { apply: bool(flags.apply), repoPath: flags.repoPath });
-    } else throw new Error('usage: offload <start|wait|job|repair|revert|cancel|doctor|mcp>');
+    } else throw new Error('usage: offload <start|wait|job|repair|revert|cancel|retrospective|doctor|mcp>');
     stdout.write(`${typeof result === 'string' ? result : JSON.stringify(result, null, 2)}\n`);
     return 0;
   } catch (error) {

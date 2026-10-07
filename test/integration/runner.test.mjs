@@ -12,12 +12,18 @@ import {
   sandboxCanonicalPath,
   caseInsensitiveGlob,
   terminateWindowsTree,
+  sandboxToolEnv,
+  probeVerifierTemp,
 } from '../../src/sandbox.mjs';
 import { globToRegExp } from '../../src/glob.mjs';
-import { mkdtemp, access, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { Runner } from '../../src/runner.mjs';
+import { mkdtemp, access, mkdir, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
+import { createIsolatedWorktree, snapshotPrimaryWorkingTree } from '../../src/worktree.mjs';
+import { isolatedWorkspaceReadablePaths } from '../../src/core.mjs';
+import { cleanup as removeTree, git as runGit, makeRepo } from '../unit/helpers.mjs';
 
 // Keep capability-gated TAP output stable: strict CI approves this exact
 // rationale for the small set of live Seatbelt integration probes below.
@@ -504,6 +510,77 @@ test(
     assert.ok(result.stdout.includes(`cwd:${physicalParent}`), result.stdout);
   },
 );
+test(
+  'macOS sandbox lets a worktree command read linked dependencies but never write through them',
+  { skip: !sandboxAvailable() && MACOS_SANDBOX_SKIP_REASON },
+  async (t) => {
+    const repo = makeRepo();
+    const pwned = await mkdtemp(`${tmpdir()}/offload-deps-elsewhere-`);
+    t.after(() => removeTree(pwned));
+    await writeFile(join(repo, '.gitignore'), 'node_modules/\n');
+    runGit(repo, ['add', '.gitignore']);
+    runGit(repo, ['commit', '-m', 'ignore deps']);
+    await mkdir(join(repo, 'node_modules', 'dep-pkg'), { recursive: true });
+    await writeFile(join(repo, 'node_modules', 'dep-pkg', 'index.js'), 'module.exports = "dep-ok";\n');
+    await writeFile(join(repo, 'node_modules', 'dep-pkg', '.env'), 'TOKEN=should-not-be-readable\n');
+    await mkdir(join(repo, 'node_modules', '.cache'), { recursive: true });
+    await writeFile(join(repo, 'node_modules', '.cache', 'entry.json'), '{}\n');
+    const isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotPrimaryWorkingTree(repo) });
+    // Cleanup needs the primary's object store, so the worktree goes first.
+    t.after(() => {
+      isolated.cleanup();
+      removeTree(repo);
+    });
+    const workspace = isolated.path;
+    const readablePaths = isolatedWorkspaceReadablePaths({ workspacePath: workspace, repoPath: repo }, workspace);
+    assert.equal(readablePaths.length, 2, 'the private-root parent plus exactly the primary node_modules');
+    const primaryModules = join(repo, 'node_modules');
+    const attack = join(workspace, 'attack');
+    // The broadest scope a package can be given: the whole workspace.
+    const run = (command) =>
+      runCommand(command, { cwd: workspace, readablePaths, writablePaths: [join(workspace, '**')], timeoutMs: 30_000 });
+    // Resolution: a module in the workspace finds the linked dependency by walking up.
+    const read = await run(`node -e ${shellQuote("console.log(require('dep-pkg'))")}`);
+    assert.equal(read.sandbox, 'macos');
+    assert.equal(read.code, 0, read.stderr);
+    assert.match(read.stdout, /dep-ok/);
+    // No write reaches the primary's node_modules by any route.
+    const writes = await run(
+      [
+        `touch ../node_modules/dep-pkg/via-link; echo link:$?`,
+        `touch ${shellQuote(join(primaryModules, 'dep-pkg', 'direct'))}; echo direct:$?`,
+        `echo x > ${shellQuote(join(primaryModules, 'dep-pkg', 'index.js'))}; echo overwrite:$?`,
+        `rm ${shellQuote(join(primaryModules, 'dep-pkg', 'index.js'))}; echo remove:$?`,
+        // A symlink the worker creates in its own scope must not write through either.
+        `ln -s ${shellQuote(primaryModules)} attack; touch attack/dep-pkg/via-worker-link; echo worker-link:$?`,
+        // Nor may it retarget or delete the server-owned link in the private root.
+        `rm ../node_modules; echo unlink:$?`,
+        `ln -sfn ${shellQuote(pwned)} ../node_modules; echo retarget:$?`,
+        `touch ../sibling; echo parent:$?`,
+      ].join('\n'),
+    );
+    for (const name of ['link', 'direct', 'overwrite', 'remove', 'worker-link', 'unlink', 'retarget', 'parent'])
+      assert.match(writes.stdout, new RegExp(`${name}:[1-9]`), `${name} must fail: ${writes.stdout}`);
+    assert.equal(existsSync(join(primaryModules, 'dep-pkg', 'via-link')), false);
+    assert.equal(existsSync(join(primaryModules, 'dep-pkg', 'direct')), false);
+    assert.equal(existsSync(join(primaryModules, 'dep-pkg', 'via-worker-link')), false);
+    assert.equal(await readFile(join(primaryModules, 'dep-pkg', 'index.js'), 'utf8'), 'module.exports = "dep-ok";\n');
+    assert.equal(existsSync(join(dirname(workspace), 'sibling')), false);
+    assert.equal(existsSync(join(pwned, 'index.js')), false);
+    // The link still points at the primary after the attempts.
+    assert.equal(await realpath(join(dirname(workspace), 'node_modules')), await realpath(primaryModules));
+    // Credential-shaped files and dependency caches in the mount stay unreadable.
+    const denied = await run(
+      [
+        `cat ../node_modules/dep-pkg/.env > /dev/null 2>&1; echo env:$?`,
+        `cat ${shellQuote(join(primaryModules, 'dep-pkg', '.env'))} > /dev/null 2>&1; echo envdirect:$?`,
+        `cat ../node_modules/.cache/entry.json > /dev/null 2>&1; echo cache:$?`,
+      ].join('\n'),
+    );
+    for (const name of ['env', 'envdirect', 'cache']) assert.match(denied.stdout, new RegExp(`${name}:[1-9]`), denied.stdout);
+    void attack;
+  },
+);
 test('macOS sandbox blocks out-of-scope and git writes', { skip: !sandboxAvailable() }, async (t) => {
   const dir = await mkdtemp(`${tmpdir()}/offload-macos-`);
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -645,3 +722,352 @@ test(
     assert.notEqual(result.code, 0);
   },
 );
+
+// A fake child whose stdout/stderr the test drives directly.
+function fakeChild() {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  return child;
+}
+const COMMAND_LINE_TOOLS = '/Library/Developer/CommandLineTools';
+
+test('the macOS verifier grants exactly one physical per-run temp directory through TMPDIR, TMP, TEMP and HOME', async () => {
+  const child = fakeChild();
+  let environment;
+  let profile;
+  let existedWhileRunning;
+  await runCommand('true', {
+    platform: 'darwin',
+    sandboxProbe: () => true,
+    cwd: tmpdir(),
+    env: { PATH: '/bin', TMPDIR: '/caller/tmp', DEVELOPER_DIR: '/caller/evil', GIT_CONFIG_GLOBAL: '/caller/evil.cfg' },
+    spawnProcess(_command, args, options) {
+      environment = options.env;
+      profile = args[1];
+      existedWhileRunning = existsSync(options.env.TMPDIR);
+      queueMicrotask(() => child.emit('close', 0, null));
+      return child;
+    },
+  });
+  const temp = environment.TMPDIR;
+  assert.equal(environment.TMP, temp);
+  assert.equal(environment.TEMP, temp);
+  assert.equal(environment.HOME, temp);
+  assert.match(basename(temp), /^offload-sandbox-/);
+  assert.equal(temp, await realpath(dirname(temp)).then((parent) => join(parent, basename(temp))), 'the grant is the physical spelling');
+  assert.equal(existedWhileRunning, true);
+  assert.equal(existsSync(temp), false, 'the per-run directory is removed when the command ends');
+  // The write set is exactly that directory: no /tmp, /private/tmp or /var/folders grant, ever.
+  const writes = [...profile.matchAll(/^\(allow file-write\* \(subpath "([^"]*)"\)\)$/gm)].map((match) => match[1]);
+  assert.deepEqual(writes, [temp]);
+  for (const broad of ['/tmp', '/private/tmp', '/var/folders', '/private/var/folders', await realpath(tmpdir())])
+    assert.equal(writes.includes(broad), false, `${broad} is never granted`);
+  // Caller-chosen values never survive the scrub.
+  assert.notEqual(environment.TMPDIR, '/caller/tmp');
+  assert.equal(environment.GIT_CONFIG_GLOBAL, undefined);
+  assert.notEqual(environment.DEVELOPER_DIR, '/caller/evil');
+});
+
+test('sandbox tool environment disables system git config and fixes DEVELOPER_DIR only when the Command Line Tools exist', async () => {
+  assert.deepEqual(sandboxToolEnv({ exists: () => true }), {
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_ATTR_NOSYSTEM: '1',
+    DEVELOPER_DIR: COMMAND_LINE_TOOLS,
+  });
+  assert.deepEqual(sandboxToolEnv({ exists: () => false }), { GIT_CONFIG_NOSYSTEM: '1', GIT_ATTR_NOSYSTEM: '1' });
+  const probed = [];
+  sandboxToolEnv({ exists: (path) => probed.push(path) && false });
+  assert.deepEqual(probed, [`${COMMAND_LINE_TOOLS}/usr/bin/git`]);
+
+  let sandboxed;
+  let policyOnly;
+  for (const [platform, sandbox, assign] of [
+    ['darwin', true, (env) => (sandboxed = env)],
+    ['linux', false, (env) => (policyOnly = env)],
+  ]) {
+    const child = fakeChild();
+    await runCommand('true', {
+      platform,
+      sandbox,
+      sandboxProbe: () => true,
+      cwd: tmpdir(),
+      env: { PATH: '/bin' },
+      spawnProcess(_command, _args, options) {
+        assign(options.env);
+        queueMicrotask(() => child.emit('close', 0, null));
+        return child;
+      },
+    });
+  }
+  assert.equal(sandboxed.GIT_CONFIG_NOSYSTEM, '1');
+  assert.equal(sandboxed.GIT_ATTR_NOSYSTEM, '1');
+  assert.equal(sandboxed.DEVELOPER_DIR, sandboxToolEnv().DEVELOPER_DIR);
+  for (const key of ['GIT_CONFIG_NOSYSTEM', 'GIT_ATTR_NOSYSTEM', 'DEVELOPER_DIR', 'OPENSSL_CONF'])
+    assert.equal(policyOnly[key], undefined, `${key} is added only after a real sandbox was applied`);
+});
+
+test('onOutput observes each chunk in order without changing the retained output or the exit result', async () => {
+  const run = async (onOutput) => {
+    const child = fakeChild();
+    return runCommand('true', {
+      platform: 'linux',
+      sandbox: false,
+      onOutput,
+      spawnProcess() {
+        queueMicrotask(() => {
+          child.stdout.emit('data', Buffer.from('a'));
+          child.stderr.emit('data', Buffer.from('b'));
+          child.stdout.emit('data', Buffer.from('c'));
+          child.emit('close', 3, null);
+        });
+        return child;
+      },
+    });
+  };
+  const seen = [];
+  const observed = await run((value, stream) => seen.push([Buffer.from(value).toString(), stream]));
+  assert.deepEqual(seen, [
+    ['a', 'stdout'],
+    ['b', 'stderr'],
+    ['c', 'stdout'],
+  ]);
+  assert.equal(observed.stdout, 'ac');
+  assert.equal(observed.stderr, 'b');
+  assert.equal(observed.code, 3);
+  const throwing = await run(() => {
+    throw new Error('hook failure');
+  });
+  assert.equal(throwing.code, 3);
+  assert.equal(throwing.stdout, 'ac');
+  assert.equal(throwing.stderr, 'b');
+  await assert.rejects(() => run('not a function'), /onOutput must be a function/);
+});
+
+test(
+  'macOS verifier temp contract: only the per-run TMPDIR is writable and it is cleaned afterwards',
+  { skip: !sandboxAvailable() && MACOS_SANDBOX_SKIP_REASON },
+  async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'offload-temp-contract-'));
+    const token = `offload-contract-${process.pid}-${Date.now()}`;
+    try {
+      const result = await runCommand(
+        [
+          'printf "tmpdir=%s\\n" "$TMPDIR"',
+          'mktemp -d "$TMPDIR/x.XXXXXX" >/dev/null && echo own=ok || echo own=denied',
+          `mktemp -d /tmp/${token}.XXXXXX >/dev/null 2>&1 && echo system=writable || echo system=denied`,
+          'echo "darwin=$(getconf DARWIN_USER_TEMP_DIR)"',
+          'echo "stripped=$(env -i /usr/bin/mktemp -d 2>&1 | head -1)"',
+          `echo "node=$(node -p 'require("os").tmpdir()' 2>&1 | head -1)"`,
+        ].join('\n'),
+        { cwd, requireSandbox: true, timeoutSec: 30 },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      const lines = Object.fromEntries(
+        result.stdout
+          .trim()
+          .split('\n')
+          .map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]),
+      );
+      assert.equal(lines.own, 'ok', 'a directory can be made under TMPDIR');
+      assert.equal(lines.system, 'denied', 'a hard-coded /tmp stays denied');
+      assert.equal(lines.darwin, lines.tmpdir, 'getconf honors the per-run directory');
+      assert.match(lines.stripped, /Operation not permitted/, 'a child that drops TMPDIR falls back to the denied /tmp');
+      if (HOMEBREW_NODE) assert.equal(lines.node, lines.tmpdir, 'Node os.tmpdir() honors it too');
+      assert.deepEqual(
+        (await readdir('/tmp')).filter((name) => name.startsWith(token)),
+        [],
+        'nothing was created in /tmp',
+      );
+      assert.equal(existsSync(lines.tmpdir), false, 'the per-run directory is gone');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'macOS verifier can run git in its temp directory because the tool environment fixes the xcode-select shim',
+  { skip: !sandboxAvailable() && MACOS_SANDBOX_SKIP_REASON },
+  async () => {
+    if (!existsSync(`${COMMAND_LINE_TOOLS}/usr/bin/git`)) return;
+    const cwd = await mkdtemp(join(tmpdir(), 'offload-git-contract-'));
+    try {
+      const script = (prefix) =>
+        [
+          `${prefix}git init -q "$TMPDIR/g" || exit 10`,
+          'cd "$TMPDIR/g"',
+          'git config user.email a@example.invalid && git config user.name n',
+          'echo x > f && git add f && git commit -qm initial || exit 11',
+          'git status --short | wc -l | tr -d " "',
+          'git log --format=%s',
+        ].join('\n');
+      const worked = await runCommand(script(''), { cwd, requireSandbox: true, timeoutSec: 30 });
+      assert.equal(worked.code, 0, worked.stderr);
+      assert.deepEqual(worked.stdout.trim().split('\n'), ['0', 'initial']);
+      // Falsifiability: with the three variables removed inside the same sandbox git cannot even start.
+      const broken = await runCommand('env -u DEVELOPER_DIR -u GIT_CONFIG_NOSYSTEM -u GIT_ATTR_NOSYSTEM git init -q "$TMPDIR/g" 2>&1', {
+        cwd,
+        requireSandbox: true,
+        timeoutSec: 30,
+      });
+      assert.notEqual(broken.code, 0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+const probeOutput = (stdout, extra = {}) => ({ code: 0, stdout, stderr: '', timedOut: false, ...extra });
+async function probeWith(options = {}) {
+  const made = [];
+  const removed = [];
+  const result = await probeVerifierTemp({
+    platform: 'darwin',
+    tmp: () => '/host/tmp',
+    mkdtemp: (prefix) => {
+      made.push(prefix);
+      return `${prefix}SCRATCH`;
+    },
+    rm: (path) => removed.push(path),
+    run: async () => probeOutput(''),
+    ...options,
+  });
+  return { result, made, removed };
+}
+
+test('the verifier temp probe reports each outcome as a bounded, path-free summary and always removes its scratch directory', async () => {
+  let call;
+  const writable = await probeWith({
+    run: async (script, options) => {
+      call = { script, options };
+      return probeOutput('tmpdir=ok\nsystem-tmp=denied\ngit-init=ok\n');
+    },
+  });
+  assert.deepEqual(writable.result, {
+    status: 'writable',
+    reason: 'per-run-tmpdir-writable',
+    systemTmp: 'denied',
+    gitInit: 'ok',
+    note: 'a verifier can create temp dirs under its per-run TMPDIR; a hard-coded /tmp is denied by design',
+  });
+  assert.equal(call.options.requireSandbox, true, 'the probe goes through the real sandboxed runner');
+  assert.equal(call.options.cwd, '/host/tmp/offload-probe-SCRATCH'.replace('/offload-probe-SCRATCH', '') + '/offload-probe-SCRATCH');
+  assert.deepEqual(writable.removed, ['/host/tmp/offload-probe-SCRATCH'], 'the host scratch directory is removed');
+  assert.match(call.script, /mktemp -d "\$\{TMPDIR:-\/nonexistent\}\/offload-probe\./);
+
+  const denied = await probeWith({ run: async () => probeOutput('tmpdir=denied\nsystem-tmp=denied\ngit-init=failed\n') });
+  assert.equal(denied.result.status, 'unwritable');
+  assert.equal(denied.result.reason, 'per-run-tmpdir-denied');
+  assert.equal(denied.result.gitInit, 'failed');
+
+  const regressed = await probeWith({ run: async () => probeOutput('tmpdir=ok\nsystem-tmp=writable\ngit-init=ok\n') });
+  assert.equal(regressed.result.status, 'writable');
+  assert.equal(regressed.result.systemTmp, 'writable');
+  assert.equal(regressed.result.warning, 'system temp is writable inside the verifier; the sandbox profile has regressed');
+
+  // Only exact key=value lines count: a command echoing the text inside other output does not.
+  const forged = await probeWith({ run: async () => probeOutput('note: tmpdir=ok\n  tmpdir=ok\ntmpdir=okay\n') });
+  assert.equal(forged.result.reason, 'probe-failed');
+  assert.equal(forged.result.status, 'unknown');
+
+  const timedOut = await probeWith({ run: async () => probeOutput('', { code: null, timedOut: true }) });
+  assert.deepEqual([timedOut.result.status, timedOut.result.reason], ['unknown', 'probe-timed-out']);
+
+  const unavailable = await probeWith({
+    run: async () => {
+      throw new Error('Required macOS sandbox is unavailable for this command');
+    },
+  });
+  assert.deepEqual([unavailable.result.status, unavailable.result.reason], ['not-probed', 'sandbox-unavailable']);
+
+  const crashed = await probeWith({
+    run: async () => {
+      throw new Error('spawn exploded \u001b[31mat /private/secret');
+    },
+  });
+  assert.equal(crashed.result.reason, 'probe-failed');
+  assert.equal(crashed.result.error, 'exception', 'exception text can carry host paths and is never echoed');
+  assert.doesNotMatch(JSON.stringify(crashed.result), /private|secret|exploded/);
+  const coded = await probeWith({
+    run: async () => {
+      throw Object.assign(new Error('spawn /private/secret/sandbox-exec ENOENT'), { code: 'ENOENT' });
+    },
+  });
+  assert.equal(coded.result.error, 'ENOENT');
+  assert.doesNotMatch(JSON.stringify(coded.result), /private|secret/);
+  assert.equal(forged.result.error, 'exit-0', 'stderr text is replaced by the exit status');
+  const noisy = await probeWith({ run: async () => probeOutput('', { code: 3, stderr: 'denied /private/secret/file' }) });
+  assert.equal(noisy.result.error, 'exit-3');
+  assert.doesNotMatch(JSON.stringify(noisy.result), /private|secret/);
+
+  for (const { removed } of [denied, regressed, forged, timedOut, unavailable, crashed])
+    assert.deepEqual(removed, ['/host/tmp/offload-probe-SCRATCH'], 'every outcome removes the scratch directory');
+});
+
+test('the verifier temp probe reports an unwritable host temp root by error code only, and checks just the host without a macOS sandbox', async () => {
+  let ran = 0;
+  const unwritable = await probeWith({
+    mkdtemp: () => {
+      throw Object.assign(new Error("EACCES: permission denied, mkdtemp '/host/tmp/offload-probe-XXXXXX'"), { code: 'EACCES' });
+    },
+    run: async () => {
+      ran += 1;
+      return probeOutput('');
+    },
+  });
+  assert.equal(unwritable.result.status, 'unwritable');
+  assert.equal(unwritable.result.reason, 'host-tmpdir-unwritable');
+  assert.equal(unwritable.result.error, 'EACCES');
+  assert.doesNotMatch(JSON.stringify(unwritable.result), /\/host\/tmp/);
+  assert.equal(ran, 0, 'no sandboxed command runs when the host temp root itself is unusable');
+
+  const linux = await probeWith({
+    platform: 'linux',
+    run: async () => {
+      ran += 1;
+      return probeOutput('');
+    },
+  });
+  assert.equal(linux.result.status, 'writable');
+  assert.equal(linux.result.reason, 'policy-only-host-tmpdir-writable');
+  assert.equal(linux.result.systemTmp, 'unknown');
+  assert.equal(linux.result.gitInit, 'unknown');
+  assert.equal(ran, 0);
+  assert.deepEqual(linux.removed, ['/host/tmp/offload-probe-SCRATCH']);
+});
+
+test(
+  'the real verifier temp probe finds the per-run TMPDIR writable and /tmp denied',
+  { skip: !sandboxAvailable() && MACOS_SANDBOX_SKIP_REASON },
+  async () => {
+    const result = await probeVerifierTemp();
+    assert.equal(result.status, 'writable');
+    assert.equal(result.reason, 'per-run-tmpdir-writable');
+    assert.equal(result.systemTmp, 'denied');
+    assert.ok(['ok', 'failed'].includes(result.gitInit));
+    if (existsSync(`${COMMAND_LINE_TOOLS}/usr/bin/git`)) assert.equal(result.gitInit, 'ok');
+  },
+);
+
+test('Runner reports sandbox availability from its injectable probe and still passes verify options through untouched', async () => {
+  const probes = [];
+  const unavailable = new Runner({
+    probeSandbox: (platform) => (probes.push(platform), { available: false, reason: 'sandbox-apply-not-permitted' }),
+  });
+  assert.deepEqual(unavailable.sandboxStatus('darwin'), { available: false, reason: 'sandbox-apply-not-permitted' });
+  assert.equal(unavailable.sandboxAvailable('darwin'), false);
+  assert.equal(new Runner({ probeSandbox: () => ({ available: true, reason: 'profile-applied' }) }).sandboxAvailable(), true);
+  assert.deepEqual(probes, ['darwin', 'darwin']);
+  // The default probe is the real one and agrees with sandbox.mjs.
+  assert.equal(new Runner().sandboxAvailable(), sandboxAvailable());
+  assert.equal(new Runner().sandboxStatus().reason, sandboxStatus().reason);
+  const seen = [];
+  const runner = new Runner({
+    execute: async (command, options) => (seen.push({ command, options }), { code: 0, stdout: '', stderr: '', sandbox: 'macos' }),
+    defaults: { sandbox: true, timeoutMs: 1 },
+  });
+  const verified = await runner.verify('check', { timeoutMs: 300_000, requireSandbox: true, writablePaths: [] });
+  assert.equal(verified.verdict, 'PASS');
+  assert.deepEqual(seen[0].options, { sandbox: true, timeoutMs: 300_000, requireSandbox: true, writablePaths: [] });
+});

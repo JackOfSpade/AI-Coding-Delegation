@@ -1,7 +1,9 @@
 import { AgentContext } from './context.mjs';
-import { TOOL_DEFINITIONS, isReadOnlyTool } from './tools.mjs';
+import { DEFAULT_COMMAND_TIMEOUT_SEC, MAX_COMMAND_TIMEOUT_SEC, TOOL_DEFINITIONS, isReadOnlyTool } from './tools.mjs';
 import { Meter, resolveModel, samePricedModel } from '../pricing.mjs';
 import { OpenAIChatProvider, PROVIDER_FINISH_REASONS, ProviderError, providerFailure } from '../provider/openai-chat.mjs';
+import { FAILURE_ERRORS, summarizeToolFailure, toolErrorHint } from '../failure.mjs';
+import { MAX_BATCH_COMMAND_SEC } from '../timing.mjs';
 
 const asToolCalls = (calls) => calls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } }));
 // Arguments originate with an untrusted provider response. Never persist a
@@ -47,6 +49,18 @@ const CAPPED_IMPLEMENTATION_RECOVERY_REMINDER = 'Continue implementation using a
 // appended to the durable transcript. It is the entire trusted request after
 // that transcript can no longer fit the remaining finite budget.
 const BUDGET_FINISH_RECOVERY_MESSAGE = 'Call the finish tool now.';
+// A finish call that shares its turn with other calls, or whose arguments are
+// invalid, is never run, and neither is anything beside it: finishing is the
+// end of the job, so a turn that also mutates cannot be told apart from a
+// half-formed one. Every call in that turn gets one of these fixed results (the
+// transcript must answer every tool_call id) and the worker gets one retry. The
+// `TOOL_ERROR:` prefix matters: a refused write_file/edit_file must not read as
+// a successful direct write when a transcript is resumed. Provider-controlled
+// text (names, arguments) never appears in either.
+const FINISH_ALONE_CORRECTION =
+  'TOOL_ERROR: finish must be the only tool call in its turn; nothing in this turn was executed; call finish alone (re-issue other calls in a separate turn first if still needed)';
+const FINISH_ARGUMENTS_CORRECTION =
+  'finish arguments are invalid: summary is required (1-1500 characters); concerns and testsRun are optional arrays of up to 100 strings of up to 1000 characters; report is an optional string of up to 256000 characters';
 const MISSING_TOOL_RECOVERY_REMINDER =
   'Do not reply with prose only. Invoke one or more allowed non-finish tools to continue, or call finish as the sole tool call if complete.';
 // A provider-controlled name never reaches a durable record or the model. The
@@ -107,6 +121,10 @@ const cappedImplementationRecoveryPendingInTranscript = (messages) =>
 const implementationCheckpoint = (remainingTurns) => {
   const prefix = `Implementation checkpoint: ${remainingTurns} model turn${remainingTurns === 1 ? '' : 's'} remain.`;
   return `${prefix} The next response must make an allowed tool call. If necessary information remains unread, read or list it now; otherwise make a mutation immediately. Put source only in write_file.content. To avoid output caps, write one complete file per response when multiple files are material. Finish when complete.`;
+};
+const verifierCompletionCheckpoint = (remainingTurns) => {
+  const prefix = `Completion checkpoint: ${remainingTurns} model turn${remainingTurns === 1 ? '' : 's'} remain.`;
+  return `${prefix} A focused server verifier will run after finish. Do not continue exploring or rerun the verifier. If the required in-scope changes are complete, call finish now as the sole tool call. Use another tool only for an essential remaining edit or diagnosis.`;
 };
 const validMetadata = (value, max = 256) =>
   typeof value === 'string' && value.length > 0 && value.length <= max && !/[\x00-\x1F\x7F]/.test(value);
@@ -240,6 +258,13 @@ export class AgentLoop {
     // may legitimately use the same prose in a task.
     cappedFinishRecovery,
     budgetFinishRecovery,
+    // The manager has a focused verifier it will run after a successful
+    // finish. This affects only completion steering; it never changes the
+    // tools a worker may execute or exposes the verifier command to it.
+    serverVerifierConfigured = false,
+    // `[[absolutePrefix, label], ...]` applied to the failing call recorded when
+    // the loop guard trips, so a temp or home directory never reaches a report.
+    pathAliases = [],
   } = {}) {
     if (!provider || typeof provider.chat !== 'function') throw new TypeError('provider.chat is required');
     if (!tools || typeof tools.execute !== 'function') throw new TypeError('tools.execute is required');
@@ -260,6 +285,14 @@ export class AgentLoop {
       throw new TypeError('persistCappedFinishRecovery must be a function');
     if (persistBudgetFinishRecovery !== undefined && typeof persistBudgetFinishRecovery !== 'function')
       throw new TypeError('persistBudgetFinishRecovery must be a function');
+    if (typeof serverVerifierConfigured !== 'boolean') throw new TypeError('serverVerifierConfigured must be boolean');
+    if (
+      !Array.isArray(pathAliases) ||
+      pathAliases.length > 16 ||
+      pathAliases.some((pair) => !Array.isArray(pair) || pair.length !== 2 || pair.some((part) => typeof part !== 'string'))
+    )
+      throw new TypeError('pathAliases must be up to 16 [prefix, label] string pairs');
+    this.pathAliases = pathAliases;
     this.provider = provider;
     this.tools = tools;
     this.context = context ?? new AgentContext();
@@ -282,10 +315,14 @@ export class AgentLoop {
     this.persistBudgetFinishRecovery = persistBudgetFinishRecovery;
     this.cappedFinishRecovery = cappedFinishRecovery;
     this.budgetFinishRecovery = budgetFinishRecovery;
+    this.serverVerifierConfigured = serverVerifierConfigured;
   }
-  async #execute(calls, signal) {
+  async #execute(calls, signal, errors = [], timings = []) {
     const result = new Array(calls.length);
     const one = async (call, i) => {
+      // Reads overlap, so these are per-call figures (for the longest call), not
+      // a partition of the batch's wall time.
+      const startedAt = this.now();
       try {
         if (signal?.aborted) throw signal.reason ?? new Error('Aborted');
         result[i] = await this.tools.execute(call.name, safeJson(call.arguments), { signal });
@@ -297,8 +334,14 @@ export class AgentLoop {
         if (signal?.aborted) throw signal.reason ?? error;
         // Tool implementations can wrap command output or OS errors.  Those
         // messages are fed back to the model and may contain credentials, so
-        // keep the retry signal useful without reflecting untrusted text.
-        result[i] = 'TOOL_ERROR: Tool execution failed';
+        // keep the retry signal useful without reflecting untrusted text. The
+        // real error is kept for the server (the loop guard records it for the
+        // primary); the worker sees at most a fixed hint chosen by pattern.
+        errors[i] = error;
+        const hint = toolErrorHint(error);
+        result[i] = hint ? `TOOL_ERROR: Tool execution failed (hint: ${hint})` : 'TOOL_ERROR: Tool execution failed';
+      } finally {
+        timings.push({ name: call.name, ms: Math.max(0, Math.round(this.now() - startedAt)) });
       }
     };
     // Reads are concurrent. A write is a barrier, so its order relative to all
@@ -374,6 +417,9 @@ export class AgentLoop {
     let cappedReasoningContinuationUsed = false;
     let missingToolRecoveryUsed = false;
     let unadvertisedToolRecoveryUsed = false;
+    // One finish-protocol correction per run (so per round of a job): a second
+    // violation is the worker's, not a fluke, and ends the round.
+    let finishProtocolRecoveryUsed = false;
     // The durable lifecycle state—not a human-language transcript marker—is
     // the authority for the one post-write implementation continuation. In
     // particular, a user task equal to the reminder remains an ordinary task.
@@ -412,6 +458,12 @@ export class AgentLoop {
     let completedNonWritingTurns = 0;
     let directWriteSucceeded = successfulDirectWriteInTranscript(initialTranscript);
     let implementationCheckpointUsed = false;
+    // A successful write used to disable every later focus reminder. That
+    // left a worker free to spend its final turns re-exploring even though the
+    // manager already had a focused verifier waiting for finish. One separate
+    // post-write checkpoint preserves room for essential follow-up work while
+    // making the finish boundary explicit.
+    let verifierCompletionCheckpointUsed = false;
     let implementationFocusPending = false;
     // A DeepSeek-focused required-tool request that exhausts its output
     // allowance before it can call a tool gets the loop's existing one
@@ -453,6 +505,7 @@ export class AgentLoop {
         costUsd: this.meter.usd,
         pricingKnown,
         error: this.maxUsd === 0 ? 'Budget is zero' : 'Pricing is unknown for a finite budget',
+        budgetCap: 'other',
         ...modelMeta(),
       };
     const deadline = new AbortController();
@@ -662,6 +715,7 @@ export class AgentLoop {
                 costUsd: this.meter.usd,
                 pricingKnown: true,
                 error: 'Remaining budget cannot cover a conservative prompt and minimum response reservation',
+                budgetCap: 'reservation',
                 ...(cheapest ? { budgetReservation: cheapest } : {}),
                 ...modelMeta(),
               };
@@ -884,6 +938,7 @@ export class AgentLoop {
             pricingKnown: !this.meter.unknownPricing,
             model: responseModel,
             error: 'Provider response model is not authorized for this finite budget',
+            budgetCap: 'other',
             ...modelMeta(),
           };
         if (this.meter.usd > this.maxUsd || (this.meter.unknownPricing && this.maxUsd !== Infinity))
@@ -894,6 +949,8 @@ export class AgentLoop {
             costUsd: this.meter.usd,
             pricingKnown: !this.meter.unknownPricing,
             model: responseModel,
+            // A finite budget with an unpriced response trips here too; only a real overspend is the USD cap.
+            budgetCap: this.meter.usd > this.maxUsd ? 'usd' : 'other',
             ...modelMeta(),
           };
         if (
@@ -1061,9 +1118,10 @@ export class AgentLoop {
             costUsd: this.meter.usd,
             pricingKnown: !this.meter.unknownPricing,
             model: responseModel,
-            error: outputCapRecoveryExhausted
-              ? 'Worker exhausted output-cap recovery without an allowed tool call'
-              : 'Worker ended without mandatory finish call',
+            // A closed, worker-side cause that offload_continue may resume. A
+            // content-filter stop is the provider's, and would simply recur.
+            ...(providerFinishReason === 'content_filter' ? {} : { failureKind: outputCapRecoveryExhausted ? 'output-cap' : 'no-finish' }),
+            error: outputCapRecoveryExhausted ? FAILURE_ERRORS['output-cap'] : FAILURE_ERRORS['no-finish'],
             text,
             ...modelMeta(),
           };
@@ -1098,7 +1156,31 @@ export class AgentLoop {
             ...modelMeta(),
           };
         const finishIndex = calls.findIndex((call) => call.name === 'finish');
-        if (finishIndex !== -1 && (calls.length !== 1 || !finishArgs(parsed[finishIndex])))
+        const finishNotAlone = finishIndex !== -1 && calls.length !== 1;
+        const finishInvalid = finishIndex !== -1 && !finishArgs(parsed[finishIndex]);
+        if (finishNotAlone || finishInvalid) {
+          // One bounded, execute-nothing correction, like the unadvertised-tool
+          // one above. The response was already metered, nothing in it runs, the
+          // retry takes a normal turn (so it counts against maxTurns, and needs
+          // one left) and keeps every reservation, timeout and accounting check.
+          // The finish-only budget recovery stays fail-closed.
+          const recoverFinishProtocol = !finishProtocolRecoveryUsed && !budgetFinishRecovery && turn < this.maxTurns;
+          if (recoverFinishProtocol) {
+            finishProtocolRecoveryUsed = true;
+            const correction = finishNotAlone
+              ? `${FINISH_ALONE_CORRECTION}${finishInvalid ? `; also, ${FINISH_ARGUMENTS_CORRECTION}` : ''}`
+              : `TOOL_ERROR: ${FINISH_ARGUMENTS_CORRECTION}; nothing in this turn was executed; call finish alone again`;
+            // One atomic, durable batch: a crash can never leave an assistant
+            // tool_call without its result.
+            await this.context.addBatch([
+              assistant,
+              ...calls.map((call) => ({ role: 'tool', tool_call_id: call.id, name: call.name, content: correction })),
+            ]);
+            await this.context.flush();
+            await settleCappedImplementationRecovery();
+            await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'finish_protocol_recover' });
+            continue;
+          }
           return {
             status: 'FAILED',
             turn,
@@ -1106,17 +1188,50 @@ export class AgentLoop {
             costUsd: this.meter.usd,
             pricingKnown: !this.meter.unknownPricing,
             model: responseModel,
-            error: 'finish must be the sole valid tool call in a turn',
+            // A worker-side cause offload_continue may resume (the work is in the workspace).
+            failureKind: 'finish-protocol',
+            error: FAILURE_ERRORS['finish-protocol'],
             ...modelMeta(),
           };
+        }
         // Persist only a valid assistant tool-call turn.  This ensures a repair
         // never replays an OpenAI-invalid assistant message without matching
         // tool results.
         this.context.add(assistant);
         await this.context.flush();
         let values;
+        const toolErrors = new Array(calls.length);
+        const toolTimings = [];
+        // Marks the start of tool time: nothing else is reported between the
+        // provider's answer and the tools' results, so without it a long
+        // command is indistinguishable from a stuck round. It carries no
+        // `action`/`actions`, which would overwrite the job's recent actions.
+        // Commands run one after another, so the batch's limit is the sum of theirs.
+        const commandLimits = calls.flatMap((call, i) =>
+          call.name === 'run_command'
+            ? [
+                Number.isSafeInteger(parsed[i]?.timeoutSec)
+                  ? Math.min(MAX_COMMAND_TIMEOUT_SEC, Math.max(1, parsed[i].timeoutSec))
+                  : DEFAULT_COMMAND_TIMEOUT_SEC,
+              ]
+            : [],
+        );
+        const commandTimeoutSec = commandLimits.length
+          ? Math.min(
+              MAX_BATCH_COMMAND_SEC,
+              commandLimits.reduce((sum, limit) => sum + limit, 0),
+            )
+          : undefined;
+        // `finish` is the sole call of its turn and returns at once: no marker.
+        if (finishIndex === -1)
+          await this.progress?.({
+            turn,
+            phase: 'tool',
+            tools: calls.map((call) => call.name).slice(0, 8),
+            ...(commandTimeoutSec ? { commandTimeoutSec } : {}),
+          });
         try {
-          values = await this.#execute(calls, deadline.signal);
+          values = await this.#execute(calls, deadline.signal, toolErrors, toolTimings);
         } catch (error) {
           if (this.signal?.aborted) return { status: 'CANCELLED', turn, usage: totalUsage, costUsd: this.meter.usd, ...modelMeta() };
           if (deadline.signal.aborted)
@@ -1140,7 +1255,14 @@ export class AgentLoop {
             error: 'Agent wall clock deadline exceeded',
             ...modelMeta(),
           };
-        await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, actions: calls.map((call) => call.name).slice(0, 32) });
+        await this.progress?.({
+          turn,
+          usage: totalUsage,
+          costUsd: this.meter.usd,
+          actions: calls.map((call) => call.name).slice(0, 32),
+          // `finish` is not worker tool time.
+          toolTimings: toolTimings.filter((timing) => timing.name !== 'finish').slice(0, 32),
+        });
         const signatures = calls.map((c) => `${c.name}:${c.arguments}`).join('|');
         const failed = values.some((v) => typeof v === 'string' && v.startsWith('TOOL_ERROR:'));
         const n = failed ? (repeated.get(signatures) ?? 0) + 1 : 0;
@@ -1154,7 +1276,17 @@ export class AgentLoop {
             costUsd: this.meter.usd,
             pricingKnown: !this.meter.unknownPricing,
             model: responseModel,
-            error: 'Loop detected: identical failing tool calls repeated 3 times',
+            failureKind: 'tool-loop',
+            error: FAILURE_ERRORS['tool-loop'],
+            toolFailure: summarizeToolFailure({
+              calls,
+              parsed,
+              values,
+              errors: toolErrors,
+              turn,
+              repeats: n,
+              pathAliases: this.pathAliases,
+            }),
             ...modelMeta(),
           };
         for (let i = 0; i < calls.length; i++) {
@@ -1190,6 +1322,17 @@ export class AgentLoop {
             !(typeof values[index] === 'string' && values[index].startsWith('TOOL_ERROR:')),
         );
         directWriteSucceeded ||= successfulDirectWrite;
+        if (this.serverVerifierConfigured && successfulDirectWrite && !verifierCompletionCheckpointUsed && turn < this.maxTurns) {
+          verifierCompletionCheckpointUsed = true;
+          this.context.add({ role: 'user', content: verifierCompletionCheckpoint(this.maxTurns - turn) });
+          await this.context.flush();
+          await this.progress?.({ turn, action: 'verifier_completion_checkpoint' });
+          // Keep the official DeepSeek route at its focused tool-call boundary
+          // for this next response. The complete schema remains available: a
+          // worker may still make an essential edit, but cannot spend the turn
+          // on narrative instead of either acting or finishing.
+          if (this.maxUsd !== Infinity) implementationFocusPending = true;
+        }
         if (!successfulDirectWrite) completedNonWritingTurns++;
         if (
           writeCapable &&
@@ -1214,6 +1357,7 @@ export class AgentLoop {
         usage: totalUsage,
         costUsd: this.meter.usd,
         error: 'Maximum turns reached',
+        budgetCap: 'turns',
         ...modelMeta(),
       };
     } finally {
