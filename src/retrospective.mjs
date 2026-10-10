@@ -27,6 +27,10 @@ export const MAINTAINER_CLOSING = 'Add tests for each change, run the full suite
 export const WASTE_USD = 0.2;
 // A turn-cap stop that left more than this share of the dollar cap unspent was sized, not exhausted.
 export const LOW_SPEND_SHARE = 0.5;
+// A large gap from the server's own recommendation is useful only when it is
+// both material in absolute terms and clearly disproportionate.
+export const TURN_SIZING_OUTLIER_RATIO = 2;
+export const TURN_SIZING_OUTLIER_EXCESS = 40;
 
 const TASK_CHARS = 100;
 const EVIDENCE_CHARS = 200;
@@ -92,6 +96,26 @@ const FAMILIES = Object.freeze({
     request:
       'A job stopped on a server-sized turn cap with most of its dollar cap unspent. Revisit the turn sizing (budgetSizing) so cheap runs are not stranded, or say plainly in the budget-stop line which cap to raise.',
   },
+  'repeated-turn-cap': {
+    attributable: true,
+    request:
+      'A correctly completed job hit the turn cap repeatedly before it could finish. Investigate worker focus, budget sizing, and completion discipline so an automatically sized package reaches implementation and verification without repeated continuations.',
+  },
+  'turn-sizing-outlier': {
+    attributable: true,
+    request:
+      'A correctly completed job used far more turns than the server recommendation. Investigate whether the worker lost focus, the turn-sizing estimate missed the real work, or the completion loop needed clearer discipline; preserve the caller-fixed-cap safeguards.',
+  },
+  'repeated-continuation': {
+    attributable: true,
+    request:
+      'A worker needed several continuations before completing. Review worker focus and completion discipline, including whether an earlier round should have implemented the remaining work and run verification before stopping.',
+  },
+  'late-verification': {
+    attributable: true,
+    request:
+      'Verification was deferred until after repeated budget stops. Investigate budget sizing and worker completion discipline so implementation leaves enough room for the verifier in the original run or an earlier continuation.',
+  },
   'wasted-spend-on-failed-job': {
     attributable: true,
     request:
@@ -126,6 +150,8 @@ const familyOf = (code) =>
 const VERIFY_ENV_KIND = /^[a-z][a-z-]{0,39}$/;
 // Turn caps the server chose; one the caller set or raised is the caller's own.
 const SERVER_SIZED = new Set(['scaled', 'default']);
+const TURN_SOURCES = new Set(['default', 'scaled', 'caller', 'raised']);
+const EFFICIENCY_PAIR = new Set(['turn-sizing-outlier', 'repeated-continuation']);
 
 /** What the digest keeps of a job: closed fields, bounded values, no source, diff, path or brief. */
 export function jobFacts(job, context = {}) {
@@ -225,6 +251,141 @@ function applyPath(record) {
   return record.applied === true ? { via: 'server' } : undefined;
 }
 
+const turnSource = (value) => (typeof value === 'string' && TURN_SOURCES.has(value) ? value : undefined);
+const CONDITIONAL_EFFICIENCY_FAMILIES = new Set(['turn-sizing-outlier', 'repeated-continuation', 'late-verification']);
+
+/**
+ * The only sizing facts efficiency rules may use. An absent or caller-fixed
+ * provenance is deliberately a non-finding: retrospective must not turn a
+ * caller's explicit undersized cap into an Offload defect.
+ */
+function turnSizingOf(record) {
+  const sizing = object(record?.budgetSizing);
+  const recommendedTurns = count(sizing?.recommendedTurns, 100_000);
+  const currentSource = turnSource(sizing?.turnsSource);
+  // A legacy record whose only source is "raised" could have begun with a
+  // caller-fixed cap. Do not infer attribution from it after the fact.
+  const initialSource = turnSource(sizing?.initialTurnsSource) ?? (currentSource === 'raised' ? undefined : currentSource);
+  if (!recommendedTurns || !initialSource || initialSource === 'caller') return undefined;
+  return { recommendedTurns, initialSource, currentSource };
+}
+
+const safeRoundHistory = (value) => {
+  const entry = object(value);
+  const status = word(entry?.status, 24);
+  if (!entry || !status || !TERMINAL.has(status)) return undefined;
+  const round = count(entry.round, 100);
+  const stop = object(entry.budgetStop);
+  const cap = word(stop?.cap, 16);
+  const provider = object(entry.providerFailure);
+  const failureKind = safeFailureKind(entry.failureKind);
+  return {
+    ...(round !== undefined ? { round } : {}),
+    status,
+    ...(cap === 'turns' ? { budgetStop: { cap } } : {}),
+    ...(turnSource(entry.turnSizingSource) ? { turnSizingSource: entry.turnSizingSource } : {}),
+    ...(failureKind ? { failureKind } : {}),
+    ...(word(provider?.kind, 24) ? { providerFailure: provider.kind } : {}),
+    ...(entry.verificationRan === true ? { verificationRan: true } : {}),
+  };
+};
+
+const safeContinuationStatus = (value) => {
+  const status = word(value, 24);
+  return status && TERMINAL.has(status) ? status : undefined;
+};
+
+/**
+ * Recover the bounded lifecycle facts a retrospective needs. New jobs carry
+ * explicit lifecycle events; for older jobs the terminal event stream still
+ * lets us recover cap stops and, conservatively, infer why continuations were
+ * accepted. This view never reaches the digest itself.
+ */
+function roundHistoryOf(record, facts) {
+  const direct = object(record?.retrospectiveHistory);
+  const rounds = [];
+  const continuationStatuses = [];
+  const verificationRounds = [];
+  const addRound = (value) => {
+    const entry = safeRoundHistory(value);
+    if (entry && rounds.length < 8) rounds.push(entry);
+  };
+  const addContinuation = (value) => {
+    const status = safeContinuationStatus(value);
+    if (status && continuationStatuses.length < 8) continuationStatuses.push(status);
+  };
+  if (direct) {
+    for (const value of Array.isArray(direct.rounds) ? direct.rounds : []) addRound(value);
+    for (const value of Array.isArray(direct.continuationStatuses) ? direct.continuationStatuses : []) addContinuation(value);
+    for (const value of Array.isArray(direct.verificationRounds) ? direct.verificationRounds : []) {
+      const round = count(value, 100);
+      if (round !== undefined && verificationRounds.length < 8) verificationRounds.push(round);
+    }
+  } else if (typeof record?.retrospectiveEvents === 'string') {
+    const lines = record.retrospectiveEvents.split('\n');
+    for (const line of lines.slice(0, 512)) {
+      if (line.length > 4096) continue;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (!object(event)) continue;
+      if (event.type === 'finished') addRound(event);
+      if (event.type === 'continuation') addContinuation(event.fromStatus);
+      if (event.type === 'verify-phase' && event.phase === 'result' && event.status === 'started') {
+        const round = count(event.round, 100);
+        if (round !== undefined && verificationRounds.length < 8) verificationRounds.push(round);
+      }
+    }
+  }
+  // Events before explicit continuation records did not name their source
+  // status. Their earlier terminal results are a conservative fallback only
+  // for the number of continuations the job itself recorded.
+  const needed = facts.continuations ?? 0;
+  if (continuationStatuses.length < needed) {
+    for (const entry of rounds) {
+      if (continuationStatuses.length >= needed) break;
+      if (['BUDGET', 'TIMEOUT', 'FAILED'].includes(entry.status)) addContinuation(entry.status);
+    }
+  }
+  // Standard verification was not originally an event. A verified final
+  // record can still establish a late verifier run when every earlier round
+  // was a cap stop; do not claim its exact start time otherwise.
+  if (!verificationRounds.length && object(record?.verify) && facts.status === 'DONE_VERIFIED') {
+    const finalRound = count(facts.rounds, 100);
+    if (finalRound !== undefined) verificationRounds.push(finalRound);
+  }
+  return { rounds, continuationStatuses, verificationRounds };
+}
+
+const sizingSourceText = (sizing) =>
+  sizing.currentSource && sizing.currentSource !== sizing.initialSource
+    ? `${sizing.initialSource}; continuation cap ${sizing.currentSource}`
+    : sizing.initialSource;
+
+const ratioText = (actual, recommended) => `${(actual / recommended).toFixed(1)}×`;
+
+/**
+ * Most attributable signals warrant a maintainer prompt on their own. A large
+ * turn delta or several continuations is useful context but becomes a prompt
+ * threshold only together; a repeated cap independently crosses it. This
+ * keeps a benign one-off continuation from being escalated while ensuring a
+ * correct final result cannot hide persistent inefficiency.
+ */
+function promptWarrantSignals(signals) {
+  const attributable = signals.filter((signal) => signal.attributable);
+  const codes = new Set(attributable.map((signal) => signal.code));
+  const paired = [...EFFICIENCY_PAIR].every((code) => codes.has(code));
+  return attributable.filter((signal) => {
+    const family = familyOf(signal.code);
+    return (
+      !CONDITIONAL_EFFICIENCY_FAMILIES.has(family) || (paired && EFFICIENCY_PAIR.has(family)) || (family === 'late-verification' && paired)
+    );
+  });
+}
+
 /** Every signal the jobs and health support. Pure and deterministic; `nowMs` only ages an active job's stall. */
 export function deriveSignals(jobs, { health: rawHealth, nowMs, secrets = [] } = {}) {
   let health = rawHealth;
@@ -265,6 +426,57 @@ export function deriveSignals(jobs, { health: rawHealth, nowMs, secrets = [] } =
         `${where} on the turn cap (${stop.turns}/${stop.maxTurns} turns) with ${money(stop.costUsd)} of ${money(stop.maxUsd)} spent` +
           `${stop.turnsSource ? `; cap source ${stop.turnsSource}` : ''}`,
       );
+    // A final DONE_VERIFIED is a correctness success, not a failure. It can
+    // still reveal that an automatically sized package was inefficient: the
+    // cap stopped it repeatedly, continuations were needed, and verification
+    // had no chance to run until later. Require explicit server-sizing
+    // provenance so a caller's deliberately fixed cap remains their choice.
+    const history = roundHistoryOf(record, facts);
+    const protocolOrExternalHistory = history.rounds.some(
+      (entry) => entry.status === 'CANCELLED' || entry.providerFailure || ['finish-protocol', 'no-finish'].includes(entry.failureKind),
+    );
+    const sizing = turnSizingOf(record);
+    if (facts.mode === 'write' && sizing && status !== 'CANCELLED' && !facts.providerFailure && !protocolOrExternalHistory) {
+      const turnCaps = history.rounds.filter((entry) => entry.status === 'BUDGET' && entry.budgetStop?.cap === 'turns');
+      const continuations = facts.continuations ?? 0;
+      const source = sizingSourceText(sizing);
+      if (turnCaps.length >= 2) {
+        const rounds = turnCaps.map((entry) => entry.round).filter((round) => round !== undefined);
+        push(
+          'repeated-turn-cap',
+          id,
+          `${where} reached the turn cap ${turnCaps.length} times${rounds.length ? ` in rounds ${rounds.join(', ')}` : ''}; turn-sizing source ${source}`,
+        );
+      }
+      if (
+        facts.turns !== undefined &&
+        facts.turns >= TURN_SIZING_OUTLIER_RATIO * sizing.recommendedTurns &&
+        facts.turns - sizing.recommendedTurns >= TURN_SIZING_OUTLIER_EXCESS
+      )
+        push(
+          'turn-sizing-outlier',
+          id,
+          `${where} used ${facts.turns} actual turns versus ${sizing.recommendedTurns} recommended (${ratioText(facts.turns, sizing.recommendedTurns)}; ${facts.turns - sizing.recommendedTurns} over); turn-sizing source ${source}`,
+        );
+      const causedBy = history.continuationStatuses.slice(0, continuations);
+      if (continuations >= 2 && causedBy.length === continuations)
+        push(
+          'repeated-continuation',
+          id,
+          `${where} needed ${continuations} continuations after ${causedBy.join(', ')}; turn-sizing source ${source}`,
+        );
+      const firstVerificationRound = history.verificationRounds.length ? Math.min(...history.verificationRounds) : undefined;
+      const capsBeforeVerification =
+        firstVerificationRound === undefined
+          ? []
+          : turnCaps.filter((entry) => entry.round !== undefined && entry.round < firstVerificationRound);
+      if (capsBeforeVerification.length >= 2 && continuations >= 1)
+        push(
+          'late-verification',
+          id,
+          `${where} first ran verification in round ${firstVerificationRound} after ${capsBeforeVerification.length} turn-cap BUDGET stops and ${continuations} continuations; turn-sizing source ${source}`,
+        );
+    }
     const time = facts.timeSec ?? {};
     const slow = [
       time.providerMax * 1000 >= STALL.providerSevereShare * attemptMs &&
@@ -365,14 +577,17 @@ export function buildRetrospective({
   const facts = all.map((job) => jobFacts(job, context)).filter(Boolean);
   const signals = deriveSignals(all, { health, nowMs, secrets }).sort((a, b) => rank(a) - rank(b));
   const attributable = signals.filter((signal) => signal.attributable);
+  const warranting = promptWarrantSignals(signals);
   const tally = new Map();
-  for (const signal of attributable) tally.set(signal.code, (tally.get(signal.code) ?? 0) + 1);
-  const reasons = attributable.length
+  for (const signal of warranting) tally.set(signal.code, (tally.get(signal.code) ?? 0) + 1);
+  const reasons = warranting.length
     ? [...tally].map(([code, n]) => (n > 1 ? `${n}x ${code}` : code))
     : [
-        signals.length
-          ? `no Offload-attributable signal (${signals.length} informational)`
-          : 'no Offload-attributable signal derived from this session',
+        attributable.length
+          ? 'efficiency signal observed but the maintainer-prompt threshold was not met'
+          : signals.length
+            ? `no Offload-attributable signal (${signals.length} informational)`
+            : 'no Offload-attributable signal derived from this session',
       ];
   const known = facts.filter((job) => job.costUsd !== null);
   const created = all.map((job) => stamp(job?.createdAt)).filter((value) => value !== undefined);
@@ -394,7 +609,7 @@ export function buildRetrospective({
       ...(worker ? { workerSec: worker } : {}),
     },
     health: healthFacts(health),
-    maintainerPromptWarranted: attributable.length > 0,
+    maintainerPromptWarranted: warranting.length > 0,
     reasons,
   };
   // Jobs that carry a signal come first, then the newest; the shrink steps below cut from the tail.

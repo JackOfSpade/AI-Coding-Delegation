@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { access, mkdtemp, mkdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -74,6 +74,27 @@ test('report inputs reject duplicate paths, final symlinks, and size limits with
     await assert.rejects(() => copyReportInputs({ inputFiles: totalFiles, workspacePath: workspace, roots }), /total limit/);
     assert.equal(existsSync(join(workspace, REPORT_INPUT_DIRECTORY)), false, 'a rejected later input removes the earlier private copy');
     await assert.rejects(access(join(workspace, REPORT_INPUT_DIRECTORY)), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('report input rollback never removes a pre-existing private input directory', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'offload-report-inputs-'));
+  const workspace = join(root, 'workspace');
+  const input = join(root, 'input.txt');
+  const privateDirectory = join(workspace, REPORT_INPUT_DIRECTORY);
+  const sentinel = join(privateDirectory, 'keep.txt');
+  try {
+    await mkdir(privateDirectory, { recursive: true });
+    await writeFile(input, 'input');
+    await writeFile(sentinel, 'do not delete');
+    const canonicalRoot = await realpath(root);
+    await assert.rejects(
+      () => copyReportInputs({ inputFiles: [input], workspacePath: workspace, roots: [canonicalRoot] }),
+      (error) => error?.code === 'EEXIST',
+    );
+    assert.equal(await readFile(sentinel, 'utf8'), 'do not delete');
   } finally {
     await rm(root, { recursive: true, force: true });
   }

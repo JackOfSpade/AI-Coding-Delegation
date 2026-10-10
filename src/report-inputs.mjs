@@ -75,10 +75,15 @@ export async function copyReportInputs({ inputFiles = [], workspacePath, roots =
   if (!inputFiles.length) return [];
   if (!Array.isArray(roots) || !roots.length) throw new Error('no caller scratch/temp directory is allowlisted for report inputs');
   const destinationRoot = join(workspacePath, REPORT_INPUT_DIRECTORY);
-  await mkdir(destinationRoot, { mode: 0o700 });
+  // Rollback must only remove a directory created by this invocation.  The
+  // workspace is normally fresh, but this exported helper must not turn an
+  // EEXIST collision into recursive deletion of pre-existing data.
+  let destinationCreated = false;
   const manifest = [];
   let total = 0;
   try {
+    await mkdir(destinationRoot, { mode: 0o700 });
+    destinationCreated = true;
     for (let index = 0; index < inputFiles.length; index += 1) {
       const requested = inputFiles[index];
       const before = await lstat(requested, BIGINT);
@@ -135,8 +140,10 @@ export async function copyReportInputs({ inputFiles = [], workspacePath, roots =
     // Do not retain a partial private copy if a later caller input fails its
     // validation or size check. Directory permissions may already be 0500 in
     // a future refactor, so restore owner removal access before cleanup.
-    await chmod(destinationRoot, 0o700).catch(() => {});
-    await rm(destinationRoot, { recursive: true, force: true }).catch(() => {});
+    if (destinationCreated) {
+      await chmod(destinationRoot, 0o700).catch(() => {});
+      await rm(destinationRoot, { recursive: true, force: true }).catch(() => {});
+    }
     throw error;
   }
 }

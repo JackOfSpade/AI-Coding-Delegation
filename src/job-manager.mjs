@@ -2289,6 +2289,7 @@ export class JobManager {
             const providerFailure = safeProviderFailure(done.providerFailure);
             const providerFinishReason = safeProviderFinishReason(done.providerFinishReason);
             const budgetReservation = safeBudgetReservation(done.budgetReservation);
+            const sizing = safeBudgetSizing(done.budgetSizing);
             await this.store.event(id, {
               type: 'finished',
               status: done.status,
@@ -2297,6 +2298,9 @@ export class JobManager {
               ...(providerFinishReason ? { providerFinishReason } : {}),
               ...(budgetReservation ? { budgetReservation } : {}),
               ...(safeBudgetStop(done.budgetStop) && done.status === 'BUDGET' ? { budgetStop: safeBudgetStop(done.budgetStop) } : {}),
+              ...(done.status === 'BUDGET' && done.budgetStop?.cap === 'turns' && sizing
+                ? { turnSizingSource: sizing.initialTurnsSource ?? sizing.turnsSource }
+                : {}),
               // The failing call also sits in the non-progress tail of the log.
               ...(done.status === 'FAILED' ? failureView(done) : {}),
             });
@@ -2609,6 +2613,10 @@ export class JobManager {
     const resultCollector = baselineMode
       ? createFailureCollector({ roots: this.#collectorRoots(executionPath), stopsEarly: commandStopsEarly(job.testCommand) })
       : undefined;
+    // This is intentionally separate from timing: retrospectives need to
+    // distinguish a verifier that ran late from rounds that stopped before
+    // verification was ever reached.
+    await this.#verifyPhase(job.id, { phase: 'result', status: 'started', round: job.rounds || 0 });
     let verify = await this.runner.verify(job.testCommand, {
       ...(await this.#verifierOptions(job, executionPath)),
       // Left out entirely in the standard mode so its behavior is unchanged.
@@ -2976,7 +2984,22 @@ export class JobManager {
     // `last` is a request for that many, so what it leaves out was never in scope; only the digest's own cap omits.
     const cap = last ?? limit;
     const omitted = last === undefined ? Math.max(0, jobs.length - cap) : 0;
-    return { jobs: jobs.slice(0, cap), omitted, secrets: this.store?.secrets || [], nowMs: this.#nowMs() };
+    // A continuation resets its current budget stop and verifier record, but
+    // the append-only lifecycle artifact retains those earlier rounds. Attach
+    // it only as private input to the retrospective deriver; it is parsed into
+    // a closed view there and never returned in the digest.
+    const selected = await Promise.all(
+      jobs.slice(0, cap).map(async (job) => {
+        if (typeof this.store.readArtifact !== 'function') return job;
+        try {
+          const events = await this.store.readArtifact(job.id, 'events.jsonl');
+          return typeof events === 'string' ? { ...job, retrospectiveEvents: events } : job;
+        } catch {
+          return job;
+        }
+      }),
+    );
+    return { jobs: selected, omitted, secrets: this.store?.secrets || [], nowMs: this.#nowMs() };
   }
   #sessionStartMs() {
     const start = Date.parse(this.config.sessionStartedAt ?? '');
@@ -3253,6 +3276,15 @@ export class JobManager {
       // Record acceptance before launching asynchronously. A worker that
       // returns without model/tool progress is still distinguishable from a
       // repair request that was never accepted.
+      if (continuation) {
+        const sizing = safeBudgetSizing(next.budgetSizing);
+        await this.store.event(id, {
+          type: 'continuation',
+          fromStatus: job.status,
+          round: job.rounds || 0,
+          ...(sizing ? { turnSizingSource: sizing.initialTurnsSource ?? sizing.turnsSource } : {}),
+        });
+      }
       await this.store.event(id, { type: 'started', reason: 'repair', round: next.rounds || 0, status: next.status });
       await this.store.event(id, {
         type: 'progress',

@@ -306,6 +306,134 @@ test('a thin brief is not an Offload defect: weak code, a failing suite and repa
   assert.equal(result.jobs.find((entry) => entry.id === ID('b')).continuations, 1);
 });
 
+const automaticSizing = (extra = {}) => ({
+  maxTurns: 191,
+  turnsSource: 'raised',
+  initialTurnsSource: 'scaled',
+  turnPolicy: 'auto',
+  recommendedTurns: 62,
+  ...extra,
+});
+const twoCapHistory = (extra = {}) => ({
+  rounds: [
+    { round: 0, status: 'BUDGET', budgetStop: { cap: 'turns' }, turnSizingSource: 'scaled' },
+    { round: 1, status: 'BUDGET', budgetStop: { cap: 'turns' }, turnSizingSource: 'raised' },
+    { round: 2, status: 'DONE_VERIFIED', verificationRan: true },
+  ],
+  continuationStatuses: ['BUDGET', 'BUDGET'],
+  verificationRounds: [2],
+  ...extra,
+});
+const twoCapEvents = () =>
+  [
+    { type: 'finished', status: 'BUDGET', round: 0, budgetStop: { cap: 'turns' }, turnSizingSource: 'scaled' },
+    { type: 'continuation', fromStatus: 'BUDGET', round: 0 },
+    { type: 'finished', status: 'BUDGET', round: 1, budgetStop: { cap: 'turns' }, turnSizingSource: 'scaled' },
+    { type: 'continuation', fromStatus: 'BUDGET', round: 1 },
+    { type: 'verify-phase', phase: 'result', status: 'started', round: 2 },
+    { type: 'finished', status: 'DONE_VERIFIED', round: 2 },
+  ]
+    .map((event) => JSON.stringify(event))
+    .join('\n');
+
+test('successful-but-inefficient history warrants a prompt with cap, sizing, continuation and late-verification evidence', () => {
+  const reproduced = job('z', {
+    profile: 'flash',
+    turns: 191,
+    costUsd: 0.865638,
+    createdAt: iso(-694),
+    finishedAt: iso(0),
+    rounds: 2,
+    continuations: 2,
+    verify: { verdict: 'PASS' },
+    budgetSizing: automaticSizing(),
+    retrospectiveEvents: twoCapEvents(),
+  });
+  const result = buildRetrospective({ jobs: [reproduced], health: healthy, nowMs: NOW, maintainerRoot: ROOT });
+  assert.equal(result.jobs[0].status, 'DONE_VERIFIED', 'the final result stays a correctness success');
+  assert.equal(result.maintainerPromptWarranted, true);
+  assert.deepEqual(result.reasons, ['repeated-turn-cap', 'turn-sizing-outlier', 'repeated-continuation', 'late-verification']);
+  const signals = new Map(result.signals.map((signal) => [signal.code, signal.evidence]));
+  assert.match(
+    signals.get('repeated-turn-cap'),
+    /reached the turn cap 2 times in rounds 0, 1; turn-sizing source scaled; continuation cap raised/,
+  );
+  assert.match(
+    signals.get('turn-sizing-outlier'),
+    /used 191 actual turns versus 62 recommended \(3\.1×; 129 over\); turn-sizing source scaled; continuation cap raised/,
+  );
+  assert.match(signals.get('repeated-continuation'), /needed 2 continuations after BUDGET, BUDGET/);
+  assert.match(signals.get('late-verification'), /first ran verification in round 2 after 2 turn-cap BUDGET stops and 2 continuations/);
+  assert.match(result.maintainerPromptSkeleton, /worker focus, budget sizing, and completion discipline/);
+  assert.doesNotMatch(JSON.stringify(result), /correctness failure|code failure/i);
+});
+
+test('efficiency thresholds preserve harmless, caller-owned, provider and efficient successful cases', () => {
+  const singleCap = job('a', {
+    turns: 80,
+    rounds: 1,
+    continuations: 1,
+    verify: { verdict: 'PASS' },
+    budgetSizing: automaticSizing({ maxTurns: 80, turnsSource: 'raised' }),
+    retrospectiveHistory: {
+      rounds: [
+        { round: 0, status: 'BUDGET', budgetStop: { cap: 'turns' } },
+        { round: 1, status: 'DONE_VERIFIED', verificationRan: true },
+      ],
+      continuationStatuses: ['BUDGET'],
+      verificationRounds: [1],
+    },
+  });
+  const callerFixed = job('b', {
+    turns: 191,
+    rounds: 2,
+    continuations: 2,
+    verify: { verdict: 'PASS' },
+    budgetSizing: automaticSizing({ initialTurnsSource: 'caller' }),
+    retrospectiveHistory: twoCapHistory(),
+  });
+  const provider = job('c', {
+    status: 'FAILED',
+    providerFailure: { kind: 'attempt_timeout' },
+    turns: 191,
+    rounds: 2,
+    continuations: 2,
+    budgetSizing: automaticSizing(),
+    retrospectiveHistory: twoCapHistory(),
+  });
+  const efficient = job('d', {
+    turns: 62,
+    verify: { verdict: 'PASS' },
+    budgetSizing: automaticSizing({ maxTurns: 80, turnsSource: 'default', initialTurnsSource: 'default' }),
+  });
+  const protocol = job('e', {
+    turns: 191,
+    rounds: 3,
+    continuations: 2,
+    verify: { verdict: 'PASS' },
+    budgetSizing: automaticSizing(),
+    retrospectiveHistory: twoCapHistory({
+      rounds: [
+        { round: 0, status: 'FAILED', failureKind: 'no-finish' },
+        { round: 1, status: 'BUDGET', budgetStop: { cap: 'turns' } },
+        { round: 2, status: 'BUDGET', budgetStop: { cap: 'turns' } },
+        { round: 3, status: 'DONE_VERIFIED', verificationRan: true },
+      ],
+      continuationStatuses: ['FAILED', 'BUDGET'],
+      verificationRounds: [3],
+    }),
+  });
+  for (const candidate of [singleCap, callerFixed, provider, efficient, protocol]) {
+    const result = buildRetrospective({ jobs: [candidate], health: healthy, nowMs: NOW, maintainerRoot: ROOT });
+    const efficiency = result.signals.filter((signal) =>
+      ['repeated-turn-cap', 'turn-sizing-outlier', 'repeated-continuation', 'late-verification'].includes(signal.code),
+    );
+    assert.deepEqual(efficiency, [], candidate.id);
+    assert.equal(result.maintainerPromptWarranted, false, candidate.id);
+  }
+  assert.deepEqual(codes([provider]), ['provider-failure:attempt_timeout']);
+});
+
 test('warranted and reasons come from the attributable signals, counted per code', () => {
   const env = (letter) => job(letter, { status: 'VERIFY_ENV_FAILED', verifyEnvironment: { kind: 'missing-package' } });
   const result = buildRetrospective({

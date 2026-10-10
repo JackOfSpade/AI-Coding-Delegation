@@ -198,6 +198,10 @@ export function buildBudgetSizing({ resolved, recommendation, files = [] }) {
   return safeBudgetSizing({
     maxTurns: resolved.maxTurns,
     turnsSource: resolved.turnsSource,
+    // A continuation changes turnsSource to "raised". Keep the initial
+    // decision as bounded provenance so later diagnostics can distinguish an
+    // automatically sized package from a caller-fixed cap.
+    initialTurnsSource: resolved.turnsSource,
     turnPolicy: resolved.turnPolicy,
     timeoutMinutes: resolved.timeoutMinutes,
     recommendedTurns: recommendation?.recommendedTurns,
@@ -253,6 +257,7 @@ export function safeBudgetSizing(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const maxTurns = boundedInteger(value.maxTurns, MAX_SAFE_TURNS);
   if (!maxTurns || !TURN_SOURCES.has(value.turnsSource) || !TURN_POLICIES.has(value.turnPolicy)) return undefined;
+  const initialTurnsSource = TURN_SOURCES.has(value.initialTurnsSource) ? value.initialTurnsSource : undefined;
   const files = Array.isArray(value.files)
     ? value.files
         .flatMap((file) => {
@@ -281,6 +286,7 @@ export function safeBudgetSizing(value) {
   return {
     maxTurns,
     turnsSource: value.turnsSource,
+    ...(initialTurnsSource ? { initialTurnsSource } : {}),
     turnPolicy: value.turnPolicy,
     ...optional('timeoutMinutes', 1440),
     ...optional('recommendedTurns', MAX_SAFE_RECOMMENDATION),
