@@ -4,6 +4,7 @@ import { Meter, resolveModel, samePricedModel } from '../pricing.mjs';
 import { OpenAIChatProvider, PROVIDER_FINISH_REASONS, ProviderError, providerFailure } from '../provider/openai-chat.mjs';
 import { FAILURE_ERRORS, summarizeToolFailure, toolErrorHint } from '../failure.mjs';
 import { MAX_BATCH_COMMAND_SEC } from '../timing.mjs';
+import { anthropicContentMatchesAssistant, cloneAnthropicContent, validAnthropicContent } from '../anthropic-content.mjs';
 
 const asToolCalls = (calls) => calls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } }));
 // Arguments originate with an untrusted provider response. Never persist a
@@ -58,7 +59,7 @@ const BUDGET_FINISH_RECOVERY_MESSAGE = 'Call the finish tool now.';
 // a successful direct write when a transcript is resumed. Provider-controlled
 // text (names, arguments) never appears in either.
 const FINISH_ALONE_CORRECTION =
-  'TOOL_ERROR: finish must be the only tool call in its turn; nothing in this turn was executed; call finish alone (re-issue other calls in a separate turn first if still needed)';
+  'TOOL_ERROR: finish must be the only tool call in its turn; nothing in this turn was executed. The prior implementation may already be complete. On your next response, either call finish alone if no actual work remains, or make only the non-finish calls needed for remaining work; after their results, call finish alone in a later response. Do not repeat or pair a rejected call with finish.';
 const FINISH_ARGUMENTS_CORRECTION =
   'finish arguments are invalid: summary is required (1-1500 characters); concerns and testsRun are optional arrays of up to 100 strings of up to 1000 characters; report is an optional string of up to 256000 characters';
 const MISSING_TOOL_RECOVERY_REMINDER =
@@ -524,11 +525,13 @@ export class AgentLoop {
         let text = '',
           reasoning = '',
           calls = [],
+          anthropicContent,
           reasoningWasExplicitNull = false,
           reasoningWasExplicitString = false,
           responseModel,
           usageRecords = 0,
           toolCallRecords = 0,
+          anthropicContentRecords = 0,
           unauthorizedResponseModel,
           modelConflict = false;
         const usageCharges = [];
@@ -788,6 +791,7 @@ export class AgentLoop {
               Array.isArray(event) ||
               (event.text !== undefined && typeof event.text !== 'string') ||
               (event.reasoning !== undefined && event.reasoning !== null && typeof event.reasoning !== 'string') ||
+              (event.anthropicContent !== undefined && !validAnthropicContent(event.anthropicContent)) ||
               (event.model !== undefined && !validMetadata(event.model)) ||
               (event.modelConflict !== undefined && typeof event.modelConflict !== 'boolean') ||
               (event.providerFinishReason !== undefined && !PROVIDER_FINISH_REASONS.has(event.providerFinishReason)) ||
@@ -819,6 +823,11 @@ export class AgentLoop {
               toolCallRecords++;
               calls = event.toolCalls;
             }
+            if (event.anthropicContent !== undefined) {
+              anthropicContentRecords++;
+              if (anthropicContentRecords > 1) throw new Error('Provider yielded multiple Anthropic replay records');
+              anthropicContent = cloneAnthropicContent(event.anthropicContent);
+            }
             if (text.length + reasoning.length > MAX_ASSISTANT_CHARS) throw new Error('Provider response exceeds assistant size limit');
             // Some compatible providers send model metadata only in an earlier
             // delta and omit it from their terminal usage event. Carry the last
@@ -832,7 +841,11 @@ export class AgentLoop {
               // budget, only that exact priced entry (including an explicit table
               // alias) may authorize tool execution; a provider cannot silently
               // substitute a more expensive model after the request begins.
-              if (this.maxUsd !== Infinity && !samePricedModel(this.meter.table, this.model, event.model))
+              if (
+                this.maxUsd !== Infinity &&
+                !samePricedModel(this.meter.table, this.model, event.model) &&
+                this.provider.allowsResponseModel?.(this.model, event.model) !== true
+              )
                 unauthorizedResponseModel ??= event.model;
             }
             modelConflict ||= event.modelConflict === true;
@@ -1015,6 +1028,11 @@ export class AgentLoop {
         if (reasoningWasExplicitString) assistant.reasoning_content = reasoning;
         else if (reasoningWasExplicitNull) assistant.reasoning_content = null;
         if (calls.length) assistant.tool_calls = asToolCalls(calls);
+        if (anthropicContent !== undefined) {
+          if (!anthropicContentMatchesAssistant(anthropicContent, assistant))
+            throw new Error('Provider Anthropic replay does not match its assistant response');
+          assistant.anthropic_content = anthropicContent;
+        }
         // Never invent an empty reasoning_content to make a disabled-thinking
         // tool response look like a thinking response.  Once this exact
         // replay shape is durable, subsequent official DeepSeek requests must

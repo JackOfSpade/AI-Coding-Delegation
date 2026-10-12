@@ -124,6 +124,30 @@ test('repeated-env-failure: the same kind on two jobs, not two different kinds',
   assert.equal(codes([env('a', 'temp-dir-denied'), env('b', 'missing-package')]).includes('repeated-env-failure'), false);
 });
 
+test('a runtime change after a recorded-current start is restart context, not a stale-start finding', () => {
+  const current = job('a', { runtimePreflight: { server: 'current' } });
+  const drifted = buildRetrospective({
+    jobs: [current],
+    health: { ...healthy, server: { stale: true } },
+    nowMs: NOW,
+    maintainerRoot: ROOT,
+  });
+  assert.deepEqual(drifted.signals.map((signal) => signal.code), ['runtime-changed-after-start']);
+  assert.equal(drifted.signals[0].attributable, false);
+  assert.match(drifted.signals[0].evidence, /passed a current runtime preflight; runtime artifacts changed after start/);
+  assert.equal(drifted.maintainerPromptWarranted, false);
+  assert.deepEqual(drifted.reasons, ['no Offload-attributable signal (1 informational)']);
+
+  const legacy = buildRetrospective({
+    jobs: [job('b')],
+    health: { ...healthy, server: { stale: true } },
+    nowMs: NOW,
+    maintainerRoot: ROOT,
+  });
+  assert.deepEqual(legacy.signals.map((signal) => signal.code), ['stale-server-ignored']);
+  assert.match(legacy.signals[0].evidence, /have no start-runtime snapshot and the server is stale now/);
+});
+
 test('budget-stop-low-spend: a server-sized turn cap that left most of the dollar cap, nothing else', () => {
   const stop = (extra = {}, sizing = { turnsSource: 'scaled' }) =>
     job('a', {

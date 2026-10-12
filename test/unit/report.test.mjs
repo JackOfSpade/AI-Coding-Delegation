@@ -505,6 +505,24 @@ test('a temp-dir-denied environment failure explains the TMPDIR contract and off
   );
 });
 
+test('a Git fixture blocked by the verifier is named as an environment limitation, not a product-test failure', () => {
+  const report = compactReport({
+    id: 'oj-git-fixture',
+    status: 'VERIFY_ENV_FAILED',
+    workspacePath: '/w',
+    files: [{ path: 'src/a.js', status: 'M' }],
+    verifyEnvironment: {
+      kind: 'git-config-denied',
+      detail: 'Git fixture setup could not read host system configuration in the verifier sandbox',
+    },
+    verify: { command: 'node --test test/integration/core-routing.test.mjs', verdict: 'FAIL', result: { code: 1, sandbox: 'macos' } },
+  });
+  assert.match(report, /verifier environment: Git fixture setup could not read host system configuration/);
+  assert.match(report, /temporary Git-fixture test could not read host Git configuration in the verifier sandbox/);
+  assert.match(report, /environment limitation, not a product-test failure; run that integration suite in the primary checkout/);
+  assert.doesNotMatch(report.split('\n').find((line) => line.startsWith('next:')), /repair/);
+});
+
 const tailOf = (count, prefix = 'out') => Array.from({ length: count }, (_, i) => `${prefix} ${i}`).join('\n');
 const applied = (applyVerify, extra = {}) => ({
   id: 'oj-av',
@@ -587,6 +605,25 @@ test('a reverted applyThenVerify failure says so, keeps the failing tail nested,
     applyVerify: { command: 'c', outcome: 'TIMED_OUT', reverted: true, primaryRestoredExactly: false },
   });
   assert.match(partial, /applyThenVerify TIMED_OUT.*REVERTED.*other primary files changed during verification and were left alone/);
+});
+
+test('a reverted applyThenVerify Git-fixture failure tells the primary to use verifiedBy without widening the sandbox', () => {
+  const report = compactReport({
+    id: 'oj-git-fixture',
+    status: 'FAILED',
+    applyVerify: {
+      command: 'node --test test/integration/late-integration.test.mjs',
+      outcome: 'FAILED',
+      exitCode: 1,
+      ranUnder: 'macos',
+      reverted: true,
+      outputTail: 'Error: repoPath must be inside a git working tree',
+    },
+  });
+  assert.match(report, /Git metadata that applyThenVerify intentionally keeps unreadable/);
+  assert.match(report, /Run it yourself in the primary checkout, then call offload_apply with verifiedBy/);
+  assert.match(report, /do not widen the sandbox/);
+  assert.match(report, /^  \| Error: repoPath must be inside a git working tree$/m);
 });
 
 test('an applyThenVerify whose revert did not complete is loud and offers revert', () => {

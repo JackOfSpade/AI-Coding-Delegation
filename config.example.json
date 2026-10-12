@@ -1,5 +1,12 @@
 {
   "providers": {
+    "anthropic": {
+      "type": "anthropic-messages",
+      "baseUrl": "https://api.anthropic.com",
+      "keyRef": "keychain:offload-anthropic",
+      "pricing": "anthropic-sonnet-2026-10-12",
+      "attemptTimeoutMs": 300000
+    },
     "deepseek": {
       "type": "openai-chat",
       "baseUrl": "https://api.deepseek.com",
@@ -9,9 +16,10 @@
     }
   },
   "profiles": {
-    "flash": { "provider": "deepseek", "model": "deepseek-flash" }
+    "promo": { "provider": "anthropic", "model": "latest-sonnet", "fallback": "flash" },
+    "flash": { "provider": "deepseek", "model": "latest-flash" }
   },
-  "default": "flash",
+  "default": "promo",
   "limits": { "maxTurns": 80, "timeoutMinutes": 30, "maxUsd": 2 },
   "verifier": { "interpreterRoots": [] }
 }

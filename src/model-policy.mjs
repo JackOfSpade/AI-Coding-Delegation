@@ -1,14 +1,19 @@
 /**
  * Hard routing policy for delegated workers.
  *
- * Offload runs only DeepSeek V4.1 Flash. A Pro model must not be reachable
- * through configuration, a persisted execution snapshot, a per-request model
- * override, or a model-name spelling variant. Every layer that can choose a
- * model calls `modelPolicyViolation`, so a single edit here changes them all.
+ * Offload runs the provider-maintained Flash and Sonnet routes. A DeepSeek Pro
+ * model must not be reachable through configuration, a persisted execution
+ * snapshot, a per-request model override, or a model-name spelling variant.
+ * Every layer that can choose a model calls `modelPolicyViolation`, so a
+ * single edit here changes them all.
  */
 
 /** The one model a DeepSeek endpoint may be asked for. */
 export const OFFLOAD_DEEPSEEK_MODEL = 'deepseek-flash';
+export const OFFLOAD_DEEPSEEK_LATEST_FLASH = 'latest-flash';
+export const OFFLOAD_ANTHROPIC_LATEST_SONNET = 'latest-sonnet';
+
+export const isAnthropicSonnetModel = (model) => typeof model === 'string' && /^claude-sonnet-[0-9]+-[0-9]+(?:-[0-9]+)?$/.test(model);
 
 const modelTokens = (model) =>
   String(model)
@@ -41,8 +46,13 @@ export function isDeepSeekEndpoint(baseUrl) {
  * Returns a human-readable reason when `model` may not be requested from
  * `baseUrl`, or undefined when it is allowed. Callers throw their own error type.
  */
-export function modelPolicyViolation({ baseUrl, model } = {}) {
+export function modelPolicyViolation({ baseUrl, model, type, allowSelector = false } = {}) {
   if (typeof model !== 'string' || model.length === 0) return 'a model name is required';
+  if (type === 'anthropic-messages') {
+    if (allowSelector && model === OFFLOAD_ANTHROPIC_LATEST_SONNET) return undefined;
+    return isAnthropicSonnetModel(model) ? undefined : 'only a Claude Sonnet model is permitted on an Anthropic Messages endpoint';
+  }
+  if (type === 'openai-chat' && isDeepSeekEndpoint(baseUrl) && allowSelector && model === OFFLOAD_DEEPSEEK_LATEST_FLASH) return undefined;
   if (isProModel(model))
     return `model "${model}" is disabled: Offload does not route to Pro models; use "${OFFLOAD_DEEPSEEK_MODEL}" (DeepSeek V4.1 Flash)`;
   if (isDeepSeekEndpoint(baseUrl) && model !== OFFLOAD_DEEPSEEK_MODEL)

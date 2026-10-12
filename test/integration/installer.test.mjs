@@ -191,9 +191,9 @@ test('installer is idempotent and removes only managed routing blocks', async ()
   const doc = await readFile(join(home, '.codex', 'AGENTS.md'), 'utf8');
   assert.equal((doc.match(/BEGIN offload/g) || []).length, 1);
   assert.match(afterFirstInstall, /Use Offload only when the user invokes `\/offload` as a slash command/);
-  assert.match(afterFirstInstall, /configured profile `flash`/);
-  assert.match(afterFirstInstall, /provider-maintained current DeepSeek V4\.1 Flash route/);
-  assert.match(afterFirstInstall, /Never invent a generic “latest Flash” model name/);
+  assert.match(afterFirstInstall, /configured profile `promo`/);
+  assert.match(afterFirstInstall, /falls back to provider-maintained DeepSeek Flash/);
+  assert.match(afterFirstInstall, /newest supported Sonnet model at job start/);
   assert.match(afterFirstInstall, /on policy-only hosts they also have no worker shell/);
   assert.match(afterFirstInstall, /edit permitted private-worktree files with file tools/);
   assert.match(

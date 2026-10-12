@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { AgentLoop } from '../../src/agent/loop.mjs';
@@ -46,7 +46,7 @@ const assertToolProtocol = (messages) => {
   assert.equal(new AgentContext(messages).trimmedIncomplete, false);
 };
 const FINISH_ALONE =
-  'TOOL_ERROR: finish must be the only tool call in its turn; nothing in this turn was executed; call finish alone (re-issue other calls in a separate turn first if still needed)';
+  'TOOL_ERROR: finish must be the only tool call in its turn; nothing in this turn was executed. The prior implementation may already be complete. On your next response, either call finish alone if no actual work remains, or make only the non-finish calls needed for remaining work; after their results, call finish alone in a later response. Do not repeat or pair a rejected call with finish.';
 // A scripted provider that records the conversation each request carried.
 const scripted = (turns, requests = []) => ({
   async *chat({ messages }) {
@@ -74,6 +74,44 @@ test('finish mixed with a write runs nothing and is corrected once; a repeat fai
   assert.equal(result.error, 'finish must be the sole valid tool call in a turn');
   assert.deepEqual(invoked, [], 'neither the write nor either finish was executed');
 });
+
+test('loop retains a validated Anthropic thinking replay record with its tool transaction', async () => {
+  const requests = [];
+  let turn = 0;
+  const context = new AgentContext();
+  const provider = {
+    async *chat({ messages }) {
+      requests.push(structuredClone(messages));
+      turn++;
+      if (turn === 1) {
+        yield { toolCalls: [call('read_file', '{"path":"README.md"}', 'read')], model: 'claude-sonnet-5-5' };
+        yield {
+          anthropicContent: [
+            { type: 'thinking', thinking: 'Read the project instructions.', signature: 'signed-thought' },
+            { type: 'tool_use', id: 'read', name: 'read_file', input: '{"path":"README.md"}' },
+          ],
+          model: 'claude-sonnet-5-5',
+        };
+        return;
+      }
+      yield { toolCalls: [call('finish', '{"summary":"done"}', 'finish')], model: 'claude-sonnet-5-5' };
+    },
+  };
+  const result = await new AgentLoop({
+    provider,
+    context,
+    tools: {
+      execute: async (name) => (name === 'finish' ? { finish: { summary: 'done', concerns: [], testsRun: [] } } : 'README contents'),
+    },
+  }).run({ task: 'inspect' });
+  assert.equal(result.status, 'DONE');
+  const replayedAssistant = requests[1].find((message) => message.role === 'assistant');
+  assert.deepEqual(replayedAssistant.anthropic_content, [
+    { type: 'thinking', thinking: 'Read the project instructions.', signature: 'signed-thought' },
+    { type: 'tool_use', id: 'read', name: 'read_file', input: '{"path":"README.md"}' },
+  ]);
+  assert.deepEqual(context.snapshot()[1].anthropic_content, replayedAssistant.anthropic_content);
+});
 test('finish sharing a turn with other calls answers every call without running any, and a clean finish next turn succeeds', async () => {
   const invoked = [];
   const requests = [];
@@ -100,6 +138,9 @@ test('finish sharing a turn with other calls answers every call without running 
   assert.equal(result.turn, 2, 'the correction turn is a normal turn against the budget');
   assert.deepEqual(invoked, ['finish'], 'only the clean finish ran: not the write, the read, or the first finish');
   assert.equal(requests.length, 2);
+  assert.match(FINISH_ALONE, /prior implementation may already be complete/i);
+  assert.match(FINISH_ALONE, /next response, either call finish alone if no actual work remains/i);
+  assert.doesNotMatch(FINISH_ALONE, /re-issue other calls in a separate turn first/i);
   // The retry request carried one corrective result per call, in call order.
   assert.deepEqual(
     requests[1].slice(1).map((message) => [message.role, message.tool_call_id, message.name, message.content]),
@@ -125,6 +166,46 @@ test('finish sharing a turn with other calls answers every call without running 
     final.filter((message) => message.role === 'tool').map((message) => message.tool_call_id),
     ['w', 'r', 'f', 'f2'],
   );
+});
+test('a finish mixed with a read-only call after a successful write is corrected once and the earlier write survives', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-loop-finish-recovery-'));
+  try {
+    const local = new LocalTools({ repoPath: dir, ownedPaths: ['**'], gitExec: () => ({ status: 1, stdout: '' }) });
+    const invoked = [];
+    const tools = {
+      execute: async (name, args, ...rest) => {
+        invoked.push(name);
+        return local.execute(name, args, ...rest);
+      },
+    };
+    const requests = [];
+    const progress = [];
+    const result = await new AgentLoop({
+      provider: scripted(
+        [
+          [call('write_file', '{"path":"note.txt","content":"kept\\n"}', 'w')],
+          [call('read_file', '{"path":"note.txt"}', 'r'), call('finish', '{"summary":"done"}', 'f')],
+          [call('finish', '{"summary":"done"}', 'f2')],
+        ],
+        requests,
+      ),
+      tools,
+      progress: (event) => progress.push(event),
+    }).run({ task: 'x' });
+    assert.equal(result.status, 'DONE');
+    assert.equal(result.failureKind, undefined);
+    assert.deepEqual(invoked, ['write_file', 'finish'], 'one write, no duplicate, and nothing from the rejected mixed turn');
+    assert.equal(await readFile(path.join(dir, 'note.txt'), 'utf8'), 'kept\n');
+    assert.equal(progress.filter((event) => event.action === 'finish_protocol_recover').length, 1);
+    const rejected = requests[2].slice(-3);
+    assert.deepEqual(
+      rejected.map((message) => [message.role, message.tool_call_id, message.name]),
+      [['assistant', undefined, undefined], ['tool', 'r', 'read_file'], ['tool', 'f', 'finish']],
+    );
+    assert.deepEqual(rejected.slice(1).map((message) => message.content), [FINISH_ALONE, FINISH_ALONE]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 test('a second finish-protocol violation fails after exactly one correction and persists only the corrected turn', async () => {
   const invoked = [];

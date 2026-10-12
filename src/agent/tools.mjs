@@ -205,7 +205,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   ),
   schema(
     'finish',
-    'Finish as the sole tool call with a structured report.',
+    'Finish with a structured report. Use only after every other needed tool result has returned, in a response containing exactly this one tool call; pairing it with another call rejects the entire response.',
     {
       summary: { type: 'string', minLength: 1, maxLength: 1500 },
       report: { type: 'string', maxLength: 256_000, description: 'Optional detailed report text, used by read-only report jobs.' },

@@ -5,6 +5,13 @@ import { modelPolicyViolation } from './model-policy.mjs';
 
 export const DEFAULT_CONFIG = Object.freeze({
   providers: {
+    anthropic: {
+      type: 'anthropic-messages',
+      baseUrl: 'https://api.anthropic.com',
+      keyRef: 'keychain:offload-anthropic',
+      pricing: 'anthropic-sonnet-2026-10-12',
+      attemptTimeoutMs: 300_000,
+    },
     deepseek: {
       type: 'openai-chat',
       baseUrl: 'https://api.deepseek.com',
@@ -14,9 +21,10 @@ export const DEFAULT_CONFIG = Object.freeze({
     },
   },
   profiles: {
-    flash: { provider: 'deepseek', model: 'deepseek-flash' },
+    promo: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' },
+    flash: { provider: 'deepseek', model: 'latest-flash' },
   },
-  default: 'flash',
+  default: 'promo',
   limits: { maxTurns: 80, timeoutMinutes: 30, maxUsd: 2 },
 });
 const MAX_CONFIG_BYTES = 1024 * 1024;
@@ -174,7 +182,11 @@ export function validateConfig(config) {
     }
     assertSafeKeys(provider);
     assertAllowedKeys(provider, ['type', 'baseUrl', 'keyRef', 'pricing', 'pricingFile', 'attemptTimeoutMs'], `Provider ${name}`);
-    if (provider.type !== 'openai-chat' || !safeProviderUrl(provider.baseUrl) || !safeKeyRef(provider.keyRef))
+    if (
+      !['openai-chat', 'anthropic-messages'].includes(provider.type) ||
+      !safeProviderUrl(provider.baseUrl) ||
+      !safeKeyRef(provider.keyRef)
+    )
       throw new ConfigError(`Provider ${name} has invalid connection settings`, 'E_CONFIG_PROVIDER');
     if (provider.pricing !== undefined && !boundedText(provider.pricing, MAX_NAME))
       throw new ConfigError(`Provider ${name}.pricing must be a bounded string`, 'E_CONFIG_PROVIDER');
@@ -192,11 +204,20 @@ export function validateConfig(config) {
     )
       throw new ConfigError(`Profile ${name} requires provider and model`);
     assertSafeKeys(profile);
-    assertAllowedKeys(profile, ['provider', 'model', 'effort'], `Profile ${name}`);
+    assertAllowedKeys(profile, ['provider', 'model', 'effort', 'fallback'], `Profile ${name}`);
     if (!config.providers[profile.provider]) throw new ConfigError(`Profile ${name} refers to unknown provider: ${profile.provider}`);
     if (profile.effort !== undefined && !['normal', 'high'].includes(profile.effort))
       throw new ConfigError(`Profile ${name}.effort must be normal or high`);
-    const violation = modelPolicyViolation({ baseUrl: config.providers[profile.provider].baseUrl, model: profile.model });
+    if (profile.fallback !== undefined) {
+      if (!boundedText(profile.fallback, MAX_NAME) || !config.profiles[profile.fallback] || profile.fallback === name)
+        throw new ConfigError(`Profile ${name}.fallback must name another profile`, 'E_CONFIG_PROFILE');
+    }
+    const violation = modelPolicyViolation({
+      type: config.providers[profile.provider].type,
+      baseUrl: config.providers[profile.provider].baseUrl,
+      model: profile.model,
+      allowSelector: true,
+    });
     if (violation) throw new ConfigError(`Profile ${name}: ${violation}`, 'E_CONFIG_MODEL_POLICY');
   }
   return config;

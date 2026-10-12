@@ -7,6 +7,8 @@ import { macosProfile, sandboxStatus } from './sandbox.mjs';
 import { healthIdentity } from './identity.mjs';
 import { resolveClientPaths } from './client-paths.mjs';
 import { DEFAULT_ATTEMPT_TIMEOUT_MS, OpenAIChatProvider } from './provider/openai-chat.mjs';
+import { AnthropicMessagesProvider, resolveLatestAnthropicSonnet } from './provider/anthropic-messages.mjs';
+import { OFFLOAD_ANTHROPIC_LATEST_SONNET, OFFLOAD_DEEPSEEK_LATEST_FLASH, OFFLOAD_DEEPSEEK_MODEL } from './model-policy.mjs';
 import { loadPricing } from './pricing-registry.mjs';
 import { priceUsage, resolveModel, samePricedModel, validatePricingTable } from './pricing.mjs';
 import { snapshotGitEnv } from './git-snapshot.mjs';
@@ -416,44 +418,60 @@ export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = pr
   const loaded = loadConfig({ configPath, repoPath, env });
   const profile = loaded.config.profiles[loaded.config.default];
   const providerConfig = loaded.config.providers[profile.provider];
-  if (providerConfig.type !== 'openai-chat') throw new Error('live probe supports only openai-chat providers');
-  const table = pricingForLive(providerConfig, loaded.configPath);
-  if (!resolveModel(table, profile.model)) throw new Error('live probe refuses unknown priced model');
+  if (!['openai-chat', 'anthropic-messages'].includes(providerConfig.type)) throw new Error('live probe provider type is unsupported');
   let apiKey;
   try {
     apiKey = resolveKeyRef(providerConfig.keyRef, { env });
   } catch {
     throw new Error('live probe key is unavailable');
   }
+  let model = profile.model;
+  try {
+    if (model === OFFLOAD_ANTHROPIC_LATEST_SONNET)
+      model = await resolveLatestAnthropicSonnet({ baseUrl: providerConfig.baseUrl, apiKey, fetchImpl });
+    else if (model === OFFLOAD_DEEPSEEK_LATEST_FLASH) model = OFFLOAD_DEEPSEEK_MODEL;
+  } catch {
+    throw new Error('live probe model discovery failed');
+  }
+  const table = pricingForLive(providerConfig, loaded.configPath);
+  if (!resolveModel(table, model)) throw new Error('live probe refuses unknown priced model');
   // The probe forces one exact function call. DeepSeek enables thinking by
   // default and rejects named tool choice in that mode, so explicitly disable
   // it for both capability-check turns regardless of the job profile's effort.
-  const provider = new OpenAIChatProvider({
+  const providerOptions = {
     baseUrl: providerConfig.baseUrl,
     apiKey,
-    model: profile.model,
+    model,
     retries: 0,
-    thinking: { type: 'disabled' },
     timeoutMs: providerConfig.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS,
     ...(fetchImpl ? { fetchImpl } : {}),
-  });
+  };
+  const provider =
+    providerConfig.type === 'anthropic-messages'
+      ? new AnthropicMessagesProvider(providerOptions)
+      : new OpenAIChatProvider({ ...providerOptions, thinking: { type: 'disabled' } });
   const firstMessages = [{ role: 'user', content: 'Use offload_doctor_echo once with {"ok":true}.' }];
   let measuredUsd = 0,
     reservedUsd = 0;
   const request = async (messages, options) => {
-    const reservation = worstReservation(table, profile.model, messages, options);
+    const reservation = worstReservation(table, model, messages, options);
     if (measuredUsd + reservation.usd > maxUsd) throw new Error('live probe cap is insufficient for the next reserved request');
     reservedUsd += reservation.usd;
     const response = await chatProbe(provider, messages, options);
-    const chargedModel = response.model || profile.model;
-    if (response.model && !samePricedModel(table, profile.model, response.model))
+    const chargedModel = response.model || model;
+    if (response.model && !samePricedModel(table, model, response.model))
       throw new Error('live probe returned a model not authorized by its reservation');
     const priced = priceUsage(table, chargedModel, response.usage, now());
     measuredUsd += priced.usd;
     if (measuredUsd > maxUsd || priced.usd > reservation.usd) throw new Error('live probe observed usage beyond its reserved cap');
     return { response, priced };
   };
-  const first = await request(firstMessages, { tool_choice: { type: 'function', function: { name: 'offload_doctor_echo' } } });
+  const first = await request(
+    firstMessages,
+    providerConfig.type === 'anthropic-messages'
+      ? { tool_choice: { type: 'tool', name: 'offload_doctor_echo' } }
+      : { tool_choice: { type: 'function', function: { name: 'offload_doctor_echo' } } },
+  );
   if (first.response.toolCalls?.length !== 1) throw new Error('live probe first response must contain exactly one tool call');
   const call = first.response.toolCalls[0];
   let callArguments;
@@ -488,7 +506,7 @@ export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = pr
   const summarize = ({ response, priced }) => ({
     usage: response.usage,
     cache: { hit: response.usage.cacheHitTokens, miss: response.usage.cacheMissTokens },
-    returnedModel: response.model || profile.model,
+    returnedModel: response.model || model,
     estimatedUsd: priced.usd,
     toolCall: !!response.toolCalls?.length,
     reasoningReturned: response.reasoning !== undefined,
@@ -496,7 +514,7 @@ export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = pr
   return {
     live: true,
     maxUsd,
-    requestedModel: profile.model,
+    requestedModel: model,
     first: summarize(first),
     followup: summarize(second),
     reasoningReplayed: first.response.reasoning !== undefined,

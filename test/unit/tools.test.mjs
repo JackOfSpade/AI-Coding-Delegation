@@ -32,6 +32,8 @@ test('tool definitions have stable names and read/edit protects concurrent write
   assert.match(TOOL_DEFINITIONS[0].function.description, /limit is a byte count of at most 64000 per call/);
   assert.match(TOOL_DEFINITIONS[5].function.description, /one complete owned repository file/);
   assert.match(TOOL_DEFINITIONS[5].function.description, /Put all source content in content, never in prose/);
+  assert.match(TOOL_DEFINITIONS[7].function.description, /exactly this one tool call/);
+  assert.match(TOOL_DEFINITIONS[7].function.description, /rejects the entire response/);
   const { dir, tools } = await fixture();
   await tools.read_file({ path: 'a.txt' });
   await tools.edit_file({ path: 'a.txt', old_string: 'two', new_string: 'TWO\nthree' });

@@ -12,6 +12,12 @@ const MISSING_PACKAGE = /Cannot find (?:package|module) '((?![./#~]|@\/|file:|no
 const COMMAND_NOT_FOUND = /(?:^|\n)[^\n]*?(?:sh|bash|zsh|dash): (?:line \d+: )?([^\s:'"]{1,100}): (?:command )?not found\b/i;
 const NO_EXECUTABLE = /could not determine executable to run/i;
 const ASSERTION_FAILURE = /\bAssertionError\b|\bERR_ASSERTION\b/;
+// Git fixture helpers commonly shell out to the system Git binary. The
+// verifier intentionally denies the host system configuration, so an older
+// Git that still reaches it cannot initialize the disposable fixture. This is
+// an execution-environment limit, not evidence about the worker's patch.
+const GIT_SYSTEM_CONFIG_DENIED =
+  /(?:fatal:\s+unable to access ['"]\/etc\/gitconfig['"]|xcode-select: error: unable to read data link at ['"]\/var\/select\/developer_dir['"])[\s\S]{0,160}?(?:operation not permitted|permission denied)/i;
 // The two places a hard-coded temp path lands on macOS and Linux. The verifier
 // grants only its per-run TMPDIR, so a command that spells one of these out (or
 // spawns a child that dropped TMPDIR) is denied by design.
@@ -107,6 +113,11 @@ export function classifyVerifierEnvironment(verify, { workspacePath, writeScope 
   // logged EACCES): the text signals below must not mask it. An exit-127 or
   // "could not determine executable" run has no tests to have failed.
   const assertionFailure = ASSERTION_FAILURE.test(text);
+  if (!assertionFailure && GIT_SYSTEM_CONFIG_DENIED.test(text))
+    return {
+      kind: 'git-config-denied',
+      detail: 'Git fixture setup could not read host system configuration in the verifier sandbox',
+    };
   const missing = assertionFailure ? null : text.match(MISSING_PACKAGE);
   if (missing)
     return { kind: 'missing-package', specifier: clip(missing[1]), detail: `package '${clip(missing[1])}' could not be resolved` };

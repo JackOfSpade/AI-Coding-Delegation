@@ -1,3 +1,10 @@
+import {
+  anthropicContentChars,
+  anthropicContentMatchesAssistant,
+  cloneAnthropicContent,
+  validAnthropicContent,
+} from '../anthropic-content.mjs';
+
 /** Append-only conversation store.  Only old bulky tool output is replaced,
  * preserving message order (and therefore provider prefix-cache locality). */
 export class AgentContext {
@@ -236,12 +243,13 @@ function messageChars(message) {
   return typeof message?.content === 'string'
     ? message.content.length +
         (typeof message.reasoning_content === 'string' ? message.reasoning_content.length : 0) +
+        anthropicContentChars(message.anthropic_content) +
         (Array.isArray(message.tool_calls)
           ? message.tool_calls.reduce((n, call) => n + String(call?.function?.arguments ?? '').length, 0)
           : 0)
     : typeof message?.reasoning_content === 'string'
-      ? message.reasoning_content.length
-      : 0;
+      ? message.reasoning_content.length + anthropicContentChars(message.anthropic_content)
+      : anthropicContentChars(message?.anthropic_content);
 }
 function elideMessages(messages, maxToolChars, keepRecentToolResults) {
   const tools = messages.map((message, index) => [message, index]).filter(([message]) => message.role === 'tool' && !message.elided);
@@ -279,6 +287,7 @@ function cloneMessage(message, { includeElided = false } = {}) {
       role: 'assistant',
       content: message.content,
       ...(message.reasoning_content !== undefined ? { reasoning_content: message.reasoning_content } : {}),
+      ...(message.anthropic_content !== undefined ? { anthropic_content: cloneAnthropicContent(message.anthropic_content) } : {}),
       ...(message.tool_calls !== undefined
         ? {
             tool_calls: message.tool_calls.map((call) => ({
@@ -316,7 +325,8 @@ function validateMessageShape(message) {
   if (message.role === 'assistant') {
     if (
       !boundedText(message.content) ||
-      (message.reasoning_content !== undefined && message.reasoning_content !== null && !boundedText(message.reasoning_content))
+      (message.reasoning_content !== undefined && message.reasoning_content !== null && !boundedText(message.reasoning_content)) ||
+      (message.anthropic_content !== undefined && !validAnthropicContent(message.anthropic_content))
     )
       throw new Error('Conversation transcript has an invalid role or assistant content');
     if (
@@ -328,6 +338,8 @@ function validateMessageShape(message) {
         new Set(message.tool_calls.map((call) => call.id)).size !== message.tool_calls.length)
     )
       throw new Error('Conversation transcript has invalid assistant tool calls');
+    if (message.anthropic_content !== undefined && !anthropicContentMatchesAssistant(message.anthropic_content, message))
+      throw new Error('Conversation transcript has invalid Anthropic assistant replay');
     return;
   }
   if (

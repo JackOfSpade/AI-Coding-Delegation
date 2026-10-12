@@ -14,7 +14,8 @@ const RANGE_ENTRY = /:\d{1,7}-\d{1,7}(?: \(read_file offset |$)/;
 // tests that pass for the wrong reason are the commonest quality miss.
 export const WORKER_TEST_QUALITY_RULE = 'Assertions must be falsifiable; no substring checks that match unrelated text.';
 // A finish that shares its response with another call is rejected unrun (the loop allows one correction).
-const FINISH_ALONE_RULE = 'Call finish by itself: never in the same response as another tool call.';
+const FINISH_ALONE_RULE =
+  'Use finish only after every other needed tool result has returned. Its response must contain exactly one tool call: finish. Pairing finish with any other tool rejects the entire response, including its writes.';
 
 export async function repoConventions(repoPath, maxChars = 12_000) {
   if (typeof repoPath !== 'string' || !repoPath) return '';
@@ -153,13 +154,13 @@ export async function buildSystemPrompt({
     `Network access is ${allowNetwork ? 'permitted for this job only when necessary' : 'not permitted for this job'}. Never commit, push, switch branches, reset, stash, clean, or access secrets.`,
     allowCommand
       ? serverVerifierConfigured
-        ? 'Read files before editing them. Keep changes focused. A focused server verifier is already configured and runs after finish; do not spend turns rediscovering or rerunning it. Use run_command only for an essential diagnostic, then call finish as soon as the in-scope implementation is ready.'
+        ? 'Read files before editing them. Keep changes focused. A focused server verifier is already configured and runs after finish; do not spend turns rediscovering or rerunning it. Use run_command only for an essential diagnostic. When the in-scope implementation is ready, make a separate final response containing only finish.'
         : 'Read files before editing them. Keep changes focused. Run relevant tests when possible.'
       : 'Read files before editing them. Keep changes focused. Shell commands are unavailable for this job; report tests that you could not run.',
     `read_file's limit is a byte count of at most ${DEFAULT_READ_CAP} per call (omit it for that default); a call returns at most about ${DEFAULT_OUTPUT_CAP} characters, so page through a large file by continuing at the exact offset N printed after [truncated; next offset N].`,
     WORKER_TEST_QUALITY_RULE,
     !reportMode && finiteRemainingTurns
-      ? `You have ${finiteRemainingTurns} model turn${finiteRemainingTurns === 1 ? '' : 's'} available. Batch independent reads and lists, then after their required reads make an allowed tool call immediately. Do not emit source code, a plan, progress update, or other narrative outside tool calls; put source only in write_file.content. Prefer read_file, list_dir, glob, and grep for ordinary inspection. When read_file returns [truncated; next offset N], continue that file with exactly offset N. ${allowCommand ? (serverVerifierConfigured ? 'The configured focused verifier runs server-side after finish, so reserve the final turn for finish rather than rerunning or searching for tests. ' : 'Reserve run_command for focused build, test, or diagnostic work after changes. ') : ''}Prefer writing complete final file content with write_file over a write-then-edit sequence. If several new files are needed, write one complete file per tool-call response, then continue with the next file. edit_file requires a fresh read of that file, including after write_file. Reserve time for the configured verifier and the mandatory single finish call.`
+      ? `You have ${finiteRemainingTurns} model turn${finiteRemainingTurns === 1 ? '' : 's'} available. Batch independent reads and lists, then after their required reads make an allowed tool call immediately. Do not emit source code, a plan, progress update, or other narrative outside tool calls; put source only in write_file.content. Prefer read_file, list_dir, glob, and grep for ordinary inspection. When read_file returns [truncated; next offset N], continue that file with exactly offset N. ${allowCommand ? (serverVerifierConfigured ? 'The configured focused verifier runs server-side after finish, so reserve one final response containing only finish rather than rerunning or searching for tests. ' : 'Reserve run_command for focused build, test, or diagnostic work after changes. ') : ''}Prefer writing complete final file content with write_file over a write-then-edit sequence. If several new files are needed, write one complete file per tool-call response, then continue with the next file. edit_file requires a fresh read of that file, including after write_file. Reserve time for the configured verifier and the mandatory single finish call.`
       : '',
     reportMode
       ? `You must call finish with a concise summary and your detailed findings in its report field (up to 256000 characters), plus concerns and testsRun. ${FINISH_ALONE_RULE}`

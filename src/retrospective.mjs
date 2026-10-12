@@ -141,6 +141,9 @@ const FAMILIES = Object.freeze({
     request:
       'Jobs were started against a stale server. Make the stale-server preflight harder to skip (for example, refuse or loudly warn at offload_start).',
   },
+  // Runtime files may change because a worker just edited the checkout. This
+  // is useful restart context, not evidence that the job bypassed preflight.
+  'runtime-changed-after-start': { attributable: false },
   'cancelled-by-user': { attributable: false },
   'provider-failure': { attributable: false },
 });
@@ -511,8 +514,24 @@ export function deriveSignals(jobs, { health: rawHealth, nowMs, secrets = [] } =
         undefined,
         `${pairs.length} job(s) ran while the installed skill was stale (${health.skillState ?? 'state unknown'})`,
       );
-    if (health.serverStale)
-      push('stale-server-ignored', undefined, `${pairs.length} job(s) ran while the server was stale (runtime artifacts changed)`);
+    if (health.serverStale) {
+      const currentAtStart = pairs.filter(([record]) => record?.runtimePreflight?.server === 'current');
+      const withoutSnapshot = pairs.length - currentAtStart.length;
+      if (currentAtStart.length)
+        push(
+          'runtime-changed-after-start',
+          undefined,
+          `${currentAtStart.length} job(s) passed a current runtime preflight; runtime artifacts changed after start. Those jobs used the loaded runtime; restart the MCP client before starting another job.`,
+        );
+      // Older records have no start snapshot. Keep the old signal only for
+      // that ambiguity; never describe a recorded-current start as stale.
+      if (withoutSnapshot)
+        push(
+          'stale-server-ignored',
+          undefined,
+          `${withoutSnapshot} job(s) have no start-runtime snapshot and the server is stale now (runtime artifacts changed); restart before another job.`,
+        );
+    }
   }
   const python = health.verifierPython;
   if (['missing', 'partial'].includes(python?.status)) {

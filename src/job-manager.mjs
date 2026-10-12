@@ -249,7 +249,16 @@ function safeReportString(value, maxChars = MAX_REPORT_TEXT) {
 const safeReportText = (value) => safeReportString(value);
 const safeReportError = (value) =>
   safeReportString(typeof value === 'string' ? value : String(value || ''), 1500) || 'report worker failed';
-const PROVIDER_FAILURE_KINDS = new Set(['request', 'http', 'transport', 'attempt_timeout', 'redirect', 'sse_protocol', 'sse_limit']);
+const PROVIDER_FAILURE_KINDS = new Set([
+  'request',
+  'http',
+  'transport',
+  'attempt_timeout',
+  'redirect',
+  'sse_protocol',
+  'sse_limit',
+  'credit_exhausted',
+]);
 const PROVIDER_FINISH_REASONS = new Set(['stop', 'length', 'tool_calls', 'function_call', 'content_filter', 'other']);
 const CAPPED_FINISH_RECOVERY_STATES = new Set(['queued', 'consumed', 'settled']);
 const BUDGET_FINISH_RECOVERY_STATES = new Set(['queued', 'consumed']);
@@ -420,39 +429,42 @@ function canonicalRelevantPaths(paths) {
 }
 function validExecutionProfile(value) {
   if (value == null) return true;
-  const permitted = new Set(['type', 'baseUrl', 'keyRef', 'model', 'effort', 'pricing', 'pricingFile', 'attemptTimeoutMs']);
+  const permitted = new Set(['type', 'baseUrl', 'keyRef', 'model', 'effort', 'pricing', 'pricingFile', 'attemptTimeoutMs', 'fallback']);
   const cleanProviderText = (text, maximum) =>
     typeof text === 'string' && text.length > 0 && text.length <= maximum && !/[\x00-\x1f\x7f]/.test(text);
-  if (
-    !value ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
-    Object.keys(value).some((key) => !permitted.has(key)) ||
-    value.type !== 'openai-chat' ||
-    !cleanProviderText(value.baseUrl, 2048) ||
-    !cleanText(value.model, 128) ||
-    modelPolicyViolation(value) ||
-    !cleanText(value.keyRef, 4096) ||
-    (value.effort !== undefined && !allowedEffort.has(value.effort)) ||
-    (value.pricing !== undefined && !cleanProviderText(value.pricing, 128)) ||
-    (value.pricingFile !== undefined && (!cleanProviderText(value.pricingFile, 4096) || !isAbsolute(value.pricingFile))) ||
-    (value.attemptTimeoutMs !== undefined &&
-      (!Number.isSafeInteger(value.attemptTimeoutMs) || value.attemptTimeoutMs < 30_000 || value.attemptTimeoutMs > 600_000))
-  )
-    return false;
-  try {
-    parseKeyRef(value.keyRef);
-    const url = new URL(value.baseUrl);
-    return (
-      !url.username &&
-      !url.password &&
-      !url.search &&
-      !url.hash &&
-      (url.protocol === 'https:' || (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)))
-    );
-  } catch {
-    return false;
-  }
+  const one = (profile, nested = false) => {
+    if (
+      !profile ||
+      typeof profile !== 'object' ||
+      Array.isArray(profile) ||
+      Object.keys(profile).some((key) => !permitted.has(key) || (nested && key === 'fallback')) ||
+      !['openai-chat', 'anthropic-messages'].includes(profile.type) ||
+      !cleanProviderText(profile.baseUrl, 2048) ||
+      !cleanText(profile.model, 128) ||
+      modelPolicyViolation(profile) ||
+      !cleanText(profile.keyRef, 4096) ||
+      (profile.effort !== undefined && !allowedEffort.has(profile.effort)) ||
+      (profile.pricing !== undefined && !cleanProviderText(profile.pricing, 128)) ||
+      (profile.pricingFile !== undefined && (!cleanProviderText(profile.pricingFile, 4096) || !isAbsolute(profile.pricingFile))) ||
+      (profile.attemptTimeoutMs !== undefined &&
+        (!Number.isSafeInteger(profile.attemptTimeoutMs) || profile.attemptTimeoutMs < 30_000 || profile.attemptTimeoutMs > 600_000))
+    )
+      return false;
+    try {
+      parseKeyRef(profile.keyRef);
+      const url = new URL(profile.baseUrl);
+      return (
+        !url.username &&
+        !url.password &&
+        !url.search &&
+        !url.hash &&
+        (url.protocol === 'https:' || (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)))
+      );
+    } catch {
+      return false;
+    }
+  };
+  return one(value) && (value.fallback === undefined || one(value.fallback, true));
 }
 // `writePaths` is a convenience snapshot written alongside a job, never an
 // authority. Derive the operative scope from fields validated at every
@@ -470,7 +482,13 @@ const DEPENDENCY_STATES = new Set([
   'link-failed',
   'not-linked',
 ]);
-const VERIFY_ENV_KINDS = new Set(['missing-package', 'command-not-found', 'permission-denied', 'temp-dir-denied']);
+const VERIFY_ENV_KINDS = new Set(['missing-package', 'command-not-found', 'permission-denied', 'temp-dir-denied', 'git-config-denied']);
+const validRuntimePreflight = (value) =>
+  !!value &&
+  typeof value === 'object' &&
+  !Array.isArray(value) &&
+  Object.keys(value).length === 1 &&
+  value.server === 'current';
 const safeVerifyEnvironment = (value) =>
   VERIFY_ENV_KINDS.has(value?.kind)
     ? {
@@ -1283,6 +1301,8 @@ export class JobManager {
       (typeof job.verifyBaselineWorkspacePath !== 'string' || !job.verifyBaselineWorkspacePath)
     )
       throw new Error('stored job has invalid baseline workspace metadata');
+    if (job.runtimePreflight !== undefined && !validRuntimePreflight(job.runtimePreflight))
+      throw new Error('stored job has invalid runtime preflight metadata');
     if (job.cappedFinishRecovery !== undefined && !CAPPED_FINISH_RECOVERY_STATES.has(job.cappedFinishRecovery))
       throw new Error('stored job has invalid capped implementation recovery state');
     if (job.budgetFinishRecovery !== undefined && !BUDGET_FINISH_RECOVERY_STATES.has(job.budgetFinishRecovery))
@@ -1355,8 +1375,9 @@ export class JobManager {
     // would reintroduce a time-of-check/time-of-use repository redirect.
     return { ...job, repoPath: this.repoPath };
   }
-  async start(input, { launch = true, turnBudget } = {}) {
+  async start(input, { launch = true, turnBudget, runtimePreflight } = {}) {
     this.validate(input);
+    if (runtimePreflight !== undefined && !validRuntimePreflight(runtimePreflight)) throw new Error('runtime preflight metadata is invalid');
     const setupStartedMs = this.#nowMs();
     // `turnBudget` is the trusted, out-of-band result of Core resolving the
     // caller's turn policy against its configuration; it is not a request
@@ -1449,6 +1470,7 @@ export class JobManager {
       job = await this.store.create({
         ...persistedInput,
         ...(sizing?.budgetSizing ? { budgetSizing: sizing.budgetSizing } : {}),
+        ...(runtimePreflight ? { runtimePreflight: structuredClone(runtimePreflight) } : {}),
         repoPath,
         branch,
         head,
@@ -1701,19 +1723,23 @@ export class JobManager {
         cancellationWatch.unref?.();
         try {
           if (!this.worker?.run) throw new Error('no worker configured');
-          // A stored assistant reasoning trace is provider protocol state, not
-          // display text.  If durability redacted it, only the live process
-          // that still holds the original context may continue; a resumed or
-          // repair worker must never replay the placeholder as though it were
-          // the provider's original reasoning.  Older records did not carry
-          // the positive marker, so fail closed only when they actually have
-          // reasoning to replay.
+          // Stored assistant reasoning and Anthropic thinking blocks are
+          // provider protocol state, not display text. If durability redacted
+          // either, only the live process that still holds the original
+          // context may continue; a resumed or repair worker must never replay
+          // a placeholder as though it were provider-issued. Older records did
+          // not carry the positive marker, so fail closed only when they have
+          // provider protocol state to replay.
           if (job.mode !== 'report') {
             const transcript = await this.store.readMessages?.(id);
-            const hasReasoning = Array.isArray(transcript)
-              ? transcript.some((message) => message?.role === 'assistant' && Object.hasOwn(message, 'reasoning_content'))
+            const hasProviderProtocolState = Array.isArray(transcript)
+              ? transcript.some(
+                  (message) =>
+                    message?.role === 'assistant' &&
+                    (Object.hasOwn(message, 'reasoning_content') || Object.hasOwn(message, 'anthropic_content')),
+                )
               : false;
-            if (job.transcriptReplayable === false || (job.transcriptReplayable !== true && hasReasoning))
+            if (job.transcriptReplayable === false || (job.transcriptReplayable !== true && hasProviderProtocolState))
               throw new Error('durable transcript reasoning is unavailable for safe provider replay; start a fresh job');
           }
           // Keep lifecycle transitions in this worker claim rather than

@@ -559,9 +559,9 @@ test('MCP keeps current requests stateless and legacy initialize envelopes separ
     assert.match(discovery.instructions, /skill:\/\/offload\/offload\/SKILL\.md/);
     assert.match(discovery.instructions, /repoPath/);
     assert.match(discovery.instructions, /native Claude subagents/);
-    assert.match(discovery.instructions, /profile "flash"/);
+    assert.match(discovery.instructions, /profile "promo"/);
     assert.match(discovery.instructions, /policy-only/);
-    assert.match(discovery.instructions, /Do not invent a “latest Flash” model/);
+    assert.match(discovery.instructions, /latest supported Sonnet/);
     assert.match(discovery.instructions, /policy-only hosts workers edit permitted private-worktree files, no shell/);
     assert.ok(discovery.instructions.length < 512);
   }
@@ -604,7 +604,7 @@ test('MCP keeps current requests stateless and legacy initialize envelopes separ
   assert.match(list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.allowNetwork.description, /only/);
   assert.match(
     list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.profile.description,
-    /provider-maintained DeepSeek V4\.1 Flash route/,
+    /falls back to the provider-maintained DeepSeek Flash route/,
   );
   assert.match(
     list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.profile.description,
@@ -734,7 +734,7 @@ test('MCP exposes the canonical static skill with exact resources and safe reque
   );
   assert.match(expectedText, /A standalone instruction not to use native subagents does not trigger Offload/);
   assert.match(expectedText, /For a `\/offload` command invocation, end every final answer/);
-  assert.match(expectedText, /explicitly set `profile: "flash"`/);
+  assert.match(expectedText, /explicitly set `profile: "promo"`/);
   assert.match(expectedText, /omit `effort`/);
   assert.match(expectedText, /explicitly selects a supported profile name within a `\/offload` command invocation/);
   assert.match(expectedText, /provider or model name never triggers Offload or permits inferring, overriding, or inventing a profile/);

@@ -13,7 +13,7 @@ const terminal = new Set([
   'CANCELLED',
 ]);
 export { terminal as terminalStatuses };
-const VERIFY_ENV_KINDS = new Set(['missing-package', 'command-not-found', 'permission-denied', 'temp-dir-denied']);
+const VERIFY_ENV_KINDS = new Set(['missing-package', 'command-not-found', 'permission-denied', 'temp-dir-denied', 'git-config-denied']);
 const APPLY_ELIGIBLE = new Set(APPLY_ELIGIBLE_STATUSES);
 /**
  * `detail: 'full'` is the durable report.md. `detail: 'compact'` is what a
@@ -130,6 +130,8 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
               : ' Either it is not installed in the primary checkout, it lives in a nested/workspace package outside the linked root node_modules, or the worker imported a package that does not exist (check the diff).'
             : job.verifyEnvironment.kind === 'temp-dir-denied'
               ? ' Hard-coded /tmp is not writable in the verifier; tests must use os.tmpdir()/$TMPDIR and forward the environment to child processes. For a suite with such pre-existing failures, start with verifierMode "baseline-diff".'
+              : job.verifyEnvironment.kind === 'git-config-denied'
+                ? ' A temporary Git-fixture test could not read host Git configuration in the verifier sandbox. This is an environment limitation, not a product-test failure; run that integration suite in the primary checkout.'
               : ''
         }${
           // An applyThenVerify run is already acting on this very advice.
@@ -376,7 +378,17 @@ function applyVerifyLines(record, lean) {
     return `applyThenVerify ${outcome}: VERIFICATION DID NOT PASS and the AUTO-REVERT DID NOT COMPLETE (${scalar(record.autoRevertError || 'unknown')}) — the diff is STILL APPLIED; run offload_revert (dry run first)${tail(lean ? 20 : 40)}`;
   const exit =
     record.exitCode !== undefined ? `exit ${scalar(record.exitCode)}` : record.error ? scalar(record.error).slice(0, 160) : undefined;
-  return `applyThenVerify ${outcome}${exit || seconds ? ` (${[exit, seconds, ran].filter(Boolean).join(', ')})` : ''}: ${command} — the diff was REVERTED; the primary's job-owned paths are verified identical to before${record.primaryRestoredExactly === false ? ' (other primary files changed during verification and were left alone)' : ''}. Fix the cause and call offload_apply again${tail(lean ? 20 : 40)}`;
+  // `applyThenVerify` intentionally hides the primary checkout's Git metadata
+  // from the command. Some test helpers need that metadata even when their
+  // fixtures live in a disposable temp directory. This is advice only; it
+  // never changes the failed command's outcome or the revert decision.
+  const gitFixtureHint =
+    record.outcome === 'FAILED' &&
+    typeof record.outputTail === 'string' &&
+    /\brepoPath must be inside a git working tree\b/.test(record.outputTail)
+      ? ' This check needs Git metadata that applyThenVerify intentionally keeps unreadable. Run it yourself in the primary checkout, then call offload_apply with verifiedBy; do not widen the sandbox.'
+      : '';
+  return `applyThenVerify ${outcome}${exit || seconds ? ` (${[exit, seconds, ran].filter(Boolean).join(', ')})` : ''}: ${command} — the diff was REVERTED; the primary's job-owned paths are verified identical to before${record.primaryRestoredExactly === false ? ' (other primary files changed during verification and were left alone)' : ''}. Fix the cause and call offload_apply again${gitFixtureHint}${tail(lean ? 20 : 40)}`;
 }
 const BASELINE_HINTS = {
   'unparseable-output': 'Use a runner with node:test/TAP/jest/pytest/go/cargo output so failing tests can be named.',

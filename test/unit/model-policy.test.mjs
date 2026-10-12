@@ -6,7 +6,14 @@ import { fileURLToPath } from 'node:url';
 import { DEFAULT_CONFIG, ConfigError, loadConfig, validateConfig } from '../../src/config.mjs';
 import { OpenAIChatProvider } from '../../src/provider/openai-chat.mjs';
 import { loadPricing } from '../../src/pricing-registry.mjs';
-import { OFFLOAD_DEEPSEEK_MODEL, assertModelAllowed, isProModel, modelPolicyViolation } from '../../src/model-policy.mjs';
+import {
+  OFFLOAD_ANTHROPIC_LATEST_SONNET,
+  OFFLOAD_DEEPSEEK_LATEST_FLASH,
+  OFFLOAD_DEEPSEEK_MODEL,
+  assertModelAllowed,
+  isProModel,
+  modelPolicyViolation,
+} from '../../src/model-policy.mjs';
 import { cleanup, tempDir, write } from './helpers.mjs';
 
 const root = fileURLToPath(new URL('../..', import.meta.url));
@@ -48,12 +55,40 @@ test('other endpoints keep arbitrary model names but can never request a Pro mod
   assert.throws(() => assertModelAllowed({ baseUrl: 'https://api.deepseek.com', model: 'deepseek-v4-pro' }), { code: 'E_MODEL_POLICY' });
 });
 
-test('shipped defaults and the example config expose only flash', () => {
-  assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles), ['flash']);
-  assert.equal(DEFAULT_CONFIG.default, 'flash');
+test('dynamic selectors are accepted only while validating configuration, never on the provider wire', () => {
+  assert.equal(
+    modelPolicyViolation({
+      type: 'anthropic-messages',
+      baseUrl: 'https://api.anthropic.com',
+      model: OFFLOAD_ANTHROPIC_LATEST_SONNET,
+      allowSelector: true,
+    }),
+    undefined,
+  );
+  assert.ok(
+    modelPolicyViolation({ type: 'anthropic-messages', baseUrl: 'https://api.anthropic.com', model: OFFLOAD_ANTHROPIC_LATEST_SONNET }),
+  );
+  assert.equal(
+    modelPolicyViolation({
+      type: 'openai-chat',
+      baseUrl: 'https://api.deepseek.com',
+      model: OFFLOAD_DEEPSEEK_LATEST_FLASH,
+      allowSelector: true,
+    }),
+    undefined,
+  );
+  assert.ok(modelPolicyViolation({ type: 'openai-chat', baseUrl: 'https://api.deepseek.com', model: OFFLOAD_DEEPSEEK_LATEST_FLASH }));
+});
+
+test('shipped defaults and the example config route promo Sonnet to Flash fallback', () => {
+  assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles), ['promo', 'flash']);
+  assert.equal(DEFAULT_CONFIG.default, 'promo');
+  assert.equal(DEFAULT_CONFIG.profiles.promo.model, OFFLOAD_ANTHROPIC_LATEST_SONNET);
+  assert.equal(DEFAULT_CONFIG.profiles.promo.fallback, 'flash');
+  assert.equal(DEFAULT_CONFIG.profiles.flash.model, OFFLOAD_DEEPSEEK_LATEST_FLASH);
   const example = JSON.parse(readFileSync(join(root, 'config.example.json'), 'utf8'));
-  assert.deepEqual(Object.keys(example.profiles), ['flash']);
-  assert.equal(example.default, 'flash');
+  assert.deepEqual(Object.keys(example.profiles), ['promo', 'flash']);
+  assert.equal(example.default, 'promo');
   assert.doesNotThrow(() => validateConfig(structuredClone(example)));
 });
 

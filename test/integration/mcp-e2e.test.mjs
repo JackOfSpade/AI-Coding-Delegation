@@ -49,7 +49,7 @@ const calls = (...entries) => ({
   ],
 });
 const FINISH_ALONE =
-  'TOOL_ERROR: finish must be the only tool call in its turn; nothing in this turn was executed; call finish alone (re-issue other calls in a separate turn first if still needed)';
+  'TOOL_ERROR: finish must be the only tool call in its turn; nothing in this turn was executed. The prior implementation may already be complete. On your next response, either call finish alone if no actual work remains, or make only the non-finish calls needed for remaining work; after their results, call finish alone in a later response. Do not repeat or pair a rejected call with finish.';
 
 async function makeRepo(files = {}) {
   const path = await mkdtemp(join(tmpdir(), 'offload-mcp-e2e-repo-'));

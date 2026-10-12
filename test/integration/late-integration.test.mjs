@@ -98,6 +98,47 @@ test('an environmental verifier failure is terminal, spends no repair round or b
   }
 });
 
+test('a git-config-denied verifier failure is an environment limitation: no repair round, still apply-eligible, run the suite in the primary checkout', async () => {
+  const GIT_DENIED = "fatal: unable to access '/etc/gitconfig': Operation not permitted";
+  const h = await harness({
+    worker: async (job) => {
+      writeSrc(job, 'a.js', 'export const a = 1;\n');
+      return { status: 'DONE', turns: 2, costUsd: 0.02 };
+    },
+    verify: () => ({ command: 'npm test', verdict: 'FAIL', result: { code: 1, stderr: GIT_DENIED, sandbox: 'macos' } }),
+  });
+  try {
+    const { started, done } = await startEnvJob(h, { maxRepairRounds: 2 });
+    const id = started.jobId;
+    assert.equal(done.status, 'VERIFY_ENV_FAILED');
+    assert.equal(done.verifyEnvironment.kind, 'git-config-denied');
+    const job = await h.manager.store.get(id);
+    assert.equal(job.status, 'VERIFY_ENV_FAILED');
+    assert.equal(job.verifyEnvironment.kind, 'git-config-denied');
+    // No automatic repair round.
+    assert.equal(h.counters.runs, 1, 'the worker is not run again');
+    assert.equal(h.counters.verifies, 1, 'the verifier is not retried');
+    assert.equal(job.rounds ?? 0, 0);
+    assert.doesNotMatch(done.report, /next: .*\brepair\b/);
+    // Normal apply eligibility is retained: the diff is reviewable and a dry run offers it.
+    assert.match(await h.manager.store.readArtifact(id, 'patch.diff'), /src\/a\.js/);
+    assert.match(done.report, /next: .*apply/);
+    assert.equal(job.applied === true, false);
+    assert.deepEqual(await h.manager.apply(id), {
+      dryRun: true,
+      applied: false,
+      files: ['src/a.js'],
+      fromStatus: 'VERIFY_ENV_FAILED',
+    });
+    // The report names the limitation and the remedy.
+    assert.match(done.report, /verifier environment: Git fixture setup could not read host system configuration in the verifier sandbox\./);
+    assert.match(done.report, /This is an environment limitation, not a product-test failure; run that integration suite in the primary checkout\./);
+    assert.match(done.report, /no repair round was spent and none will be started automatically/);
+  } finally {
+    cleanup(h.repo);
+  }
+});
+
 test('an ordinary assertion failure is still a repairable VERIFY_FAILED, not an environment failure', async () => {
   let pending = true;
   const h = await harness({

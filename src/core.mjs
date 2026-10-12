@@ -44,15 +44,22 @@ import {
   sameCredentialFingerprint,
   validCredentialFingerprint,
 } from './integrity.mjs';
-import { DEFAULT_ATTEMPT_TIMEOUT_MS, OpenAIChatProvider } from './provider/openai-chat.mjs';
+import { DEFAULT_ATTEMPT_TIMEOUT_MS, OpenAIChatProvider, ProviderError } from './provider/openai-chat.mjs';
+import { AnthropicMessagesProvider, resolveLatestAnthropicSonnet } from './provider/anthropic-messages.mjs';
+import { CreditFallbackProvider } from './provider/fallback.mjs';
 import { PathPolicy } from './policy.mjs';
 import { LocalTools, availableToolDefinitions } from './agent/tools.mjs';
 import { AgentLoop } from './agent/loop.mjs';
 import { AgentContext } from './agent/context.mjs';
 import { annotateRelevantPaths, buildSystemPrompt } from './agent/prompt.mjs';
 import { loadPricing } from './pricing-registry.mjs';
-import { assertModelAllowed } from './model-policy.mjs';
-import { validatePricingTable } from './pricing.mjs';
+import {
+  assertModelAllowed,
+  OFFLOAD_ANTHROPIC_LATEST_SONNET,
+  OFFLOAD_DEEPSEEK_LATEST_FLASH,
+  OFFLOAD_DEEPSEEK_MODEL,
+} from './model-policy.mjs';
+import { resolveModel, validatePricingTable } from './pricing.mjs';
 import { readRegularFileSync } from './regular-file.mjs';
 
 // Repository discovery must not pass provider credentials, ambient Git
@@ -168,6 +175,59 @@ function pricingFile(path) {
     throw new Error(`invalid pricing file ${path}: expected models object`);
   return table;
 }
+
+export async function resolveLatestDeepSeekFlash({ baseUrl, apiKey, fetchImpl = globalThis.fetch, signal } = {}) {
+  let response;
+  try {
+    response = await fetchImpl(new URL('models', `${baseUrl.replace(/\/+$/, '')}/`).href, {
+      headers: { authorization: `Bearer ${apiKey}` },
+      signal,
+      redirect: 'error',
+    });
+  } catch {
+    throw new Error('DeepSeek model discovery failed');
+  }
+  if (!response.ok) throw new Error(`DeepSeek model discovery failed (HTTP ${response.status})`);
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    throw new Error('DeepSeek model discovery returned invalid JSON');
+  }
+  const model = Array.isArray(body?.data) ? body.data.find((entry) => entry?.id === OFFLOAD_DEEPSEEK_MODEL) : undefined;
+  if (!model) throw new Error('No provider-maintained DeepSeek Flash model is available');
+  return model.id;
+}
+
+// Only a ProviderError's bare HTTP status is safe to surface from discovery;
+// its message, body and every other field may carry provider detail.
+function safeDiscoveryStatusSuffix(error) {
+  if (!(error instanceof ProviderError)) return '';
+  const status = error.status;
+  return Number.isSafeInteger(status) && status >= 100 && status <= 599 ? ` (HTTP ${status})` : '';
+}
+
+async function resolveProfileModel(profile, provider, key, { fetchImpl, signal } = {}) {
+  if (profile.model === OFFLOAD_ANTHROPIC_LATEST_SONNET)
+    return resolveLatestAnthropicSonnet({ baseUrl: provider.baseUrl, apiKey: key, fetchImpl, signal });
+  if (profile.model === OFFLOAD_DEEPSEEK_LATEST_FLASH)
+    return resolveLatestDeepSeekFlash({ baseUrl: provider.baseUrl, apiKey: key, fetchImpl, signal });
+  return profile.model;
+}
+
+function providerInstance(providerConfig, key, model, { fetchImpl, reasoningEffort } = {}) {
+  const options = {
+    baseUrl: providerConfig.baseUrl,
+    apiKey: key,
+    model,
+    timeoutMs: providerConfig.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS,
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(fetchImpl ? { fetchImpl } : {}),
+  };
+  if (providerConfig.type === 'anthropic-messages') return new AnthropicMessagesProvider(options);
+  if (providerConfig.type === 'openai-chat') return new OpenAIChatProvider(options);
+  throw new Error(`unsupported provider type: ${providerConfig?.type || 'missing'}`);
+}
 /** Snapshot through a temporary index; neither user index nor history changes. */
 export function gitSnapshots() {
   return {
@@ -271,13 +331,26 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         const credential = resolveCredential(execution.keyRef);
         if (!sameCredentialFingerprint(job.credentialFingerprint, credentialFingerprint(root.value, credential)))
           throw new Error('stored job credential check failed');
-        return credential;
+        if (!execution.fallback) return { primary: credential };
+        if (typeof execution.fallback.keyRef !== 'string' || !validCredentialFingerprint(job.fallbackCredentialFingerprint))
+          throw new Error('stored job credential check failed');
+        const fallback = resolveCredential(execution.fallback.keyRef);
+        if (!sameCredentialFingerprint(job.fallbackCredentialFingerprint, credentialFingerprint(root.value, fallback)))
+          throw new Error('stored job credential check failed');
+        return { primary: credential, fallback };
       },
       async prepare(job) {
         const execution = job?.executionProfile;
         if (!execution || typeof execution.keyRef !== 'string') throw new Error('job credential is unavailable');
         const credential = resolveCredential(execution.keyRef);
-        return { ...job, credentialFingerprint: credentialFingerprint(root.value, credential) };
+        const fallback = execution.fallback;
+        if (fallback && typeof fallback.keyRef !== 'string') throw new Error('job credential is unavailable');
+        const fallbackCredential = fallback ? resolveCredential(fallback.keyRef) : undefined;
+        return {
+          ...job,
+          credentialFingerprint: credentialFingerprint(root.value, credential),
+          ...(fallbackCredential ? { fallbackCredentialFingerprint: credentialFingerprint(root.value, fallbackCredential) } : {}),
+        };
       },
       preflight: (keyRef) => resolveCredential(keyRef),
     };
@@ -309,23 +382,43 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         if (!execution && !configured) throw new Error(`unknown profile: ${profileName}`);
         const profile = execution ? { model: execution.model, effort: execution.effort } : configured;
         const providerConfig = execution || loaded.config.providers[configured.provider];
-        if (providerConfig?.type !== 'openai-chat') throw new Error(`unsupported provider type: ${providerConfig?.type || 'missing'}`);
-        assertModelAllowed({ baseUrl: providerConfig.baseUrl, model: profile.model });
-        let key;
+        if (!['openai-chat', 'anthropic-messages'].includes(providerConfig?.type))
+          throw new Error(`unsupported provider type: ${providerConfig?.type || 'missing'}`);
+        // Execution profiles contain a concrete model snapshot. A direct
+        // embedded worker without one remains limited to ordinary configured
+        // models; selectors are resolved only while accepting a job.
+        assertModelAllowed({ type: providerConfig.type, baseUrl: providerConfig.baseUrl, model: profile.model });
+        let key, authenticated;
         try {
-          key = state.integrity ? await state.integrity.authenticate(job) : (config.resolveKey || resolveKeyRef)(providerConfig.keyRef);
+          authenticated = state.integrity ? await state.integrity.authenticate(job) : undefined;
+          key = authenticated?.primary || (config.resolveKey || resolveKeyRef)(providerConfig.keyRef);
         } catch {
           throw new Error('worker key is unavailable; run offload doctor or configure keyRef');
         }
         state.store.secrets ||= [];
         if (!state.store.secrets.includes(key)) state.store.secrets.push(key);
-        const provider = new OpenAIChatProvider({
-          baseUrl: providerConfig.baseUrl,
-          apiKey: key,
-          model: profile.model,
+        let provider = providerInstance(providerConfig, key, profile.model, {
           reasoningEffort: (job.effort || profile.effort) === 'high' ? 'high' : undefined,
-          timeoutMs: providerConfig.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS,
         });
+        const fallbackConfig = execution?.fallback;
+        if (fallbackConfig) {
+          assertModelAllowed({ type: fallbackConfig.type, baseUrl: fallbackConfig.baseUrl, model: fallbackConfig.model });
+          let fallbackKey;
+          try {
+            fallbackKey = authenticated?.fallback || (config.resolveKey || resolveKeyRef)(fallbackConfig.keyRef);
+          } catch {
+            throw new Error('fallback worker key is unavailable; run offload doctor or configure keyRef');
+          }
+          if (!state.store.secrets.includes(fallbackKey)) state.store.secrets.push(fallbackKey);
+          provider = new CreditFallbackProvider({
+            primary: provider,
+            fallback: providerInstance(fallbackConfig, fallbackKey, fallbackConfig.model, {
+              reasoningEffort: (job.effort || fallbackConfig.effort) === 'high' ? 'high' : undefined,
+            }),
+            primaryModel: profile.model,
+            fallbackModel: fallbackConfig.model,
+          });
+        }
         // A queued job is an immutable execution request.  In particular, do not
         // let a later .offload.json edit relax (or unexpectedly revoke) its policy.
         // repoPath remains the public/lease identity; a real Core job executes
@@ -452,7 +545,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         );
         const responseModel = rawResult.model;
         const mismatch =
-          responseModel && responseModel !== profile.model
+          responseModel && responseModel !== profile.model && provider.allowsResponseModel?.(profile.model, responseModel) !== true
             ? `provider response model ${responseModel} differs from configured model ${profile.model}`
             : null;
         const result = {
@@ -470,7 +563,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       const loaded = config.loaded || loadConfig({ configPath: config.configPath, repoPath: root });
       const profile = loaded.config.profiles[loaded.config.default];
       const provider = profile && loaded.config.providers[profile.provider];
-      if (loaded.disabled || provider?.type !== 'openai-chat') return false;
+      if (loaded.disabled || !['openai-chat', 'anthropic-messages'].includes(provider?.type)) return false;
       // Resolve only as a boolean preflight; never place the key or resolver
       // diagnostics in a health response.
       const key = (config.resolveKey || resolveKeyRef)(provider.keyRef);
@@ -740,25 +833,68 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       health: { ...(await sandboxHealth()), worker: false, repositories: [...states.keys()] },
     };
   };
-  const pricingMetadata = (providerConfig, loaded) => {
-    let table = config.pricingTable || loadPricing(providerConfig.pricing);
-    let identifier = providerConfig.pricing;
-    if (!table && providerConfig.pricingFile) {
-      const pricePath = resolveConfigRelativePath(providerConfig.pricingFile, loaded.configPath);
-      try {
-        table = pricingFile(pricePath);
-      } catch (error) {
-        throw new Error(`unable to load pricing file ${pricePath}: ${error.message || error}`);
+  const pricingMetadata = (providerConfigs, loaded, requiredModels = []) => {
+    const inputs = Array.isArray(providerConfigs) ? providerConfigs : [providerConfigs];
+    const tables = inputs.map((providerConfig, index) => {
+      // An injected table is a test/embedding override for the selected
+      // primary provider only. A fallback always receives its own recorded
+      // table, so it cannot inherit unrelated rates by accident.
+      let table = index === 0 ? config.pricingTable || loadPricing(providerConfig.pricing) : loadPricing(providerConfig.pricing);
+      let identifier = providerConfig.pricing;
+      if (!table && providerConfig.pricingFile) {
+        const pricePath = resolveConfigRelativePath(providerConfig.pricingFile, loaded.configPath);
+        try {
+          table = pricingFile(pricePath);
+        } catch (error) {
+          throw new Error(`unable to load pricing file ${pricePath}: ${error.message || error}`);
+        }
+        identifier ||= `file:${pricePath}`;
       }
-      identifier ||= `file:${pricePath}`;
+      if (table) validatePricingTable(table);
+      return { table, identifier };
+    });
+    const supplied = tables.filter((entry) => entry.table);
+    let table;
+    if (supplied.length === 1) table = structuredClone(supplied[0].table);
+    else if (supplied.length > 1) {
+      table = { models: {}, legacy_aliases: {}, sources: [] };
+      for (const entry of supplied) {
+        if (entry.table.peak) {
+          if (table.peak && JSON.stringify(table.peak) !== JSON.stringify(entry.table.peak))
+            throw new Error('fallback pricing peak schedule conflicts with the primary provider');
+          table.peak ||= structuredClone(entry.table.peak);
+        }
+        for (const [model, price] of Object.entries(entry.table.models)) {
+          if (Object.hasOwn(table.models, model) && JSON.stringify(table.models[model]) !== JSON.stringify(price))
+            throw new Error(`conflicting pricing entries for ${model}`);
+          table.models[model] = structuredClone(price);
+        }
+        for (const [alias, model] of Object.entries(entry.table.legacy_aliases || {})) {
+          if (Object.hasOwn(table.legacy_aliases, alias) && table.legacy_aliases[alias] !== model)
+            throw new Error(`conflicting pricing aliases for ${alias}`);
+          table.legacy_aliases[alias] = model;
+        }
+        if (Array.isArray(entry.table.sources)) table.sources.push(...entry.table.sources);
+      }
     }
-    // Reject malformed rates before a snapshot, lease, or durable job exists.
-    // Otherwise a supplied pricing file can create a job that is guaranteed
-    // to fail only after the worker has started.
-    if (table) validatePricingTable(table);
-    // Keep the small, public pricing table alongside the accepted job.  The
-    // worker must not silently use a modified pricing file after handoff.
-    return { pricingId: identifier, pricingFetchedAt: table?.fetched_at, ...(table ? { pricingSnapshot: structuredClone(table) } : {}) };
+    // A finite job must not discover an unpriced newer model after a paid
+    // request. Dynamic discovery is therefore paired with a price snapshot;
+    // an unfamiliar release fails before a job, lease, or provider call.
+    for (const model of requiredModels)
+      if (!table || !resolveModel(table, model)) throw new Error(`pricing is unknown for selected model ${model}`);
+    return {
+      pricingId:
+        tables
+          .map((entry) => entry.identifier)
+          .filter(Boolean)
+          .join('+') || undefined,
+      pricingFetchedAt: supplied
+        .map((entry) => entry.table.fetched_at)
+        .filter(Boolean)
+        .sort()
+        .at(-1),
+      ...(table ? { pricingSnapshot: table } : {}),
+    };
   };
   return {
     // Exposing this only helps same-process embeddings/tests; normal callers
@@ -780,7 +916,8 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       // Health remains visible through offload_job, but stale runtime/skill
       // state is a hard boundary here: a client must not spend budget simply
       // because it skipped or overlooked the preflight response.
-      assertStartRuntimeCurrent(skillHealth(), { requireCurrentSkill: config.enforceInstalledSkillPreflight === true });
+      const startHealth = skillHealth();
+      assertStartRuntimeCurrent(startHealth, { requireCurrentSkill: config.enforceInstalledSkillPreflight === true });
       const state = await makeState(input?.repoPath);
       if (closing) throw new Error('offload core is shutting down');
       const loaded = config.loaded || loadConfig({ configPath: config.configPath, repoPath: state.repoPath });
@@ -789,32 +926,78 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       const profileName = input.profile || loaded.config.default;
       const profile = loaded.config.profiles[profileName];
       const providerConfig = loaded.config.providers[profile.provider];
-      if (providerConfig?.type !== 'openai-chat') throw new Error(`unsupported provider type: ${providerConfig?.type || 'missing'}`);
-      assertModelAllowed({ baseUrl: providerConfig.baseUrl, model: profile.model });
+      if (!['openai-chat', 'anthropic-messages'].includes(providerConfig?.type))
+        throw new Error(`unsupported provider type: ${providerConfig?.type || 'missing'}`);
+      const fallbackProfile = profile.fallback ? loaded.config.profiles[profile.fallback] : undefined;
+      const fallbackProviderConfig = fallbackProfile && loaded.config.providers[fallbackProfile.provider];
+      if (fallbackProviderConfig && !['openai-chat', 'anthropic-messages'].includes(fallbackProviderConfig.type))
+        throw new Error(`unsupported fallback provider type: ${fallbackProviderConfig.type || 'missing'}`);
       // Resolve before snapshotting or acquiring a lease so a missing key can
       // never leave an executable but unsigned durable job behind.
-      if (state.integrity) {
-        let credential;
+      const resolveStartCredential = (provider, label) => {
         try {
-          credential = state.integrity.preflight(providerConfig.keyRef);
+          return state.integrity ? state.integrity.preflight(provider.keyRef) : (config.resolveKey || resolveKeyRef)(provider.keyRef);
         } catch {
-          throw new Error('worker key is unavailable; run offload doctor or configure keyRef');
+          throw new Error(`${label} worker key is unavailable; run offload doctor or configure keyRef`);
         }
+      };
+      const primaryNeedsDiscovery = [OFFLOAD_ANTHROPIC_LATEST_SONNET, OFFLOAD_DEEPSEEK_LATEST_FLASH].includes(profile.model);
+      // A fallback can be selected only after the primary reports the exact
+      // credit-exhausted refusal, so verify its key before accepting a job.
+      const fallbackNeedsDiscovery =
+        !!fallbackProfile && [OFFLOAD_ANTHROPIC_LATEST_SONNET, OFFLOAD_DEEPSEEK_LATEST_FLASH].includes(fallbackProfile.model);
+      const primaryKey = state.integrity || primaryNeedsDiscovery ? resolveStartCredential(providerConfig, 'primary') : undefined;
+      const fallbackKey = fallbackProfile ? resolveStartCredential(fallbackProviderConfig, 'fallback') : undefined;
+      for (const credential of [primaryKey, fallbackKey]) {
+        if (!credential) continue;
         // Preserve the resolved value only in the in-memory redaction set.
         // A caller can otherwise put a non-heuristic literal credential in
         // initial task/criteria/test-command text before the worker runs.
         state.store.secrets ||= [];
         if (!state.store.secrets.includes(credential)) state.store.secrets.push(credential);
       }
+      let model;
+      try {
+        model = await resolveProfileModel(profile, providerConfig, primaryKey, { fetchImpl: config.fetchImpl });
+      } catch (error) {
+        throw new Error(`primary provider model discovery failed${safeDiscoveryStatusSuffix(error)}`);
+      }
+      let fallbackModel;
+      if (fallbackProfile) {
+        try {
+          fallbackModel = await resolveProfileModel(fallbackProfile, fallbackProviderConfig, fallbackKey, { fetchImpl: config.fetchImpl });
+        } catch (error) {
+          throw new Error(`fallback provider model discovery failed${safeDiscoveryStatusSuffix(error)}`);
+        }
+      }
+      assertModelAllowed({ type: providerConfig.type, baseUrl: providerConfig.baseUrl, model });
+      if (fallbackProviderConfig)
+        assertModelAllowed({ type: fallbackProviderConfig.type, baseUrl: fallbackProviderConfig.baseUrl, model: fallbackModel });
       const executionProfile = {
         type: providerConfig.type,
         baseUrl: providerConfig.baseUrl,
         keyRef: providerConfig.keyRef,
-        model: profile.model,
+        model,
         effort: profile.effort,
         pricing: providerConfig.pricing,
         attemptTimeoutMs: providerConfig.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS,
         ...(providerConfig.pricingFile ? { pricingFile: resolveConfigRelativePath(providerConfig.pricingFile, loaded.configPath) } : {}),
+        ...(fallbackProviderConfig
+          ? {
+              fallback: {
+                type: fallbackProviderConfig.type,
+                baseUrl: fallbackProviderConfig.baseUrl,
+                keyRef: fallbackProviderConfig.keyRef,
+                model: fallbackModel,
+                effort: fallbackProfile.effort,
+                pricing: fallbackProviderConfig.pricing,
+                attemptTimeoutMs: fallbackProviderConfig.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS,
+                ...(fallbackProviderConfig.pricingFile
+                  ? { pricingFile: resolveConfigRelativePath(fallbackProviderConfig.pricingFile, loaded.configPath) }
+                  : {}),
+              },
+            }
+          : {}),
       };
       // Repository policy may tighten reads, but never expands write scope.
       // A repository-provided verifier is always sandbox-required; only a
@@ -876,12 +1059,20 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           verifierInterpreter: interpreter?.declared,
           verifierInterpreterRoots: interpreter?.roots,
           sandboxMode: sandboxAvailable() ? 'macos' : 'policy-only',
-          configuredModel: profile.model,
+          configuredModel: model,
           executionProfile,
-          ...pricingMetadata(providerConfig, loaded),
+          ...pricingMetadata(fallbackProviderConfig ? [providerConfig, fallbackProviderConfig] : [providerConfig], loaded, [
+            ...(primaryNeedsDiscovery ? [model] : []),
+            ...(fallbackNeedsDiscovery ? [fallbackModel] : []),
+          ]),
         },
         {
           launch,
+          // This is a trusted fact about the accepted start boundary, not a
+          // re-check of files on disk. A worker can legitimately edit this
+          // checkout, which makes a still-running MCP process stale only
+          // after the job has already begun.
+          runtimePreflight: { server: 'current' },
           turnBudget: {
             requested: requestedTurns,
             configured: loaded.config.limits.maxTurns,

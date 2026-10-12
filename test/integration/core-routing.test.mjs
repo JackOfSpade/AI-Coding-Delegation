@@ -79,6 +79,166 @@ function integrityTestConfig({ loaded: loadedConfig = loaded, statePath, resolve
     resolveKey,
   };
 }
+test('Core snapshots the currently listed Sonnet and Flash routes before a local promo job starts', async () => {
+  const path = await repo('offload-core-dynamic-models-');
+  const dynamicLoaded = {
+    disabled: false,
+    repoConfig: {},
+    config: {
+      default: 'promo',
+      profiles: {
+        promo: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' },
+        flash: { provider: 'deepseek', model: 'latest-flash' },
+      },
+      providers: {
+        anthropic: {
+          type: 'anthropic-messages',
+          baseUrl: 'https://api.anthropic.com',
+          keyRef: 'env:ANTHROPIC_TEST',
+          pricing: 'anthropic-sonnet-2026-10-12',
+        },
+        deepseek: {
+          type: 'openai-chat',
+          baseUrl: 'https://api.deepseek.com',
+          keyRef: 'env:DEEPSEEK_TEST',
+          pricing: 'deepseek-2026-10-01',
+        },
+      },
+      limits: { maxTurns: 2, timeoutMinutes: 1, maxUsd: 1 },
+    },
+  };
+  const requests = [];
+  let observed;
+  const isolation = { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree };
+  const core = createCore({
+    config: {
+      loaded: dynamicLoaded,
+      resolveKey: (ref) => (ref === 'env:ANTHROPIC_TEST' ? 'anthropic-key' : 'deepseek-key'),
+      fetchImpl: async (url) => {
+        requests.push(url);
+        if (url === 'https://api.anthropic.com/v1/models?lifecycle=active')
+          return new Response(JSON.stringify({ data: [{ id: 'claude-sonnet-5-5', line: 'sonnet' }] }));
+        if (url === 'https://api.deepseek.com/models') return new Response(JSON.stringify({ data: [{ id: 'deepseek-flash' }] }));
+        throw new Error(`unexpected discovery URL ${url}`);
+      },
+      skillHealth: noInstalledSkill,
+      isolation,
+    },
+    isolation,
+    worker: {
+      run: async (job) => {
+        observed = job;
+        return { status: 'DONE', summary: 'resolved' };
+      },
+    },
+  });
+  try {
+    const started = await core.start({ mode: 'report', task: 'inspect', repoPath: path });
+    await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    assert.deepEqual(requests, ['https://api.anthropic.com/v1/models?lifecycle=active', 'https://api.deepseek.com/models']);
+    assert.equal(observed.configuredModel, 'claude-sonnet-5-5');
+    assert.equal(observed.executionProfile.model, 'claude-sonnet-5-5');
+    assert.equal(observed.executionProfile.fallback.model, 'deepseek-flash');
+    assert.deepEqual(observed.runtimePreflight, { server: 'current' });
+    assert.deepEqual(Object.keys(observed.pricingSnapshot.models).sort(), ['claude-sonnet-5-5', 'deepseek-flash']);
+  } finally {
+    await core.shutdown();
+    await rm(path, { recursive: true, force: true });
+  }
+});
+test('Core reports only the HTTP status when primary or fallback model discovery fails with a ProviderError', async () => {
+  const path = await repo('offload-core-discovery-status-');
+  const secretBody = 'SECRET_BODY_9f31 sk-live-discovery-key https://api.anthropic.com/private';
+  const dynamicLoaded = {
+    disabled: false,
+    repoConfig: {},
+    config: {
+      default: 'promo',
+      profiles: {
+        promo: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' },
+        flash: { provider: 'deepseek', model: 'latest-flash' },
+      },
+      providers: {
+        anthropic: {
+          type: 'anthropic-messages',
+          baseUrl: 'https://api.anthropic.com',
+          keyRef: 'env:ANTHROPIC_TEST',
+          pricing: 'anthropic-sonnet-2026-10-12',
+        },
+        deepseek: {
+          type: 'openai-chat',
+          baseUrl: 'https://api.deepseek.com',
+          keyRef: 'env:DEEPSEEK_TEST',
+          pricing: 'deepseek-2026-10-01',
+        },
+      },
+      limits: { maxTurns: 2, timeoutMinutes: 1, maxUsd: 1 },
+    },
+  };
+  const deepseekUrl = 'https://api.deepseek.com/models';
+  const isAnthropicDiscovery = (url) => String(url).startsWith('https://api.anthropic.com/v1/models');
+  const ok = (url) =>
+    isAnthropicDiscovery(url)
+      ? new Response(JSON.stringify({ data: [{ id: 'claude-sonnet-5-5', line: 'sonnet' }] }))
+      : new Response(JSON.stringify({ data: [{ id: 'deepseek-flash' }] }));
+  const startWith = async (loadedConfig, fetchImpl) => {
+    const core = createCore({
+      config: {
+        loaded: loadedConfig,
+        resolveKey: (ref) => (ref === 'env:ANTHROPIC_TEST' ? 'anthropic-key' : 'deepseek-key'),
+        fetchImpl,
+        skillHealth: noInstalledSkill,
+      },
+      worker: { run: async () => assert.fail('worker must not launch') },
+    });
+    try {
+      return await core.start({ mode: 'report', task: 'inspect', repoPath: path }).then(
+        () => assert.fail('start must reject'),
+        (error) => error,
+      );
+    } finally {
+      await core.shutdown();
+    }
+  };
+  try {
+    // Primary: Anthropic ProviderError with HTTP 400 and a secret-bearing body.
+    const primary400 = await startWith(dynamicLoaded, async (url) =>
+      isAnthropicDiscovery(url) ? new Response(secretBody, { status: 400 }) : ok(url),
+    );
+    assert.equal(primary400.message, 'primary provider model discovery failed (HTTP 400)');
+    // Fallback: primary succeeds, Anthropic fallback fails with HTTP 503.
+    const fallbackLoaded = structuredClone(dynamicLoaded);
+    fallbackLoaded.config.profiles = {
+      promo: { provider: 'deepseek', model: 'latest-flash', fallback: 'sonnet' },
+      sonnet: { provider: 'anthropic', model: 'latest-sonnet' },
+    };
+    const fallback503 = await startWith(fallbackLoaded, async (url) =>
+      isAnthropicDiscovery(url) ? new Response(secretBody, { status: 503 }) : ok(url),
+    );
+    assert.equal(fallback503.message, 'fallback provider model discovery failed (HTTP 503)');
+    for (const error of [primary400, fallback503]) assert.doesNotMatch(error.message, /SECRET_BODY|sk-live|private|anthropic|key/i);
+    // A non-ProviderError discovery failure (DeepSeek throws a plain Error) stays generic.
+    const primaryPlain = await startWith(fallbackLoaded, async (url) =>
+      url === deepseekUrl ? new Response(secretBody, { status: 500 }) : ok(url),
+    );
+    assert.equal(primaryPlain.message, 'primary provider model discovery failed');
+    const flashPrimary = structuredClone(dynamicLoaded);
+    flashPrimary.config.profiles = {
+      promo: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' },
+      flash: { provider: 'deepseek', model: 'latest-flash' },
+    };
+    const fallbackPlain = await startWith(flashPrimary, async (url) =>
+      url === deepseekUrl ? new Response(secretBody, { status: 500 }) : ok(url),
+    );
+    assert.equal(fallbackPlain.message, 'fallback provider model discovery failed');
+    const primaryNetwork = await startWith(dynamicLoaded, async () => {
+      throw new Error(secretBody);
+    });
+    assert.equal(primaryNetwork.message, 'primary provider model discovery failed');
+  } finally {
+    await rm(path, { recursive: true, force: true });
+  }
+});
 test('Core rejects malformed raw starts before initializing durable state', async () => {
   let initialized = 0;
   const core = createCore({

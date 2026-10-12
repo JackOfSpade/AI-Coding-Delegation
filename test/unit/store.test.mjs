@@ -269,6 +269,49 @@ test('clean assistant reasoning remains durably replayable', async () => {
   }
 });
 
+test('Anthropic thinking replay state survives storage and redaction makes it non-replayable', async () => {
+  const gitDir = tempDir();
+  const clean = [
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'read-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"README.md"}' } }],
+      anthropic_content: [
+        { type: 'thinking', thinking: 'Read the local README.', signature: 'signed-thought' },
+        { type: 'tool_use', id: 'read-1', name: 'read_file', input: '{"path":"README.md"}' },
+      ],
+    },
+    { role: 'tool', tool_call_id: 'read-1', content: 'READ: README.md' },
+  ];
+  try {
+    const store = new JobStore({ gitDir }).configureIntegrity({ requiredFor: () => true, keyForId: () => 'key' });
+    const cleanJob = await store.create({ task: 'clean', ownedPaths: ['src/**'] });
+    await store.messagesBatch(cleanJob.id, clean);
+    assert.deepEqual(await store.readMessages(cleanJob.id), clean);
+    assert.equal((await store.get(cleanJob.id)).transcriptReplayable, true);
+
+    const redactedJob = await store.create({ task: 'redacted', ownedPaths: ['src/**'] });
+    const secret = 'sk-abcdefghijklmnop';
+    await store.messagesBatch(redactedJob.id, [
+      {
+        ...clean[0],
+        anthropic_content: [
+          { type: 'thinking', thinking: `credential ${secret}`, signature: 'signed-thought' },
+          { type: 'tool_use', id: 'read-1', name: 'read_file', input: '{"path":"README.md"}' },
+        ],
+      },
+      clean[1],
+    ]);
+    const stored = await store.get(redactedJob.id);
+    const transcript = await store.readMessages(redactedJob.id);
+    assert.equal(stored.transcriptReplayable, false);
+    assert.match(transcript[0].anthropic_content[0].thinking, /\[REDACTED\]/);
+    assert.doesNotMatch(JSON.stringify({ stored, transcript }), new RegExp(secret));
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
 test('publication locks grace a partial owner and serialize concurrent event records', async () => {
   const gitDir = tempDir();
   try {

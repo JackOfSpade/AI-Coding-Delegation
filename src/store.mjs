@@ -6,11 +6,13 @@ import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto
 import { setTimeout as sleep } from 'node:timers/promises';
 import { redact as foundationRedact, redactText, redactTokenShapes, safeTokenAccountingValue } from './redact.mjs';
 import { validJobId } from './job-manager.mjs';
+import { anthropicContentMatchesAssistant, validAnthropicContent } from './anthropic-content.mjs';
 
 // Keep the accounting exception shared with the foundation redactor. A
 // token-shaped key only bypasses redaction when its value is a safe count.
 const secretKey = (key, value) =>
   key !== 'credentialFingerprint' &&
+  key !== 'fallbackCredentialFingerprint' &&
   !safeTokenAccountingValue(key, value) &&
   /(?:api[_-]?key|authorization|secret|password|credential|bearer|(?:access|refresh|auth|session|id)?[_-]?token)/i.test(key);
 const MAX_TRANSCRIPT_BYTES = 4 * 1024 * 1024;
@@ -366,9 +368,11 @@ export class JobStore {
     // A root-keyed fingerprint is opaque verification metadata, not a
     // credential. Preserve its already validated adapter-generated shape.
     const credentialFingerprint = job.credentialFingerprint;
+    const fallbackCredentialFingerprint = job.fallbackCredentialFingerprint;
     const copy = foundationRedact(redact({ ...job, updatedAt: this.now().toISOString() }), this.secrets);
     if (ownerNonce) copy.leaseOwnerNonce = ownerNonce;
     if (credentialFingerprint) copy.credentialFingerprint = credentialFingerprint;
+    if (fallbackCredentialFingerprint) copy.fallbackCredentialFingerprint = fallbackCredentialFingerprint;
     // Normalize through the exact JSON representation before signing. This
     // handles Date/toJSON values and rejects values JSON cannot persist rather
     // than emitting a record whose subsequent read has different MAC bytes.
@@ -546,16 +550,17 @@ export class JobStore {
     if (!Array.isArray(messages) || messages.length === 0 || messages.some((message) => !validMessage(message)))
       throw new Error('invalid transcript message');
     const storedMessages = messages.map((message) => foundationRedact(redact(message), this.secrets));
-    // DeepSeek requires exact assistant reasoning on a later tool/reasoning
-    // replay.  Durable artifacts must still redact credentials, so remember
-    // the one-way fact that redaction changed reasoning rather than retaining
-    // the original secret-bearing text anywhere on disk.
-    const reasoningRedacted = messages.some((message, index) => {
+    // Provider thinking/replay blocks are protocol state, not display text.
+    // Durable artifacts must still redact credentials, so remember the
+    // one-way fact that redaction changed either format rather than retaining
+    // the original secret-bearing data anywhere on disk.
+    const providerProtocolRedacted = messages.some((message, index) => {
       const stored = storedMessages[index];
       return (
         message?.role === 'assistant' &&
-        typeof message.reasoning_content === 'string' &&
-        stored?.reasoning_content !== message.reasoning_content
+        ((typeof message.reasoning_content === 'string' && stored?.reasoning_content !== message.reasoning_content) ||
+          (message.anthropic_content !== undefined &&
+            JSON.stringify(stored?.anthropic_content) !== JSON.stringify(message.anthropic_content)))
       );
     });
     const lines = storedMessages.map((message) => JSON.stringify(message) + '\n');
@@ -585,7 +590,7 @@ export class JobStore {
         const text = `${prefix}${lines.join('')}`;
         const bytes = Buffer.byteLength(text);
         if (bytes > MAX_TRANSCRIPT_BYTES) throw new Error('transcript exceeds size limit');
-        const replayability = reasoningRedacted ? { transcriptReplayable: false } : {};
+        const replayability = providerProtocolRedacted ? { transcriptReplayable: false } : {};
         if (this.integrityRequired(job)) {
           // The sealed intent makes either side of a crash unambiguous: readers
           // accept precisely the old or the new full digest, never arbitrary
@@ -599,10 +604,10 @@ export class JobStore {
             transcriptPendingBytes: bytes,
           };
           await this.#writeJob(pending);
-        } else if (reasoningRedacted) {
+        } else if (providerProtocolRedacted) {
           // Publish the conservative marker first.  A crash before the
           // transcript rename can make a clean transcript non-replayable,
-          // but can never make a redacted reasoning record replayable.
+          // but can never make a redacted provider replay record replayable.
           await this.#writeJob({ ...job, transcriptReplayable: false });
         }
         await this.#replaceStoredFile(path, text);
@@ -1259,13 +1264,15 @@ function validMessage(value) {
     return (
       messageText(value.content) &&
       (value.reasoning_content === undefined || value.reasoning_content === null || messageText(value.reasoning_content)) &&
+      (value.anthropic_content === undefined ||
+        (validAnthropicContent(value.anthropic_content) && anthropicContentMatchesAssistant(value.anthropic_content, value))) &&
       (value.tool_calls === undefined ||
         (Array.isArray(value.tool_calls) &&
           value.tool_calls.length > 0 &&
           value.tool_calls.length <= 64 &&
           value.tool_calls.every(validCall) &&
           new Set(value.tool_calls.map((call) => call.id)).size === value.tool_calls.length)) &&
-      Object.keys(value).every((key) => ['role', 'content', 'reasoning_content', 'tool_calls'].includes(key))
+      Object.keys(value).every((key) => ['role', 'content', 'reasoning_content', 'anthropic_content', 'tool_calls'].includes(key))
     );
   return (
     messageId(value.tool_call_id, 512) &&

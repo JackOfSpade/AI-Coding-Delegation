@@ -65,6 +65,8 @@
     "./cli": "./src/cli.mjs",
     "./provider/sse": "./src/provider/sse.mjs",
     "./provider/openai-chat": "./src/provider/openai-chat.mjs",
+    "./provider/anthropic-messages": "./src/provider/anthropic-messages.mjs",
+    "./provider/fallback": "./src/provider/fallback.mjs",
     "./agent/context": "./src/agent/context.mjs",
     "./agent/loop": "./src/agent/loop.mjs",
     "./agent/prompt": "./src/agent/prompt.mjs",

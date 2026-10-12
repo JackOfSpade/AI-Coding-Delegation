@@ -56,6 +56,23 @@ test('a command that cannot be found is an environment failure', () => {
   assert.equal(classifyVerifierEnvironment(failed('AssertionError: user not found')), null);
 });
 
+test('a temporary Git fixture blocked from host configuration is an environment limitation, not a product-test failure', () => {
+  const blocked = classifyVerifierEnvironment(
+    failed("fatal: unable to access '/etc/gitconfig': Operation not permitted\nError: repoPath must be inside a git working tree"),
+  );
+  assert.deepEqual(blocked, {
+    kind: 'git-config-denied',
+    detail: 'Git fixture setup could not read host system configuration in the verifier sandbox',
+  });
+  assert.equal(
+    classifyVerifierEnvironment(
+      failed("fatal: unable to access '/etc/gitconfig': Operation not permitted\nAssertionError [ERR_ASSERTION]: expected a repository"),
+    ),
+    null,
+    'an actual assertion remains a product-test failure',
+  );
+});
+
 test("permission denied counts only outside the job's write scope, in either spelling of the worktree", () => {
   const workspace = realpathSync(mkdtempSync(join(tmpdir(), 'offload-venv-')));
   try {

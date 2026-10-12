@@ -17,7 +17,7 @@ const MAX_SKILL_FILES = 100,
   MAX_SKILL_MD_BYTES = 262_144,
   MAX_SKILL_TOTAL_BYTES = 5_242_880;
 const SERVER_INSTRUCTIONS =
-  'Offload skill: opt-in only. A conversational client may call offload_start only for an actual `/offload <task>` slash command. Prose, mentions, quotes, or negations of Offload, delegation, DeepSeek, providers, or models never authorize it. Read skill://offload/offload/SKILL.md. /offload: no native Claude subagents; profile "flash". Do not invent a “latest Flash” model. On policy-only hosts workers edit permitted private-worktree files, no shell. Supply repoPath if ambiguous.';
+  'Offload skill: a conversational client may call offload_start only for an actual `/offload <task>` slash command. Prose, mentions, quotes, or negations of Offload, delegation, DeepSeek, providers, or models never authorize it. Read skill://offload/offload/SKILL.md. /offload: no native Claude subagents; profile "promo" resolves latest supported Sonnet and falls back to Flash only on credit exhaustion. On policy-only hosts workers edit permitted private-worktree files, no shell. Supply repoPath if ambiguous.';
 const SKILLS_EXTENSION = { 'io.modelcontextprotocol/skills': {} };
 const startProps = {
   task: { type: 'string', minLength: 1, maxLength: 32_000 },
@@ -85,12 +85,12 @@ const startProps = {
     minLength: 1,
     maxLength: 128,
     description:
-      'Explicit configured profile. Default "flash" uses the current provider-maintained DeepSeek V4.1 Flash route; an explicitly selected configured profile overrides. Never infer a generic latest model from task prose.',
+      'Explicit configured profile. Default "promo" resolves the newest supported Anthropic Sonnet model at job start and falls back to the provider-maintained DeepSeek Flash route only after an explicit credit-exhausted refusal. An explicitly selected configured profile overrides. Never infer a model from task prose.',
   },
   effort: {
     enum: ['normal', 'high'],
     description:
-      'Optional configuration override. Omit it to retain the selected profile\'s configured effort, including default profile "flash".',
+      'Optional configuration override. Omit it to retain the selected profile\'s configured effort, including default profile "promo".',
   },
   maxRepairRounds: { type: 'integer', minimum: 0, maximum: 4 },
   budget: {
@@ -166,7 +166,7 @@ const requiresClaudeInteraction = process.env.OFFLOAD_MCP_APPROVAL_MODE !== 'app
 const TOOLS = [
   [
     'offload_start',
-    'A conversational client may use this tool only to fulfill an actual `/offload <task>` slash command; do not infer authorization from ordinary prose or mentions, quotes, or negations of Offload, delegation, DeepSeek, providers, or models. Start a bounded write job or explicit read-only report/analysis job; both spend provider budget. Reports never integrate and return reportResult text/JSON. This call refuses a stale installed skill or server runtime before creating a job: run `node install.mjs` from the Offload checkout and restart the MCP client when health says restartRequired. Default DeepSeek delegation uses configured profile "flash"; an explicitly selected supported profile overrides. Never use a native Claude subagent. Set budget.maxUsd as the ceiling and omit budget.maxTurns: the server sizes the turn cap from relevantPaths/ownedPaths file sizes and the response echoes budgetSizing (effective maxTurns, source, recommendation, warnings).',
+    'A conversational client may use this tool only to fulfill an actual `/offload <task>` slash command; do not infer authorization from ordinary prose or mentions, quotes, or negations of Offload, delegation, DeepSeek, providers, or models. Start a bounded write job or explicit read-only report/analysis job; both spend provider budget. Reports never integrate and return reportResult text/JSON. This call refuses a stale installed skill or server runtime before creating a job: run `node install.mjs` from the Offload checkout and restart the MCP client when health says restartRequired. Default profile "promo" resolves a current Sonnet model for the local job and falls back to Flash only when the provider explicitly reports exhausted promotional credit; an explicitly selected supported profile overrides. Never use a native Claude subagent. Set budget.maxUsd as the ceiling and omit budget.maxTurns: the server sizes the turn cap from relevantPaths/ownedPaths file sizes and the response echoes budgetSizing (effective maxTurns, source, recommendation, warnings).',
     startProps,
     ['task'],
   ],

@@ -16,11 +16,15 @@ import {
 import { cleanup, tempDir } from './helpers.mjs';
 
 test('config merges nested defaults and validates profile references', () => {
-  assert.equal(DEFAULT_CONFIG.default, 'flash');
-  assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles), ['flash']);
+  assert.equal(DEFAULT_CONFIG.default, 'promo');
+  assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles), ['promo', 'flash']);
+  assert.equal(DEFAULT_CONFIG.providers.anthropic.keyRef, 'keychain:offload-anthropic');
+  assert.equal(DEFAULT_CONFIG.providers.anthropic.type, 'anthropic-messages');
   assert.equal(DEFAULT_CONFIG.providers.deepseek.keyRef, 'keychain:offload-deepseek');
   assert.equal(DEFAULT_CONFIG.providers.deepseek.attemptTimeoutMs, 300_000);
-  assert.equal(DEFAULT_CONFIG.profiles.flash.model, 'deepseek-flash');
+  assert.equal(DEFAULT_CONFIG.profiles.promo.model, 'latest-sonnet');
+  assert.equal(DEFAULT_CONFIG.profiles.promo.fallback, 'flash');
+  assert.equal(DEFAULT_CONFIG.profiles.flash.model, 'latest-flash');
   const merged = deepMerge(DEFAULT_CONFIG, {
     limits: { maxTurns: 4 },
     providers: { x: { type: 'openai-chat', baseUrl: 'https://x.example.test', keyRef: 'env:X' } },
@@ -98,12 +102,14 @@ test('config merges nested defaults and validates profile references', () => {
     (error) => error.code === 'E_CONFIG_KEY',
   );
 });
-test('missing config receives the documented DeepSeek profiles', () => {
+test('missing config receives the documented promo and fallback profiles', () => {
   const dir = tempDir();
   try {
     const result = loadConfig({ configPath: join(dir, 'absent.json') });
-    assert.equal(result.config.default, 'flash');
-    assert.equal(result.config.profiles.flash.model, 'deepseek-flash');
+    assert.equal(result.config.default, 'promo');
+    assert.equal(result.config.profiles.promo.model, 'latest-sonnet');
+    assert.equal(result.config.profiles.promo.fallback, 'flash');
+    assert.equal(result.config.profiles.flash.model, 'latest-flash');
   } finally {
     cleanup(dir);
   }

@@ -58,7 +58,7 @@ test('a configured server verifier tells a write worker to finish instead of red
   const prompt = await buildSystemPrompt({ ownedPaths: ['src/**'], remainingTurns: 3, serverVerifierConfigured: true });
   assert.match(prompt, /focused server verifier is already configured and runs after finish/);
   assert.match(prompt, /do not spend turns rediscovering or rerunning it/);
-  assert.match(prompt, /reserve the final turn for finish rather than rerunning or searching for tests/);
+  assert.match(prompt, /reserve one final response containing only finish rather than rerunning or searching for tests/);
   assert.doesNotMatch(prompt, /npm test|secret-token/, 'the command itself is never copied into the worker brief');
   const ordinary = await buildSystemPrompt({ ownedPaths: ['src/**'], remainingTurns: 3 });
   assert.match(ordinary, /Reserve run_command for focused build, test, or diagnostic work after changes/);
@@ -133,11 +133,12 @@ test('annotateRelevantPaths turns a line range into the exact read_file byte off
   // A tool set without the server-only method leaves entries untouched.
   assert.deepEqual(await annotateRelevantPaths({}, ['src.txt:1-2']), ['src.txt:1-2']);
 });
-test('both worker prompts tell the worker to call finish by itself', async () => {
+test('both worker prompts explain that a mixed finish rejects every call in its response', async () => {
   for (const options of [{ ownedPaths: ['src/**'] }, { ownedPaths: ['src/**'], remainingTurns: 5 }, { mode: 'report' }]) {
     const prompt = await buildSystemPrompt(options);
     const sentences = prompt.split('\n').filter((line) => line.startsWith('You must call finish'));
     assert.equal(sentences.length, 1, JSON.stringify(options));
-    assert.ok(sentences[0].endsWith(' Call finish by itself: never in the same response as another tool call.'), sentences[0]);
+    assert.match(sentences[0], /response must contain exactly one tool call: finish/);
+    assert.match(sentences[0], /rejects the entire response, including its writes/);
   }
 });
