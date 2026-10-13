@@ -6,7 +6,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
-  createCore,
+  createCore as createRuntimeCore,
   defaultIntegrityStatePath,
   insidePath,
   integrityStateHintAllowed,
@@ -53,6 +53,11 @@ const loaded = {
 // Health compares the client's installed skill with the server's: keep these cores
 // off the developer's real ~/.claude, whose copy may legitimately be stale.
 const noInstalledSkill = (options) => installedSkillHealth({ ...options, home: join(tmpdir(), 'offload-no-installed-skill'), env: {} });
+const createCore = (options) =>
+  createRuntimeCore({
+    ...options,
+    config: { ...options.config, skillHealth: options.config?.skillHealth ?? noInstalledSkill },
+  });
 function testCore() {
   return createCore({
     config: { loaded, skillHealth: noInstalledSkill },
@@ -1063,6 +1068,7 @@ test('a no-id server listing does not bind its incidental cwd as a repository', 
     failureDiagnostics: true,
     timingBreakdown: true,
     verifierInterpreter: true,
+    verifierImports: true,
     retrospective: true,
   });
   assert.match(result.health.server.buildHash, /^sha256:[0-9a-f]{64}$/);

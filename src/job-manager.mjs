@@ -23,7 +23,7 @@ import {
   safeToolFailure,
 } from './failure.mjs';
 import { isolatedDependencyReadPaths } from './worktree.mjs';
-import { classifyVerifierEnvironment } from './verify-env.mjs';
+import { classifyVerifierEnvironment, isVerifierEnvironmentKind } from './verify-env.mjs';
 import {
   interpreterPathsOption,
   normalizeInterpreterDeclaration,
@@ -482,19 +482,18 @@ const DEPENDENCY_STATES = new Set([
   'link-failed',
   'not-linked',
 ]);
-const VERIFY_ENV_KINDS = new Set(['missing-package', 'command-not-found', 'permission-denied', 'temp-dir-denied', 'git-config-denied']);
 const validRuntimePreflight = (value) =>
-  !!value &&
-  typeof value === 'object' &&
-  !Array.isArray(value) &&
-  Object.keys(value).length === 1 &&
-  value.server === 'current';
+  !!value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 1 && value.server === 'current';
 const safeVerifyEnvironment = (value) =>
-  VERIFY_ENV_KINDS.has(value?.kind)
+  isVerifierEnvironmentKind(value?.kind)
     ? {
         kind: value.kind,
         detail: String(value.detail ?? '').slice(0, 240),
         ...(value.specifier ? { specifier: String(value.specifier).slice(0, 214) } : {}),
+        ...(value.kind === 'native-module-crash' && /^[A-Za-z0-9_.-]{1,120}$/.test(value.module) ? { module: value.module } : {}),
+        ...(value.kind === 'native-module-crash' && /^[A-Za-z0-9_.-]{1,120}$/.test(value.nativeModule)
+          ? { nativeModule: value.nativeModule }
+          : {}),
       }
     : undefined;
 const BASELINE_STATUSES = new Set(['compared', 'skipped', 'inconclusive']);
@@ -1377,7 +1376,8 @@ export class JobManager {
   }
   async start(input, { launch = true, turnBudget, runtimePreflight } = {}) {
     this.validate(input);
-    if (runtimePreflight !== undefined && !validRuntimePreflight(runtimePreflight)) throw new Error('runtime preflight metadata is invalid');
+    if (runtimePreflight !== undefined && !validRuntimePreflight(runtimePreflight))
+      throw new Error('runtime preflight metadata is invalid');
     const setupStartedMs = this.#nowMs();
     // `turnBudget` is the trusted, out-of-band result of Core resolving the
     // caller's turn policy against its configuration; it is not a request

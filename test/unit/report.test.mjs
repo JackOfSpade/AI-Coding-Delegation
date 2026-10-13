@@ -520,7 +520,10 @@ test('a Git fixture blocked by the verifier is named as an environment limitatio
   assert.match(report, /verifier environment: Git fixture setup could not read host system configuration/);
   assert.match(report, /temporary Git-fixture test could not read host Git configuration in the verifier sandbox/);
   assert.match(report, /environment limitation, not a product-test failure; run that integration suite in the primary checkout/);
-  assert.doesNotMatch(report.split('\n').find((line) => line.startsWith('next:')), /repair/);
+  assert.doesNotMatch(
+    report.split('\n').find((line) => line.startsWith('next:')),
+    /repair/,
+  );
 });
 
 const tailOf = (count, prefix = 'out') => Array.from({ length: count }, (_, i) => `${prefix} ${i}`).join('\n');

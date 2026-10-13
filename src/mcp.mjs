@@ -200,7 +200,14 @@ const TOOLS = [
         maxItems: 4,
         items: { type: 'string', minLength: 1, maxLength: 4_096 },
         description:
-          'Health only (omit jobId): absolute path(s) of the virtualenv root or interpreter you would pass to offload_start. Health runs `<interpreter> -c "import sys; print(sys.version)"` inside the verifier sandbox with that declaration applied and reports the outcome as verifierPython, before any job is spent.',
+          'Health only (omit jobId): absolute path(s) of the virtualenv root or interpreter you would pass to offload_start. Health runs `<interpreter> -c "import sys; print(sys.version)"` inside the verifier sandbox with that declaration applied and reports the outcome as verifierPython, before any job is spent. Pair with verifierImports to probe native imports such as torch.',
+      },
+      verifierImports: {
+        type: 'array',
+        maxItems: 16,
+        items: { type: 'string', minLength: 1, maxLength: 256 },
+        description:
+          'Health only; requires verifierInterpreter. Dotted Python modules to import inside its sandboxed probe (for example ["torch"]). This catches native-import crashes before a job is started; it does not change a job verifier or grant extra access.',
       },
       ...repoHint,
     },
@@ -619,11 +626,17 @@ export function createMcpServer(
     }
     if (name === 'offload_job' && args.jobId !== undefined && (args.all !== undefined || args.maxJobs !== undefined))
       throw new Error('all and maxJobs apply only when jobId is omitted');
-    if (name === 'offload_job' && args.jobId !== undefined && args.verifierInterpreter !== undefined)
-      throw new Error('verifierInterpreter applies only when jobId is omitted');
+    if (
+      name === 'offload_job' &&
+      args.jobId !== undefined &&
+      (args.verifierInterpreter !== undefined || args.verifierImports !== undefined)
+    )
+      throw new Error('verifierInterpreter and verifierImports apply only when jobId is omitted');
+    if (name === 'offload_job' && args.verifierImports !== undefined && args.verifierInterpreter === undefined)
+      throw new Error('verifierImports requires verifierInterpreter');
     if (name === 'offload_job' && args.include === 'retrospective') {
       // One digest over several jobs: a single job id, a window or a log option has no meaning here.
-      for (const key of ['jobId', 'all', 'maxJobs', 'tail', 'limit', 'verifierInterpreter'])
+      for (const key of ['jobId', 'all', 'maxJobs', 'tail', 'limit', 'verifierInterpreter', 'verifierImports'])
         if (args[key] !== undefined) throw new Error(`${key} does not apply to include "retrospective"; pass jobIds to choose jobs`);
     }
     if (name === 'offload_job' && args.jobIds !== undefined && args.include !== 'retrospective')
@@ -683,6 +696,7 @@ export function createMcpServer(
               ...(args.all !== undefined ? { all: args.all } : {}),
               ...(args.maxJobs !== undefined ? { maxJobs: args.maxJobs } : {}),
               ...(args.verifierInterpreter !== undefined ? { verifierInterpreter: args.verifierInterpreter } : {}),
+              ...(args.verifierImports !== undefined ? { verifierImports: args.verifierImports } : {}),
             }),
       offload_repair: () => core.repair(args.jobId, args.defects, { repoPath: args.repoPath }),
       // `apply` is optional and defaults to a dry run. Passing an explicit

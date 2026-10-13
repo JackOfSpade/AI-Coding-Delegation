@@ -2,7 +2,7 @@ import { createCore } from './core.mjs';
 import { createMcpServer } from './mcp.mjs';
 import { createDiagnosticLog, resolveLogWindow } from './diagnostics.mjs';
 import { validateExplicitRepoPath, validateJobRequest, validJobId } from './job-manager.mjs';
-import { normalizeInterpreterDeclaration } from './verify-interpreter.mjs';
+import { normalizeInterpreterDeclaration, normalizeVerifierImports } from './verify-interpreter.mjs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { doctor, doctorLive } from './doctor.mjs';
@@ -43,7 +43,7 @@ const CLI_COMMANDS = Object.freeze({
   },
   wait: { valueFlags: ['timeoutSec', 'repoPath', 'detail'], booleanFlags: [], positionals: 'one' },
   job: {
-    valueFlags: ['include', 'repoPath', 'detail', 'tail', 'limit', 'maxJobs', 'verifierInterpreter'],
+    valueFlags: ['include', 'repoPath', 'detail', 'tail', 'limit', 'maxJobs', 'verifierInterpreter', 'verifierImports'],
     booleanFlags: ['all'],
     positionals: 'zero-or-one',
   },
@@ -275,6 +275,11 @@ function validateInvocation(command, flags, positionals) {
     if (positionals.length === 1) throw new Error('job --verifierInterpreter applies only to the health call (no job id)');
     normalizeInterpreterDeclaration(interpreterFlag(flags.verifierInterpreter));
   }
+  if (command === 'job' && flags.verifierImports !== undefined) {
+    if (positionals.length === 1) throw new Error('job --verifierImports applies only to the health call (no job id)');
+    if (flags.verifierInterpreter === undefined) throw new Error('job --verifierImports requires --verifierInterpreter');
+    normalizeVerifierImports(decodedFlag(flags, 'verifierImports', undefined));
+  }
   if (command === 'job' && (flags.tail !== undefined || flags.limit !== undefined)) {
     if (flags.include !== 'log') throw new Error('job --tail/--limit require --include log');
     resolveLogWindow(logWindowFlags(flags));
@@ -470,6 +475,7 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
         ...(positionals[0] == null ? { all: flags.all === undefined ? true : bool(flags.all) } : {}),
         ...(flags.maxJobs !== undefined ? { maxJobs: Number(flags.maxJobs) } : {}),
         ...(flags.verifierInterpreter !== undefined ? { verifierInterpreter: interpreterFlag(flags.verifierInterpreter) } : {}),
+        ...(flags.verifierImports !== undefined ? { verifierImports: decode(flags.verifierImports, undefined) } : {}),
         repoPath: flags.repoPath || (positionals[0] == null ? process.cwd() : undefined),
       });
     } else if (command === 'retrospective') {

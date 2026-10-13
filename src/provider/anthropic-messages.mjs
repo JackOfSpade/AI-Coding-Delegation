@@ -370,7 +370,7 @@ export async function resolveLatestAnthropicSonnet({ baseUrl, apiKey, fetchImpl 
   const seenCursors = new Set();
   let afterId;
   let activeOnly = true;
-  for (let page = 0; page < 32; ) {
+  for (let page = 0; page < 32;) {
     const endpoint = new URL('v1/models', `${checked}/`);
     if (activeOnly) endpoint.searchParams.set('lifecycle', 'active');
     if (afterId) endpoint.searchParams.set('after_id', afterId);

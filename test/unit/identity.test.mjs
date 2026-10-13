@@ -84,6 +84,12 @@ test('runtime identity advertises verifierInterpreter as an additive capability'
   assert.equal(identity.schemaRevision, 2, 'a new optional start/health parameter is additive: no schema revision bump');
 });
 
+test('runtime identity advertises verifierImports as an additive health-probe capability', () => {
+  const identity = runtimeIdentity();
+  assert.equal(identity.capabilities.verifierImports, true);
+  assert.equal(identity.schemaRevision, 2, 'a new optional health parameter is additive: no schema revision bump');
+});
+
 test('runtime identity advertises the retrospective digest as an additive capability', () => {
   const identity = runtimeIdentity();
   assert.equal(identity.capabilities.retrospective, true);

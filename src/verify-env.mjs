@@ -4,6 +4,15 @@ import { matchesAny } from './glob.mjs';
 
 const MAX_SCAN_CHARS = 64 * 1024;
 const MAX_DETAIL = 200;
+const ENVIRONMENT_KINDS = new Set([
+  'missing-package',
+  'command-not-found',
+  'permission-denied',
+  'temp-dir-denied',
+  'git-config-denied',
+  'native-module-crash',
+]);
+export const isVerifierEnvironmentKind = (kind) => ENVIRONMENT_KINDS.has(kind);
 
 // A bare Node specifier that could not be resolved. Relative/absolute paths,
 // file:/node: URLs, `#imports` and `@/`/`~/` aliases are the worker's own files
@@ -41,6 +50,26 @@ const INTERPRETER_PATH =
   /(?:\/bin\/(?:python|pypy)[\d.]*[a-z]?\/?$|\/site-packages\b|\/lib\/python\d|pyvenv\.cfg$|\/Python\d*\.framework\b|\/(?:\.?venv|virtualenvs?|\.pyenv|\.?conda|miniconda\d*|anaconda\d*|mambaforge)(?:\/|$))/;
 const PYTHON_COMMAND = /(?:^|[\s/;&|(])(?:python[\d.]*|pypy[\d.]*|pytest|py\.test|tox|pip[\d.]*|poetry|uv|pipenv)(?:\s|$)/;
 const INTERPRETER_STARTUP = /Fatal Python error:[^\n]*|No module named 'encodings'|Could not find platform independent libraries/;
+// Some native Python extensions crash while their module initializer is
+// running when Seatbelt denies an OS service.  That is neither a missing
+// interpreter nor a repairable test failure.  Be deliberately strict: an
+// ordinary SIGSEGV is not enough; faulthandler must also have printed a native
+// frame and named the library being initialized.
+const NATIVE_SEGFAULT = /(?:\bSIGSEGV\b|Fatal Python error:\s*Segmentation fault)/i;
+const FAULTHANDLER_NATIVE_FRAME =
+  /(?:^|\n)\s*(?:C\s+\[[^\n]*(?:\.dylib|\.so(?:\.\d+)?)|[^\n]*(?:\.dylib|\.so(?:\.\d+)?)[^\n]*\binitModule\b)/im;
+const NATIVE_LIBRARY = /(?:^|[\s\[/(])((?:lib)?[A-Za-z0-9_.-]+\.(?:dylib|so(?:\.\d+)*))(?:[\s\]+):]|$)/im;
+
+function nativeCrashModule(text) {
+  const frame = text.match(FAULTHANDLER_NATIVE_FRAME)?.[0];
+  const library = frame?.match(NATIVE_LIBRARY)?.[1];
+  const torchLibrary = frame?.match(/\blibtorch_python\.(?:dylib|so(?:\.\d+)*)\b/i)?.[0];
+  // PyTorch's extension is loaded as torch._C, but its initializer lives in
+  // libtorch_python.  Name both the Python module and the native library so a
+  // report is actionable without claiming every native crash is Torch.
+  if (torchLibrary || /\btorch\._C\b/i.test(text)) return { module: 'torch', nativeModule: torchLibrary || library || 'libtorch_python' };
+  return library ? { module: library.replace(/^lib/i, '').replace(/\.(?:dylib|so(?:\.\d+)?)$/i, ''), nativeModule: library } : null;
+}
 
 const clip = (value, max = MAX_DETAIL) =>
   String(value)
@@ -108,6 +137,21 @@ export function classifyVerifierEnvironment(verify, { workspacePath, writeScope 
   const text = `${result.stderr || ''}\n${result.stdout || ''}`.slice(-MAX_SCAN_CHARS);
   const testCommand = String(verify.command ?? '');
 
+  const native =
+    !ASSERTION_FAILURE.test(text) &&
+    (result.code === 139 || result.signal === 'SIGSEGV') &&
+    NATIVE_SEGFAULT.test(text) &&
+    FAULTHANDLER_NATIVE_FRAME.test(text)
+      ? nativeCrashModule(text)
+      : null;
+  if (native)
+    return {
+      kind: 'native-module-crash',
+      module: native.module,
+      nativeModule: native.nativeModule,
+      detail: `native module '${native.module}' (${native.nativeModule}) crashed during interpreter initialization (SIGSEGV / exit 139)`,
+    };
+
   // Output that also carries an ordinary assertion failure is a code failure
   // that merely mentions a module or path (an optional require inside a test, a
   // logged EACCES): the text signals below must not mask it. An exit-127 or
@@ -131,6 +175,7 @@ export function classifyVerifierEnvironment(verify, { workspacePath, writeScope 
   // Every permission line is read: the actionable temp-dir denial must not be
   // lost to whichever other denial happens to print first.
   let denied;
+  const roots = workspaceRoots(workspacePath);
   for (const line of assertionFailure ? [] : text.split(/\r?\n/)) {
     if (!PERMISSION.test(line) || TOOL_CACHE.test(line)) continue;
     const path = permissionPath(line);
@@ -138,7 +183,7 @@ export function classifyVerifierEnvironment(verify, { workspacePath, writeScope 
     let ownedByWorker = false;
     let insideWorkspace = false;
     search: for (const candidate of spellings(path)) {
-      for (const root of workspaceRoots(workspacePath)) {
+      for (const root of roots) {
         const rel = relative(root, candidate);
         if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) continue;
         insideWorkspace = true;

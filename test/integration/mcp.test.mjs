@@ -63,6 +63,7 @@ test('MCP lists exact tools, initializes, pings and dispatches', async () => {
     failureDiagnostics: true,
     timingBreakdown: true,
     verifierInterpreter: true,
+    verifierImports: true,
     retrospective: true,
   });
   assert.ok(
@@ -1518,7 +1519,7 @@ test('the skill names exactly the capabilities, tools, parameters and CLI flags 
   const params = {
     offload_start: ['verifierMode', 'verifierTimeoutSec', 'verifierInterpreter', 'relevantPaths', 'budget'],
     offload_wait: ['timeoutSec', 'detail'],
-    offload_job: ['include', 'jobIds', 'tail', 'limit', 'all', 'maxJobs', 'detail', 'verifierInterpreter'],
+    offload_job: ['include', 'jobIds', 'tail', 'limit', 'all', 'maxJobs', 'detail', 'verifierInterpreter', 'verifierImports'],
     offload_continue: ['extraTurns', 'extraUsd', 'note'],
     offload_apply: ['apply', 'verifiedBy', 'applyThenVerify', 'applyThenVerifyTimeoutSec', 'unsafePolicyOnlyVerifier'],
   };
@@ -1551,7 +1552,7 @@ test('the skill names exactly the capabilities, tools, parameters and CLI flags 
     });
     return { code, stderr };
   };
-  for (const flag of ['--verifierMode', '--verifierTimeoutSec', '--verifierInterpreter'])
+  for (const flag of ['--verifierMode', '--verifierTimeoutSec', '--verifierInterpreter', '--verifierImports'])
     assert.ok(text.includes(`\`${flag}\``), `the skill documents ${flag}`);
   assert.equal(
     (await run(['start', '--task', 'x', '--ownedPaths', '["a/**"]', '--verifierMode', 'baseline-diff', '--verifierTimeoutSec', '60'])).code,
@@ -1564,6 +1565,7 @@ test('the skill names exactly the capabilities, tools, parameters and CLI flags 
   );
   assert.equal((await run(['start', '--task', 'x', '--ownedPaths', '["a/**"]', '--verifierInterpreter', 'relative/venv'])).code, 2);
   assert.equal((await run(['job', '--verifierInterpreter', '/opt/py/venv'])).code, 0);
+  assert.equal((await run(['job', '--verifierInterpreter', '/opt/py/venv', '--verifierImports', '["torch"]'])).code, 0);
   assert.equal((await run(['job', 'oj-1', '--verifierInterpreter', '/opt/py/venv'])).code, 2, 'a job id and a health probe are exclusive');
   assert.ok(text.includes('--tail N --limit N'));
   assert.equal((await run(['job', 'oj-1', '--include', 'log', '--tail', '5', '--limit', '2000'])).code, 0);

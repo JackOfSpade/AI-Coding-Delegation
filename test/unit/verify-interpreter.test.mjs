@@ -377,4 +377,34 @@ test('probing a declaration runs python -c inside the sandbox and reports each o
     calls.at(-1).command.startsWith(`'${join(quoted, 'bin', 'python3').replaceAll("'", "'\\''")}'`),
     'a quote in the path cannot break out of the command',
   );
+
+  const imported = await probeVerifierInterpreter(join(root, 'venv'), {
+    ...context,
+    imports: ['torch', 'package.submodule', 'torch'],
+    run: run({ code: 139, stdout: '', stderr: 'Fatal Python error: Segmentation fault\nC  [libtorch_python.dylib] initModule\n' }),
+  });
+  assert.equal(imported.status, 'partial');
+  assert.equal(imported.reason, 'native-module-crash');
+  assert.deepEqual(imported.imports, ['torch', 'package.submodule']);
+  assert.equal(imported.interpreters[0].module, 'torch');
+  assert.equal(imported.interpreters[0].nativeModule, 'libtorch_python.dylib');
+  assert.match(calls.at(-1).command, /importlib\.import_module/);
+  assert.match(calls.at(-1).command, /torch/);
+
+  const noisyImport = await probeVerifierInterpreter(join(root, 'venv'), {
+    ...context,
+    imports: ['noisy_module'],
+    run: run({ code: 0, stdout: 'module startup message\n__OFFLOAD_PYTHON_VERSION__=3.99.0 (main) [fake]\n', stderr: '' }),
+  });
+  assert.equal(noisyImport.status, 'ok');
+  assert.equal(noisyImport.interpreters[0].version, '3.99.0 (main) [fake]');
+  const noVersion = await probeVerifierInterpreter(join(root, 'venv'), {
+    ...context,
+    imports: ['noisy_module'],
+    run: run({ code: 0, stdout: 'module startup message\n', stderr: '' }),
+  });
+  assert.equal(noVersion.reason, 'probe-failed');
+
+  const invalidImports = await probeVerifierInterpreter(join(root, 'venv'), { ...context, imports: ['torch; exploit'] });
+  assert.deepEqual([invalidImports.status, invalidImports.reason, invalidImports.accepted], ['missing', 'invalid-imports', false]);
 });

@@ -13,6 +13,7 @@ import { healthIdentity, runtimeIdentity } from './identity.mjs';
 import { assertStartRuntimeCurrent, installedSkillHealth, withSkillHealth } from './skill-health.mjs';
 import {
   normalizeInterpreterDeclaration,
+  normalizeVerifierImports,
   probeVerifierInterpreter,
   pythonProjectMarkers,
   resolveVerifierInterpreters,
@@ -1279,6 +1280,11 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         if (id !== undefined) throw new Error('verifierInterpreter applies only to the health call; omit jobId');
         normalizeInterpreterDeclaration(opts.verifierInterpreter);
       }
+      if (opts.verifierImports !== undefined) {
+        if (id !== undefined) throw new Error('verifierImports applies only to the health call; omit jobId');
+        if (opts.verifierInterpreter === undefined) throw new Error('verifierImports requires verifierInterpreter');
+        normalizeVerifierImports(opts.verifierImports);
+      }
       if (id === undefined && (opts.tail !== undefined || opts.limit !== undefined)) {
         // Same order as JobManager.job: bad values are named before misuse.
         resolveLogWindow({ tail: opts.tail, limit: opts.limit });
@@ -1301,6 +1307,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         const probe = await probeVerifierInterpreter(opts.verifierInterpreter, {
           repoPath: root,
           allowlist: interpreterAllowlist(root),
+          ...(opts.verifierImports !== undefined ? { imports: opts.verifierImports } : {}),
           ...(config.runVerifierProbe ? { run: config.runVerifierProbe } : {}),
         });
         const mirror = root && pythonProjectMarkers(root).length ? pythonDeps(verifierDependencyStatus(root), probe) : {};

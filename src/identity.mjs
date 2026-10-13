@@ -20,6 +20,7 @@ export const RUNTIME_CAPABILITIES = Object.freeze({
   failureDiagnostics: true,
   timingBreakdown: true,
   verifierInterpreter: true,
+  verifierImports: true,
   retrospective: true,
 });
 

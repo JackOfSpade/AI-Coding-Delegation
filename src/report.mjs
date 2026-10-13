@@ -1,6 +1,7 @@
 import { redactText } from './redact.mjs';
 import { APPLY_ELIGIBLE_STATUSES, continuableFailure, failedApplyRefusal, safeFailureKind, safeToolFailure } from './failure.mjs';
 import { formatDuration, sanitizeTiming, timingTotals } from './timing.mjs';
+import { isVerifierEnvironmentKind } from './verify-env.mjs';
 
 const terminal = new Set([
   'DONE_VERIFIED',
@@ -13,7 +14,6 @@ const terminal = new Set([
   'CANCELLED',
 ]);
 export { terminal as terminalStatuses };
-const VERIFY_ENV_KINDS = new Set(['missing-package', 'command-not-found', 'permission-denied', 'temp-dir-denied', 'git-config-denied']);
 const APPLY_ELIGIBLE = new Set(APPLY_ELIGIBLE_STATUSES);
 /**
  * `detail: 'full'` is the durable report.md. `detail: 'compact'` is what a
@@ -122,7 +122,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
   // (it has no network and cannot write outside its scope). The server did not
   // spend a repair round on it and never retries automatically.
   const environment =
-    !reportMode && VERIFY_ENV_KINDS.has(job.verifyEnvironment?.kind)
+    !reportMode && isVerifierEnvironmentKind(job.verifyEnvironment?.kind)
       ? `verifier environment: ${scalar(job.verifyEnvironment.detail || job.verifyEnvironment.kind)}. This is not a repair-able code failure; no repair round was spent and none will be started automatically.${
           job.verifyEnvironment.kind === 'missing-package'
             ? job.workspaceDependencies && job.workspaceDependencies !== 'linked'
@@ -132,7 +132,9 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
               ? ' Hard-coded /tmp is not writable in the verifier; tests must use os.tmpdir()/$TMPDIR and forward the environment to child processes. For a suite with such pre-existing failures, start with verifierMode "baseline-diff".'
               : job.verifyEnvironment.kind === 'git-config-denied'
                 ? ' A temporary Git-fixture test could not read host Git configuration in the verifier sandbox. This is an environment limitation, not a product-test failure; run that integration suite in the primary checkout.'
-              : ''
+                : job.verifyEnvironment.kind === 'native-module-crash'
+                  ? ' Run the import in the primary checkout to determine whether the verifier sandbox caused the crash.'
+                  : ''
         }${
           // An applyThenVerify run is already acting on this very advice.
           applyRunning

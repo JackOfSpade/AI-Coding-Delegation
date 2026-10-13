@@ -15,13 +15,16 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { matchesAny, pathsOverlap } from './glob.mjs';
 import { DEFAULT_DENY_READ } from './policy.mjs';
 import { MACOS_HOST_CONFIG_DENY, runCommand } from './sandbox.mjs';
+import { classifyVerifierEnvironment } from './verify-env.mjs';
 
 export const MAX_VERIFIER_INTERPRETERS = 4;
+export const MAX_VERIFIER_IMPORTS = 16;
 const MAX_ROOTS = 8;
 const MAX_PATH = 4096;
 const MAX_DETAIL = 200;
 const PYVENV_CFG_BYTES = 8 * 1024;
 const PYTHON_NAME = /^(?:python|pypy)[0-9.]*[a-z]?$/i;
+const PYTHON_MODULE = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 const PYTHON_MARKERS = Object.freeze(['pyproject.toml', 'setup.py', 'setup.cfg', 'pytest.ini', 'tox.ini', 'Pipfile']);
 const REQUIREMENTS = /^requirements[\w.-]*\.txt$/i;
 // Directories below the user's home that hold credentials, client sessions or
@@ -115,6 +118,16 @@ export function normalizeInterpreterDeclaration(value) {
   if (list.length > MAX_VERIFIER_INTERPRETERS)
     throw reject(`verifierInterpreter accepts at most ${MAX_VERIFIER_INTERPRETERS} paths`, 'too-many');
   return unique(list.map(checkedPath));
+}
+
+/** Names imported only by the health probe; they never affect a worker or job verifier. */
+export function normalizeVerifierImports(value) {
+  if (!Array.isArray(value) || value.length > MAX_VERIFIER_IMPORTS)
+    throw reject(`verifierImports must be an array of at most ${MAX_VERIFIER_IMPORTS} Python module names`, 'invalid-imports');
+  const imports = unique(value);
+  if (!imports.every((entry) => typeof entry === 'string' && entry.length > 0 && entry.length <= 256 && PYTHON_MODULE.test(entry)))
+    throw reject('verifierImports entries must be dotted Python module names', 'invalid-imports');
+  return imports;
 }
 
 /** Syntax of the server-derived roots a job record carries (see Core.start). */
@@ -381,7 +394,11 @@ export function verifierPythonStatus(repoPath, context = {}) {
 }
 
 const shellQuote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
-const PROBE_SCRIPT = '-c "import sys; print(sys.version)"';
+const VERSION_MARKER = '__OFFLOAD_PYTHON_VERSION__=';
+const probeScript = (imports) =>
+  imports.length
+    ? `-c ${shellQuote(`import importlib, sys; [importlib.import_module(name) for name in ${JSON.stringify(imports)}]; print(${JSON.stringify(VERSION_MARKER)} + sys.version)`)}`
+    : '-c "import sys; print(sys.version)"';
 
 /**
  * Run `<interpreter> -c "import sys; print(sys.version)"` inside the real
@@ -389,7 +406,17 @@ const PROBE_SCRIPT = '-c "import sys; print(sys.version)"';
  * spends a job whether the declared interpreter works. Never throws for a
  * rejected or failing interpreter: that is the answer.
  */
-export async function probeVerifierInterpreter(declared, { run = runCommand, timeoutSec = 10, ...context } = {}) {
+export async function probeVerifierInterpreter(
+  declared,
+  { run = runCommand, timeoutSec = 10, imports: requestedImports, ...context } = {},
+) {
+  let imports;
+  try {
+    imports = requestedImports === undefined ? [] : normalizeVerifierImports(requestedImports);
+  } catch (error) {
+    if (!(error instanceof VerifierInterpreterError)) throw error;
+    return { status: 'missing', reason: 'invalid-imports', accepted: false, note: clip(error.message) };
+  }
   let resolved;
   try {
     resolved = resolveVerifierInterpreters(declared, context);
@@ -404,26 +431,39 @@ export async function probeVerifierInterpreter(declared, { run = runCommand, tim
     for (const grant of resolved.grants) {
       const entry = { declared: grant.declared, kind: grant.kind, interpreter: grant.interpreter };
       try {
-        const result = await run(`${shellQuote(grant.interpreter)} ${PROBE_SCRIPT}`, {
+        const command = `${shellQuote(grant.interpreter)} ${probeScript(imports)}`;
+        const result = await run(command, {
           cwd: scratch,
           requireSandbox: true,
           timeoutSec,
           interpreterPaths: resolved.roots,
         });
-        const version = clip(String(result?.stdout ?? '').split(/\r?\n/)[0], 120);
+        const lines = String(result?.stdout ?? '').split(/\r?\n/);
+        const version = clip(
+          imports.length ? lines.findLast((line) => line.startsWith(VERSION_MARKER))?.slice(VERSION_MARKER.length) : lines[0],
+          120,
+        );
         if (result?.code === 0 && !result.timedOut && version) interpreters.push({ ...entry, status: 'ok', version });
-        else
+        else {
+          const environment = classifyVerifierEnvironment({ command, verdict: 'FAIL', result });
           interpreters.push({
             ...entry,
             status: 'failed',
-            reason: result?.timedOut ? 'probe-timed-out' : 'probe-failed',
+            reason: result?.timedOut
+              ? 'probe-timed-out'
+              : environment?.kind === 'native-module-crash'
+                ? 'native-module-crash'
+                : 'probe-failed',
             ...(Number.isInteger(result?.code) ? { exitCode: result.code } : {}),
+            ...(environment?.module ? { module: environment.module } : {}),
+            ...(environment?.nativeModule ? { nativeModule: environment.nativeModule } : {}),
             detail: clip(
               String(result?.stderr ?? '')
                 .split(/\r?\n/)
                 .find((line) => line.trim()) ?? '',
             ),
           });
+        }
       } catch (error) {
         const sandboxless = /Required macOS sandbox is unavailable/.test(String(error?.message));
         interpreters.push({ ...entry, status: 'not-probed', reason: sandboxless ? 'sandbox-unavailable' : 'probe-failed' });
@@ -443,6 +483,7 @@ export async function probeVerifierInterpreter(declared, { run = runCommand, tim
     interpreter: resolved.grants[0].interpreter,
     interpreters,
     readExecRoots: resolved.roots,
+    ...(imports.length ? { imports } : {}),
     note: failed
       ? 'the declaration was accepted but the interpreter did not run inside the verifier sandbox; a testCommand using it would fail the same way'
       : 'the declared interpreter runs inside the verifier sandbox (read and exec only, never write); call it by this absolute path in testCommand',

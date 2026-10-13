@@ -347,6 +347,11 @@ test(
     assert.equal(probes[0].options.requireSandbox, true);
     assert.deepEqual([...probes[0].options.interpreterPaths].sort(), [venv, join(base, 'base2')].sort());
 
+    const imports = await health({ verifierInterpreter: [venv], verifierImports: ['torch'] });
+    assert.deepEqual(imports.verifierPython.imports, ['torch']);
+    assert.match(probes.at(-1).command, /importlib\.import_module/);
+    assert.match(probes.at(-1).command, /torch/);
+
     outcome = { code: 126, stdout: '', stderr: 'sh: python: Operation not permitted\n' };
     const failed = await health({ verifierInterpreter: venv });
     assert.equal(failed.verifierPython.status, 'partial');
@@ -357,10 +362,15 @@ test(
     assert.equal(refused.verifierPython.status, 'missing');
     assert.equal(refused.verifierPython.reason, 'interpreter-rejected');
     assert.equal(refused.verifierPython.accepted, false);
-    assert.equal(probes.length, 2, 'a rejected declaration is never run');
+    assert.equal(probes.length, 3, 'a rejected declaration is never run');
 
     await assert.rejects(() => core.job('some-job', { repoPath: repo, verifierInterpreter: [venv] }), /omit jobId/);
     await assert.rejects(() => core.job(undefined, { repoPath: repo, verifierInterpreter: ['relative'] }), /absolute/);
+    await assert.rejects(() => core.job(undefined, { repoPath: repo, verifierImports: ['torch'] }), /requires verifierInterpreter/);
+    await assert.rejects(
+      () => core.job(undefined, { repoPath: repo, verifierInterpreter: [venv], verifierImports: ['torch; nope'] }),
+      /dotted Python module/,
+    );
   },
 );
 
@@ -476,7 +486,9 @@ test('the MCP tools advertise verifierInterpreter and refuse it where it cannot 
   call(13, 'offload_start', { ...start, verifierInterpreter: ['relative'] });
   call(14, 'offload_start', { task: 'r', mode: 'report', verifierInterpreter: ['/opt/py/venv'] });
   call(20, 'offload_job', { verifierInterpreter: ['/opt/py/venv'] });
+  call(201, 'offload_job', { verifierInterpreter: ['/opt/py/venv'], verifierImports: ['torch'] });
   call(21, 'offload_job', { jobId: 'oj-1', verifierInterpreter: ['/opt/py/venv'] });
+  call(211, 'offload_job', { verifierImports: ['torch'] });
   call(22, 'offload_job', {});
   await new Promise((resolve) => setTimeout(resolve, 40));
   await server.close();
@@ -490,6 +502,7 @@ test('the MCP tools advertise verifierInterpreter and refuse it where it cannot 
   }
   assert.match(tools.get('offload_job').description, /staleSkill/);
   assert.match(tools.get('offload_job').description, /verifierPython/);
+  assert.equal(tools.get('offload_job').inputSchema.properties.verifierImports.maxItems, 16);
   const result = (id) => values.find((value) => value.id === id).result;
   assert.notEqual(result(10).isError, true);
   assert.deepEqual(seen[0][1].verifierInterpreter, ['/opt/py/venv']);
@@ -497,6 +510,10 @@ test('the MCP tools advertise verifierInterpreter and refuse it where it cannot 
   assert.match(JSON.stringify(result(21)), /only when jobId is omitted/);
   assert.match(JSON.stringify(result(14)), /report jobs/);
   assert.notEqual(result(20).isError, true);
+  assert.notEqual(result(201).isError, true);
+  assert.deepEqual(seen.find((entry) => entry[0] === 'job' && entry[2].verifierImports)[2].verifierImports, ['torch']);
+  assert.equal(result(211).isError, true);
+  assert.match(JSON.stringify(result(211)), /requires verifierInterpreter/);
   assert.deepEqual(seen.find((entry) => entry[0] === 'job' && entry[2].verifierInterpreter)[2].verifierInterpreter, ['/opt/py/venv']);
   const plainJob = seen.filter((entry) => entry[0] === 'job').at(-1);
   assert.equal(Object.hasOwn(plainJob[2], 'verifierInterpreter'), false, 'no explicit undefined reaches Core');
@@ -528,6 +545,11 @@ test('the CLI passes a path or a JSON array as verifierInterpreter and refuses i
   }
   assert.equal((await run(['job', '--verifierInterpreter', '/opt/py/venv'])).code, 0);
   assert.deepEqual(calls.at(-1)[2].verifierInterpreter, ['/opt/py/venv']);
+  assert.equal((await run(['job', '--verifierInterpreter', '/opt/py/venv', '--verifierImports', '["torch"]'])).code, 0);
+  assert.deepEqual(calls.at(-1)[2].verifierImports, ['torch']);
+  const missingInterpreter = await run(['job', '--verifierImports', '["torch"]']);
+  assert.equal(missingInterpreter.code, 2);
+  assert.match(missingInterpreter.stderr, /requires --verifierInterpreter/);
   const refused = await run(['job', 'oj-1', '--verifierInterpreter', '/opt/py/venv']);
   assert.equal(refused.code, 2);
   assert.match(refused.stderr, /health call/);

@@ -47,6 +47,40 @@ test('a passing, timed-out, cancelled, or unrun verifier is never classified', (
   assert.equal(classifyVerifierEnvironment(null), null);
 });
 
+test('a faulthandler-native interpreter segfault is its own environment failure and names the module', () => {
+  const crash = classifyVerifierEnvironment(
+    failed(
+      [
+        'Fatal Python error: Segmentation fault',
+        'Current thread 0x000000000 (most recent call first):',
+        '  C  [libtorch_python.dylib:0x0000000101234567] initModule(_object*, _object*)',
+        'Extension modules: torch._C (total: 1)',
+      ].join('\n'),
+      { code: 139 },
+    ),
+  );
+  assert.deepEqual(crash, {
+    kind: 'native-module-crash',
+    module: 'torch',
+    nativeModule: 'libtorch_python.dylib',
+    detail: "native module 'torch' (libtorch_python.dylib) crashed during interpreter initialization (SIGSEGV / exit 139)",
+  });
+  const withUnrelatedLibrary = classifyVerifierEnvironment(
+    failed('loaded libother.dylib\nFatal Python error: Segmentation fault\nC  [libtorch_python.dylib] initModule\n', { code: 139 }),
+  );
+  assert.equal(withUnrelatedLibrary.nativeModule, 'libtorch_python.dylib');
+  assert.equal(
+    classifyVerifierEnvironment(failed('Fatal Python error: Segmentation fault\nC  [libtorch_python.dylib] initModule', { code: 1 })),
+    null,
+    'the exit status must corroborate the native faulthandler evidence',
+  );
+  assert.equal(
+    classifyVerifierEnvironment(failed('Fatal Python error: Segmentation fault\nPython stack only', { code: 139 })),
+    null,
+    'do not call an arbitrary Python crash a native-module sandbox failure',
+  );
+});
+
 test('a command that cannot be found is an environment failure', () => {
   assert.equal(classifyVerifierEnvironment(failed('sh: vitest: command not found')).kind, 'command-not-found');
   assert.equal(classifyVerifierEnvironment(failed('/bin/sh: line 1: jest: command not found')).detail, "command 'jest' not found");

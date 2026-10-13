@@ -200,9 +200,16 @@ test('a finish mixed with a read-only call after a successful write is corrected
     const rejected = requests[2].slice(-3);
     assert.deepEqual(
       rejected.map((message) => [message.role, message.tool_call_id, message.name]),
-      [['assistant', undefined, undefined], ['tool', 'r', 'read_file'], ['tool', 'f', 'finish']],
+      [
+        ['assistant', undefined, undefined],
+        ['tool', 'r', 'read_file'],
+        ['tool', 'f', 'finish'],
+      ],
     );
-    assert.deepEqual(rejected.slice(1).map((message) => message.content), [FINISH_ALONE, FINISH_ALONE]);
+    assert.deepEqual(
+      rejected.slice(1).map((message) => message.content),
+      [FINISH_ALONE, FINISH_ALONE],
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

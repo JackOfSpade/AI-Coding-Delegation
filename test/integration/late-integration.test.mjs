@@ -98,6 +98,38 @@ test('an environmental verifier failure is terminal, spends no repair round or b
   }
 });
 
+test('a native module crash remains visible in the public job and report without starting a repair round', async () => {
+  const h = await harness({
+    worker: async (job) => {
+      writeSrc(job, 'a.js', 'export const a = 1;\n');
+      return { status: 'DONE', turns: 2, costUsd: 0.02 };
+    },
+    verify: () => ({
+      command: 'python -c "import torch"',
+      verdict: 'FAIL',
+      result: {
+        code: 139,
+        stderr: 'Fatal Python error: Segmentation fault\nC  [libtorch_python.dylib] initModule\n',
+        sandbox: 'macos',
+      },
+    }),
+  });
+  try {
+    const { started, done } = await startEnvJob(h);
+    assert.equal(done.status, 'VERIFY_ENV_FAILED');
+    assert.equal(done.verifyEnvironment.kind, 'native-module-crash');
+    assert.equal(done.verifyEnvironment.module, 'torch');
+    assert.equal(done.verifyEnvironment.nativeModule, 'libtorch_python.dylib');
+    assert.match(done.verifyEnvironment.detail, /torch/);
+    assert.match(done.report, /verifier environment: native module 'torch'/);
+    assert.match(done.report, /Run the import in the primary checkout/);
+    assert.equal((await h.manager.job(started.jobId)).verifyEnvironment.nativeModule, 'libtorch_python.dylib');
+    assert.equal(h.counters.runs, 1);
+  } finally {
+    cleanup(h.repo);
+  }
+});
+
 test('a git-config-denied verifier failure is an environment limitation: no repair round, still apply-eligible, run the suite in the primary checkout', async () => {
   const GIT_DENIED = "fatal: unable to access '/etc/gitconfig': Operation not permitted";
   const h = await harness({
@@ -132,7 +164,10 @@ test('a git-config-denied verifier failure is an environment limitation: no repa
     });
     // The report names the limitation and the remedy.
     assert.match(done.report, /verifier environment: Git fixture setup could not read host system configuration in the verifier sandbox\./);
-    assert.match(done.report, /This is an environment limitation, not a product-test failure; run that integration suite in the primary checkout\./);
+    assert.match(
+      done.report,
+      /This is an environment limitation, not a product-test failure; run that integration suite in the primary checkout\./,
+    );
     assert.match(done.report, /no repair round was spent and none will be started automatically/);
   } finally {
     cleanup(h.repo);
