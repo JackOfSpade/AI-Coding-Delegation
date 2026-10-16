@@ -587,3 +587,138 @@ test('a FAILED job whose automatic revert fails keeps the STILL APPLIED record a
     cleanup(h.repo);
   }
 });
+
+test('provider failure verifies an audited retained diff before reporting without integrating or repairing', async () => {
+  for (const pass of [false, true]) {
+    const h = await harness({
+      worker: async (job) => {
+        writeSrc(job, 'a.js', A_BYTES);
+        return { status: 'FAILED', turns: 22, costUsd: 2.58, providerFailure: { kind: 'http', status: 503, attempts: 1 } };
+      },
+      check: (command, options) => {
+        assert.notEqual(options.cwd, h.repo);
+        return {
+          command,
+          verdict: pass ? 'PASS' : 'FAIL',
+          result: {
+            code: pass ? 0 : 1,
+            sandbox: 'macos',
+            stdout: pass ? '15/15 PASS' : '14/15 PASS',
+            stderr: pass ? '' : 'AssertionError src/a.js: wrong constant',
+          },
+        };
+      },
+    });
+    try {
+      const { id, done } = await h.begin({ testCommand: 'node check.js', budget: { maxUsd: 3 } });
+      assert.equal(done.status, 'FAILED');
+      assert.equal(h.counters.checks.length, 1);
+      assert.equal(h.counters.runs, 1);
+      assert.match(done.report, pass ? /verify:.*PASS/ : /verify:.*FAIL/);
+      if (!pass) {
+        assert.match(done.report, /14\/15 PASS/);
+        assert.match(done.report, /wrong constant/);
+      }
+      assert.match(done.report, /\$0\.420000 remaining against maxUsd \$3\.000000/);
+      assert.equal(existsSync(join(h.repo, 'src/a.js')), false);
+      assert.equal((await h.manager.apply(id)).dryRun, true);
+    } finally {
+      cleanup(h.repo);
+    }
+  }
+});
+
+test('provider failure never runs a verifier on empty or out-of-scope output', async () => {
+  for (const outside of [false, true]) {
+    const h = await harness({
+      worker: async (job) => {
+        if (outside) write(join(job.workspacePath, 'outside.js'), 'bad\n');
+        return { status: 'FAILED', providerFailure: { kind: 'transport', attempts: 1 } };
+      },
+    });
+    try {
+      const { done } = await h.begin({ testCommand: 'node check.js' });
+      assert.equal(done.status, 'FAILED');
+      assert.equal(h.counters.checks.length, 0);
+    } finally {
+      cleanup(h.repo);
+    }
+  }
+});
+
+test('provider diagnostic verifier mutations are rejected and never integrated', async () => {
+  const h = await harness({
+    worker: async (job) => {
+      writeSrc(job, 'a.js', A_BYTES);
+      return { status: 'FAILED', providerFailure: { kind: 'transport', attempts: 1 } };
+    },
+    check: (command, options) => {
+      write(join(options.cwd, 'src/a.js'), 'verifier authored\n');
+      return green();
+    },
+  });
+  try {
+    const { id } = await h.begin({ testCommand: 'node check.js' });
+    const job = await h.store.get(id);
+    assert.deepEqual(job.verifierMutations, ['src/a.js']);
+    await assert.rejects(() => h.manager.apply(id), /scope|authorship/);
+  } finally {
+    cleanup(h.repo);
+  }
+});
+
+test('named assertion repair gets an explicit fixed allowance after a reverted apply check even with spent caps', async () => {
+  const h = await harness({ worker: goodWork, check: red });
+  try {
+    const { id } = await h.begin({ budget: { maxUsd: 3, maxTurns: 3 } });
+    await h.manager.apply(id, { apply: true, applyThenVerify: 'node check.js' });
+    await h.store.update(id, { costUsd: 3 });
+    const before = await h.manager.job(id);
+    assert.match(before.report, /assertionPaths.*\$0\.50 fixed allowance/);
+    await assert.rejects(() => h.manager.repair(id, ['wrong expected constant']), /budget exhausted/);
+    for (const paths of [['outside.js'], ['src/**'], [], ['src/a.js', 'src/a.js']])
+      await assert.rejects(() => h.manager.repair(id, ['wrong constant'], { assertionPaths: paths, launch: false }), /assertionPaths/);
+    await h.manager.repair(id, ['src/a.js: expected constant should be 42'], { assertionPaths: ['src/a.js'], launch: false });
+    const queued = await h.store.get(id);
+    assert.equal(queued.budget.maxUsd, 3.5);
+    assert.equal(queued.budget.maxTurns, 9);
+    assert.equal(queued.rounds, 1);
+    assert.match(queued.pendingDefects.join('\n'), /expected constant should be 42/);
+    assert.deepEqual(queued.assertionRepair.paths, ['src/a.js']);
+    assert.equal(queued.applyVerify, undefined);
+    await h.manager.cancel(id);
+  } finally {
+    cleanup(h.repo);
+  }
+});
+
+test('fixed assertion pass enforces file and USD boundaries on the worker', async () => {
+  for (const violation of ['scope', 'usd', 'none']) {
+    const h = await harness({
+      check: red,
+      worker: async (job, round) => {
+        writeSrc(job, 'a.js', A_BYTES);
+        if (round === 1) return failedProtocol({ costUsd: 3 });
+        assert.deepEqual(job.ownedPaths, ['src/a.js']);
+        assert.deepEqual(job.extraWritable, []);
+        if (violation === 'scope') writeSrc(job, 'b.js', 'unauthorized\n');
+        return { status: 'DONE', turns: 1, costUsd: violation === 'usd' ? 0.51 : 0.1 };
+      },
+    });
+    try {
+      const { id } = await h.begin({ budget: { maxUsd: 3 } });
+      await h.manager.apply(id, { apply: true, applyThenVerify: 'node check.js' });
+      await h.manager.repair(id, ['src/a.js: fix expected value'], { assertionPaths: ['src/a.js'] });
+      const done = await h.settle(id);
+      assert.equal(done.status, violation === 'scope' ? 'FAILED' : violation === 'usd' ? 'BUDGET' : 'DONE_UNVERIFIED');
+      if (violation === 'scope') assert.deepEqual((await h.store.get(id)).scopeViolations, ['src/b.js']);
+      assert.equal(h.counters.runs, 2);
+      await assert.rejects(
+        () => h.manager.repair(id, ['again'], { assertionPaths: ['src/a.js'] }),
+        /allowance.*used|applied job|failed.*reverted|scope or verifier/,
+      );
+    } finally {
+      cleanup(h.repo);
+    }
+  }
+});

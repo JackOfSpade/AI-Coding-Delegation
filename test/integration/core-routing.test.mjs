@@ -2389,3 +2389,75 @@ test('a real worker loop through Core records provider calls, tool timings and a
     await rm(path, { recursive: true, force: true });
   }
 });
+
+test('assertion repair sends a fresh focused conversation through Core while preserving implementation history', async () => {
+  const path = await repo('offload-assertion-context-');
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  const script = [
+    [toolChunk('initial-write', 'write_file', { path: 'src/a.js', content: 'export const a = 1;\n' }), usageChunk],
+    null,
+    [finishChunk('fixed named assertion'), usageChunk],
+  ];
+  globalThis.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    const chunks = script.shift();
+    return chunks
+      ? new Response(chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n', {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        })
+      : new Response('{}', { status: 503 });
+  };
+  let core;
+  try {
+    const configured = structuredClone(loaded);
+    configured.config.providers.test.baseUrl = 'http://127.0.0.1:4321/v1';
+    configured.config.profiles.test.model = 'mock-model';
+    const zero = { off_peak: 0, peak: 0 };
+    const pricingTable = {
+      fetched_at: '2026-10-01',
+      models: {
+        'mock-model': {
+          usd_per_1m: { input_cache_hit: zero, input_cache_miss: zero, output: zero },
+        },
+      },
+    };
+    const isolation = {
+      create: createIsolatedWorktree,
+      open: openIsolatedWorktree,
+      cleanup: cleanupIsolatedWorktree,
+      integrateRecorded: integrateRecordedTree,
+    };
+    core = createCore({
+      config: { loaded: configured, pricingTable, resolveKey: () => 'credential', isolation },
+      isolation,
+      runner: {
+        verify: async (command) => ({
+          command,
+          verdict: 'FAIL',
+          result: { code: 1, sandbox: 'macos', stderr: 'AssertionError src/a.js: expected 42' },
+        }),
+      },
+    });
+    const started = await core.start({ repoPath: path, task: 'ORIGINAL_IMPLEMENTATION_HISTORY', ownedPaths: ['src/**'] });
+    const failed = await core.wait(started.jobId, { repoPath: path, timeoutSec: 20 });
+    assert.equal(failed.status, 'FAILED');
+    await core.apply(started.jobId, { repoPath: path, apply: true, applyThenVerify: 'node check.js' });
+    await core.repair(started.jobId, ['src/a.js: expected 42'], { repoPath: path, assertionPaths: ['src/a.js'] });
+    const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 20 });
+    assert.equal(done.status, 'DONE_UNVERIFIED');
+    assert.equal(requests.length, 3);
+    const repairMessages = requests[2].messages;
+    assert.equal(repairMessages[0].role, 'system');
+    assert.match(repairMessages[1].content, /src\/a.js: expected 42/);
+    assert.doesNotMatch(JSON.stringify(repairMessages), /ORIGINAL_IMPLEMENTATION_HISTORY|initial-write/);
+    const audit = await core.manager.store.readMessages(started.jobId);
+    assert.match(JSON.stringify(audit), /ORIGINAL_IMPLEMENTATION_HISTORY/);
+    assert.match(JSON.stringify(audit), /expected 42/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await core?.shutdown();
+    await rm(path, { recursive: true, force: true });
+  }
+});

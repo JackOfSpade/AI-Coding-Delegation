@@ -469,7 +469,11 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         // conversational/tool transcript is therefore intentionally
         // ephemeral: only the separately-sanitized report result is durable.
         // Write jobs retain their exact resume and transcript semantics.
-        const prior = job.mode === 'report' ? [] : (await state.store.readMessages?.(job.id)) || [];
+        const stored = job.mode === 'report' ? [] : (await state.store.readMessages?.(job.id)) || [];
+        // A named assertion pass starts a fresh protocol conversation; replaying
+        // the implementation history can consume its entire fixed allowance.
+        // Retain that history for audit, and resume from this sealed offset.
+        const prior = job.assertionRepair ? stored.slice(job.assertionRepair.transcriptStart) : stored;
         const context =
           job.mode === 'report'
             ? new AgentContext()
@@ -541,7 +545,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
                     serverVerifierConfigured:
                       job.mode !== 'report' && typeof job.testCommand === 'string' && job.testCommand.trim().length > 0,
                   }),
-                  task: job.task,
+                  task: job.assertionRepair?.round === (job.rounds || 0) ? repair : job.task,
                 },
         );
         const responseModel = rawResult.model;
@@ -1395,7 +1399,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       validateJobId(id);
       validateExplicitRepoPath(opts.repoPath);
       const state = await knownStateForJob(id, opts.repoPath);
-      return state.manager.repair(id, defects, { launch: opts.launch !== false });
+      return state.manager.repair(id, defects, { launch: opts.launch !== false, assertionPaths: opts.assertionPaths });
     },
     async continue(id, opts = {}) {
       if (closing) throw new Error('offload core is shutting down');

@@ -1300,3 +1300,26 @@ test('session spend cannot be forged through job data and is absent without the 
   // Without the option (the durable report.md path) nothing time-varying is rendered.
   assert.equal(compactReport({ id: 'oj-z', status: 'DONE_VERIFIED', costUsd: 1 }).includes('spend across'), false);
 });
+
+test('every terminal report shows remaining USD against maxUsd in both detail modes', () => {
+  for (const status of [
+    'DONE_VERIFIED',
+    'DONE_UNVERIFIED',
+    'VERIFY_FAILED',
+    'VERIFY_ENV_FAILED',
+    'FAILED',
+    'TIMEOUT',
+    'BUDGET',
+    'CANCELLED',
+  ]) {
+    for (const detail of ['compact', 'full']) {
+      assert.match(
+        compactReport({ status, budget: { maxUsd: 3 }, costUsd: 2.58 }, { detail }),
+        /budget: \$0\.420000 remaining against maxUsd \$3\.000000/,
+      );
+      assert.match(compactReport({ status, budget: { maxUsd: 3 }, costUsd: 3.1 }, { detail }), /\$0\.000000 remaining/);
+      assert.match(compactReport({ status, budget: { maxUsd: 3 } }, { detail }), /remaining USD unavailable/);
+      assert.match(compactReport({ status, costUsd: 1 }, { detail }), /maxUsd unavailable/);
+    }
+  }
+});

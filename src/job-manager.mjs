@@ -1129,6 +1129,11 @@ export class JobManager {
         ...all
           .filter((file) => !inScope(file?.path, job.ownedPaths || []) && !inScope(file?.path, job.extraWritable || []))
           .map((file) => file.path),
+        ...(job.assertionRepair?.round === (job.rounds || 0) && job.workspaceSeed
+          ? diffTreeFiles(job.repoPath, job.workspaceSeed, workspaceAfter)
+              .map((file) => file.path)
+              .filter((path) => !job.assertionRepair.paths.includes(path))
+          : []),
         ...invalidIgnored,
         ...unrevertibleOwned,
         ...verifierMutations,
@@ -1748,7 +1753,9 @@ export class JobManager {
           // allowed to cross the provider POST boundary.
           let cappedFinishRecoveryState = job.cappedFinishRecovery;
           let budgetFinishRecoveryState = job.budgetFinishRecovery;
-          const result = await this.worker.run(job, {
+          const workerJob =
+            job.assertionRepair?.round === (job.rounds || 0) ? { ...job, ownedPaths: job.assertionRepair.paths, extraWritable: [] } : job;
+          const result = await this.worker.run(workerJob, {
             signal: controller.signal,
             defects,
             progress: async (event) => {
@@ -2027,20 +2034,52 @@ export class JobManager {
                     : String(error.message || error),
           });
         } finally {
-          if (cancellationWatch) clearInterval(cancellationWatch);
           // Also closes a worker that threw mid-request into the phase it was in.
           await this.store.update(id, stamp('finalize')).catch(() => {});
           // Preserve partial changes even after cancellation, timeouts and worker failures.
           try {
             job = this.validatePersisted(await this.store.get(id));
-            // A detached caller can set cancellation after the polling interval
-            // is cleared but before publication. Honor the durable request here
+            // A detached caller can set cancellation between polling ticks
+            // before publication. Honor the durable request here
             // so that finalization cannot accidentally publish DONE.
             if ((await this.store.cancelRequested?.(id)) && !final(job.status))
               job = await this.store.update(id, { status: 'FINALIZING', finalStatus: 'CANCELLED' });
             if (workspace && job.mode !== 'report') {
-              const workspaceAfter = await workspace.snapshot();
-              const audited = await this.#classifyIsolatedWorkspace(job, workspace, workspaceAfter);
+              let workspaceAfter = await workspace.snapshot();
+              let audited = await this.#classifyIsolatedWorkspace(job, workspace, workspaceAfter);
+              // A provider outage says nothing about the retained implementation.
+              // Audit before executing it, then audit again to catch verifier writes.
+              if (
+                job.finalStatus === 'FAILED' &&
+                safeProviderFailure(job.providerFailure) &&
+                job.testCommand &&
+                !job.verify &&
+                !controller.signal.aborted &&
+                !leaseLost &&
+                !audited.violations.length &&
+                audited.revertPaths.length
+              ) {
+                job = await this.store.update(id, { workerAfter: workspaceAfter });
+                await this.#pinTrees(job, { before: job.before, workerAfter: workspaceAfter });
+                await this.store.update(id, stamp('verify'));
+                try {
+                  await this._verify(job, { diagnosticOnly: true });
+                } catch (error) {
+                  await this.store.update(id, {
+                    verify: {
+                      command: job.testCommand,
+                      verdict: 'UNVERIFIED',
+                      result: { stderr: `Verifier could not run: ${String(error.message || error).slice(0, 1000)}` },
+                    },
+                  });
+                }
+                await this.store.update(id, stamp('finalize'));
+                job = this.validatePersisted(await this.store.get(id));
+                if (controller.signal.aborted || (await this.store.cancelRequested?.(id)))
+                  job = await this.store.update(id, { finalStatus: 'CANCELLED' });
+                workspaceAfter = await workspace.snapshot();
+                audited = await this.#classifyIsolatedWorkspace(job, workspace, workspaceAfter);
+              }
               await this.store.writeArtifact(id, 'patch.diff', audited.allPatch);
               await this.store.writeArtifact(id, 'revert.diff', audited.revertPatch);
               job = await this.store.update(id, {
@@ -2276,6 +2315,7 @@ export class JobManager {
               error: String(snapshotError.message || snapshotError),
             });
           }
+          if (cancellationWatch) clearInterval(cancellationWatch);
           let done;
           let terminalCleanupComplete = false;
           try {
@@ -2625,7 +2665,7 @@ export class JobManager {
       await this.store.event(id, { type: 'verify-phase', ...event });
     } catch {}
   }
-  async _verify(job) {
+  async _verify(job, { diagnosticOnly = false } = {}) {
     // Progress callbacks can durably advance a safety lifecycle while the
     // worker is running.  The object supplied by the caller predates those
     // callbacks, so verification must use the authenticated current record
@@ -2736,6 +2776,7 @@ export class JobManager {
       !environment &&
       !sandboxRequirementFailed &&
       !finishRecoveryUnresolved &&
+      job.assertionRepair?.round !== (job.rounds || 0) &&
       !baselineInconclusive &&
       sandboxed &&
       (job.rounds || 0) < (job.maxRepairRounds ?? 2);
@@ -2750,11 +2791,11 @@ export class JobManager {
             : 'VERIFY_FAILED';
     return this.store.update(job.id, {
       status: 'FINALIZING',
-      finalStatus: status,
+      finalStatus: diagnosticOnly ? 'FAILED' : status,
       verify,
       // Always written: a later verification must not inherit an earlier round's classification.
       verifyEnvironment: environment || undefined,
-      ...(finishRecoveryUnresolved && verify.verdict !== 'PASS'
+      ...(!diagnosticOnly && finishRecoveryUnresolved && verify.verdict !== 'PASS'
         ? {
             error: cappedFinishRecoveryUnresolved
               ? 'automatic repair suppressed: unresolved capped implementation recovery; start a fresh job'
@@ -3138,7 +3179,7 @@ export class JobManager {
       continuation: { extraTurns, extraUsd },
     });
   }
-  async repair(id, defects, { launch = true, continuation } = {}) {
+  async repair(id, defects, { launch = true, continuation, assertionPaths } = {}) {
     if (
       !Array.isArray(defects) ||
       !defects.length ||
@@ -3201,7 +3242,43 @@ export class JobManager {
     // A continuation raises the cumulative caps by an explicit, bounded amount
     // and is otherwise subject to every limit a repair is: it consumes one of
     // the job's rounds, and turns/cost stay cumulative across the whole job.
-    const budget = continuation ? this.#raisedBudget(job, continuation) : job.budget;
+    let assertionRepair;
+    if (assertionPaths !== undefined) {
+      if (continuation || !this.isolated || job.applyVerify?.outcome !== 'FAILED' || job.applyVerify?.reverted !== true)
+        throw new Error('assertionPaths requires a failed, automatically reverted applyThenVerify check');
+      if (
+        !Array.isArray(assertionPaths) ||
+        !assertionPaths.length ||
+        assertionPaths.length > 8 ||
+        new Set(assertionPaths).size !== assertionPaths.length ||
+        !assertionPaths.every(
+          (path) =>
+            typeof path === 'string' &&
+            safeRevertPath(path) &&
+            !/[?*\[\]{}!]/.test(path) &&
+            matchesAny(path, job.ownedPaths || []) &&
+            job.files?.some((file) => file.path === path),
+        )
+      )
+        throw new Error('assertionPaths must name 1-8 distinct literal files changed and owned by this job');
+      if (job.assertionRepair) throw new Error('the fixed assertion repair allowance has already been used');
+      assertionRepair = {
+        paths: assertionPaths,
+        allowanceUsd: 0.5,
+        maxTurns: 6,
+        round: (job.rounds || 0) + 1,
+        transcriptStart: ((await this.store.readMessages?.(id)) || []).length,
+      };
+    }
+    const budget = assertionRepair
+      ? {
+          ...job.budget,
+          maxUsd: Math.min(10_000, (job.costUsd || 0) + assertionRepair.allowanceUsd),
+          maxTurns: Math.min(1000, (job.turns || 0) + assertionRepair.maxTurns),
+        }
+      : continuation
+        ? this.#raisedBudget(job, continuation)
+        : job.budget;
     if (
       (budget?.maxTurns != null && (job.turns || 0) >= budget.maxTurns) ||
       (budget?.maxUsd != null && (job.costUsd || 0) >= budget.maxUsd)
@@ -3266,7 +3343,13 @@ export class JobManager {
         handoffState: launch ? 'LOCAL' : 'PARENT_QUEUED',
         runnerPid: process.pid,
         runnerHeartbeatAt: this.now().toISOString(),
-        pendingDefects: effective,
+        pendingDefects: assertionRepair
+          ? [
+              `Fix only these named assertions in ${assertionRepair.paths.join(', ')}. Six turns and $0.50 total for this pass; finish promptly.`,
+              ...effective,
+            ]
+          : effective,
+        ...(assertionRepair ? { assertionRepair, budget, transcriptReplayable: true } : {}),
         ...ROUND_SCOPED_VERIFIER_STATE,
         ...ROUND_SCOPED_ERROR_STATE,
         // Remembered across the reset above: if the next round loops on this

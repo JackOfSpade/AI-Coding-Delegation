@@ -44,6 +44,12 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
       : job.costUsd != null
         ? 'cost unavailable'
         : '';
+  const validUsd = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+  const remaining = terminal.has(job.status)
+    ? validUsd(job.budget?.maxUsd)
+      ? `budget: ${validUsd(job.costUsd) ? `$${Math.max(0, job.budget.maxUsd - job.costUsd).toFixed(6)} remaining` : 'remaining USD unavailable'} against maxUsd $${job.budget.maxUsd.toFixed(6)}`
+      : 'budget: remaining USD unavailable (maxUsd unavailable)'
+    : '';
   const meta = [
     job.profile && `profile ${scalar(job.profile)}${configured ? ` (${scalar(configured)})` : ''}`,
     responseModel,
@@ -98,7 +104,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     Array.isArray(job.discardedEphemeralOutputs) && job.discardedEphemeralOutputs.length
       ? `discarded ephemeral outputs: ${job.discardedEphemeralOutputs.slice(0, 200).map(scalar).join(', ')}`
       : '';
-  const verifierDiagnostic = job.verify?.result?.stderr || job.verify?.result?.stdout;
+  const verifierDiagnostic = [job.verify?.result?.stdout, job.verify?.result?.stderr].filter(Boolean).join('\n');
   // A passing run's output is noise to a reviewer; a failing run's tail is the
   // evidence. The compact view keeps only the failure tail, and keeps it short.
   const showDiagnostic = verifierDiagnostic && (!lean || job.verify?.verdict !== 'PASS');
@@ -223,6 +229,18 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     !budgetSpent
   )
     nextActions.push('repair');
+  if (
+    !reportMode &&
+    mutationSettled &&
+    !violations.length &&
+    roundAvailable &&
+    !job.assertionRepair &&
+    job.applyVerify?.outcome === 'FAILED' &&
+    job.applyVerify?.reverted === true
+  )
+    nextActions.push(
+      'repair with assertionPaths [job-owned changed files] and defects [named assertions] ($0.50 fixed allowance, 6 turns; independent of prior maxUsd)',
+    );
   // A cap stop is not a failure of the work: keep it and let the primary
   // raise the cap. A FAILED round the worker itself ended (loop, no finish,
   // output cap) is resumable too, by the same gate the server enforces.
@@ -238,6 +256,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     line1,
     meta,
     spendLine,
+    remaining,
     ...timingLines(job, { lean, elapsed }),
     stallLine(stall),
     pricing,

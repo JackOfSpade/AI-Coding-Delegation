@@ -605,3 +605,19 @@ test('CLI retrospective reads the newest jobs or the named ones, prints the dige
   }
   assert.equal(seen.length, 5, 'a rejected request never reaches core');
 });
+
+test('CLI forwards explicit assertion paths and named defects for the fixed repair allowance', async () => {
+  let seen;
+  const status = await runCli(['repair', 'job', '--defects', '["src/a.js: expected 42"]', '--assertionPaths', '["src/a.js"]'], {
+    core: {
+      repair: async (...args) => {
+        seen = args;
+        return {};
+      },
+    },
+    stdout: sink().stream,
+    stderr: sink().stream,
+  });
+  assert.equal(status, 0);
+  assert.deepEqual(seen, ['job', ['src/a.js: expected 42'], { repoPath: undefined, assertionPaths: ['src/a.js'] }]);
+});

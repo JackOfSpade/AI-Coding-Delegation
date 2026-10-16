@@ -215,10 +215,17 @@ const TOOLS = [
   ],
   [
     'offload_repair',
-    'Start another bounded worker pass for precise defects; it may edit files and spend provider budget.',
+    'Start another bounded worker pass for precise defects; it may edit files and spend provider budget. After a failed, auto-reverted applyThenVerify assertion, pass assertionPaths with the job-owned changed files and name the assertions in defects for a one-time six-turn $0.50 allowance independent of the previous maxUsd. Only those files may change; consumes a repair round. The caller identifies the failing assertions; no automatic weakening of tests is authorized.',
     {
       jobId,
       defects: { type: 'array', minItems: 1, maxItems: 32, items: { type: 'string', minLength: 1, maxLength: 4_000 } },
+      assertionPaths: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 8,
+        uniqueItems: true,
+        items: { type: 'string', minLength: 1, maxLength: 4096 },
+      },
       ...repoHint,
     },
     ['jobId', 'defects'],
@@ -698,7 +705,11 @@ export function createMcpServer(
               ...(args.verifierInterpreter !== undefined ? { verifierInterpreter: args.verifierInterpreter } : {}),
               ...(args.verifierImports !== undefined ? { verifierImports: args.verifierImports } : {}),
             }),
-      offload_repair: () => core.repair(args.jobId, args.defects, { repoPath: args.repoPath }),
+      offload_repair: () =>
+        core.repair(args.jobId, args.defects, {
+          repoPath: args.repoPath,
+          ...(args.assertionPaths !== undefined ? { assertionPaths: args.assertionPaths } : {}),
+        }),
       // `apply` is optional and defaults to a dry run. Passing an explicit
       // undefined property defeats JobManager's destructuring default, so
       // normalize it at the protocol boundary.

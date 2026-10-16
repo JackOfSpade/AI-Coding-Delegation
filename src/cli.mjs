@@ -48,7 +48,7 @@ const CLI_COMMANDS = Object.freeze({
     positionals: 'zero-or-one',
   },
   retrospective: { valueFlags: ['jobs', 'last', 'repoPath'], booleanFlags: [], positionals: 'zero-or-one' },
-  repair: { valueFlags: ['defects', 'repoPath'], booleanFlags: ['foreground'], positionals: 'one' },
+  repair: { valueFlags: ['defects', 'assertionPaths', 'repoPath'], booleanFlags: ['foreground'], positionals: 'one' },
   revert: { valueFlags: ['repoPath'], booleanFlags: ['apply'], positionals: 'one' },
   cancel: { valueFlags: ['repoPath'], booleanFlags: [], positionals: 'one' },
 });
@@ -496,9 +496,11 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
     } else if (command === 'repair') {
       if (!validId(positionals[0])) throw new Error('valid job id is required');
       const defects = decode(flags.defects, []);
-      if (injectedCore || bool(flags.foreground)) result = await core.repair(positionals[0], defects, { repoPath: flags.repoPath });
+      const assertionOptions = flags.assertionPaths === undefined ? {} : { assertionPaths: decode(flags.assertionPaths, []) };
+      if (injectedCore || bool(flags.foreground))
+        result = await core.repair(positionals[0], defects, { repoPath: flags.repoPath, ...assertionOptions });
       else {
-        result = await core.repair(positionals[0], defects, { repoPath: flags.repoPath, launch: false });
+        result = await core.repair(positionals[0], defects, { repoPath: flags.repoPath, ...assertionOptions, launch: false });
         try {
           const child = await spawnWorker({ jobId: result.jobId, repoPath: result.repo });
           await core.assignWorkerPid(result.jobId, child.pid, result.repo);

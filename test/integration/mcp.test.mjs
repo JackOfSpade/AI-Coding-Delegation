@@ -140,7 +140,7 @@ test('MCP enforces advertised input schemas and maps only public operation optio
   call(6, 'offload_start', { task: 'implement', ownedPaths: ['src/**'], budget: { maxTurns: 1 }, unsafePolicyOnlyVerifier: true });
   call(7, 'offload_wait', { jobId: 'j', timeoutSec: 5, repoPath: '/repo' });
   call(8, 'offload_job', { jobId: 'j', include: 'files', repoPath: '/repo' });
-  call(9, 'offload_repair', { jobId: 'j', defects: ['fix'], repoPath: '/repo' });
+  call(9, 'offload_repair', { jobId: 'j', defects: ['fix assertion value'], assertionPaths: ['src/a.js'], repoPath: '/repo' });
   call(10, 'offload_revert', { jobId: 'j', apply: true, repoPath: '/repo' });
   call(11, 'offload_cancel', { jobId: 'j', repoPath: '/repo' });
   call(12, 'offload_wait', { jobId: '' });
@@ -195,7 +195,7 @@ test('MCP enforces advertised input schemas and maps only public operation optio
   assert.equal(calls.wait[0][1].timeoutSec, 5);
   assert.ok(calls.wait[0][1].signal instanceof AbortSignal);
   assert.deepEqual(calls.job[0], ['j', { repoPath: '/repo', include: 'files' }]);
-  assert.deepEqual(calls.repair[0], ['j', ['fix'], { repoPath: '/repo' }]);
+  assert.deepEqual(calls.repair[0], ['j', ['fix assertion value'], { repoPath: '/repo', assertionPaths: ['src/a.js'] }]);
   assert.deepEqual(calls.revert[0], ['j', { repoPath: '/repo', apply: true }]);
   assert.deepEqual(calls.revert[1], ['dry-run', { repoPath: undefined, apply: false }], 'omitted apply must be an explicit dry run');
   assert.deepEqual(calls.cancel[0], ['j', { repoPath: '/repo' }]);
