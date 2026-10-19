@@ -45,7 +45,29 @@ const ANTHROPIC_SONNET_2026_10_12 = deepFreeze({
   },
 });
 
+const ANTHROPIC_2026_10_19 = deepFreeze({
+  fetched_at: '2026-10-19T00:00Z',
+  sources: ['https://platform.claude.com/docs/en/about-claude/pricing'],
+  models: {
+    'claude-sonnet-5-5': {
+      usd_per_1m: {
+        input_cache_hit: { off_peak: 0.1, peak: 0.1 },
+        input_cache_miss: { off_peak: 2, peak: 2 },
+        output: { off_peak: 10, peak: 10 },
+      },
+    },
+    'claude-opus-5-5': {
+      usd_per_1m: {
+        input_cache_hit: { off_peak: 0.2, peak: 0.2 },
+        input_cache_miss: { off_peak: 4, peak: 4 },
+        output: { off_peak: 20, peak: 20 },
+      },
+    },
+  },
+});
+
 const TABLES = Object.freeze({
+  'anthropic-2026-10-19': ANTHROPIC_2026_10_19,
   'deepseek-2026-10-01': DEEPSEEK_2026_10_01,
   'anthropic-sonnet-2026-10-12': ANTHROPIC_SONNET_2026_10_12,
 });

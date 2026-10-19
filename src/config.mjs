@@ -9,7 +9,7 @@ export const DEFAULT_CONFIG = Object.freeze({
       type: 'anthropic-messages',
       baseUrl: 'https://api.anthropic.com',
       keyRef: 'keychain:offload-anthropic',
-      pricing: 'anthropic-sonnet-2026-10-12',
+      pricing: 'anthropic-2026-10-19',
       attemptTimeoutMs: 300_000,
     },
     deepseek: {
@@ -21,10 +21,11 @@ export const DEFAULT_CONFIG = Object.freeze({
     },
   },
   profiles: {
-    promo: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' },
+    sonnet: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' },
+    opus: { provider: 'anthropic', model: 'latest-opus', fallback: 'flash' },
     flash: { provider: 'deepseek', model: 'latest-flash' },
   },
-  default: 'promo',
+  default: 'sonnet',
   limits: { maxTurns: 80, timeoutMinutes: 30, maxUsd: 2 },
 });
 const MAX_CONFIG_BYTES = 1024 * 1024;

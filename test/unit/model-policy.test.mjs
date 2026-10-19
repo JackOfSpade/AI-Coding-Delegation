@@ -81,14 +81,14 @@ test('dynamic selectors are accepted only while validating configuration, never 
 });
 
 test('shipped defaults and the example config route promo Sonnet to Flash fallback', () => {
-  assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles), ['promo', 'flash']);
-  assert.equal(DEFAULT_CONFIG.default, 'promo');
-  assert.equal(DEFAULT_CONFIG.profiles.promo.model, OFFLOAD_ANTHROPIC_LATEST_SONNET);
-  assert.equal(DEFAULT_CONFIG.profiles.promo.fallback, 'flash');
+  assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles), ['sonnet', 'opus', 'flash']);
+  assert.equal(DEFAULT_CONFIG.default, 'sonnet');
+  assert.equal(DEFAULT_CONFIG.profiles.sonnet.model, OFFLOAD_ANTHROPIC_LATEST_SONNET);
+  assert.equal(DEFAULT_CONFIG.profiles.sonnet.fallback, 'flash');
   assert.equal(DEFAULT_CONFIG.profiles.flash.model, OFFLOAD_DEEPSEEK_LATEST_FLASH);
   const example = JSON.parse(readFileSync(join(root, 'config.example.json'), 'utf8'));
-  assert.deepEqual(Object.keys(example.profiles), ['promo', 'flash']);
-  assert.equal(example.default, 'promo');
+  assert.deepEqual(Object.keys(example.profiles), ['sonnet', 'opus', 'flash']);
+  assert.equal(example.default, 'sonnet');
   assert.doesNotThrow(() => validateConfig(structuredClone(example)));
 });
 

@@ -50,7 +50,8 @@ const productionFields = ['dependencies', 'optionalDependencies', 'bundleDepende
 const offloadPluginFiles = [
   'plugins/offload/plugin.json',
   'plugins/offload/.codex-plugin/plugin.json',
-  'plugins/offload/skills/offload/SKILL.md',
+  'plugins/offload/skills/offload_sonnet/SKILL.md',
+  'plugins/offload/skills/offload_opus/SKILL.md',
 ];
 
 function isPlainObject(value) {
@@ -101,7 +102,7 @@ export function validateOffloadPluginArtifacts(marketplace, codex, skill) {
         !metadata.description
       )
         errors.push('plugin SKILL.md frontmatter requires non-empty name and description');
-      else if (isPlainObject(marketplace) && metadata.name !== marketplace.name)
+      else if (isPlainObject(marketplace) && !['offload_sonnet', 'offload_opus'].includes(metadata.name))
         errors.push('plugin SKILL.md name differs from plugin manifest');
     } catch {
       errors.push('plugin SKILL.md frontmatter must be strict JSON');
@@ -248,12 +249,16 @@ export async function packageGate(
   let pluginArtifacts = [];
   if (manifest.name === 'offload' && !missing.some((file) => offloadPluginFiles.includes(file))) {
     try {
-      const [marketplace, codex, skill] = await Promise.all([
+      const [marketplace, codex, skill, opus] = await Promise.all([
         readFile(join(root, offloadPluginFiles[0]), 'utf8').then(JSON.parse),
         readFile(join(root, offloadPluginFiles[1]), 'utf8').then(JSON.parse),
         readFile(join(root, offloadPluginFiles[2]), 'utf8'),
+        readFile(join(root, offloadPluginFiles[3]), 'utf8'),
       ]);
-      pluginArtifacts = validateOffloadPluginArtifacts(marketplace, codex, skill);
+      pluginArtifacts = [
+        ...validateOffloadPluginArtifacts(marketplace, codex, skill),
+        ...validateOffloadPluginArtifacts(marketplace, codex, opus),
+      ];
     } catch {
       pluginArtifacts = ['plugin artifacts must contain valid JSON manifests'];
     }

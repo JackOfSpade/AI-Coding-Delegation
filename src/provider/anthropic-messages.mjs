@@ -1,6 +1,6 @@
 import { sseEvents } from './sse.mjs';
 import { ProviderError } from './openai-chat.mjs';
-import { assertModelAllowed, isAnthropicSonnetModel, modelPolicyViolation } from '../model-policy.mjs';
+import { assertModelAllowed, isAnthropicModel, modelPolicyViolation } from '../model-policy.mjs';
 import { anthropicContentMatchesAssistant, cloneAnthropicContent, validAnthropicContent } from '../anthropic-content.mjs';
 
 export const DEFAULT_ANTHROPIC_VERSION = '2023-06-01';
@@ -191,7 +191,7 @@ export class AnthropicMessagesProvider {
   constructor({ baseUrl, apiKey, model, fetchImpl = globalThis.fetch, timeoutMs = 300_000, retries = 3 } = {}) {
     this.baseUrl = checkedBaseUrl(baseUrl);
     if (typeof apiKey !== 'string' || !apiKey) throw new TypeError('apiKey is required');
-    if (!isAnthropicSonnetModel(model)) throw new TypeError('model must be a concrete Claude Sonnet model id');
+    if (!isAnthropicModel(model)) throw new TypeError('model must be a concrete Claude Sonnet or Opus model id');
     assertModelAllowed({ type: 'anthropic-messages', baseUrl: this.baseUrl, model });
     if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 30_000 || timeoutMs > 600_000) throw new TypeError('timeoutMs is invalid');
@@ -268,7 +268,15 @@ export class AnthropicMessagesProvider {
     const wire = wireMessages(messages);
     const choice = wireToolChoice(tool_choice);
     const events = await this.#collect(
-      { model: requestModel, max_tokens, stream: true, tools: wireTools(tools), ...(choice ? { tool_choice: choice } : {}), ...wire },
+      {
+        model: requestModel,
+        thinking: { type: 'adaptive' },
+        max_tokens,
+        stream: true,
+        tools: wireTools(tools),
+        ...(choice ? { tool_choice: choice } : {}),
+        ...wire,
+      },
       signal,
       retryLimit,
     );
@@ -282,7 +290,7 @@ export class AnthropicMessagesProvider {
       if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.type !== 'string')
         throw new ProviderError('Invalid Anthropic SSE event');
       if (event.type === 'message_start') {
-        if (!isAnthropicSonnetModel(event.message?.model)) throw new ProviderError('Invalid Anthropic response model');
+        if (!isAnthropicModel(event.message?.model)) throw new ProviderError('Invalid Anthropic response model');
         modelName = event.message.model;
         inputUsage = event.message.usage;
       } else if (event.type === 'content_block_start') {
@@ -361,7 +369,10 @@ export class AnthropicMessagesProvider {
   }
 }
 
-export async function resolveLatestAnthropicSonnet({ baseUrl, apiKey, fetchImpl = globalThis.fetch, signal } = {}) {
+export const resolveLatestAnthropicSonnet = (options) => resolveLatestAnthropicModel({ ...options, line: 'sonnet' });
+export const resolveLatestAnthropicOpus = (options) => resolveLatestAnthropicModel({ ...options, line: 'opus' });
+
+async function resolveLatestAnthropicModel({ baseUrl, apiKey, fetchImpl = globalThis.fetch, signal, line } = {}) {
   const checked = checkedBaseUrl(baseUrl);
   // Anthropic documents newest-first ordering. Keep that provider-defined
   // release order rather than guessing from model-id spelling. Prefer the
@@ -397,8 +408,10 @@ export async function resolveLatestAnthropicSonnet({ baseUrl, apiKey, fetchImpl 
     if (!Array.isArray(body?.data)) throw new ProviderError('Invalid Anthropic Models response');
     const model = body.data.find(
       (entry) =>
-        entry?.line === 'sonnet' &&
-        isAnthropicSonnetModel(entry.id) &&
+        entry?.line === line &&
+        isAnthropicModel(entry.id) &&
+        entry.id.startsWith(`claude-${line}-`) &&
+        entry.capabilities?.thinking?.types?.adaptive?.supported !== false &&
         (activeOnly || entry.lifecycle === undefined || entry.lifecycle === 'active'),
     );
     if (model) return model.id;
@@ -408,5 +421,5 @@ export async function resolveLatestAnthropicSonnet({ baseUrl, apiKey, fetchImpl 
     afterId = body.last_id;
     page += 1;
   }
-  throw new ProviderError('No supported Claude Sonnet model is available');
+  throw new ProviderError(`No supported Claude ${line} model is available`);
 }

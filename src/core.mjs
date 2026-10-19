@@ -46,7 +46,7 @@ import {
   validCredentialFingerprint,
 } from './integrity.mjs';
 import { DEFAULT_ATTEMPT_TIMEOUT_MS, OpenAIChatProvider, ProviderError } from './provider/openai-chat.mjs';
-import { AnthropicMessagesProvider, resolveLatestAnthropicSonnet } from './provider/anthropic-messages.mjs';
+import { AnthropicMessagesProvider, resolveLatestAnthropicSonnet, resolveLatestAnthropicOpus } from './provider/anthropic-messages.mjs';
 import { CreditFallbackProvider } from './provider/fallback.mjs';
 import { PathPolicy } from './policy.mjs';
 import { LocalTools, availableToolDefinitions } from './agent/tools.mjs';
@@ -57,6 +57,8 @@ import { loadPricing } from './pricing-registry.mjs';
 import {
   assertModelAllowed,
   OFFLOAD_ANTHROPIC_LATEST_SONNET,
+  OFFLOAD_ANTHROPIC_LATEST_OPUS,
+  isDeepSeekEndpoint,
   OFFLOAD_DEEPSEEK_LATEST_FLASH,
   OFFLOAD_DEEPSEEK_MODEL,
 } from './model-policy.mjs';
@@ -209,6 +211,8 @@ function safeDiscoveryStatusSuffix(error) {
 }
 
 async function resolveProfileModel(profile, provider, key, { fetchImpl, signal } = {}) {
+  if (profile.model === OFFLOAD_ANTHROPIC_LATEST_OPUS)
+    return resolveLatestAnthropicOpus({ baseUrl: provider.baseUrl, apiKey: key, fetchImpl, signal });
   if (profile.model === OFFLOAD_ANTHROPIC_LATEST_SONNET)
     return resolveLatestAnthropicSonnet({ baseUrl: provider.baseUrl, apiKey: key, fetchImpl, signal });
   if (profile.model === OFFLOAD_DEEPSEEK_LATEST_FLASH)
@@ -226,7 +230,11 @@ function providerInstance(providerConfig, key, model, { fetchImpl, reasoningEffo
     ...(fetchImpl ? { fetchImpl } : {}),
   };
   if (providerConfig.type === 'anthropic-messages') return new AnthropicMessagesProvider(options);
-  if (providerConfig.type === 'openai-chat') return new OpenAIChatProvider(options);
+  if (providerConfig.type === 'openai-chat')
+    return new OpenAIChatProvider({
+      ...options,
+      ...(isDeepSeekEndpoint(providerConfig.baseUrl) ? { thinking: { type: 'enabled' }, reasoningEffort: reasoningEffort ?? 'high' } : {}),
+    });
   throw new Error(`unsupported provider type: ${providerConfig?.type || 'missing'}`);
 }
 /** Snapshot through a temporary index; neither user index nor history changes. */
@@ -597,7 +605,10 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
     try {
       return withSkillHealth(
         (config.runtimeHealth || healthIdentity)(),
-        (config.skillHealth || installedSkillHealth)({ expectedHash: runtimeIdentity().skillHash }),
+        (config.skillHealth || installedSkillHealth)({
+          expectedHash: runtimeIdentity().skillHash,
+          expectedOpusHash: runtimeIdentity().opusSkillHash,
+        }),
       );
     } catch {
       // Whether a client's skill copy is current must never fail health.
@@ -946,11 +957,16 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           throw new Error(`${label} worker key is unavailable; run offload doctor or configure keyRef`);
         }
       };
-      const primaryNeedsDiscovery = [OFFLOAD_ANTHROPIC_LATEST_SONNET, OFFLOAD_DEEPSEEK_LATEST_FLASH].includes(profile.model);
+      const primaryNeedsDiscovery = [
+        OFFLOAD_ANTHROPIC_LATEST_SONNET,
+        OFFLOAD_ANTHROPIC_LATEST_OPUS,
+        OFFLOAD_DEEPSEEK_LATEST_FLASH,
+      ].includes(profile.model);
       // A fallback can be selected only after the primary reports the exact
       // credit-exhausted refusal, so verify its key before accepting a job.
       const fallbackNeedsDiscovery =
-        !!fallbackProfile && [OFFLOAD_ANTHROPIC_LATEST_SONNET, OFFLOAD_DEEPSEEK_LATEST_FLASH].includes(fallbackProfile.model);
+        !!fallbackProfile &&
+        [OFFLOAD_ANTHROPIC_LATEST_SONNET, OFFLOAD_ANTHROPIC_LATEST_OPUS, OFFLOAD_DEEPSEEK_LATEST_FLASH].includes(fallbackProfile.model);
       const primaryKey = state.integrity || primaryNeedsDiscovery ? resolveStartCredential(providerConfig, 'primary') : undefined;
       const fallbackKey = fallbackProfile ? resolveStartCredential(fallbackProviderConfig, 'fallback') : undefined;
       for (const credential of [primaryKey, fallbackKey]) {
@@ -1327,7 +1343,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       }
     },
     /**
-     * The evidence digest and prompt skeleton for an `/offload` run (see
+     * The evidence digest and prompt skeleton for an Offload command run (see
      * retrospective.mjs): the jobs of this server session, the named
      * `jobIds`, or the newest `last` of the store. Read-only apart from one
      * bounded local history line, which `persist: false` skips.

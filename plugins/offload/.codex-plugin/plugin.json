@@ -1,7 +1,7 @@
 {
   "name": "offload",
-  "version": "0.1.0+codex.0cf772e41a6a3476",
-  "description": "Runs only after an explicit /offload slash-command invocation; ordinary prose does not invoke it.",
+  "version": "0.1.0+codex.c9c976b99a660e51",
+  "description": "Runs only after an explicit /offload_sonnet or /offload_opus slash-command invocation; ordinary prose does not invoke it.",
   "author": {
     "name": "Offload"
   },
@@ -9,12 +9,12 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Offload",
-    "shortDescription": "Explicit /offload slash command only",
-    "longDescription": "Available only after the user explicitly enters /offload as a slash command; ordinary prose does not invoke it.",
+    "shortDescription": "Explicit /offload_sonnet or /offload_opus slash command only",
+    "longDescription": "Available only after the user explicitly enters /offload_sonnet or /offload_opus as a slash command; ordinary prose does not invoke it.",
     "developerName": "Offload",
     "category": "Productivity",
     "capabilities": ["Interactive"],
-    "defaultPrompt": ["/offload "],
+    "defaultPrompt": ["/offload_sonnet ", "/offload_opus "],
     "brandColor": "#2563EB"
   }
 }

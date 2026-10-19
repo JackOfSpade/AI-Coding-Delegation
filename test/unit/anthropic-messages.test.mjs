@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AnthropicMessagesProvider, resolveLatestAnthropicSonnet } from '../../src/provider/anthropic-messages.mjs';
+import {
+  AnthropicMessagesProvider,
+  resolveLatestAnthropicSonnet,
+  resolveLatestAnthropicOpus,
+} from '../../src/provider/anthropic-messages.mjs';
 import { ProviderError } from '../../src/provider/openai-chat.mjs';
 import { CreditFallbackProvider } from '../../src/provider/fallback.mjs';
 import { resolveLatestDeepSeekFlash } from '../../src/core.mjs';
@@ -43,6 +47,7 @@ test('Anthropic Messages provider translates the local transcript and normalizes
   assert.equal(request.redirect, 'error');
   assert.equal(request.headers['x-api-key'], 'test-key');
   assert.equal(request.body.model, 'claude-sonnet-5-5');
+  assert.deepEqual(request.body.thinking, { type: 'adaptive' });
   assert.equal(request.body.max_tokens, 16_384);
   assert.deepEqual(request.body.system, [{ type: 'text', text: 'local-only worker' }]);
   assert.deepEqual(request.body.messages, [{ role: 'user', content: 'say hello' }]);
@@ -297,4 +302,29 @@ test('DeepSeek discovery snapshots only the provider-maintained Flash route', as
       }),
     /No provider-maintained DeepSeek Flash model/,
   );
+});
+
+test('Opus discovery filters by line and uses provider release order across pages', async () => {
+  const urls = [];
+  const model = await resolveLatestAnthropicOpus({
+    baseUrl: 'https://api.anthropic.com',
+    apiKey: 'test-key',
+    fetchImpl: async (url) => {
+      urls.push(url);
+      return new Response(
+        JSON.stringify(
+          urls.length === 1
+            ? { data: [{ id: 'claude-sonnet-5-5', line: 'sonnet' }], has_more: true, last_id: 'claude-sonnet-5-5' }
+            : {
+                data: [
+                  { id: 'claude-opus-5-5', line: 'opus' },
+                  { id: 'claude-opus-4-8', line: 'opus' },
+                ],
+              },
+        ),
+      );
+    },
+  });
+  assert.equal(model, 'claude-opus-5-5');
+  assert.equal(new URL(urls[1]).searchParams.get('after_id'), 'claude-sonnet-5-5');
 });

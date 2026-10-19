@@ -546,7 +546,8 @@ async function installOwnedFile(path, content, uninstall, backups, manifest, bac
   return false;
 }
 const pluginName = 'offload';
-const pluginFiles = ['plugin.json', '.codex-plugin/plugin.json', 'skills/offload/SKILL.md'];
+const pluginFiles = ['plugin.json', '.codex-plugin/plugin.json', 'skills/offload_sonnet/SKILL.md', 'skills/offload_opus/SKILL.md'];
+const legacyPluginSkill = 'skills/offload/SKILL.md';
 const pluginEntry = () => ({
   name: pluginName,
   source: { source: 'local', path: './plugins/offload' },
@@ -567,7 +568,7 @@ function validPluginState(state, home) {
   if (!safeRecord(state)) return false;
   const source = join(home, 'plugins', pluginName);
   if (state.source !== source || !safeRecord(state.files)) return false;
-  const allowed = new Set(pluginFiles.map((path) => join(source, path)));
+  const allowed = new Set([...pluginFiles, legacyPluginSkill].map((path) => join(source, path)));
   if (Object.entries(state.files).some(([path, hash]) => !allowed.has(path) || typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash)))
     return false;
   if (state.marketplace !== undefined && !validPluginCatalog(state.marketplace, home)) return false;
@@ -989,7 +990,7 @@ async function manageClaudeMcp({ root, home, uninstall, env, platform, commandEx
   );
 }
 async function safeOwnedPluginFile(path, source) {
-  const expected = new Set(pluginFiles.map((file) => join(source, file)));
+  const expected = new Set([...pluginFiles, legacyPluginSkill].map((file) => join(source, file)));
   if (!expected.has(path)) return false;
   try {
     const parent = await lstat(dirname(source));
@@ -1017,7 +1018,7 @@ async function safeOwnedPluginFile(path, source) {
   }
 }
 async function safePluginDestination(path, source) {
-  const expected = new Set(pluginFiles.map((file) => join(source, file)));
+  const expected = new Set([...pluginFiles, legacyPluginSkill].map((file) => join(source, file)));
   if (!expected.has(path)) return false;
   try {
     const parent = await lstat(dirname(source));
@@ -1057,6 +1058,8 @@ async function removePluginSource(state) {
   if (!Object.keys(state.files || {}).length && state.source) {
     for (const directory of [
       join(state.source, 'skills', 'offload'),
+      join(state.source, 'skills', 'offload_sonnet'),
+      join(state.source, 'skills', 'offload_opus'),
       join(state.source, 'skills'),
       join(state.source, '.codex-plugin'),
       state.source,
@@ -1089,7 +1092,22 @@ async function manageCodexPlugin({
   // old adjacent skill backup.
   const source = join(home, 'plugins', pluginName);
   if (state && state.source !== source) throw new Error('refusing invalid offload Codex plugin installer state');
-  if (state) await migrateLegacySkillBackup(join(source, 'skills', 'offload', 'SKILL.md'), skillBackupDirectory, backups, home);
+  if (state) {
+    for (const name of ['offload', 'offload_sonnet', 'offload_opus'])
+      await migrateLegacySkillBackup(join(source, 'skills', name, 'SKILL.md'), skillBackupDirectory, backups, home);
+  }
+  if (state) {
+    const legacy = join(source, legacyPluginSkill);
+    if (state.files[legacy] && (await safeOwnedPluginFile(legacy, source))) {
+      const current = await read(legacy);
+      if (state.files[legacy] === digest(current)) {
+        await preserveSkillBackup(legacy, skillBackupDirectory, current, backups, home);
+        await rm(legacy);
+        delete state.files[legacy];
+        changed.push(legacy);
+      }
+    }
+  }
   const marketplacePath = join(home, '.agents', 'plugins', 'marketplace.json');
   if (uninstall) {
     if (!state) return { active: false, retained: false };
@@ -1296,7 +1314,7 @@ async function manageCodexPlugin({
       sourceState.files[target] = digest(desired);
       changed.push(target);
     } else if (sourceState.files[target] === digest(current) && current !== desired) {
-      if (relativePath === 'skills/offload/SKILL.md') await preserveSkillBackup(target, skillBackupDirectory, current, backups, home);
+      if (relativePath.endsWith('/SKILL.md')) await preserveSkillBackup(target, skillBackupDirectory, current, backups, home);
       else {
         const backup = `${target}.offload.bak`;
         if (!(await exists(backup))) {
@@ -1679,7 +1697,7 @@ export async function install({
   // a partial or moved package checkout.
   const artifacts = uninstall ? [] : [join(root, 'bin', 'offload.mjs'), join(root, 'install.mjs'), join(root, 'config.example.json')];
   if (!uninstall && (selected.has('codex') || selected.has('claude')))
-    artifacts.push(join(root, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md'));
+    artifacts.push(...['offload_sonnet', 'offload_opus'].map((name) => join(root, 'plugins', 'offload', 'skills', name, 'SKILL.md')));
   if (!uninstall && selected.has('codex'))
     artifacts.push(join(root, 'plugins', 'offload', 'plugin.json'), join(root, 'plugins', 'offload', '.codex-plugin', 'plugin.json'));
   if (!uninstall && selected.has('claude')) artifacts.push(join(root, 'templates', 'CLAUDE.md.block.md'));
@@ -1808,8 +1826,13 @@ export async function install({
   const nativeSkill =
     selected.has('codex') &&
     !uninstall &&
-    (await exists(clientPaths.codexSkill)) &&
-    manifest.files[clientPaths.codexSkill] !== digest(await read(clientPaths.codexSkill));
+    (
+      await Promise.all(
+        [clientPaths.codexSkill, clientPaths.codexOpusSkill].map(
+          async (file) => (await exists(file)) && manifest.files[file] !== digest(await read(file)),
+        ),
+      )
+    ).some(Boolean);
   const plugin = selected.has('codex')
     ? await manageCodexPlugin({
         root,
@@ -1826,42 +1849,23 @@ export async function install({
         nativeSkillBlocksPlugin: nativeSkill,
       })
     : { active: false };
-  const skill = !uninstall ? artifactContents.get(join(root, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md')) : '';
-  // The canonical skill works for both native coding clients. Legacy Claude
-  // commands lose to same-named skills, so migration removes only our exact file.
-  if (selected.has('claude'))
-    await migrateLegacySkillBackup(clientPaths.claudeSkill, clientPaths.claudeSkillBackupDir, backups, clientPaths.claudeDir);
-  if (selected.has('codex'))
-    await migrateLegacySkillBackup(clientPaths.codexSkill, clientPaths.codexSkillBackupDir, backups, clientPaths.codexDir);
-  if (
-    selected.has('claude') &&
-    (await installOwnedFile(
-      clientPaths.claudeSkill,
-      skill,
-      uninstall,
-      backups,
-      manifest,
-      clientPaths.claudeSkillBackupDir,
-      clientPaths.claudeDir,
-    ))
-  )
-    changed.push(clientPaths.claudeSkill);
-  // A successfully active desktop plugin supplies the same skill. Remove only
-  // a prior installer-owned native duplicate; user-owned native skills stay.
-  if (
-    selected.has('codex') &&
-    !plugin.blockNative &&
-    (await installOwnedFile(
-      clientPaths.codexSkill,
-      skill,
-      uninstall || plugin.active,
-      backups,
-      manifest,
-      clientPaths.codexSkillBackupDir,
-      clientPaths.codexDir,
-    ))
-  )
-    changed.push(clientPaths.codexSkill);
+  // Retire only installer-owned copies of the removed command.
+  for (const client of ['claude', 'codex']) {
+    if (!selected.has(client)) continue;
+    const directory = clientPaths[`${client}Dir`];
+    const backup = clientPaths[`${client}SkillBackupDir`];
+    const legacy = join(directory, 'skills', 'offload', 'SKILL.md');
+    await migrateLegacySkillBackup(legacy, backup, backups, directory);
+    if (await installOwnedFile(legacy, '', true, backups, manifest, backup, directory)) changed.push(legacy);
+    for (const name of ['offload_sonnet', 'offload_opus']) {
+      const target = join(directory, 'skills', name, 'SKILL.md');
+      const skill = uninstall ? '' : artifactContents.get(join(root, 'plugins', 'offload', 'skills', name, 'SKILL.md'));
+      await migrateLegacySkillBackup(target, backup, backups, directory);
+      if (client === 'codex' && plugin.blockNative) continue;
+      if (await installOwnedFile(target, skill, uninstall || (client === 'codex' && plugin.active), backups, manifest, backup, directory))
+        changed.push(target);
+    }
+  }
   if (selected.has('claude')) {
     const legacy = await read(clientPaths.claudeLegacyCommand);
     if (legacy && manifest.files[clientPaths.claudeLegacyCommand] === digest(legacy)) {

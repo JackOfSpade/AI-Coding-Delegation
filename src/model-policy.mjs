@@ -1,7 +1,7 @@
 /**
  * Hard routing policy for delegated workers.
  *
- * Offload runs the provider-maintained Flash and Sonnet routes. A DeepSeek Pro
+ * Offload runs the provider-maintained Flash, Sonnet and Opus routes. A DeepSeek Pro
  * model must not be reachable through configuration, a persisted execution
  * snapshot, a per-request model override, or a model-name spelling variant.
  * Every layer that can choose a model calls `modelPolicyViolation`, so a
@@ -12,8 +12,9 @@
 export const OFFLOAD_DEEPSEEK_MODEL = 'deepseek-flash';
 export const OFFLOAD_DEEPSEEK_LATEST_FLASH = 'latest-flash';
 export const OFFLOAD_ANTHROPIC_LATEST_SONNET = 'latest-sonnet';
+export const OFFLOAD_ANTHROPIC_LATEST_OPUS = 'latest-opus';
 
-export const isAnthropicSonnetModel = (model) => typeof model === 'string' && /^claude-sonnet-[0-9]+-[0-9]+(?:-[0-9]+)?$/.test(model);
+export const isAnthropicModel = (model) => typeof model === 'string' && /^claude-(?:sonnet|opus)-[0-9]+-[0-9]+(?:-[0-9]+)?$/.test(model);
 
 const modelTokens = (model) =>
   String(model)
@@ -49,8 +50,8 @@ export function isDeepSeekEndpoint(baseUrl) {
 export function modelPolicyViolation({ baseUrl, model, type, allowSelector = false } = {}) {
   if (typeof model !== 'string' || model.length === 0) return 'a model name is required';
   if (type === 'anthropic-messages') {
-    if (allowSelector && model === OFFLOAD_ANTHROPIC_LATEST_SONNET) return undefined;
-    return isAnthropicSonnetModel(model) ? undefined : 'only a Claude Sonnet model is permitted on an Anthropic Messages endpoint';
+    if (allowSelector && [OFFLOAD_ANTHROPIC_LATEST_SONNET, OFFLOAD_ANTHROPIC_LATEST_OPUS].includes(model)) return undefined;
+    return isAnthropicModel(model) ? undefined : 'only a Claude Sonnet or Opus model is permitted on an Anthropic Messages endpoint';
   }
   if (type === 'openai-chat' && isDeepSeekEndpoint(baseUrl) && allowSelector && model === OFFLOAD_DEEPSEEK_LATEST_FLASH) return undefined;
   if (isProModel(model))

@@ -7,9 +7,9 @@ import { redactText } from './redact.mjs';
 import { readRegularFile } from './regular-file.mjs';
 import { runtimeIdentity } from './identity.mjs';
 import { validateJobRequest } from './job-manager.mjs';
-const SKILL_NAME = 'offload';
-const SKILL_URI = 'skill://offload/offload/SKILL.md';
-const SKILL_ROOT = fileURLToPath(new URL('../plugins/offload/skills/offload/', import.meta.url));
+const SKILL_NAMES = ['offload_sonnet', 'offload_opus'];
+const skillUri = (name) => `skill://offload/${name}/SKILL.md`;
+const SKILL_ROOT = fileURLToPath(new URL('../plugins/offload/skills/', import.meta.url));
 // These keep the static catalog within OpenAI's import caps as well as SEP-2640's
 // broader 512-resource/16 MiB interoperability limits.
 const MAX_SKILL_FILES = 100,
@@ -17,7 +17,7 @@ const MAX_SKILL_FILES = 100,
   MAX_SKILL_MD_BYTES = 262_144,
   MAX_SKILL_TOTAL_BYTES = 5_242_880;
 const SERVER_INSTRUCTIONS =
-  'Offload skill: a conversational client may call offload_start only for an actual `/offload <task>` slash command. Prose, mentions, quotes, or negations of Offload, delegation, DeepSeek, providers, or models never authorize it. Read skill://offload/offload/SKILL.md. /offload: no native Claude subagents; profile "promo" resolves latest supported Sonnet and falls back to Flash only on credit exhaustion. On policy-only hosts workers edit permitted private-worktree files, no shell. Supply repoPath if ambiguous.';
+  'Offload skill: a conversational client may call offload_start only for an actual `/offload_sonnet <task>` or `/offload_opus <task>` slash command. Prose, mentions, quotes, or negations of Offload, delegation, DeepSeek, providers, or models never authorize it. Read the command’s skill://offload/offload_sonnet/SKILL.md or skill://offload/offload_opus/SKILL.md. /offload_sonnet and /offload_opus: no native Claude subagents; profiles "sonnet" and "opus" resolve the respective latest Sonnet or Opus with adaptive thinking and fall back to Flash only on credit exhaustion. On policy-only hosts workers edit permitted private-worktree files, no shell. Supply repoPath if ambiguous.';
 const SKILLS_EXTENSION = { 'io.modelcontextprotocol/skills': {} };
 const startProps = {
   task: { type: 'string', minLength: 1, maxLength: 32_000 },
@@ -85,12 +85,12 @@ const startProps = {
     minLength: 1,
     maxLength: 128,
     description:
-      'Explicit configured profile. Default "promo" resolves the newest supported Anthropic Sonnet model at job start and falls back to the provider-maintained DeepSeek Flash route only after an explicit credit-exhausted refusal. An explicitly selected configured profile overrides. Never infer a model from task prose.',
+      'Explicit configured profile. Default "sonnet" resolves the newest supported Anthropic Sonnet model at job start and falls back to the provider-maintained DeepSeek Flash route only after an explicit credit-exhausted refusal. Use "sonnet" for /offload_sonnet and "opus" for /offload_opus. Both use adaptive thinking and Flash fallback with thinking enabled and high reasoning effort. Never infer a model from task prose.',
   },
   effort: {
     enum: ['normal', 'high'],
     description:
-      'Optional configuration override. Omit it to retain the selected profile\'s configured effort, including default profile "promo".',
+      'Optional configuration override. Omit it to retain the selected profile\'s configured effort, including default profile "sonnet".',
   },
   maxRepairRounds: { type: 'integer', minimum: 0, maximum: 4 },
   budget: {
@@ -166,7 +166,7 @@ const requiresClaudeInteraction = process.env.OFFLOAD_MCP_APPROVAL_MODE !== 'app
 const TOOLS = [
   [
     'offload_start',
-    'A conversational client may use this tool only to fulfill an actual `/offload <task>` slash command; do not infer authorization from ordinary prose or mentions, quotes, or negations of Offload, delegation, DeepSeek, providers, or models. Start a bounded write job or explicit read-only report/analysis job; both spend provider budget. Reports never integrate and return reportResult text/JSON. This call refuses a stale installed skill or server runtime before creating a job: run `node install.mjs` from the Offload checkout and restart the MCP client when health says restartRequired. Default profile "promo" resolves a current Sonnet model for the local job and falls back to Flash only when the provider explicitly reports exhausted promotional credit; an explicitly selected supported profile overrides. Never use a native Claude subagent. Set budget.maxUsd as the ceiling and omit budget.maxTurns: the server sizes the turn cap from relevantPaths/ownedPaths file sizes and the response echoes budgetSizing (effective maxTurns, source, recommendation, warnings).',
+    'A conversational client may use this tool only to fulfill an actual `/offload_sonnet <task>` or `/offload_opus <task>` slash command; do not infer authorization from ordinary prose or mentions, quotes, or negations of Offload, delegation, DeepSeek, providers, or models. Start a bounded write job or explicit read-only report/analysis job; both spend provider budget. Reports never integrate and return reportResult text/JSON. This call refuses a stale installed skill or server runtime before creating a job: run `node install.mjs` from the Offload checkout and restart the MCP client when health says restartRequired. Command-selected profiles "sonnet" and "opus" resolve the respective latest Sonnet or Opus with adaptive thinking and fall back to Flash only when the provider explicitly reports exhausted promotional credit; Flash uses thinking enabled with high reasoning effort. The old /offload command is removed. Never use a native Claude subagent. Set budget.maxUsd as the ceiling and omit budget.maxTurns: the server sizes the turn cap from relevantPaths/ownedPaths file sizes and the response echoes budgetSizing (effective maxTurns, source, recommendation, warnings).',
     startProps,
     ['task'],
   ],
@@ -303,7 +303,7 @@ function skillFailure(message) {
   error.code = 'E_SKILL_ARTIFACT';
   return error;
 }
-export function parseSkillFrontmatter(text) {
+export function parseSkillFrontmatter(text, expectedName) {
   const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   if (!match) throw skillFailure('SKILL.md must begin with JSON-compatible YAML frontmatter');
   let frontmatter;
@@ -314,8 +314,9 @@ export function parseSkillFrontmatter(text) {
   }
   if (frontmatter === null || Array.isArray(frontmatter) || Object.getPrototypeOf(frontmatter) !== Object.prototype)
     throw skillFailure('SKILL.md frontmatter must be a JSON object');
-  if (frontmatter.name !== SKILL_NAME || typeof frontmatter.description !== 'string' || !frontmatter.description)
+  if (!SKILL_NAMES.includes(frontmatter.name) || typeof frontmatter.description !== 'string' || !frontmatter.description)
     throw skillFailure('SKILL.md must define the canonical name and description');
+  if (expectedName && frontmatter.name !== expectedName) throw skillFailure('SKILL.md name differs from its command');
   return frontmatter;
 }
 async function assertSkillDirectories(directories) {
@@ -361,7 +362,8 @@ async function readSkillDirectory(path, label) {
   if (!after.isDirectory() || after.isSymbolicLink() || !sameDirectory(before, after)) throw skillFailure(`${label} changed while reading`);
   return { entries, identity: after };
 }
-async function loadSkillCatalog() {
+async function loadSkillCatalogFor(name) {
+  const SKILL_URI = skillUri(name);
   const files = [];
   const walk = async (directory, parts = [], ancestors = []) => {
     const listed = await readSkillDirectory(directory, 'skill directory');
@@ -377,7 +379,7 @@ async function loadSkillCatalog() {
       else throw skillFailure(`skill resource ${relative} must be a regular file`);
     }
   };
-  await walk(SKILL_ROOT);
+  await walk(join(SKILL_ROOT, name));
   if (!files.length || files.length > MAX_SKILL_FILES) throw skillFailure('skill resource count is invalid');
   const canonical = files.find((file) => file.relative === 'SKILL.md');
   if (!canonical) throw skillFailure('SKILL.md is missing');
@@ -392,7 +394,7 @@ async function loadSkillCatalog() {
     );
     total += content.size;
     if (total > MAX_SKILL_TOTAL_BYTES) throw skillFailure('skill resources exceed their total size limit');
-    const uri = file === canonical ? SKILL_URI : `skill://offload/offload/${file.relative.split('/').map(encodeURIComponent).join('/')}`;
+    const uri = file === canonical ? SKILL_URI : `skill://offload/${name}/${file.relative.split('/').map(encodeURIComponent).join('/')}`;
     loaded.push({
       ...file,
       uri,
@@ -404,10 +406,14 @@ async function loadSkillCatalog() {
   const canonicalResource = loaded.find((file) => file.uri === SKILL_URI);
   const entry = {
     uri: SKILL_URI,
-    frontmatter: parseSkillFrontmatter(canonicalResource.text),
+    frontmatter: parseSkillFrontmatter(canonicalResource.text, name),
     resources: loaded.map((file) => ({ uri: file.uri, digest: file.digest, size: file.size })),
   };
   return { entry, resources: new Map(loaded.map((file) => [file.uri, file])) };
+}
+async function loadSkillCatalog() {
+  const catalogs = await Promise.all(SKILL_NAMES.map(loadSkillCatalogFor));
+  return { entries: catalogs.map((catalog) => catalog.entry), resources: new Map(catalogs.flatMap((catalog) => [...catalog.resources])) };
 }
 export function createMcpServer(
   core,
@@ -838,7 +844,7 @@ export function createMcpServer(
       try {
         return response(request.id, {
           resultType: 'complete',
-          skills: [(await skills()).entry],
+          skills: (await skills()).entries,
           ...cacheable(request),
           ...(isModern(request) ? modernServerMeta : {}),
         });
@@ -879,10 +885,11 @@ export function createMcpServer(
         return skillProtocolError(request.id, cause);
       }
       if (request.method === 'skills/get') {
-        if (request.params.uri !== SKILL_URI) return error(request.id, -32602, 'skill not found');
+        const entry = catalog.entries.find((candidate) => candidate.uri === request.params.uri);
+        if (!entry) return error(request.id, -32602, 'skill not found');
         return response(request.id, {
           resultType: 'complete',
-          skill: catalog.entry,
+          skill: entry,
           ...cacheable(request),
           ...(isModern(request) ? modernServerMeta : {}),
         });

@@ -23,7 +23,7 @@ async function home(t) {
   return path;
 }
 async function install(path, client, bytes) {
-  const directory = join(path, client === 'claude' ? '.claude' : '.codex', 'skills', 'offload');
+  const directory = join(path, client === 'claude' ? '.claude' : '.codex', 'skills', 'offload_sonnet');
   await mkdir(directory, { recursive: true });
   await writeFile(join(directory, 'SKILL.md'), bytes);
 }
@@ -39,7 +39,7 @@ test('the skill hash is the identity hash of the skill bytes, so an installed co
 test('one installed copy is current, stale, missing or unreadable against an expected hash', async (t) => {
   const path = await home(t);
   await install(path, 'claude', SKILL);
-  const file = join(path, '.claude', 'skills', 'offload', 'SKILL.md');
+  const file = join(path, '.claude', 'skills', 'offload_sonnet', 'SKILL.md');
   assert.deepEqual(skillCopyStatus(file, EXPECTED), { status: 'current', installedHash: EXPECTED });
   await writeFile(file, 'older protocol\n');
   const stale = skillCopyStatus(file, EXPECTED);
@@ -57,8 +57,8 @@ test('one installed copy is current, stale, missing or unreadable against an exp
 test('a symlinked skill copy is unreadable, never trusted as current', { skip: SYMLINK_SKIP }, async (t) => {
   const path = await home(t);
   await writeFile(join(path, 'real.md'), SKILL);
-  await mkdir(join(path, '.claude', 'skills', 'offload'), { recursive: true });
-  await symlink(join(path, 'real.md'), join(path, '.claude', 'skills', 'offload', 'SKILL.md'));
+  await mkdir(join(path, '.claude', 'skills', 'offload_sonnet'), { recursive: true });
+  await symlink(join(path, 'real.md'), join(path, '.claude', 'skills', 'offload_sonnet', 'SKILL.md'));
   const result = health(path);
   assert.equal(result.clients.claude.status, 'unreadable');
   assert.equal(result.stale, false);
@@ -97,8 +97,8 @@ test('health compares every installed client copy and any difference is stale', 
 
 test('health follows CLAUDE_CONFIG_DIR like the installer', async (t) => {
   const path = await home(t);
-  await mkdir(join(path, 'claude-cfg', 'skills', 'offload'), { recursive: true });
-  await writeFile(join(path, 'claude-cfg', 'skills', 'offload', 'SKILL.md'), 'stale\n');
+  await mkdir(join(path, 'claude-cfg', 'skills', 'offload_sonnet'), { recursive: true });
+  await writeFile(join(path, 'claude-cfg', 'skills', 'offload_sonnet', 'SKILL.md'), 'stale\n');
   const result = installedSkillHealth({ expectedHash: EXPECTED, home: path, env: { CLAUDE_CONFIG_DIR: join(path, 'claude-cfg') } });
   assert.equal(result.stale, true);
   assert.equal(health(path).stale, false, 'without the variable the default location holds nothing');
@@ -149,4 +149,22 @@ test('a stale server or installed skill is a hard, actionable start boundary', (
     () => assertStartRuntimeCurrent(staleSkill),
     /OFFLOAD START REFUSED: the installed Offload skill is STALE\. No job was created and no provider budget was spent\. .*node install\.mjs.*restart/i,
   );
+});
+
+test('a stale Opus command blocks starts even when the Sonnet command is current', async (t) => {
+  const directory = await home(t);
+  const paths = [join(directory, '.claude', 'skills', 'offload_sonnet'), join(directory, '.claude', 'skills', 'offload_opus')];
+  for (const path of paths) await mkdir(path, { recursive: true });
+  await writeFile(join(paths[0], 'SKILL.md'), SKILL);
+  await writeFile(join(paths[1], 'SKILL.md'), 'old opus command');
+  const health = installedSkillHealth({
+    expectedHash: EXPECTED,
+    expectedOpusHash: skillHashOf('new opus command'),
+    home: directory,
+    env: {},
+  });
+  assert.equal(health.stale, true);
+  assert.equal(health.clients.claude.status, 'current');
+  assert.equal(health.clients.claudeOpus.status, 'stale');
+  assert.throws(() => assertStartRuntimeCurrent(withSkillHealth({ restartRequired: false }, health)), /STALE/);
 });

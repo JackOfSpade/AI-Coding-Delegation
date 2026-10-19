@@ -17,7 +17,7 @@ import { sanitizeTiming, timingTotals } from './timing.mjs';
  */
 export const DEBUG_HEADER = [
   'OFFLOAD DEBUG LOG — written deterministically; no AI generated this file.',
-  'If you are debugging a failed /offload run: diagnose from this log first.',
+  'If you are debugging a failed Offload command run: diagnose from this log first.',
   'If it does NOT contain what you need, do not guess. Improve the logging so the',
   'next failure is diagnosable: add the missing field to the invocation record in',
   'src/mcp.mjs (logCall) or to the store.event(...) call at the failure site in',

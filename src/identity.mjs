@@ -39,7 +39,7 @@ const hash = (parts) => {
   }
   return `sha256:${digest.digest('hex')}`;
 };
-const SKILL_ENTRY = 'plugins/offload/skills/offload/SKILL.md';
+const SKILL_ENTRY = 'plugins/offload/skills/offload_sonnet/SKILL.md';
 /** The identity hash of one skill file's bytes: what a runtime expects an installed copy to hash to. */
 export const skillHashOf = (bytes) => hash([[SKILL_ENTRY, bytes]]);
 const sameDirectory = (left, right) => left.dev === right.dev && left.ino === right.ino && left.ctimeNs === right.ctimeNs;
@@ -117,9 +117,12 @@ export function runtimeIdentityFor(root = packageRoot) {
   const skillDirectory = checkedDirectory(join(root, 'plugins'));
   const offloadDirectory = checkedDirectory(join(root, 'plugins', 'offload'));
   const skillsDirectory = checkedDirectory(join(root, 'plugins', 'offload', 'skills'));
-  const skillRoot = checkedDirectory(join(root, 'plugins', 'offload', 'skills', 'offload'));
+  const skillRoot = checkedDirectory(join(root, 'plugins', 'offload', 'skills', 'offload_sonnet'));
   const skillDirectories = [...directories, skillDirectory, offloadDirectory, skillsDirectory, skillRoot];
   const skill = boundedRead(join(skillRoot.path, 'SKILL.md'), 'skill', skillDirectories, total);
+  const opusRoot = checkedDirectory(join(skillsDirectory.path, 'offload_opus'));
+  const opusDirectories = [...directories, skillDirectory, offloadDirectory, skillsDirectory, opusRoot];
+  const opus = boundedRead(join(opusRoot.path, 'SKILL.md'), 'opus skill', opusDirectories, total);
   const source = [];
   sourceFiles(join(root, 'src'), directories, source);
   const binDirectory = checkedDirectory(join(root, 'bin'));
@@ -128,16 +131,19 @@ export function runtimeIdentityFor(root = packageRoot) {
     ['package.json', metadata.bytes],
     ['bin/offload.mjs', bin],
     ...source.map((file) => [relative(root, file.path).replaceAll('\\', '/'), boundedRead(file.path, 'source', file.directories, total)]),
-    ['plugins/offload/skills/offload/SKILL.md', skill],
+    ['plugins/offload/skills/offload_sonnet/SKILL.md', skill],
+    ['plugins/offload/skills/offload_opus/SKILL.md', opus],
   ];
   checkDirectories(directories);
   checkDirectories(skillDirectories);
+  checkDirectories(opusDirectories);
   checkDirectories([...directories, binDirectory]);
   return Object.freeze({
     name: 'offload',
     version: metadata.version,
     buildHash: hash(buildParts),
     skillHash: skillHashOf(skill),
+    opusSkillHash: skillHashOf(opus),
     schemaRevision: IDENTITY_SCHEMA_REVISION,
     capabilities: RUNTIME_CAPABILITIES,
   });

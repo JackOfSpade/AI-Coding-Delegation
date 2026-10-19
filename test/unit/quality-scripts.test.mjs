@@ -660,7 +660,7 @@ test('package gate keeps the two plugin manifests semantically aligned and requi
     keywords: ['delegation'],
   };
   const codex = { ...marketplace, skills: './skills/' };
-  const skill = '---\n{"name":"offload","description":"delegate work"}\n---\n\n# Offload\n';
+  const skill = '---\n{"name":"offload_sonnet","description":"delegate work"}\n---\n\n# Offload\n';
   assert.deepEqual(validateOffloadPluginArtifacts(marketplace, codex, skill), []);
   assert.deepEqual(validateOffloadPluginArtifacts(marketplace, { ...codex, version: '1.2.4' }, skill), ['plugin manifest version differs']);
   assert.deepEqual(

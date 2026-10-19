@@ -190,10 +190,10 @@ test('installer is idempotent and removes only managed routing blocks', async ()
   assert.equal(await readFile(claudePath, 'utf8'), afterFirstInstall, 'a repeated install must not accumulate trailing newlines');
   const doc = await readFile(join(home, '.codex', 'AGENTS.md'), 'utf8');
   assert.equal((doc.match(/BEGIN offload/g) || []).length, 1);
-  assert.match(afterFirstInstall, /Use Offload only when the user invokes `\/offload` as a slash command/);
-  assert.match(afterFirstInstall, /configured profile `promo`/);
-  assert.match(afterFirstInstall, /falls back to provider-maintained DeepSeek Flash/);
-  assert.match(afterFirstInstall, /newest supported Sonnet model at job start/);
+  assert.match(afterFirstInstall, /Use Offload only when the user invokes `\/offload_sonnet` or `\/offload_opus` as a slash command/);
+  assert.match(afterFirstInstall, /profile `sonnet`/);
+  assert.match(afterFirstInstall, /fall back to the latest provider-maintained DeepSeek Flash/);
+  assert.match(afterFirstInstall, /latest Sonnet with adaptive thinking/);
   assert.match(afterFirstInstall, /on policy-only hosts they also have no worker shell/);
   assert.match(afterFirstInstall, /edit permitted private-worktree files with file tools/);
   assert.match(
@@ -202,14 +202,14 @@ test('installer is idempotent and removes only managed routing blocks', async ()
   );
   assert.match(afterFirstInstall, /including Sonnet ultracode\/native-agent workflows/);
   assert.match(afterFirstInstall, /A standalone instruction not to use native subagents does not select Offload/);
-  assert.match(afterFirstInstall, /For a `\/offload` command invocation, end every final answer/);
+  assert.match(afterFirstInstall, /For either command invocation, end every final answer/);
   assert.match(
     afterFirstInstall,
-    /A mention, quotation, negation, or discussion of `\/offload`, offload, delegation, DeepSeek, a provider, or a model does not select Offload/,
+    /A mention, quotation, negation, or discussion of `\/offload_sonnet`, offload, delegation, DeepSeek, a provider, or a model does not select Offload/,
   );
   assert.doesNotMatch(afterFirstInstall, /as well as for clearly bounded multi-file implementation/);
-  assert.match(afterFirstInstall, /explicitly selected supported profile name overrides that default/);
-  assert.match(doc, /invokes `\/offload` as a slash command/);
+  assert.match(afterFirstInstall, /old `\/offload` command is removed/);
+  assert.match(doc, /invokes `\/offload_sonnet` or `\/offload_opus` as a slash command/);
   assert.match(doc, /nor do bounded, multi-file, implementation, testing, debugging, Workflow, ultracode, or native-subagent requests/);
   assert.match(doc, /A standalone instruction not to use native subagents does not select Offload/);
   assert.match(doc, /provider or model name never routes work to Offload/);
@@ -222,13 +222,13 @@ test('installer stores a Claude skill recovery copy outside skill discovery', as
   const configHome = join(home, 'config');
   const skills = [['claude', join(home, '.claude')]];
   for (const [, clientHome] of skills) {
-    await mkdir(join(clientHome, 'skills', 'offload'), { recursive: true });
-    await writeFile(join(clientHome, 'skills', 'offload', 'SKILL.md'), `user-owned ${basename(clientHome)} skill\n`);
+    await mkdir(join(clientHome, 'skills', 'offload_sonnet'), { recursive: true });
+    await writeFile(join(clientHome, 'skills', 'offload_sonnet', 'SKILL.md'), `user-owned ${basename(clientHome)} skill\n`);
   }
 
   const first = await install({ root: process.cwd(), home, configHome, clients: ['claude'] });
   for (const [, clientHome] of skills) {
-    const legacy = join(clientHome, 'skills', 'offload', 'SKILL.md.offload.bak');
+    const legacy = join(clientHome, 'skills', 'offload_sonnet', 'SKILL.md.offload.bak');
     const backup = join(clientHome, 'offload-backups', 'SKILL.md.offload.bak');
     assert.equal(await readFile(backup, 'utf8'), `user-owned ${basename(clientHome)} skill\n`);
     await assert.rejects(access(legacy), /ENOENT/);
@@ -241,7 +241,7 @@ test('installer stores a Claude skill recovery copy outside skill discovery', as
 test('installer migrates legacy adjacent skill backups without replacing an existing recovery copy', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-legacy-skill-backup-home-`);
   const configHome = join(home, 'config');
-  const skillDirectory = join(home, '.claude', 'skills', 'offload');
+  const skillDirectory = join(home, '.claude', 'skills', 'offload_sonnet');
   const legacy = join(skillDirectory, 'SKILL.md.offload.bak');
   const backupDirectory = join(home, '.claude', 'offload-backups');
   const preferred = join(backupDirectory, 'SKILL.md.offload.bak');
@@ -302,7 +302,7 @@ test('installer refuses symlinked native skill and backup ancestry without touch
 
     const backupHome = await mkdtemp(`${tmpdir()}/offload-symlinked-backup-home-`);
     try {
-      await mkdir(join(backupHome, '.claude', 'skills', 'offload'), { recursive: true });
+      await mkdir(join(backupHome, '.claude', 'skills', 'offload_sonnet'), { recursive: true });
       await symlink(outsideBackups, join(backupHome, '.claude', 'offload-backups'));
       await writeFile(externalBackup, 'external backup must remain untouched\n');
       await assert.rejects(
@@ -508,8 +508,8 @@ test('installer uses client-specific blocks and installs reversible narrow Claud
     readFile(join(home, '.codex', 'AGENTS.md'), 'utf8'),
     readFile(join(home, '.claude', 'settings.json'), 'utf8'),
   ]);
-  assert.match(claude, /Follow the `offload` skill/);
-  assert.match(codex, /Follow the `offload` skill/);
+  assert.match(claude, /Follow the command’s `offload_sonnet` or `offload_opus` skill/);
+  assert.match(codex, /Follow the command’s `offload_sonnet` or `offload_opus` skill/);
   const parsed = JSON.parse(settings);
   assert.ok(parsed.permissions.allow.includes('mcp__offload__offload_wait'));
   assert.ok(parsed.permissions.allow.includes('mcp__offload__offload_job'));
@@ -856,8 +856,8 @@ test('installer uses relocated Claude and Codex homes consistently with doctor',
   });
   assert.ok(JSON.parse(await readFile(join(claudeDir, '.claude.json'), 'utf8')).mcpServers.offload);
   await assert.rejects(readFile(join(home, '.claude.json')), /ENOENT/);
-  assert.match(await readFile(join(claudeDir, 'skills', 'offload', 'SKILL.md'), 'utf8'), /argument-hint/);
-  assert.match(await readFile(join(codexDir, 'skills', 'offload', 'SKILL.md'), 'utf8'), /argument-hint/);
+  assert.match(await readFile(join(claudeDir, 'skills', 'offload_sonnet', 'SKILL.md'), 'utf8'), /argument-hint/);
+  assert.match(await readFile(join(codexDir, 'skills', 'offload_sonnet', 'SKILL.md'), 'utf8'), /argument-hint/);
   const result = doctor({ root: process.cwd(), home, env });
   assert.equal(result.registration.claude, true);
   assert.equal(result.registration.codex, true);
@@ -1225,7 +1225,7 @@ test('installer does not adopt identical pre-existing native skills or MCP regis
   const home = await mkdtemp(`${tmpdir()}/offload-home-`);
   const configHome = join(home, 'config');
   const root = process.cwd();
-  const skill = await readFile(join(root, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md'), 'utf8');
+  const skill = await readFile(join(root, 'plugins', 'offload', 'skills', 'offload_sonnet', 'SKILL.md'), 'utf8');
   const claude = { type: 'stdio', command: process.execPath, args: [join(root, 'bin', 'offload.mjs'), 'mcp'], env: {} };
   const cursor = { command: process.execPath, args: [join(root, 'bin', 'offload.mjs'), 'mcp'] };
   const codex = [
@@ -1236,21 +1236,21 @@ test('installer does not adopt identical pre-existing native skills or MCP regis
     'startup_timeout_sec = 15',
     'tool_timeout_sec = 60',
   ].join('\n');
-  await mkdir(join(home, '.claude', 'skills', 'offload'), { recursive: true });
+  await mkdir(join(home, '.claude', 'skills', 'offload_sonnet'), { recursive: true });
   await mkdir(join(home, '.codex'), { recursive: true });
   await mkdir(join(home, '.cursor'), { recursive: true });
-  await writeFile(join(home, '.claude', 'skills', 'offload', 'SKILL.md'), skill);
+  await writeFile(join(home, '.claude', 'skills', 'offload_sonnet', 'SKILL.md'), skill);
   await writeFile(join(home, '.claude.json'), JSON.stringify({ mcpServers: { offload: claude } }));
   await writeFile(join(home, '.codex', 'config.toml'), `${codex}\n`);
   await writeFile(join(home, '.cursor', 'mcp.json'), JSON.stringify({ mcpServers: { offload: cursor } }));
   await install({ root, home, configHome, clients: ['claude', 'codex', 'cursor'] });
   const manifest = JSON.parse(await readFile(join(configHome, 'offload', 'installer-state.json'), 'utf8'));
-  assert.equal(manifest.files[join(home, '.claude', 'skills', 'offload', 'SKILL.md')], undefined);
+  assert.equal(manifest.files[join(home, '.claude', 'skills', 'offload_sonnet', 'SKILL.md')], undefined);
   assert.equal(manifest.registrations.claude, undefined);
   assert.equal(manifest.registrations.codex, undefined);
   assert.equal(manifest.registrations.cursor, undefined);
   await install({ root, home, configHome, clients: ['claude', 'codex', 'cursor'], uninstall: true });
-  assert.equal(await readFile(join(home, '.claude', 'skills', 'offload', 'SKILL.md'), 'utf8'), skill);
+  assert.equal(await readFile(join(home, '.claude', 'skills', 'offload_sonnet', 'SKILL.md'), 'utf8'), skill);
   assert.deepEqual(JSON.parse(await readFile(join(home, '.claude.json'), 'utf8')).mcpServers.offload, claude);
   assert.equal(await readFile(join(home, '.codex', 'config.toml'), 'utf8'), `${codex}\n`);
   assert.deepEqual(JSON.parse(await readFile(join(home, '.cursor', 'mcp.json'), 'utf8')).mcpServers.offload, cursor);
@@ -1286,8 +1286,8 @@ test('Codex desktop plugin installs from the personal marketplace without a dupl
   assert.deepEqual(marketplace.plugins.at(-1).source, { source: 'local', path: './plugins/offload' });
   assert.ok(calls.some((call) => call.args.join(' ') === 'plugin add offload@personal --json'));
   assert.match(await readFile(join(codexHome, 'config.toml'), 'utf8'), /mcp_servers\.offload/);
-  await assert.rejects(access(join(codexHome, 'skills', 'offload', 'SKILL.md')), /ENOENT/);
-  assert.match(await readFile(join(home, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md'), 'utf8'), /argument-hint/);
+  await assert.rejects(access(join(codexHome, 'skills', 'offload_sonnet', 'SKILL.md')), /ENOENT/);
+  assert.match(await readFile(join(home, 'plugins', 'offload', 'skills', 'offload_sonnet', 'SKILL.md'), 'utf8'), /argument-hint/);
   assert.equal(calls[0].options.env.HOME, home);
   assert.equal(Object.hasOwn(calls[0].options.env, 'DEEPSEEK_API_KEY'), false);
   await rawInstall({
@@ -1302,7 +1302,7 @@ test('Codex desktop plugin installs from the personal marketplace without a dupl
   });
   assert.ok(calls.some((call) => call.args.join(' ') === 'plugin remove offload@personal --json'));
   assert.doesNotMatch(await readFile(join(codexHome, 'config.toml'), 'utf8'), /mcp_servers\.offload/);
-  await assert.rejects(access(join(home, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md')), /ENOENT/);
+  await assert.rejects(access(join(home, 'plugins', 'offload', 'skills', 'offload_sonnet', 'SKILL.md')), /ENOENT/);
 });
 test('Codex plugin list accepts the current pluginId-based structured response', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-plugin-`);
@@ -1338,7 +1338,7 @@ test('Codex plugin list accepts the current pluginId-based structured response',
     assert.equal(result.plugin.active, true, JSON.stringify(result.plugin));
     assert.equal(result.plugin.preexisting, true, JSON.stringify(result.plugin));
     assert.equal(adds, 0, 'a confirmed installed+enabled plugin must not be re-added');
-    await assert.rejects(access(join(home, '.codex', 'skills', 'offload', 'SKILL.md')), /ENOENT/);
+    await assert.rejects(access(join(home, '.codex', 'skills', 'offload_sonnet', 'SKILL.md')), /ENOENT/);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -1416,7 +1416,12 @@ test('plugin content versions remain canonical when a Windows checkout supplies 
   try {
     for (const path of ['bin', 'plugins', 'templates']) await cp(join(process.cwd(), path), join(product, path), { recursive: true });
     for (const path of ['install.mjs', 'config.example.json']) await cp(join(process.cwd(), path), join(product, path));
-    for (const relativePath of ['plugin.json', '.codex-plugin/plugin.json', 'skills/offload/SKILL.md']) {
+    for (const relativePath of [
+      'plugin.json',
+      '.codex-plugin/plugin.json',
+      'skills/offload_sonnet/SKILL.md',
+      'skills/offload_opus/SKILL.md',
+    ]) {
       const path = join(product, 'plugins', 'offload', relativePath);
       await writeFile(path, (await readFile(path, 'utf8')).replace(/\n/g, '\r\n'));
     }
@@ -1450,7 +1455,8 @@ test('Git pins canonical plugin artifacts to LF for cache-version stability', as
   for (const path of [
     'plugins/offload/plugin.json',
     'plugins/offload/.codex-plugin/plugin.json',
-    'plugins/offload/skills/offload/SKILL.md',
+    'plugins/offload/skills/offload_sonnet/SKILL.md',
+    'plugins/offload/skills/offload_opus/SKILL.md',
   ]) {
     assert.match(attributes, new RegExp(`^${path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} text eol=lf$`, 'm'));
     assert.doesNotMatch(await readFile(join(process.cwd(), path), 'utf8'), /\r\n?/);
@@ -1458,7 +1464,7 @@ test('Git pins canonical plugin artifacts to LF for cache-version stability', as
 });
 test('a user-owned native Codex skill prevents plugin activation', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-plugin-`);
-  const native = join(home, '.codex', 'skills', 'offload', 'SKILL.md');
+  const native = join(home, '.codex', 'skills', 'offload_sonnet', 'SKILL.md');
   await mkdir(dirname(native), { recursive: true });
   await writeFile(native, 'user-native-skill');
   const executable = join(home, 'bin', 'codex');
@@ -1518,11 +1524,13 @@ test('an installer-owned Codex plugin refreshes on its content version and falls
   const cacheVersion = async () => {
     const root = join(product, 'plugins', 'offload');
     const bytes = await Promise.all(
-      ['.codex-plugin/plugin.json', 'plugin.json', 'skills/offload/SKILL.md'].map(async (relativePath) => {
-        let text = await readFile(join(root, relativePath), 'utf8');
-        if (relativePath.endsWith('plugin.json')) text = text.replace(/("version"\s*:\s*)"(?:[^"\\]|\\.)*"/, '$1"<cache-version>"');
-        return `${relativePath}\0${text}\0`;
-      }),
+      ['.codex-plugin/plugin.json', 'plugin.json', 'skills/offload_sonnet/SKILL.md', 'skills/offload_opus/SKILL.md']
+        .sort()
+        .map(async (relativePath) => {
+          let text = await readFile(join(root, relativePath), 'utf8');
+          if (relativePath.endsWith('plugin.json')) text = text.replace(/("version"\s*:\s*)"(?:[^"\\]|\\.)*"/, '$1"<cache-version>"');
+          return `${relativePath}\0${text}\0`;
+        }),
     );
     return `0.1.0+codex.${createHash('sha256').update(bytes.join('')).digest('hex').slice(0, 16)}`;
   };
@@ -1535,7 +1543,7 @@ test('an installer-owned Codex plugin refreshes on its content version and falls
       await writeFile(path, (await readFile(path, 'utf8')).replace(/"version": "[^"]+"/, `"version": "${version}"`));
   };
   const bump = async (marker) => {
-    const skillPath = join(product, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md');
+    const skillPath = join(product, 'plugins', 'offload', 'skills', 'offload_sonnet', 'SKILL.md');
     await writeFile(skillPath, `${await readFile(skillPath, 'utf8')}\n<!-- ${marker} -->\n`);
     await setVersion();
   };
@@ -1550,7 +1558,10 @@ test('an installer-owned Codex plugin refreshes on its content version and falls
   const codexManifest = join(product, 'plugins', 'offload', '.codex-plugin', 'plugin.json');
   await writeFile(
     codexManifest,
-    (await readFile(codexManifest, 'utf8')).replace('"Explicit /offload slash command only"', '"Explicit /offload command only"'),
+    (await readFile(codexManifest, 'utf8')).replace(
+      '"Explicit /offload_sonnet or /offload_opus slash command only"',
+      '"Explicit /offload_sonnet command only"',
+    ),
   );
   await setVersion();
   calls.length = 0;
@@ -1564,7 +1575,7 @@ test('an installer-owned Codex plugin refreshes on its content version and falls
   failAdd = true;
   const failed = await rawInstall(options);
   assert.equal(failed.plugin.active, false, JSON.stringify(failed.plugin));
-  assert.match(await readFile(join(home, '.codex', 'skills', 'offload', 'SKILL.md'), 'utf8'), /argument-hint/);
+  assert.match(await readFile(join(home, '.codex', 'skills', 'offload_sonnet', 'SKILL.md'), 'utf8'), /argument-hint/);
 });
 test('installer-owned activation survives a user-owned identical marketplace entry and preserves it on uninstall', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-plugin-`);
@@ -1602,7 +1613,7 @@ test('installer-owned activation survives a user-owned identical marketplace ent
   await rawInstall(options);
   await rawInstall({ ...options, uninstall: true });
   assert.equal(await readFile(marketplacePath, 'utf8'), original);
-  await assert.rejects(access(join(home, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md')), /ENOENT/);
+  await assert.rejects(access(join(home, 'plugins', 'offload', 'skills', 'offload_sonnet', 'SKILL.md')), /ENOENT/);
 });
 test('indeterminate or manually removed conflicting plugins avoid duplication only while state is ambiguous', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-plugin-`);
@@ -1628,13 +1639,13 @@ test('indeterminate or manually removed conflicting plugins avoid duplication on
     runCommand: runner,
   };
   await rawInstall(options);
-  await writeFile(join(home, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md'), 'user edit');
+  await writeFile(join(home, 'plugins', 'offload', 'skills', 'offload_sonnet', 'SKILL.md'), 'user edit');
   installed = false;
   await rawInstall(options);
-  assert.match(await readFile(join(home, '.codex', 'skills', 'offload', 'SKILL.md'), 'utf8'), /argument-hint/);
+  assert.match(await readFile(join(home, '.codex', 'skills', 'offload_sonnet', 'SKILL.md'), 'utf8'), /argument-hint/);
   malformed = true;
   await rawInstall(options);
-  assert.match(await readFile(join(home, '.codex', 'skills', 'offload', 'SKILL.md'), 'utf8'), /argument-hint/);
+  assert.match(await readFile(join(home, '.codex', 'skills', 'offload_sonnet', 'SKILL.md'), 'utf8'), /argument-hint/);
 });
 test('Codex plugin treats available entries as inactive and leaves ambiguous conflicts without a duplicate skill', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-plugin-`);
@@ -1673,7 +1684,7 @@ test('Codex plugin treats available entries as inactive and leaves ambiguous con
     env: { PATH: '' },
     commandExists: async () => false,
   });
-  await assert.rejects(access(join(conflictHome, '.codex', 'skills', 'offload', 'SKILL.md')), /ENOENT/);
+  await assert.rejects(access(join(conflictHome, '.codex', 'skills', 'offload_sonnet', 'SKILL.md')), /ENOENT/);
   assert.equal(
     await readFile(join(conflictHome, '.agents', 'plugins', 'marketplace.json'), 'utf8'),
     JSON.stringify({ name: 'personal', plugins: [{ name: 'offload', source: { source: 'local', path: './plugins/user-offload' } }] }),
@@ -1700,7 +1711,7 @@ test('active or installer-owned conflicting plugins never receive a duplicate na
     commandExists: async (path) => path === executable,
     runCommand: runner,
   });
-  await assert.rejects(access(join(home, '.codex', 'skills', 'offload', 'SKILL.md')), /ENOENT/);
+  await assert.rejects(access(join(home, '.codex', 'skills', 'offload_sonnet', 'SKILL.md')), /ENOENT/);
   const ownedHome = await mkdtemp(`${tmpdir()}/offload-plugin-`);
   let installed = false;
   const ownedRunner = (_command, args) =>
@@ -1720,9 +1731,9 @@ test('active or installer-owned conflicting plugins never receive a duplicate na
     runCommand: ownedRunner,
   };
   await rawInstall(options);
-  await writeFile(join(ownedHome, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md'), 'user edit');
+  await writeFile(join(ownedHome, 'plugins', 'offload', 'skills', 'offload_sonnet', 'SKILL.md'), 'user edit');
   await rawInstall(options);
-  await assert.rejects(access(join(ownedHome, '.codex', 'skills', 'offload', 'SKILL.md')), /ENOENT/);
+  await assert.rejects(access(join(ownedHome, '.codex', 'skills', 'offload_sonnet', 'SKILL.md')), /ENOENT/);
 });
 test('Codex plugin uses cmd.exe safely on Windows and Cursor never receives a global rule', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-plugin-`);
@@ -1758,7 +1769,7 @@ test('Codex plugin uses cmd.exe safely on Windows and Cursor never receives a gl
 test('tampered Codex plugin state cannot delete arbitrary files during uninstall', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-plugin-`);
   const configHome = join(home, 'config');
-  const victim = join(home, 'elsewhere', 'skills', 'offload', 'SKILL.md.offload.bak');
+  const victim = join(home, 'elsewhere', 'skills', 'offload_sonnet', 'SKILL.md.offload.bak');
   await mkdir(dirname(victim), { recursive: true });
   await writeFile(victim, 'user recovery copy');
   await mkdir(join(configHome, 'offload'), { recursive: true });
@@ -1790,13 +1801,13 @@ test('plugin uninstall does not follow a substituted source symlink', async () =
   const home = await mkdtemp(`${tmpdir()}/offload-plugin-`);
   const source = join(home, 'plugins', 'offload');
   const outside = join(home, 'outside');
-  const victim = join(outside, 'skills', 'offload', 'SKILL.md');
+  const victim = join(outside, 'skills', 'offload_sonnet', 'SKILL.md');
   await mkdir(dirname(victim), { recursive: true });
   await writeFile(victim, 'outside skill');
   await mkdir(dirname(source), { recursive: true });
   await symlink(outside, source);
   const configHome = join(home, 'config');
-  const recorded = join(source, 'skills', 'offload', 'SKILL.md');
+  const recorded = join(source, 'skills', 'offload_sonnet', 'SKILL.md');
   await mkdir(join(configHome, 'offload'), { recursive: true });
   await writeFile(
     join(configHome, 'offload', 'installer-state.json'),
@@ -1854,7 +1865,7 @@ test('uninstall relinquishes ownership after an owned plugin source was manually
     error.code === 'ENOENT' ? undefined : Promise.reject(error),
   );
   assert.equal(manifest?.plugins?.codex, undefined);
-  await assert.rejects(access(join(home, '.codex', 'skills', 'offload', 'SKILL.md')), /ENOENT/);
+  await assert.rejects(access(join(home, '.codex', 'skills', 'offload_sonnet', 'SKILL.md')), /ENOENT/);
 });
 test('plugin install refuses a nested source symlink before writing an artifact', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-plugin-`);
@@ -1894,7 +1905,7 @@ test('a disabled installed plugin entry keeps the native fallback', async () => 
     runCommand: runner,
   });
   assert.equal(adds, 0);
-  assert.match(await readFile(join(home, '.codex', 'skills', 'offload', 'SKILL.md'), 'utf8'), /argument-hint/);
+  assert.match(await readFile(join(home, '.codex', 'skills', 'offload_sonnet', 'SKILL.md'), 'utf8'), /argument-hint/);
 });
 test('Codex falls back only when the installed CLI positively lacks plugin commands', async () => {
   const unsupportedHome = await mkdtemp(`${tmpdir()}/offload-plugin-`);
@@ -1915,7 +1926,7 @@ test('Codex falls back only when the installed CLI positively lacks plugin comma
     commandExists: async (path) => path === executable,
     runCommand: unsupported,
   });
-  assert.match(await readFile(join(unsupportedHome, '.codex', 'skills', 'offload', 'SKILL.md'), 'utf8'), /argument-hint/);
+  assert.match(await readFile(join(unsupportedHome, '.codex', 'skills', 'offload_sonnet', 'SKILL.md'), 'utf8'), /argument-hint/);
   assert.equal(
     calls.some((call) => call.startsWith('plugin add ')),
     false,
@@ -1938,7 +1949,7 @@ test('Codex falls back only when the installed CLI positively lacks plugin comma
     commandExists: async (path) => path === executable,
     runCommand: ambiguous,
   });
-  await assert.rejects(access(join(ambiguousHome, '.codex', 'skills', 'offload', 'SKILL.md')), /ENOENT/);
+  await assert.rejects(access(join(ambiguousHome, '.codex', 'skills', 'offload_sonnet', 'SKILL.md')), /ENOENT/);
   assert.equal(
     ambiguousCalls.some((call) => call.startsWith('plugin add ')),
     false,
@@ -1960,7 +1971,7 @@ test('Codex preserves an invalid marketplace rather than treating malformed entr
   });
   assert.equal(await readFile(marketplacePath, 'utf8'), original);
   await assert.rejects(access(join(home, 'plugins', 'offload', 'plugin.json')), /ENOENT/);
-  await assert.rejects(access(join(home, '.codex', 'skills', 'offload', 'SKILL.md')), /ENOENT/);
+  await assert.rejects(access(join(home, '.codex', 'skills', 'offload_sonnet', 'SKILL.md')), /ENOENT/);
 });
 test('Claude migrates its owned startup health hook to resume and fork without removing a user hook', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-home-`);
@@ -2017,8 +2028,8 @@ test('Claude migrates its owned startup health hook to resume and fork without r
 test('doctor hook banner names a stale skill and a foreign hook root with the fix', async () => {
   const home = await mkdtemp(join(tmpdir(), 'offload-banner-home-'));
   const claudeDir = join(home, '.claude');
-  await mkdir(join(claudeDir, 'skills', 'offload'), { recursive: true });
-  await writeFile(join(claudeDir, 'skills', 'offload', 'SKILL.md'), 'older skill\n');
+  await mkdir(join(claudeDir, 'skills', 'offload_sonnet'), { recursive: true });
+  await writeFile(join(claudeDir, 'skills', 'offload_sonnet', 'SKILL.md'), 'older skill\n');
   await writeFile(
     join(claudeDir, 'settings.json'),
     JSON.stringify({
@@ -2038,4 +2049,39 @@ test('doctor hook banner names a stale skill and a foreign hook root with the fi
   assert.match(result.stdout, /installed claude skill is STALE: run node install\.mjs from .* then restart/);
   assert.match(result.stdout, /another offload hook root is registered: \/old\/offload\/install\.mjs/);
   assert.match(result.stdout, / · restart the MCP client after updates\n$/);
+});
+
+test('installer migrates the owned legacy command to both commands and preserves user edits', async (t) => {
+  const home = await mkdtemp(`${tmpdir()}/offload-two-command-migration-`);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const options = {
+    root: process.cwd(),
+    home,
+    configHome: join(home, 'config'),
+    clients: ['claude', 'codex'],
+    skipKey: true,
+    env: { PATH: '' },
+  };
+  await install(options);
+  const manifestPath = join(home, 'config', 'offload', 'installer-state.json');
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  const legacy = join(home, '.claude', 'skills', 'offload', 'SKILL.md');
+  const edited = join(home, '.codex', 'skills', 'offload', 'SKILL.md');
+  for (const file of [legacy, edited]) {
+    await mkdir(dirname(file), { recursive: true });
+    await writeFile(file, 'old managed command');
+    manifest.files[file] = createHash('sha256').update('old managed command').digest('hex');
+  }
+  await writeFile(edited, 'user edit');
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  await install(options);
+  await assert.rejects(access(legacy), /ENOENT/);
+  assert.equal(await readFile(edited, 'utf8'), 'user edit');
+  for (const client of ['.claude', '.codex'])
+    for (const name of ['offload_sonnet', 'offload_opus'])
+      assert.match(await readFile(join(home, client, 'skills', name, 'SKILL.md'), 'utf8'), new RegExp(`"name": "${name}"`));
+  assert.equal((await install(options)).changed.length, 0);
+  await install({ ...options, uninstall: true });
+  for (const name of ['offload_sonnet', 'offload_opus'])
+    await assert.rejects(access(join(home, '.claude', 'skills', name, 'SKILL.md')), /ENOENT/);
 });

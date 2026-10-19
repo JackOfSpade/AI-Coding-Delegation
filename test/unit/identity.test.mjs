@@ -41,7 +41,7 @@ test('runtime identity rejects a final symlink and oversized package artifact', 
     await symlink(join(process.cwd(), 'package.json'), join(linked, 'package.json'));
     assert.throws(() => runtimeIdentityFor(linked), /regular file/);
 
-    await writeFile(join(oversized, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md'), Buffer.alloc(1_048_577));
+    await writeFile(join(oversized, 'plugins', 'offload', 'skills', 'offload_sonnet', 'SKILL.md'), Buffer.alloc(1_048_577));
     assert.throws(() => runtimeIdentityFor(oversized), /size limit/);
   } finally {
     await Promise.all([rm(linked, { recursive: true, force: true }), rm(oversized, { recursive: true, force: true })]);

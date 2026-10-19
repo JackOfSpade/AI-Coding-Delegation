@@ -227,12 +227,18 @@ function registrations(home, root, platform, env) {
 // Health (offload_job) reaches the same verdict for the same file through
 // skillCopyStatus, so the hook banner and `server.skill` cannot disagree.
 function skillStatus(paths, root, path) {
-  const packaged = skillFileHash(path.join(root, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md'));
-  const status = (file) => {
-    const { status: state } = skillCopyStatus(file, packaged.hash);
+  const packaged = skillFileHash(path.join(root, 'plugins', 'offload', 'skills', 'offload_sonnet', 'SKILL.md'));
+  const status = (file, expectedHash = packaged.hash) => {
+    const { status: state } = skillCopyStatus(file, expectedHash);
     return state === 'unreadable' ? 'missing' : state;
   };
-  return { claude: status(paths.claudeSkill), codex: status(paths.codexSkill) };
+  const opus = skillFileHash(path.join(root, 'plugins', 'offload', 'skills', 'offload_opus', 'SKILL.md'));
+  const combined = (sonnetFile, opusFile) => {
+    const sonnet = status(sonnetFile),
+      other = status(opusFile, opus.hash);
+    return sonnet === 'stale' || other === 'stale' ? 'stale' : sonnet;
+  };
+  return { claude: combined(paths.claudeSkill, paths.claudeOpusSkill), codex: combined(paths.codexSkill, paths.codexOpusSkill) };
 }
 // Session hooks from another Offload install root print a second, possibly
 // older runtime banner at every start. Installer ownership rules mean it will

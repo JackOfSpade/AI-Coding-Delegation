@@ -16,14 +16,14 @@ import {
 import { cleanup, tempDir } from './helpers.mjs';
 
 test('config merges nested defaults and validates profile references', () => {
-  assert.equal(DEFAULT_CONFIG.default, 'promo');
-  assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles), ['promo', 'flash']);
+  assert.equal(DEFAULT_CONFIG.default, 'sonnet');
+  assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles), ['sonnet', 'opus', 'flash']);
   assert.equal(DEFAULT_CONFIG.providers.anthropic.keyRef, 'keychain:offload-anthropic');
   assert.equal(DEFAULT_CONFIG.providers.anthropic.type, 'anthropic-messages');
   assert.equal(DEFAULT_CONFIG.providers.deepseek.keyRef, 'keychain:offload-deepseek');
   assert.equal(DEFAULT_CONFIG.providers.deepseek.attemptTimeoutMs, 300_000);
-  assert.equal(DEFAULT_CONFIG.profiles.promo.model, 'latest-sonnet');
-  assert.equal(DEFAULT_CONFIG.profiles.promo.fallback, 'flash');
+  assert.equal(DEFAULT_CONFIG.profiles.sonnet.model, 'latest-sonnet');
+  assert.equal(DEFAULT_CONFIG.profiles.sonnet.fallback, 'flash');
   assert.equal(DEFAULT_CONFIG.profiles.flash.model, 'latest-flash');
   const merged = deepMerge(DEFAULT_CONFIG, {
     limits: { maxTurns: 4 },
@@ -106,9 +106,9 @@ test('missing config receives the documented promo and fallback profiles', () =>
   const dir = tempDir();
   try {
     const result = loadConfig({ configPath: join(dir, 'absent.json') });
-    assert.equal(result.config.default, 'promo');
-    assert.equal(result.config.profiles.promo.model, 'latest-sonnet');
-    assert.equal(result.config.profiles.promo.fallback, 'flash');
+    assert.equal(result.config.default, 'sonnet');
+    assert.equal(result.config.profiles.sonnet.model, 'latest-sonnet');
+    assert.equal(result.config.profiles.sonnet.fallback, 'flash');
     assert.equal(result.config.profiles.flash.model, 'latest-flash');
   } finally {
     cleanup(dir);

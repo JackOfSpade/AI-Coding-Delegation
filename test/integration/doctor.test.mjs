@@ -440,7 +440,7 @@ test('doctor reports a stale installed skill and another Offload hook root witho
   const home = await mkdtemp(join(tmpdir(), 'offload-doctor-drift-'));
   const root = process.cwd();
   const claudeDir = join(home, '.claude');
-  await mkdir(join(claudeDir, 'skills', 'offload'), { recursive: true });
+  await mkdir(join(claudeDir, 'skills', 'offload_sonnet'), { recursive: true });
   const spawnProcess = (_command, args) => ({
     status: 0,
     stdout: args.includes('--show-toplevel') ? `${root}\n` : 'git version test',
@@ -450,10 +450,10 @@ test('doctor reports a stale installed skill and another Offload hook root witho
   assert.deepEqual(run().skill, { claude: 'missing', codex: 'missing' });
   assert.deepEqual(run().otherDoctorHooks, []);
 
-  const packaged = await readFile(join(root, 'plugins', 'offload', 'skills', 'offload', 'SKILL.md'), 'utf8');
-  await writeFile(join(claudeDir, 'skills', 'offload', 'SKILL.md'), packaged);
+  const packaged = await readFile(join(root, 'plugins', 'offload', 'skills', 'offload_sonnet', 'SKILL.md'), 'utf8');
+  await writeFile(join(claudeDir, 'skills', 'offload_sonnet', 'SKILL.md'), packaged);
   assert.equal(run().skill.claude, 'current');
-  await writeFile(join(claudeDir, 'skills', 'offload', 'SKILL.md'), `${packaged}\nolder protocol\n`);
+  await writeFile(join(claudeDir, 'skills', 'offload_sonnet', 'SKILL.md'), `${packaged}\nolder protocol\n`);
   assert.equal(run().skill.claude, 'stale');
 
   const hook = (installer) => ({ type: 'command', command: `'/usr/bin/node' '${installer}' --doctor-hook` });

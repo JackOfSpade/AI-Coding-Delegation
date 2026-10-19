@@ -6,7 +6,7 @@ import { STALL, assessStall, formatDuration, sanitizeTiming, timingTotals } from
 import { terminalStatuses } from './report.mjs';
 
 /**
- * The evidence an `/offload` run leaves for the person who maintains Offload.
+ * The evidence an Offload command run leaves for the person who maintains Offload.
  *
  * Pure: records and clock readings in, a bounded digest and a prompt skeleton
  * out, no I/O and no model. The digest names facts a primary can check (status,

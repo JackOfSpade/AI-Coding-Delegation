@@ -12,6 +12,7 @@ import {
   integrityStateHintAllowed,
   isolatedWorkspaceReadablePaths,
 } from '../../src/core.mjs';
+import { DEFAULT_CONFIG } from '../../src/config.mjs';
 import { validateJobRequest } from '../../src/job-manager.mjs';
 import { WINDOWS_INTEGRITY_ROOT_CREDENTIAL } from '../../src/integrity.mjs';
 import { JobStore } from '../../src/store.mjs';
@@ -84,73 +85,74 @@ function integrityTestConfig({ loaded: loadedConfig = loaded, statePath, resolve
     resolveKey,
   };
 }
-test('Core snapshots the currently listed Sonnet and Flash routes before a local promo job starts', async () => {
-  const path = await repo('offload-core-dynamic-models-');
-  const dynamicLoaded = {
-    disabled: false,
-    repoConfig: {},
-    config: {
-      default: 'promo',
-      profiles: {
-        promo: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' },
-        flash: { provider: 'deepseek', model: 'latest-flash' },
-      },
-      providers: {
-        anthropic: {
-          type: 'anthropic-messages',
-          baseUrl: 'https://api.anthropic.com',
-          keyRef: 'env:ANTHROPIC_TEST',
-          pricing: 'anthropic-sonnet-2026-10-12',
+for (const line of ['sonnet', 'opus'])
+  test(`Core snapshots the latest ${line} and Flash routes before spending`, async () => {
+    const path = await repo('offload-core-dynamic-models-');
+    const dynamicLoaded = {
+      disabled: false,
+      repoConfig: {},
+      config: {
+        default: line,
+        profiles: {
+          [line]: { provider: 'anthropic', model: `latest-${line}`, fallback: 'flash' },
+          flash: { provider: 'deepseek', model: 'latest-flash' },
         },
-        deepseek: {
-          type: 'openai-chat',
-          baseUrl: 'https://api.deepseek.com',
-          keyRef: 'env:DEEPSEEK_TEST',
-          pricing: 'deepseek-2026-10-01',
+        providers: {
+          anthropic: {
+            type: 'anthropic-messages',
+            baseUrl: 'https://api.anthropic.com',
+            keyRef: 'env:ANTHROPIC_TEST',
+            pricing: 'anthropic-2026-10-19',
+          },
+          deepseek: {
+            type: 'openai-chat',
+            baseUrl: 'https://api.deepseek.com',
+            keyRef: 'env:DEEPSEEK_TEST',
+            pricing: 'deepseek-2026-10-01',
+          },
         },
+        limits: { maxTurns: 2, timeoutMinutes: 1, maxUsd: 1 },
       },
-      limits: { maxTurns: 2, timeoutMinutes: 1, maxUsd: 1 },
-    },
-  };
-  const requests = [];
-  let observed;
-  const isolation = { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree };
-  const core = createCore({
-    config: {
-      loaded: dynamicLoaded,
-      resolveKey: (ref) => (ref === 'env:ANTHROPIC_TEST' ? 'anthropic-key' : 'deepseek-key'),
-      fetchImpl: async (url) => {
-        requests.push(url);
-        if (url === 'https://api.anthropic.com/v1/models?lifecycle=active')
-          return new Response(JSON.stringify({ data: [{ id: 'claude-sonnet-5-5', line: 'sonnet' }] }));
-        if (url === 'https://api.deepseek.com/models') return new Response(JSON.stringify({ data: [{ id: 'deepseek-flash' }] }));
-        throw new Error(`unexpected discovery URL ${url}`);
+    };
+    const requests = [];
+    let observed;
+    const isolation = { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree };
+    const core = createCore({
+      config: {
+        loaded: dynamicLoaded,
+        resolveKey: (ref) => (ref === 'env:ANTHROPIC_TEST' ? 'anthropic-key' : 'deepseek-key'),
+        fetchImpl: async (url) => {
+          requests.push(url);
+          if (url === 'https://api.anthropic.com/v1/models?lifecycle=active')
+            return new Response(JSON.stringify({ data: [{ id: `claude-${line}-5-5`, line }] }));
+          if (url === 'https://api.deepseek.com/models') return new Response(JSON.stringify({ data: [{ id: 'deepseek-flash' }] }));
+          throw new Error(`unexpected discovery URL ${url}`);
+        },
+        skillHealth: noInstalledSkill,
+        isolation,
       },
-      skillHealth: noInstalledSkill,
       isolation,
-    },
-    isolation,
-    worker: {
-      run: async (job) => {
-        observed = job;
-        return { status: 'DONE', summary: 'resolved' };
+      worker: {
+        run: async (job) => {
+          observed = job;
+          return { status: 'DONE', summary: 'resolved' };
+        },
       },
-    },
+    });
+    try {
+      const started = await core.start({ mode: 'report', task: 'inspect', repoPath: path });
+      await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      assert.deepEqual(requests, ['https://api.anthropic.com/v1/models?lifecycle=active', 'https://api.deepseek.com/models']);
+      assert.equal(observed.configuredModel, `claude-${line}-5-5`);
+      assert.equal(observed.executionProfile.model, `claude-${line}-5-5`);
+      assert.equal(observed.executionProfile.fallback.model, 'deepseek-flash');
+      assert.deepEqual(observed.runtimePreflight, { server: 'current' });
+      assert.deepEqual(Object.keys(observed.pricingSnapshot.models).sort(), ['claude-opus-5-5', 'claude-sonnet-5-5', 'deepseek-flash']);
+    } finally {
+      await core.shutdown();
+      await rm(path, { recursive: true, force: true });
+    }
   });
-  try {
-    const started = await core.start({ mode: 'report', task: 'inspect', repoPath: path });
-    await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
-    assert.deepEqual(requests, ['https://api.anthropic.com/v1/models?lifecycle=active', 'https://api.deepseek.com/models']);
-    assert.equal(observed.configuredModel, 'claude-sonnet-5-5');
-    assert.equal(observed.executionProfile.model, 'claude-sonnet-5-5');
-    assert.equal(observed.executionProfile.fallback.model, 'deepseek-flash');
-    assert.deepEqual(observed.runtimePreflight, { server: 'current' });
-    assert.deepEqual(Object.keys(observed.pricingSnapshot.models).sort(), ['claude-sonnet-5-5', 'deepseek-flash']);
-  } finally {
-    await core.shutdown();
-    await rm(path, { recursive: true, force: true });
-  }
-});
 test('Core reports only the HTTP status when primary or fallback model discovery fails with a ProviderError', async () => {
   const path = await repo('offload-core-discovery-status-');
   const secretBody = 'SECRET_BODY_9f31 sk-live-discovery-key https://api.anthropic.com/private';
@@ -158,9 +160,9 @@ test('Core reports only the HTTP status when primary or fallback model discovery
     disabled: false,
     repoConfig: {},
     config: {
-      default: 'promo',
+      default: 'sonnet',
       profiles: {
-        promo: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' },
+        sonnet: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' },
         flash: { provider: 'deepseek', model: 'latest-flash' },
       },
       providers: {
@@ -214,8 +216,8 @@ test('Core reports only the HTTP status when primary or fallback model discovery
     // Fallback: primary succeeds, Anthropic fallback fails with HTTP 503.
     const fallbackLoaded = structuredClone(dynamicLoaded);
     fallbackLoaded.config.profiles = {
-      promo: { provider: 'deepseek', model: 'latest-flash', fallback: 'sonnet' },
-      sonnet: { provider: 'anthropic', model: 'latest-sonnet' },
+      sonnet: { provider: 'deepseek', model: 'latest-flash', fallback: 'anthropicFallback' },
+      anthropicFallback: { provider: 'anthropic', model: 'latest-sonnet' },
     };
     const fallback503 = await startWith(fallbackLoaded, async (url) =>
       isAnthropicDiscovery(url) ? new Response(secretBody, { status: 503 }) : ok(url),
@@ -229,7 +231,7 @@ test('Core reports only the HTTP status when primary or fallback model discovery
     assert.equal(primaryPlain.message, 'primary provider model discovery failed');
     const flashPrimary = structuredClone(dynamicLoaded);
     flashPrimary.config.profiles = {
-      promo: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' },
+      sonnet: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' },
       flash: { provider: 'deepseek', model: 'latest-flash' },
     };
     const fallbackPlain = await startWith(flashPrimary, async (url) =>
@@ -2461,3 +2463,54 @@ test('assertion repair sends a fresh focused conversation through Core while pre
     await rm(path, { recursive: true, force: true });
   }
 });
+
+for (const line of ['sonnet', 'opus'])
+  test(`${line} worker uses adaptive thinking and credit fallback uses Flash thinking`, async () => {
+    const path = await repo('offload-thinking-fallback-');
+    const originalFetch = globalThis.fetch;
+    const requests = [];
+    globalThis.fetch = async (url, options = {}) => {
+      const body = options.body ? JSON.parse(options.body) : null;
+      if (body) requests.push({ url, body });
+      if (url.startsWith('https://api.anthropic.com/v1/models'))
+        return new Response(JSON.stringify({ data: [{ id: `claude-${line}-5-5`, line }] }));
+      if (url === 'https://api.deepseek.com/models') return new Response(JSON.stringify({ data: [{ id: 'deepseek-flash' }] }));
+      if (url === 'https://api.anthropic.com/v1/messages')
+        return new Response(JSON.stringify({ error: { type: 'credit_balance_too_low' } }), { status: 400 });
+      assert.equal(url, 'https://api.deepseek.com/chat/completions');
+      const call = toolChunk('finish-report', 'finish', { summary: 'done', report: 'Reviewed.', concerns: [], testsRun: [] });
+      const events = [call, usageChunk].map((chunk) => ({ ...chunk, model: 'deepseek-flash' }));
+      return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n', {
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    };
+    const core = createCore({
+      config: {
+        loaded: { disabled: false, repoConfig: {}, config: structuredClone(DEFAULT_CONFIG) },
+        resolveKey: () => 'test-key',
+        skillHealth: noInstalledSkill,
+      },
+    });
+    try {
+      const started = await core.start({
+        mode: 'report',
+        profile: line,
+        task: 'review',
+        repoPath: path,
+        budget: { maxTurns: 2, maxUsd: 1 },
+      });
+      const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      assert.equal(done.status, 'DONE_UNVERIFIED', JSON.stringify(done));
+      assert.equal(done.reportResult.text, 'Reviewed.');
+      assert.equal(requests.length, 2);
+      assert.equal(requests[0].body.model, `claude-${line}-5-5`);
+      assert.deepEqual(requests[0].body.thinking, { type: 'adaptive' });
+      assert.equal(requests[1].body.model, 'deepseek-flash');
+      assert.deepEqual(requests[1].body.thinking, { type: 'enabled' });
+      assert.equal(requests[1].body.reasoning_effort, 'high');
+    } finally {
+      globalThis.fetch = originalFetch;
+      await core.shutdown();
+      await rm(path, { recursive: true, force: true });
+    }
+  });

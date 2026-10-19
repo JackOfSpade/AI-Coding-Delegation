@@ -36,12 +36,16 @@ export function skillCopyStatus(file, expectedHash, options) {
  * A copy that is absent is normal (client not installed, or a plugin supplies
  * the skill), so health never fails and never reports staleness for it.
  */
-export function installedSkillHealth({ expectedHash, home, env = process.env, platform = process.platform, read } = {}) {
+export function installedSkillHealth({ expectedHash, expectedOpusHash, home, env = process.env, platform = process.platform, read } = {}) {
   const paths = resolveClientPaths({ home, env, platform });
   const clients = {
     claude: skillCopyStatus(paths.claudeSkill, expectedHash, { read }),
     codex: skillCopyStatus(paths.codexSkill, expectedHash, { read }),
   };
+  if (expectedOpusHash) {
+    clients.claudeOpus = skillCopyStatus(paths.claudeOpusSkill, expectedOpusHash, { read });
+    clients.codexOpus = skillCopyStatus(paths.codexOpusSkill, expectedOpusHash, { read });
+  }
   const statuses = Object.values(clients).map((copy) => copy.status);
   const stale = statuses.includes('stale');
   const state = stale
@@ -58,7 +62,14 @@ export function installedSkillHealth({ expectedHash, home, env = process.env, pl
     unknown: statuses.includes('unknown') ? 'no-expected-skill-hash' : 'installed-skill-unreadable',
   }[state];
   const shown = Object.values(clients).find((copy) => copy.status === (stale ? 'stale' : 'current'));
-  return { expectedHash: expectedHash ?? null, installedHash: shown?.installedHash ?? null, stale, state, reason, clients };
+  return {
+    expectedHash: shown && (shown === clients.claudeOpus || shown === clients.codexOpus) ? expectedOpusHash : (expectedHash ?? null),
+    installedHash: shown?.installedHash ?? null,
+    stale,
+    state,
+    reason,
+    clients,
+  };
 }
 
 /** Fold the installed-skill answer into the server identity (and health's top level). */
