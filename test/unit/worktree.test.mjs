@@ -602,6 +602,52 @@ function repoWithDependency() {
   return repo;
 }
 
+test('an exactly gitignored dependency symlink does not break isolated snapshots', () => {
+  const repo = repoWithDependency();
+  let isolated;
+  try {
+    write(join(repo, '.gitignore'), 'node_modules\n');
+    const baseline = snapshotPrimaryWorkingTree(repo);
+    isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
+    assert.equal(isolated.dependencies.nodeModules, 'linked');
+    write(join(isolated.path, 'tracked.txt'), 'worker result\n');
+    const after = isolated.snapshot();
+    assert.deepEqual(isolated.changes(after).files, [{ path: 'tracked.txt', status: 'M' }]);
+    assert.deepEqual(isolated.ignoredPaths(), []);
+  } finally {
+    isolated?.cleanup();
+    cleanup(repo);
+  }
+});
+
+test('snapshot errors preserve underlying Git stderr and capture can precede a failing pin', () => {
+  const repo = makeRepo();
+  let isolated;
+  let lock;
+  try {
+    const baseline = snapshotPrimaryWorkingTree(repo);
+    isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
+    isolated.snapshot();
+    lock = join(repo, '.git', `${treePinRef(isolated.path, 'after')}.lock`);
+    write(lock, 'occupied\n');
+    write(join(isolated.path, 'tracked.txt'), 'paid work\n');
+    assert.throws(
+      () => isolated.snapshot(),
+      (error) => {
+        assert.equal(error.code, 'E_WORKTREE_SNAPSHOT');
+        assert.match(error.message, /git update-ref failed.*cannot lock ref/s);
+        return true;
+      },
+    );
+    const after = isolated.snapshot({ pin: false });
+    assert.match(isolated.changes(after).patch.toString(), /paid work/);
+  } finally {
+    if (lock) rmSync(lock, { force: true });
+    isolated?.cleanup();
+    cleanup(repo);
+  }
+});
+
 test('a private worktree resolves primary dependencies through parent and local links, invisible to snapshots and scope checks', () => {
   const repo = repoWithDependency();
   let isolated;

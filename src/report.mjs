@@ -210,11 +210,13 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
       : '';
   const unsafeVerifier = job.unsafePolicyOnlyVerifier === true ? 'verifier consent: unsafe policy-only fallback authorized by caller' : '';
   const workspaceCleanup =
-    job.workspaceCleanupRequired === true
-      ? `workspace cleanup: MANUAL REQUIRED${job.workspaceCleanupError ? ` — ${scalar(job.workspaceCleanupError)}` : ''}`
-      : job.workspaceCleanupError
-        ? `workspace cleanup: RETRYABLE ERROR — ${scalar(job.workspaceCleanupError)}`
-        : '';
+    job.workspaceRetained === true
+      ? 'workspace retained: worker files preserved — capture failed; resolve the Git/storage error, then retry offload_apply (dry run) to capture and audit the diff'
+      : job.workspaceCleanupRequired === true
+        ? `workspace cleanup: MANUAL REQUIRED${job.workspaceCleanupError ? ` — ${scalar(job.workspaceCleanupError)}` : ''}`
+        : job.workspaceCleanupError
+          ? `workspace cleanup: RETRYABLE ERROR — ${scalar(job.workspaceCleanupError)}`
+          : '';
   const nextActions = reportMode ? ['read reportResult'] : [`offload_job {jobId:${JSON.stringify(scalar(job.id))}, include:"diff"}`];
   if (!reportMode && !violations.length && job.applied === true && !job.revertedAt && !job.revertUncertain && !applyRunning)
     nextActions.push('revert');
@@ -229,6 +231,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
   // a next action the server will refuse.
   const roundAvailable =
     !continuationReason &&
+    job.workspaceRetained !== true &&
     (job.rounds || 0) < (job.maxRepairRounds ?? 2) &&
     job.budgetFinishRecovery === undefined &&
     job.cappedFinishRecovery !== 'queued' &&

@@ -857,7 +857,18 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         ...(scoped ? { sessionStartedAt: sessionStartIso } : {}),
         ...merged.totals,
       },
-      health: { ...(await sandboxHealth()), worker: false, repositories: [...states.keys()] },
+      health: {
+        ...(await sandboxHealth()),
+        worker: false,
+        repositories: [...states.keys()],
+        verifierEnvironmentFailures: (
+          await Promise.all(
+            [...states.values()].map(async (state) =>
+              (await state.manager.verifierEnvironmentFailures()).map((failure) => ({ ...failure, repo: state.repoPath })),
+            ),
+          )
+        ).flat(),
+      },
     };
   };
   const pricingMetadata = (providerConfigs, loaded, requiredModels = []) => {

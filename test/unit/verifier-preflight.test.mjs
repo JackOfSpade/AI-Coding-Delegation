@@ -64,3 +64,65 @@ test('oversized or unresolved verifier sources give an incomplete advisory', (t)
   assert.equal(result.scannedFiles, 0);
   assert.match(verifierPreflightLines(result)[0], /incomplete/);
 });
+
+test('inline literal test arrays resolve concatenated imports and their transitive imports', (t) => {
+  const { root, write } = fixture(t);
+  write('scripts/register.mjs', "import './guard.mjs';");
+  write('scripts/guard.mjs', 'export {};');
+  write('scripts/tests/resume-download-bundle.js', "export * from '../../src/temp.js';");
+  write('scripts/tests/platform-utils.js', "const path = '/var/folders/fixture';");
+  write('scripts/tests/non-api-ai.js', 'const path = `/tmp/attachment-${process.pid}`;');
+  write('scripts/tests/local-ai-application.js', "import '../../src/identity.js';");
+  write('src/temp.js', "export const dir = '/tmp/bundle';");
+  write('src/identity.js', "import { execFile } from 'node:child_process'; execFile('/bin/ps', ['-p', '1']);");
+  write('scripts/tests/unselected.js', "const path = '/tmp/unselected';");
+  const inline =
+    "const files=['resume-download-bundle.js','platform-utils.js','non-api-ai.js','local-ai-application.js'];for(const f of files){await import('./scripts/tests/'+f)}";
+  const result = preflightVerifier({
+    repoPath: root,
+    testCommand: `node --import ./scripts/register.mjs --input-type=module -e "${inline}"`,
+  });
+  assert.equal(result.scannedFiles, 8);
+  assert.equal(result.limited, false);
+  assert.equal(result.status, 'warning');
+  assert.ok(result.warnings.some((w) => w.code === 'system-temp' && w.path === 'src/temp.js'));
+  assert.ok(result.warnings.some((w) => w.code === 'system-temp' && w.path === 'scripts/tests/platform-utils.js'));
+  assert.ok(result.warnings.some((w) => w.code === 'system-temp' && w.path === 'scripts/tests/non-api-ai.js'));
+  assert.ok(result.warnings.some((w) => w.code === 'child-process' && w.path === 'src/identity.js'));
+  assert.ok(result.warnings.some((w) => w.code === 'process-inspection' && w.path === 'src/identity.js'));
+  assert.ok(!result.resolvedFiles.includes('scripts/tests/unselected.js'));
+});
+
+test('argv group runners and template imports resolve each command context without executing the runner', (t) => {
+  const { root, write } = fixture(t);
+  write('scripts/run-group.js', "import './group-loader.js'; throw new Error('never execute');");
+  write('scripts/group-loader.js', 'const stem = process.argv[2]; await import(`./tests/${stem}.js`);');
+  write('scripts/tests/temp.js', "require('../../src/temp.cjs');");
+  write('scripts/tests/spawn.js', "export * from '../../src/spawn';");
+  write('scripts/tests/other.js', "const dir = '/tmp/other';");
+  write('src/temp.cjs', "const dir = '/private/var/folders';");
+  write('src/spawn/index.js', "require('child_process').spawnSync('/bin/ps');");
+  const result = preflightVerifier({ repoPath: root, testCommand: 'node scripts/run-group.js temp && node scripts/run-group.js spawn' });
+  assert.equal(result.scannedFiles, 6);
+  assert.equal(result.limited, false);
+  assert.deepEqual(
+    result.warnings.map((w) => [w.code, w.path]),
+    [
+      ['system-temp', 'src/temp.cjs'],
+      ['child-process', 'src/spawn/index.js'],
+      ['process-inspection', 'src/spawn/index.js'],
+    ],
+  );
+  assert.ok(!result.resolvedFiles.includes('scripts/tests/other.js'));
+});
+
+test('unresolved dynamic imports are incomplete, and resolved dynamic paths still obey denied reads and symlink boundaries', (t) => {
+  const { root, write } = fixture(t);
+  write('tests/a.js', "const files=['hidden.js','escape.js'];for (const file of files) await import('./'+file); await import(getPath());");
+  write('tests/hidden.js', "const path='/tmp/secret';");
+  if (process.platform !== 'win32') symlinkSync(join(root, 'tests/hidden.js'), join(root, 'tests/escape.js'));
+  const result = preflightVerifier({ repoPath: root, testCommand: 'node tests/a.js', denyRead: ['tests/hidden.js'] });
+  assert.equal(result.scannedFiles, 1);
+  assert.equal(result.limited, true);
+  assert.deepEqual(result.warnings, []);
+});

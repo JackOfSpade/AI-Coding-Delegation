@@ -1,14 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JobStore } from '../../src/store.mjs';
 import { JobManager } from '../../src/job-manager.mjs';
 import { FAILURE_ERRORS } from '../../src/failure.mjs';
 import { gitPatchApplier, gitSnapshots } from '../../src/core.mjs';
-import { cleanupIsolatedWorktree, createIsolatedWorktree, integrateRecordedTree, openIsolatedWorktree } from '../../src/worktree.mjs';
+import {
+  cleanupIsolatedWorktree,
+  createIsolatedWorktree,
+  integrateRecordedTree,
+  openIsolatedWorktree,
+  pinJobTrees,
+} from '../../src/worktree.mjs';
 import { cleanup, git, makeRepo, write } from '../unit/helpers.mjs';
 
 // A write job whose worker ended FAILED after doing correct, in-scope work (the
@@ -57,6 +63,7 @@ async function harness({ worker, check = green, secrets, applyPatch = gitPatchAp
         open: openIsolatedWorktree,
         cleanup: cleanupIsolatedWorktree,
         integrateRecorded: integrateRecordedTree,
+        pin: pinJobTrees,
       },
     },
   });
@@ -71,6 +78,143 @@ const writeSrc = (job, name, body = `${name}\n`) => write(join(job.workspacePath
 const goodWork = async (job) => (writeSrc(job, 'a.js', A_BYTES), failedProtocol());
 const nextLine = (report) => report.split('\n').find((line) => line.startsWith('next: '));
 const APPLY_NEXT = /apply \(after your own check\)/;
+
+test('a clean worker finish survives snapshot and durable-pin failures, logs Git stderr, and can be applied after recovery', async () => {
+  for (const failure of ['snapshot', 'pin']) {
+    let restore;
+    const h = await harness({
+      worker: async (job) => {
+        writeSrc(job, 'a.js', A_BYTES);
+        if (failure === 'snapshot') {
+          const config = join(job.repoPath, '.git', 'config');
+          const before = readFileSync(config);
+          restore = () => write(config, before);
+          write(config, '[broken config\n');
+        } else {
+          const lock = join(job.repoPath, '.git', 'refs/offload/jobs', job.id, 'workspaceAfter.lock');
+          restore = () => rmSync(lock, { force: true });
+          write(lock, 'occupied\n');
+        }
+        return { status: 'DONE', turns: 12, costUsd: 0.7 };
+      },
+    });
+    let workspacePath;
+    try {
+      const { id, done } = await h.begin();
+      assert.equal(done.status, 'FAILED');
+      const job = await h.store.get(id);
+      workspacePath = job.workspacePath;
+      assert.equal(job.workspaceRetained, true);
+      assert.equal(done.workspaceRetained, true);
+      await assert.rejects(() => h.manager.repair(id, ['recover work'], { launch: false }), /retained worker work/);
+      assert.equal(job.workspaceCleanedAt, undefined);
+      assert.equal(await readFile(join(workspacePath, 'src/a.js'), 'utf8'), A_BYTES);
+      assert.equal(job.turns, 12);
+      assert.equal(job.costUsd, 0.7);
+      const diagnostic = failure === 'snapshot' ? /bad config line/ : /cannot lock ref/;
+      assert.match(job.error, diagnostic);
+      assert.match(done.report, /workspace retained:.*offload_apply/s);
+      assert.doesNotMatch(nextLine(done.report), /\brepair\b|\bcontinue\b/);
+      assert.match((await h.manager.job(id, { include: 'log' })).log, diagnostic);
+      const events = (await h.store.readArtifact(id, 'events.jsonl')).trim().split('\n').map(JSON.parse);
+      const finished = events.findLast((event) => event.type === 'finished');
+      assert.match(finished.finalizationError.message, diagnostic);
+      assert.equal(finished.finalizationError.code, failure === 'snapshot' ? 'E_WORKTREE_SNAPSHOT' : 'E_WORKTREE_JOB_REF');
+      if (failure === 'pin') {
+        assert.match(await h.store.readArtifact(id, 'revert.diff'), /export const a = 1/);
+        assert.ok(job.workspaceAfter, 'tree and diff are persisted before pinning');
+      }
+      // A still-broken Git/storage path refuses apply and leaves the bytes intact.
+      await assert.rejects(() => h.manager.apply(id));
+      assert.equal(existsSync(workspacePath), true);
+      assert.equal(await h.manager.recover(), 0, 'startup recovery must not clean retained paid work');
+      restore();
+      restore = undefined;
+      const preview = await h.manager.apply(id);
+      assert.equal(preview.dryRun, true);
+      assert.deepEqual(preview.files, ['src/a.js']);
+      assert.equal(existsSync(join(h.repo, 'src/a.js')), false);
+      assert.equal(existsSync(workspacePath), false, 'successful capture and pin permit cleanup');
+      assert.equal((await h.store.get(id)).workspaceRetained, undefined);
+      git(h.repo, ['gc', '--prune=now']);
+      await h.manager.apply(id, { apply: true, verifiedBy: EVIDENCE });
+      assert.equal(await readFile(join(h.repo, 'src/a.js'), 'utf8'), A_BYTES);
+      assert.equal(h.counters.runs, 1, 'recovery never reruns paid worker work');
+    } finally {
+      restore?.();
+      if (workspacePath && existsSync(workspacePath)) cleanupIsolatedWorktree({ repoPath: h.repo, workspacePath });
+      cleanup(h.repo);
+    }
+  }
+});
+
+test('an artifact-write failure retains worker files until a complete capture succeeds', async () => {
+  const h = await harness({
+    worker: async (job) => {
+      writeSrc(job, 'a.js', A_BYTES);
+      return { status: 'DONE' };
+    },
+  });
+  const writeArtifact = h.store.writeArtifact.bind(h.store);
+  let broken = true;
+  h.store.writeArtifact = (id, name, data) => {
+    if (broken && name === 'revert.diff') throw new Error('disk full while saving revert.diff');
+    return writeArtifact(id, name, data);
+  };
+  let workspacePath;
+  try {
+    const { id, done } = await h.begin();
+    workspacePath = (await h.store.get(id)).workspacePath;
+    assert.equal(done.status, 'FAILED');
+    assert.equal(done.workspaceRetained, true);
+    assert.match(await h.store.readArtifact(id, 'patch.diff'), /export const a = 1/);
+    await assert.rejects(() => h.manager.apply(id), /disk full/);
+    assert.equal(existsSync(workspacePath), true);
+    broken = false;
+    assert.equal((await h.manager.apply(id)).dryRun, true);
+    assert.equal(existsSync(workspacePath), false);
+    await h.manager.apply(id, { apply: true, verifiedBy: EVIDENCE });
+    assert.equal(await readFile(join(h.repo, 'src/a.js'), 'utf8'), A_BYTES);
+    assert.equal(h.counters.runs, 1);
+  } finally {
+    if (workspacePath && existsSync(workspacePath)) cleanupIsolatedWorktree({ repoPath: h.repo, workspacePath });
+    cleanup(h.repo);
+  }
+});
+
+test('recapturing a finalization failure still rejects scope and verifier-authorship violations', async () => {
+  for (const violation of ['scope', 'verifier']) {
+    let lock;
+    const h = await harness({
+      worker: async (job) => {
+        writeSrc(job, 'a.js', A_BYTES);
+        if (violation === 'scope') write(join(job.workspacePath, 'outside.js'), 'not owned\n');
+        lock = join(job.repoPath, '.git', 'refs/offload/jobs', job.id, 'workspaceAfter.lock');
+        write(lock, 'occupied\n');
+        return { status: 'DONE' };
+      },
+      check: (_command, options) => {
+        write(join(options.cwd, 'src/a.js'), 'verifier authored\n');
+        return green();
+      },
+    });
+    let workspacePath;
+    try {
+      const { id } = await h.begin(violation === 'verifier' ? { testCommand: 'node check.js' } : {});
+      workspacePath = (await h.store.get(id)).workspacePath;
+      rmSync(lock);
+      await assert.rejects(() => h.manager.apply(id, { apply: true, verifiedBy: EVIDENCE }), /scope|authorship/);
+      const job = await h.store.get(id);
+      assert.deepEqual(job.scopeViolations, [violation === 'scope' ? 'outside.js' : 'src/a.js']);
+      if (violation === 'verifier') assert.deepEqual(job.verifierMutations, ['src/a.js']);
+      assert.equal(existsSync(join(h.repo, 'src/a.js')), false);
+    } finally {
+      if (lock) rmSync(lock, { force: true });
+      if (workspacePath && existsSync(workspacePath)) cleanupIsolatedWorktree({ repoPath: h.repo, workspacePath });
+      cleanup(h.repo);
+    }
+  }
+});
 
 test('a FAILED job with an intact in-scope diff dry-runs, applies with the primary evidence, ends DONE_UNVERIFIED with the failure on record, and reverts', async () => {
   const h = await harness({ worker: goodWork });
@@ -383,6 +527,7 @@ test('a FAILED round after a continuation applies that round, and a patch holdin
     const third = await h.settle(id);
     assert.equal(third.status, 'FAILED');
     assert.match((await h.store.get(id)).error, /patch containing configured secret/);
+    assert.equal((await h.store.get(id)).workspaceRetained, undefined, 'secret rejection keeps its existing cleanup policy');
     assert.doesNotMatch(nextLine(third.report), /apply/);
     await assert.rejects(() => h.manager.apply(id), /a FAILED job cannot be applied this way: its diff contained a configured secret/);
     assert.equal(existsSync(join(h.repo, 'src', 'c.js')), false);
@@ -455,6 +600,44 @@ test('a CANCELLED job is never applied, and the refusal says which statuses are 
     );
     assert.equal(existsSync(join(h.repo, 'src', 'a.js')), false);
   } finally {
+    cleanup(h.repo);
+  }
+});
+
+test('a pin failure during crash finalization retains the workspace for a later apply', async () => {
+  const h = await harness({ worker: async () => ({ status: 'DONE' }) });
+  let workspacePath, lock;
+  try {
+    const { jobId: id } = await h.manager.start(
+      { task: 'finished before crash', ownedPaths: ['src/**'], repoPath: h.repo },
+      { launch: false },
+    );
+    const job = await h.store.get(id);
+    workspacePath = job.workspacePath;
+    writeSrc(job, 'a.js', A_BYTES);
+    lock = join(h.repo, '.git', 'refs/offload/jobs', id, 'workspaceAfter.lock');
+    write(lock, 'occupied\n');
+    await h.store.update(id, {
+      status: 'FINALIZING',
+      finalStatus: 'FAILED',
+      handoffState: 'RUNNING',
+      runnerPid: 99999999,
+      runnerHeartbeatAt: new Date(0).toISOString(),
+    });
+    assert.equal(await h.manager.recover(), 1);
+    const failed = await h.store.get(id);
+    assert.equal(failed.status, 'FAILED');
+    assert.equal(failed.workspaceRetained, true);
+    assert.match(failed.error, /cannot lock ref/);
+    assert.equal(await readFile(join(workspacePath, 'src/a.js'), 'utf8'), A_BYTES);
+    assert.equal(await h.manager.recover(), 0);
+    rmSync(lock);
+    assert.equal((await h.manager.apply(id)).dryRun, true);
+    await h.manager.apply(id, { apply: true, verifiedBy: EVIDENCE });
+    assert.equal(await readFile(join(h.repo, 'src/a.js'), 'utf8'), A_BYTES);
+  } finally {
+    if (lock) rmSync(lock, { force: true });
+    if (workspacePath && existsSync(workspacePath)) cleanupIsolatedWorktree({ repoPath: h.repo, workspacePath });
     cleanup(h.repo);
   }
 });
@@ -883,6 +1066,53 @@ test('a retained-diff verifier exception reports VERIFY_FAILED with an UNVERIFIE
     assert.equal(h.counters.runs, 1);
     assert.equal(existsSync(join(h.repo, 'src/a.js')), false);
     assert.equal((await h.manager.apply(id)).dryRun, true);
+  } finally {
+    cleanup(h.repo);
+  }
+});
+
+test('environment failure files survive apply and detached managers and warn health and the next start', async () => {
+  const h = await harness({
+    worker: async (job) => {
+      writeSrc(job, 'a.js', A_BYTES);
+      return { status: 'DONE', turns: 55, costUsd: 3.63 };
+    },
+    check: () => ({
+      command: 'check',
+      verdict: 'FAIL',
+      result: {
+        code: 1,
+        sandbox: 'macos',
+        stderr:
+          "FAIL resume-download-bundle.js :: export\nError: EPERM: operation not permitted, mkdtemp '/tmp/bundle'\nFAIL platform-utils.js :: read\nError: EPERM: operation not permitted, mkdtemp '/tmp/text'",
+      },
+    }),
+  });
+  h.manager.config.sessionStartedAt = new Date(Date.now() - 60_000).toISOString();
+  try {
+    write(join(h.repo, 'scripts/tests/resume-download-bundle.js'), "const dir = '/tmp/bundle';");
+    write(join(h.repo, 'scripts/tests/platform-utils.js'), "const dir = '/tmp/text';");
+    const testCommand = `node -e "const files=['resume-download-bundle.js','platform-utils.js'];for(const f of files){await import('./scripts/tests/'+f)}"`;
+    const { id, done } = await h.begin({ testCommand });
+    assert.equal(done.status, 'VERIFY_ENV_FAILED');
+    const files = ['scripts/tests/resume-download-bundle.js', 'scripts/tests/platform-utils.js'];
+    assert.deepEqual(done.verifyEnvironment.files, files);
+    assert.equal(h.counters.runs, 1, 'environment failures do not spend on repair');
+    await h.manager.apply(id, { apply: true, verifiedBy: EVIDENCE });
+    assert.equal((await h.store.get(id)).status, 'DONE_UNVERIFIED');
+    // A separate manager reads durable observations, as the MCP parent does
+    // after a detached worker process finishes and after current state clears.
+    await h.store.update(id, { verifyEnvironment: undefined, verify: undefined });
+    const reader = new JobManager({ store: h.store, snapshots: h.snapshots, config: h.manager.config });
+    const health = (await reader.job()).health;
+    assert.deepEqual(health.verifierEnvironmentFailures[0].files, files);
+    assert.equal(health.verifierEnvironmentFailures[0].jobId, id);
+    assert.match(health.verifierEnvironmentFailures[0].advice, /Exclude.*next testCommand/);
+    const next = await reader.start({ repoPath: h.repo, task: 'next', ownedPaths: ['src/**'], testCommand }, { launch: false });
+    assert.deepEqual(next.verifierPreflight.previousFailures, health.verifierEnvironmentFailures);
+    assert.match((await reader.job(next.jobId)).report, /verifier session warning:.*resume-download-bundle.js.*platform-utils.js/);
+    assert.equal(h.counters.runs, 1, 'warnings are returned before another worker call');
+    await reader.cancel(next.jobId);
   } finally {
     cleanup(h.repo);
   }

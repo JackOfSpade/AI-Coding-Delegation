@@ -49,7 +49,7 @@ test('the no-argument list holds active jobs and jobs touched this session, and 
   assert.match(result.listing.hint, /all:true/);
   // The hint names counts and parameters, never a job id.
   assert.doesNotMatch(result.listing.hint, /old-done/);
-  assert.deepEqual(result.health, { sandbox: 'unknown' });
+  assert.deepEqual(result.health, { sandbox: 'unknown', verifierEnvironmentFailures: [] });
 });
 
 test('all:true lists every stored job and drops the hint', async () => {

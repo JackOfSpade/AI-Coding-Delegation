@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { readRegularFileSync } from './regular-file.mjs';
+import { redactText, stripTerminalControls } from './redact.mjs';
 
 const GIT_TIMEOUT_MS = 30_000;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
@@ -28,12 +29,28 @@ export function snapshotWorkingTree(repoPath, { excludePaths = [] } = {}) {
     // from running while the temporary index is built.
     const hooksPath = join(tempDir, 'empty-hooks');
     mkdirSync(hooksPath);
-    git(
-      repoPath,
-      ['add', '-A', ...(excludePaths.length ? ['--', '.', ...excludePaths.map((path) => `:(exclude,literal)${path}`)] : [])],
-      { GIT_INDEX_FILE: indexFile },
-      { hooksPath },
-    );
+    git(repoPath, ['add', '-A'], { GIT_INDEX_FILE: indexFile }, { hooksPath });
+    // An explicit pathspec exclusion can make `git add` reject an ignored
+    // symlink (notably node_modules on Apple Git). Build the index normally,
+    // then remove exclusions through NUL-delimited literal index entries.
+    if (excludePaths.length) {
+      const removed = git(
+        repoPath,
+        ['ls-files', '-z', '--', ...pathspecs(excludePaths, { literal: true })],
+        { GIT_INDEX_FILE: indexFile },
+        { hooksPath, output: 'buffer' },
+      );
+      if (removed.length)
+        git(
+          repoPath,
+          ['update-index', '--force-remove', '-z', '--stdin'],
+          { GIT_INDEX_FILE: indexFile },
+          {
+            hooksPath,
+            input: removed,
+          },
+        );
+    }
     return git(repoPath, ['write-tree'], { GIT_INDEX_FILE: indexFile }, { hooksPath }).trim();
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
@@ -167,8 +184,16 @@ export function git(repoPath, args, extraEnv = {}, { hooksPath, execFile = execF
       ...(input === undefined ? {} : { input }),
     });
   } catch (error) {
-    throw new GitSnapshotError(`git ${args[0]} failed`, 'E_GIT_COMMAND');
+    throw new GitSnapshotError(`git ${args[0]} failed${gitErrorDetail(error)}`, 'E_GIT_COMMAND');
   }
+}
+
+/** Bounded diagnostics; never include execFile's message (it can echo stdin). */
+export function gitErrorDetail(error) {
+  const stderr = redactText(stripTerminalControls(String(error?.stderr || '')))
+    .trim()
+    .slice(0, 2000);
+  return stderr ? `: ${stderr}` : '';
 }
 export function parseNulNameStatus(raw) {
   if (!Buffer.isBuffer(raw)) throw new GitSnapshotError('Malformed NUL name-status output', 'E_GIT_DIFF');
@@ -224,7 +249,7 @@ function disabledFilters(repoPath, env, execFile = execFileSync) {
       cwd: repoPath,
       encoding: 'utf8',
       env,
-      stdio: ['ignore', 'pipe', 'ignore'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       timeout: GIT_TIMEOUT_MS,
       maxBuffer: GIT_MAX_BUFFER,
     });
@@ -257,7 +282,7 @@ function disabledFilters(repoPath, env, execFile = execFileSync) {
     // Every other failure is an inability to establish the no-filter contract.
     if (error?.status === 1) return [];
     if (error instanceof GitSnapshotError) throw error;
-    throw new GitSnapshotError('Git filter configuration could not be enumerated', 'E_GIT_FILTER');
+    throw new GitSnapshotError(`Git filter configuration could not be enumerated${gitErrorDetail(error)}`, 'E_GIT_FILTER');
   }
 }
 function normalizeRepoPath(path, { literal = false } = {}) {

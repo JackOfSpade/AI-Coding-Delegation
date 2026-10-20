@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import {
@@ -15,6 +15,58 @@ import {
   snapshotWorkingTree,
 } from '../../src/git-snapshot.mjs';
 import { cleanup, git, makeRepo, write } from './helpers.mjs';
+
+test('snapshot exclusions handle ignored and non-ignored node_modules symlinks without changing the index or HEAD', () => {
+  const repo = makeRepo();
+  try {
+    mkdirSync(join(repo, 'deps'));
+    symlinkSync('deps', join(repo, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
+    for (const ignore of ['node_modules\n', '']) {
+      write(join(repo, '.gitignore'), ignore);
+      const indexBefore = readFileSync(join(repo, '.git', 'index'));
+      const headBefore = git(repo, ['rev-parse', 'HEAD']);
+      write(join(repo, 'tracked.txt'), 'paid worker result\n');
+      const tree = snapshotWorkingTree(repo, { excludePaths: ['node_modules'] });
+      assert.equal(git(repo, ['ls-tree', tree, '--', 'node_modules']), '');
+      assert.equal(git(repo, ['show', `${tree}:tracked.txt`]), 'paid worker result');
+      assert.deepEqual(readFileSync(join(repo, '.git', 'index')), indexBefore);
+      assert.equal(git(repo, ['rev-parse', 'HEAD']), headBefore);
+    }
+  } finally {
+    cleanup(repo);
+  }
+});
+
+test('Git failures include bounded, terminal-safe, redacted stderr without echoing command input', () => {
+  const repo = makeRepo();
+  try {
+    assert.throws(
+      () =>
+        snapshotGit(
+          repo,
+          ['write-tree'],
+          {},
+          {
+            execFile(_command, args) {
+              if (args[0] === 'config') return '';
+              throw Object.assign(new Error('command input must not be echoed'), {
+                stderr: Buffer.from(`\x1b[31mfatal: cannot lock index\x1b[0m\nAPI_KEY=do-not-leak\n${'x'.repeat(3000)}`),
+              });
+            },
+          },
+        ),
+      (error) => {
+        assert.equal(error.code, 'E_GIT_COMMAND');
+        assert.match(error.message, /fatal: cannot lock index/);
+        assert.doesNotMatch(error.message, /do-not-leak|\x1b|command input/);
+        assert.ok(error.message.length < 2100);
+        return true;
+      },
+    );
+  } finally {
+    cleanup(repo);
+  }
+});
 
 test('temporary-index snapshots include untracked files, exclude ignored files, and preserve the real index', () => {
   const repo = makeRepo();

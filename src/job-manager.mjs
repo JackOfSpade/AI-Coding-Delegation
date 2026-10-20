@@ -7,7 +7,7 @@ import { parseKeyRef } from './secrets.mjs';
 import { modelPolicyViolation } from './model-policy.mjs';
 import { diffTreeFiles, diffTrees, git as snapshotGit } from './git-snapshot.mjs';
 import { copyReportInputs, prepareReportInputsForCleanup, reportInputRoots, validateReportInputFiles } from './report-inputs.mjs';
-import { redactText, redactTokenShapes, redactedSummary } from './redact.mjs';
+import { redactText, redactTokenShapes, redactedSummary, stripTerminalControls } from './redact.mjs';
 import { jobLogWindow, resolveLogWindow } from './diagnostics.mjs';
 import { MAX_RETROSPECTIVE_JOBS } from './retrospective.mjs';
 import {
@@ -28,6 +28,7 @@ import { isolatedDependencyReadPaths } from './worktree.mjs';
 import { classifyVerifierEnvironment, isVerifierEnvironmentKind } from './verify-env.mjs';
 import { continuationBlocker, promptCacheSummary } from './continuation.mjs';
 import { preflightVerifier } from './verifier-preflight.mjs';
+import { sessionVerifierFailures, verifierFailureFiles, verifierFiles } from './verifier-history.mjs';
 import { assertVerifierCommand } from './verifier-command.mjs';
 import {
   interpreterPathsOption,
@@ -120,7 +121,13 @@ const ROUND_SCOPED_VERIFIER_STATE = Object.freeze({
 // failure (and keep it flagged as needing diagnosis). The failure kind and the
 // failing call travel with the error: a stale continuable marker must never
 // outlive the round it described.
-const ROUND_SCOPED_ERROR_STATE = Object.freeze({ error: undefined, budgetStop: undefined, failureKind: undefined, toolFailure: undefined });
+const ROUND_SCOPED_ERROR_STATE = Object.freeze({
+  error: undefined,
+  budgetStop: undefined,
+  failureKind: undefined,
+  toolFailure: undefined,
+  finalizationError: undefined,
+});
 const APPLY_ELIGIBLE = new Set(APPLY_ELIGIBLE_STATUSES);
 const MIN_VERIFIED_BY = 8,
   MAX_VERIFIED_BY = 1000;
@@ -349,8 +356,17 @@ function budgetStopFor({ reported, turns, costUsd, budget }) {
 const failureView = (job) => {
   const failureKind = safeFailureKind(job?.failureKind);
   const toolFailure = safeToolFailure(job?.toolFailure);
-  return { ...(failureKind ? { failureKind } : {}), ...(toolFailure ? { toolFailure } : {}) };
+  const finalizationError = safeFinalizationError(job?.finalizationError);
+  return {
+    ...(failureKind ? { failureKind } : {}),
+    ...(toolFailure ? { toolFailure } : {}),
+    ...(finalizationError ? { finalizationError } : {}),
+  };
 };
+const safeFinalizationError = (error) =>
+  error && /^E_(?:WORKTREE|GIT)_[A-Z_]+$/.test(error.code || '')
+    ? { code: error.code, message: redactText(stripTerminalControls(String(error.message || ''))).slice(0, 2500) }
+    : undefined;
 const safeProviderFailure = (value) => {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !PROVIDER_FAILURE_KINDS.has(value.kind)) return undefined;
   const failure = { kind: value.kind };
@@ -499,6 +515,7 @@ const safeVerifyEnvironment = (value) =>
     ? {
         kind: value.kind,
         detail: String(value.detail ?? '').slice(0, 240),
+        ...(verifierFiles(value.files).length ? { files: verifierFiles(value.files) } : {}),
         ...(value.specifier ? { specifier: String(value.specifier).slice(0, 214) } : {}),
         ...(value.kind === 'native-module-crash' && /^[A-Za-z0-9_.-]{1,120}$/.test(value.module) ? { module: value.module } : {}),
         ...(value.kind === 'native-module-crash' && /^[A-Za-z0-9_.-]{1,120}$/.test(value.nativeModule)
@@ -886,7 +903,7 @@ export class JobManager {
     // The baseline-diff verifier's private copy is removed with the job's own
     // workspace, so a crash between its creation and its removal is retried by
     // the same recovery path.
-    for (const workspacePath of [job?.verifyBaselineWorkspacePath, job?.workspacePath]) {
+    for (const workspacePath of [job?.verifyBaselineWorkspacePath, ...(job?.workspaceRetained === true ? [] : [job?.workspacePath])]) {
       if (!workspacePath) continue;
       try {
         if (job.mode === 'report' && workspacePath === job.workspacePath) await prepareReportInputsForCleanup(workspacePath);
@@ -1174,12 +1191,36 @@ export class JobManager {
     try {
       await update(
         id,
-        cleaned
+        cleaned && job.workspaceRetained !== true
           ? { workspaceCleanedAt: this.now().toISOString(), workspaceCleanupError: undefined, verifyBaselineWorkspacePath: undefined }
-          : { workspaceCleanupError: 'isolated workspace cleanup could not be completed' },
+          : cleaned
+            ? { verifyBaselineWorkspacePath: undefined }
+            : { workspaceCleanupError: 'isolated workspace cleanup could not be completed' },
       );
     } catch {}
     return cleaned;
+  }
+  /** Persist the reviewable bytes before any fallible durable pin operation. */
+  async #captureIsolatedWorkspace(job, workspaceAfter, audited) {
+    await this.store.writeArtifact(job.id, 'patch.diff', audited.allPatch);
+    await this.store.writeArtifact(job.id, 'revert.diff', audited.revertPatch);
+    job = await this.store.update(job.id, {
+      workspaceAfter,
+      after: workspaceAfter,
+      patchRound: job.rounds || 0,
+      files: audited.owned,
+      allFiles: audited.all,
+      scopeViolations: audited.violations,
+      revertFiles: audited.revertPaths,
+      discardedEphemeralOutputs: audited.discardedEphemeralOutputs,
+      verifierMutations: audited.verifierMutations,
+    });
+    await this.#pinTrees(job, {
+      before: job.before,
+      ...(job.workerAfter ? { workerAfter: job.workerAfter } : {}),
+      workspaceAfter,
+    });
+    return job;
   }
   /**
    * A queued budget-finish recovery is the sole crash state that can safely
@@ -1317,6 +1358,8 @@ export class JobManager {
       throw new Error('stored job has invalid baseline workspace metadata');
     if (job.runtimePreflight !== undefined && !validRuntimePreflight(job.runtimePreflight))
       throw new Error('stored job has invalid runtime preflight metadata');
+    if (job.workspaceRetained !== undefined && typeof job.workspaceRetained !== 'boolean')
+      throw new Error('stored job has invalid workspace retention metadata');
     if (job.cappedFinishRecovery !== undefined && !CAPPED_FINISH_RECOVERY_STATES.has(job.cappedFinishRecovery))
       throw new Error('stored job has invalid capped implementation recovery state');
     if (job.budgetFinishRecovery !== undefined && !BUDGET_FINISH_RECOVERY_STATES.has(job.budgetFinishRecovery))
@@ -1437,7 +1480,15 @@ export class JobManager {
       if (!this.isolated) throw new Error('baseline-diff verification requires an isolated private worktree');
     }
     if (input.profile && this.config.profiles && !this.config.profiles[input.profile]) throw new Error(`unknown profile: ${input.profile}`);
-    const verifierPreflight = preflightVerifier({ repoPath, testCommand: input.testCommand, denyRead: input.denyRead });
+    let verifierPreflight = preflightVerifier({ repoPath, testCommand: input.testCommand, denyRead: input.denyRead });
+    if (input.mode !== 'report') {
+      const previousFailures = await this.verifierEnvironmentFailures();
+      if (previousFailures.length) {
+        verifierPreflight ||= { scannedFiles: 0, resolvedFiles: [], limited: true, warnings: [] };
+        verifierPreflight.previousFailures = previousFailures;
+        verifierPreflight.status = 'warning';
+      }
+    }
     const branch = this.config.git ? await this.config.git.branch(repoPath) : git(repoPath, ['branch', '--show-current']);
     const head = this.config.git ? await this.config.git.head(repoPath) : git(repoPath, ['rev-parse', 'HEAD']);
     // The built-in LeaseManager takes (jobId, paths); lightweight test/custom
@@ -2032,7 +2083,7 @@ export class JobManager {
             // before invoking a command that may have write access for normal
             // build/test scratch activity.
             if (workspace && job.mode !== 'report') {
-              const workerAfter = workspace.snapshot();
+              const workerAfter = workspace.snapshot({ pin: false });
               job = await this.store.update(id, { workerAfter });
               await this.#pinTrees(job, { before: job.before, workerAfter });
             }
@@ -2042,6 +2093,7 @@ export class JobManager {
           const aborted = controller.signal.aborted;
           const providerFailure = safeProviderFailure(error);
           job = await this.store.update(id, {
+            ...(safeFinalizationError(error) ? { finalizationError: safeFinalizationError(error) } : {}),
             status: 'FINALIZING',
             finalStatus: leaseLost ? 'FAILED' : aborted ? 'CANCELLED' : providerFailure?.kind === 'attempt_timeout' ? 'TIMEOUT' : 'FAILED',
             ...(providerFailure ? { providerFailure } : {}),
@@ -2066,7 +2118,7 @@ export class JobManager {
             if ((await this.store.cancelRequested?.(id)) && !final(job.status))
               job = await this.store.update(id, { status: 'FINALIZING', finalStatus: 'CANCELLED' });
             if (workspace && job.mode !== 'report') {
-              let workspaceAfter = await workspace.snapshot();
+              let workspaceAfter = await workspace.snapshot({ pin: false });
               let audited = await this.#classifyIsolatedWorkspace(job, workspace, workspaceAfter);
               // A worker/protocol stop says nothing about the retained diff.
               // Audit before executing it, then audit again for verifier writes.
@@ -2110,28 +2162,10 @@ export class JobManager {
                 job = this.validatePersisted(await this.store.get(id));
                 if (controller.signal.aborted || (await this.store.cancelRequested?.(id)))
                   job = await this.store.update(id, { finalStatus: 'CANCELLED' });
-                workspaceAfter = await workspace.snapshot();
+                workspaceAfter = await workspace.snapshot({ pin: false });
                 audited = await this.#classifyIsolatedWorkspace(job, workspace, workspaceAfter);
               }
-              await this.store.writeArtifact(id, 'patch.diff', audited.allPatch);
-              await this.store.writeArtifact(id, 'revert.diff', audited.revertPatch);
-              job = await this.store.update(id, {
-                workspaceAfter,
-                after: workspaceAfter,
-                // Stamps this record as this round's capture (see failedApplyRefusal).
-                patchRound: job.rounds || 0,
-                files: audited.owned,
-                allFiles: audited.all,
-                scopeViolations: audited.violations,
-                revertFiles: audited.revertPaths,
-                discardedEphemeralOutputs: audited.discardedEphemeralOutputs,
-                verifierMutations: audited.verifierMutations,
-              });
-              await this.#pinTrees(job, {
-                before: job.before,
-                ...(job.workerAfter ? { workerAfter: job.workerAfter } : {}),
-                workspaceAfter,
-              });
+              job = await this.#captureIsolatedWorkspace(job, workspaceAfter, audited);
               if (audited.violations.length)
                 job = await this.store.update(id, {
                   status: 'FINALIZING',
@@ -2340,12 +2374,20 @@ export class JobManager {
             }
             job = await this.store.get(id);
           } catch (snapshotError) {
+            const failed = await this.store.get(id);
             await this.store.update(id, {
               // Cleanup/release is still pending below. Keep the durable
               // lifecycle non-terminal until that ownership work completes.
+              ...(workspace &&
+              job.mode !== 'report' &&
+              failed.applied !== true &&
+              !/patch containing configured secret/.test(String(snapshotError.message || snapshotError))
+                ? { workspaceRetained: true }
+                : {}),
+              ...(safeFinalizationError(snapshotError) ? { finalizationError: safeFinalizationError(snapshotError) } : {}),
               status: 'FINALIZING',
-              finalStatus: 'FAILED',
-              error: String(snapshotError.message || snapshotError),
+              finalStatus: failed.finalStatus === 'CANCELLED' ? 'CANCELLED' : 'FAILED',
+              error: `${leaseLost ? `lease lost: ${leaseLost}; ` : ''}${String(snapshotError.message || snapshotError)}`,
             });
           }
           if (cancellationWatch) clearInterval(cancellationWatch);
@@ -2801,6 +2843,12 @@ export class JobManager {
       baselineDecision.newFailures?.length
     )
       environment = null;
+    let environmentObservation;
+    if (environment) {
+      const scan = preflightVerifier({ repoPath: executionPath, testCommand: job.testCommand, denyRead: job.denyRead });
+      environment = { ...environment, files: verifierFailureFiles(verify, scan?.resolvedFiles) };
+      environmentObservation = { ...safeVerifyEnvironment(environment), observedAt: this.now().toISOString() };
+    }
     // A baseline that could not prove "no new failures" is a failure that no
     // repair round can address; ending here spends no further worker budget.
     const baselineInconclusive = verify.baseline?.status === 'inconclusive';
@@ -2832,6 +2880,9 @@ export class JobManager {
       ...(recoverRetained ? { error: undefined } : {}),
       // Always written: a later verification must not inherit an earlier round's classification.
       verifyEnvironment: environment || undefined,
+      ...(environmentObservation
+        ? { verifyEnvironmentHistory: [...(job.verifyEnvironmentHistory || []), environmentObservation].slice(-16) }
+        : {}),
       ...(!diagnosticOnly && finishRecoveryUnresolved && verify.verdict !== 'PASS'
         ? {
             error: cappedFinishRecoveryUnresolved
@@ -2884,6 +2935,7 @@ export class JobManager {
         ? { workspaceCleanupError: job.workspaceCleanupError }
         : {}),
       ...(job.workspaceCleanupRequired === true ? { workspaceCleanupRequired: true } : {}),
+      ...(job.workspaceRetained === true ? { workspaceRetained: true } : {}),
       ...(safeProviderFailure(job.providerFailure) ? { providerFailure: safeProviderFailure(job.providerFailure) } : {}),
       ...(safeProviderFinishReason(job.providerFinishReason)
         ? { providerFinishReason: safeProviderFinishReason(job.providerFinishReason) }
@@ -3138,6 +3190,13 @@ export class JobManager {
     const spend = detail === 'compact' ? await this.#sessionSpend() : undefined;
     return this.report(job, { detail, ...rest, ...(spend ? { spend } : {}) });
   }
+  async verifierEnvironmentFailures() {
+    if (typeof this.store.list !== 'function') return [];
+    return sessionVerifierFailures(await this.store.list({ limit: Number.MAX_SAFE_INTEGER }), {
+      sessionStartedAt: this.config.sessionStartedAt,
+      repoPath: this.repoPath || this.config.repoPath,
+    });
+  }
   async job(id, { include = 'summary', detail = 'compact', tail, limit, all, maxJobs } = {}) {
     // Validate the window before any lookup so a bad value never reads a job.
     const window = resolveLogWindow({ tail, limit });
@@ -3147,7 +3206,10 @@ export class JobManager {
     if (!id)
       return {
         ...(await this.listing({ ...(all !== undefined ? { all } : {}), ...(maxJobs !== undefined ? { maxJobs } : {}) })),
-        health: this.config.health ? await this.config.health() : { sandbox: 'unknown' },
+        health: {
+          ...(this.config.health ? await this.config.health() : { sandbox: 'unknown' }),
+          verifierEnvironmentFailures: await this.verifierEnvironmentFailures(),
+        },
       };
     const job = await this.store.get(id);
     if (!['summary', 'diff', 'files', 'log'].includes(include)) throw new Error('include must be summary, diff, files, or log');
@@ -3283,6 +3345,8 @@ export class JobManager {
         throw new Error('durable transcript reasoning is unavailable for safe provider replay; start a fresh job');
     }
     if (job.applied === true) throw new Error('an applied job cannot be repaired; start a new job from the current primary tree');
+    if (job.workspaceRetained === true)
+      throw new Error('capture the retained worker work with offload_apply (dry run) before repairing or continuing');
     if (job.integrationIntent === true || job.revertIntent === true || job.integrationUncertain === true || job.revertUncertain === true)
       throw new Error('a job with an unresolved primary mutation outcome cannot be repaired; inspect the primary tree and start a new job');
     if (job.scopeViolations?.length || job.verifierMutations?.length)
@@ -3428,6 +3492,7 @@ export class JobManager {
               ...workspaceDependencyState(workspace),
               workspaceCleanedAt: undefined,
               workspaceCleanupError: undefined,
+              workspaceRetained: undefined,
             }
           : {}),
       };
@@ -3500,7 +3565,7 @@ export class JobManager {
    * owned-path-only patch, branch/HEAD and index drift checks, a write-scope
    * lease against concurrent jobs, a durable intent journal reconciled against
    * the live tree, and `offload_revert` afterwards. `apply: false` is a
-   * side-effect-free dry run.
+   * dry run that leaves the primary unchanged; it may recapture a retained workspace.
    */
   async apply(id, { apply = false, verifiedBy, applyThenVerify, applyThenVerifyTimeoutSec, unsafePolicyOnlyVerifier, signal } = {}) {
     if (typeof apply !== 'boolean') throw new Error('apply must be boolean');
@@ -3617,6 +3682,19 @@ export class JobManager {
         throw new Error('integration outcome is uncertain; inspect primary changes manually');
     }
     if (job.applied === true) throw new Error('job is already applied (use offload_revert to undo it)');
+    if (job.status === 'FAILED' && job.workspaceRetained === true) {
+      if (await this.store.cancelRequested?.(id)) throw new Error('job was cancelled');
+      const workspace = this.#workspace(job);
+      if (!workspace) throw new Error('retained isolated workspace is unavailable');
+      const workspaceAfter = workspace.snapshot({ pin: false });
+      const audited = await this.#classifyIsolatedWorkspace(job, workspace, workspaceAfter);
+      job = await this.#captureIsolatedWorkspace(job, workspaceAfter, audited);
+      // Only a successful capture AND pin permit deleting the paid worker work.
+      job = await this.store.update(id, { workspaceRetained: undefined });
+      await this.cleanupWorkspace(id);
+      job = this.validatePersisted(await this.store.get(id));
+      await this.store.writeArtifact(id, 'report.md', this.report(job));
+    }
     // A FAILED job qualifies only through the gate the report shares, whatever
     // made it fail (see failedApplyRefusal); CANCELLED never does.
     if (job.status === 'FAILED') {
@@ -4433,7 +4511,10 @@ export class JobManager {
       }
       const hasJournal = job?.integrationIntent === true || job?.revertIntent === true || job?.applyVerifyIntent === true;
       const cleanupPending =
-        job?.workspaceCleanupRequired !== true && !!job?.workspacePath && (!job.workspaceCleanedAt || job.workspaceCleanupError);
+        job?.workspaceCleanupRequired !== true &&
+        job?.workspaceRetained !== true &&
+        !!job?.workspacePath &&
+        (!job.workspaceCleanedAt || job.workspaceCleanupError);
       if (
         !hasJournal &&
         !cleanupPending &&
@@ -4662,7 +4743,7 @@ export class JobManager {
       try {
         if (job.workspacePath && this.isolated && job.mode !== 'report') {
           const workspace = this.#workspace(job);
-          const workspaceAfter = workspace.snapshot();
+          const workspaceAfter = workspace.snapshot({ pin: false });
           const audited = await this.#classifyIsolatedWorkspace(job, workspace, workspaceAfter);
           await writeArtifact(job.id, 'patch.diff', audited.allPatch);
           await writeArtifact(job.id, 'revert.diff', audited.revertPatch);
@@ -4710,14 +4791,27 @@ export class JobManager {
         if (await publishRecoveredTerminal(job, 'FAILED', finalJob, { type: 'recovered', message: 'server restarted' })) recovered += 1;
       } catch (error) {
         try {
-          await publishRecoveredTerminal(
+          const published = await publishRecoveredTerminal(
             job,
             'FAILED',
             {
+              ...finalJob,
+              ...(job.workspacePath &&
+              this.isolated &&
+              job.mode !== 'report' &&
+              !/patch containing configured secret/.test(String(error.message || error))
+                ? { workspaceRetained: true }
+                : {}),
+              ...(safeFinalizationError(error) ? { finalizationError: safeFinalizationError(error) } : {}),
               error: `recovery finalization failed: ${error.message || error}`,
             },
-            { type: 'recovered', message: 'server restarted' },
+            {
+              type: 'recovered',
+              message: 'server restarted',
+              ...(safeFinalizationError(error) ? { finalizationError: safeFinalizationError(error) } : {}),
+            },
           );
+          if (published) recovered += 1;
         } catch {}
       }
     }

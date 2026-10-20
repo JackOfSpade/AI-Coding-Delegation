@@ -2,7 +2,7 @@ import { chmodSync, lstatSync, mkdtempSync, readlinkSync, realpathSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { diffTreeFiles, diffTrees, git, snapshotGitEnv, snapshotWorkingTree } from './git-snapshot.mjs';
+import { diffTreeFiles, diffTrees, git, gitErrorDetail, snapshotGitEnv, snapshotWorkingTree } from './git-snapshot.mjs';
 import { matchesAny, normalizePath } from './glob.mjs';
 import { DEFAULT_DENY_READ } from './policy.mjs';
 import { redactText, stripTerminalControls } from './redact.mjs';
@@ -171,7 +171,7 @@ function isolatedHandle({
     dependencies,
 
     /** Snapshot all non-ignored workspace files without modifying its index. */
-    snapshot() {
+    snapshot({ pin = true } = {}) {
       ensureOpen();
       try {
         const tree = snapshotWorkingTree(workspacePath, {
@@ -179,10 +179,12 @@ function isolatedHandle({
         });
         // A single rolling after-tree pin is enough for the lifecycle's next
         // comparison/integration step and stays bounded during a live job.
-        pinTree(primaryPath, treePinRef(privateRoot, 'after'), tree);
+        // The manager persists the patch and pins durable job refs itself.
+        // It can capture first so a pin failure never hides completed work.
+        if (pin) pinTree(primaryPath, treePinRef(privateRoot, 'after'), tree);
         return tree;
-      } catch {
-        throw new WorktreeIsolationError('Could not snapshot isolated worktree', 'E_WORKTREE_SNAPSHOT');
+      } catch (error) {
+        throw new WorktreeIsolationError(`Could not snapshot isolated worktree: ${error.message}`, 'E_WORKTREE_SNAPSHOT');
       }
     },
 
@@ -690,7 +692,7 @@ function runRefTransaction(
       if (existing.length) return runRefTransaction(repoPath, existing, { errorCode, errorMessage });
       return;
     }
-    throw new WorktreeIsolationError(errorMessage, errorCode);
+    throw new WorktreeIsolationError(`${errorMessage}${gitErrorDetail(error)}`, errorCode);
   }
 }
 function makePrivateRoot(tempRoot, mkdtemp) {
@@ -933,8 +935,8 @@ function safeLiteralPath(path) {
 function run(repoPath, args, code, { output = 'text', input } = {}) {
   try {
     return git(repoPath, args, {}, { output, input });
-  } catch {
-    throw new WorktreeIsolationError(`Git ${args[0]} failed`, code);
+  } catch (error) {
+    throw new WorktreeIsolationError(error.message, code);
   }
 }
 function isRegisteredWorktree(primaryPath, workspacePath) {
