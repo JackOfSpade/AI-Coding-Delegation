@@ -500,7 +500,7 @@ test('verifier options: the baseline mode defaults to a 300 s limit per run, run
     [300, 300],
   );
   assert.deepEqual(shape(defaults[0]), shape(defaults[1]));
-  assert.deepEqual(shape(defaults[0]).writable, ['src/**', 'cache/**']);
+  assert.deepEqual(shape(defaults[0]).writable, [join('src', '**'), join('cache', '**')]);
   assert.equal(defaults[0].options.requireSandbox, true);
   assert.deepEqual(shape(defaults[0]).denyRead, ['secret/**']);
   assert.equal(typeof defaults[0].options.onOutput, 'function');

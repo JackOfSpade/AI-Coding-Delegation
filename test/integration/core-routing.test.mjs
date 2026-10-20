@@ -2331,7 +2331,7 @@ test('a real worker loop on a failing call ends FAILED with the redacted call, t
       const shown = JSON.stringify([toolFailure, failed.report]);
       for (const private_ of [path, await realpath(path), tmpdir(), process.env.HOME])
         assert.ok(!private_ || !shown.includes(private_), private_);
-      assert.equal(toolFailure.error, "ENOENT: no such file or directory, lstat '<worktree>/src/missing.js'");
+      assert.equal(toolFailure.error, `ENOENT: no such file or directory, lstat '${join('<worktree>', 'src', 'missing.js')}'`);
       assert.ok(
         failed.report
           .split('\n')
