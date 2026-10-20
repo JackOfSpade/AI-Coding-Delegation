@@ -121,6 +121,21 @@ test('strict test runner parses TAP skips and rejects every skip outside the rev
   assert.deepEqual(result.unapprovedSkips, [{ number: 4, name: 'newly skipped regression', reason: 'oops' }]);
 });
 
+test('strict test runner reviews Darwin temp aliases and sandbox dependency isolation by exact skip reason', () => {
+  const reviewed = [
+    ['Darwin default roots accept /private/tmp and its /tmp alias after canonicalization', 'requires Darwin /private/tmp alias semantics'],
+    [
+      'a sandboxed command in the worktree imports a primary dependency, read-only, and cannot reach other host files',
+      'requires an available macOS sandbox',
+    ],
+  ];
+  for (const [name, reason] of reviewed) {
+    assert.deepEqual(analyzeStrictSkips(`ok 1 - ${name} # SKIP ${reason}`).unapprovedSkips, []);
+    assert.equal(analyzeStrictSkips(`ok 1 - ${name} # SKIP`).unapprovedSkips.length, 1);
+    assert.equal(analyzeStrictSkips(`ok 1 - ${name} # SKIP unrelated reason`).unapprovedSkips.length, 1);
+  }
+});
+
 test('CI test launcher preserves a strict runner failure exit code', async () => {
   const calls = [];
   const child = {

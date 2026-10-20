@@ -761,7 +761,7 @@ test('a retargeted or replaced dependency link grants no read path', () => {
 
 test(
   'a sandboxed command in the worktree imports a primary dependency, read-only, and cannot reach other host files',
-  { skip: process.platform !== 'darwin' || !sandboxAvailable() },
+  { skip: process.platform !== 'darwin' || !sandboxAvailable() ? 'requires an available macOS sandbox' : false },
   async () => {
     const repo = repoWithDependency();
     const outside = tempDir('offload-outside-');

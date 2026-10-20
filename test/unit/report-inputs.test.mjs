@@ -32,7 +32,7 @@ test('report input roots ignore relative ambient temp spellings rather than reso
 
 test(
   'Darwin default roots accept /private/tmp and its /tmp alias after canonicalization',
-  { skip: process.platform !== 'darwin' },
+  { skip: process.platform !== 'darwin' ? 'requires Darwin /private/tmp alias semantics' : false },
   async () => {
     const root = await mkdtemp('/private/tmp/offload-report-inputs-');
     const workspace = await mkdtemp(join(tmpdir(), 'offload-report-workspace-'));

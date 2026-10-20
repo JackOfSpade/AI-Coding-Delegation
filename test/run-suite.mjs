@@ -47,6 +47,11 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
       'real sandbox: the command sees the applied diff, cannot write the primary, and can use its temp dir',
       'requires an available macOS sandbox',
     ],
+    ['Darwin default roots accept /private/tmp and its /tmp alias after canonicalization', 'requires Darwin /private/tmp alias semantics'],
+    [
+      'a sandboxed command in the worktree imports a primary dependency, read-only, and cannot reach other host files',
+      'requires an available macOS sandbox',
+    ],
     ['end to end with the real sandboxed runner: node:test output flows through the streaming parser', 'requires a Homebrew Node on macOS'],
     [
       'end to end with the real sandboxed runner: node:test output flows through the streaming parser',
