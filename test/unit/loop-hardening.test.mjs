@@ -4374,3 +4374,31 @@ test('Claude worker reservations cover five-minute cache writes and stale snapsh
   assert.equal(stale.pricingKnown, false);
   assert.equal(request, undefined, 'an old snapshot cannot silently bill writes at ordinary input rates');
 });
+
+test('finish contract teaches a short summary and recovers the real-session oversized summaries without redoing edits', async () => {
+  for (const length of [1943, 2144, 2518]) {
+    const requests = [];
+    const invoked = [];
+    const result = await new AgentLoop({
+      provider: scripted(
+        [
+          [call('finish', JSON.stringify({ summary: 'x'.repeat(length) }), 'long')],
+          [call('finish', JSON.stringify({ summary: 'Implemented the requested changes.', report: 'Detailed findings.' }), 'short')],
+        ],
+        requests,
+      ),
+      tools: finishTools(invoked),
+    }).run({ task: 'x' });
+    assert.equal(result.status, 'DONE');
+    assert.deepEqual(invoked, ['finish']);
+    assert.match(
+      requests[1].at(-1).content,
+      /Your edits are retained\. Do not redo them\. Shorten summary to 1-2 sentences and move details to report/,
+    );
+    assert.match(requests[1].at(-1).content, /\{"summary":"Implemented the requested changes\."\}/);
+  }
+  const definition = availableToolDefinitions({ allowCommand: true }).find((tool) => tool.function.name === 'finish').function;
+  assert.equal(definition.parameters.properties.summary.maxLength, 1500);
+  assert.match(definition.parameters.properties.summary.description, /1500 characters/);
+  assert.match(await buildSystemPrompt({ task: 'x' }), /Completion prose without a finish call does not finish the job/);
+});

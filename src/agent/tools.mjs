@@ -205,10 +205,19 @@ export const TOOL_DEFINITIONS = Object.freeze([
   ),
   schema(
     'finish',
-    'Finish with a structured report. Use only after every other needed tool result has returned, in a response containing exactly this one tool call; pairing it with another call rejects the entire response.',
+    'Finish the job with this mandatory tool call, not completion prose. Use only after every other needed tool result has returned, in a response containing exactly this one tool call; pairing it with another call rejects the entire response. Keep summary to 1-2 short sentences, at most 1500 characters. Put details in report. Minimal call: {"summary":"Implemented the requested changes."}.',
     {
-      summary: { type: 'string', minLength: 1, maxLength: 1500 },
-      report: { type: 'string', maxLength: 256_000, description: 'Optional detailed report text, used by read-only report jobs.' },
+      summary: {
+        type: 'string',
+        minLength: 1,
+        maxLength: 1500,
+        description: '1-2 short sentences, at most 1500 characters. Move detailed findings to report.',
+      },
+      report: {
+        type: 'string',
+        maxLength: 256_000,
+        description: 'Detailed findings beyond the short summary; required for read-only report jobs.',
+      },
       concerns: { type: 'array', items: str, maxItems: 100 },
       testsRun: { type: 'array', items: str, maxItems: 100 },
       untouchedPaths: {

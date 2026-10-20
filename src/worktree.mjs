@@ -174,7 +174,9 @@ function isolatedHandle({
     snapshot() {
       ensureOpen();
       try {
-        const tree = snapshotWorkingTree(workspacePath);
+        const tree = snapshotWorkingTree(workspacePath, {
+          excludePaths: workspaceDependencyLink(workspacePath, primaryPath) ? ['node_modules'] : [],
+        });
         // A single rolling after-tree pin is enough for the lifecycle's next
         // comparison/integration step and stays bounded during a live job.
         pinTree(primaryPath, treePinRef(privateRoot, 'after'), tree);
@@ -200,7 +202,7 @@ function isolatedHandle({
       ensureOpen();
       try {
         const raw = run(workspacePath, ['ls-files', '--others', '--ignored', '--exclude-standard', '-z'], 'E_WORKTREE_IGNORED');
-        return raw.split('\0').filter(Boolean);
+        return raw.split('\0').filter((path) => path && !(path === 'node_modules' && workspaceDependencyLink(workspacePath, primaryPath)));
       } catch (error) {
         if (error instanceof WorktreeIsolationError) throw error;
         throw new WorktreeIsolationError('Could not inspect ignored workspace files', 'E_WORKTREE_IGNORED');
@@ -338,15 +340,16 @@ export function integrateRecordedTree({ repoPath, baselineTree, afterTree, paths
 
 /**
  * Make the primary checkout's installed `node_modules` resolvable from a
- * private worktree without putting it inside that worktree.
+ * private worktree for both package resolution and literal CLI paths.
  *
  * A Git worktree contains only tracked/non-ignored files, so a gitignored
  * `node_modules` is absent and a verifier cannot import its dependencies (and
  * the worker has no network to install them). Node and most bundlers resolve
- * packages by walking *up* from the importing file, so a symlink in the
- * server-owned private root, the workspace's parent, is found without touching
- * the workspace tree, its index, snapshots, scope checks, or ignored-output
- * accounting. The command sandbox separately grants read-only access to the
+ * packages by walking *up* from the importing file. A link in the server-owned
+ * private root supports that resolution; a second link inside the workspace
+ * supports `node node_modules/typescript/bin/tsc`. Only that authenticated
+ * server link is excluded from snapshots and ignored-output accounting. The
+ * command sandbox separately grants read-only access to the
  * link's exact target (see isolatedDependencyReadPaths); the worker can neither
  * write the private root nor retarget the link.
  *
@@ -358,10 +361,31 @@ export function linkPrimaryNodeModules(primaryPath, privateRoot) {
   if (source.reason) return { nodeModules: source.reason };
   try {
     symlinkSync(source.path, join(privateRoot, 'node_modules'), 'dir');
+    const local = join(privateRoot, 'workspace', 'node_modules');
+    // A seeded tree may already contain dependencies. Never shadow its files.
+    try {
+      lstatSync(local);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      symlinkSync('../node_modules', local, 'dir');
+    }
   } catch {
     return { nodeModules: 'link-failed' };
   }
   return { nodeModules: 'linked' };
+}
+
+function workspaceDependencyLink(workspacePath, repoPath) {
+  try {
+    const link = join(workspacePath, 'node_modules');
+    return (
+      lstatSync(link).isSymbolicLink() &&
+      readlinkSync(link) === '../node_modules' &&
+      isolatedDependencyReadPaths(workspacePath, repoPath).length === 1
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**

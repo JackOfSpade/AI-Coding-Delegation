@@ -15,7 +15,7 @@ const RANGE_ENTRY = /:\d{1,7}-\d{1,7}(?: \(read_file offset |$)/;
 export const WORKER_TEST_QUALITY_RULE = 'Assertions must be falsifiable; no substring checks that match unrelated text.';
 // A finish that shares its response with another call is rejected unrun (the loop allows one correction).
 const FINISH_ALONE_RULE =
-  'Use finish only after every other needed tool result has returned. Its response must contain exactly one tool call: finish. Pairing finish with any other tool rejects the entire response, including its writes.';
+  'Use finish only after every other needed tool result has returned. Its response must contain exactly one tool call: finish. Pairing finish with any other tool rejects the entire response, including its writes. Keep summary to 1-2 short sentences (at most 1500 characters); put detailed findings in report, not summary. A minimal valid final call is finish({"summary":"Implemented the requested changes."}). Completion prose without a finish call does not finish the job.';
 
 export async function repoConventions(repoPath, maxChars = 12_000) {
   if (typeof repoPath !== 'string' || !repoPath) return '';

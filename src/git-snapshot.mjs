@@ -19,7 +19,7 @@ export class GitSnapshotError extends Error {
 }
 
 /** Build a tree from all non-ignored working-tree files without changing the real index or HEAD. */
-export function snapshotWorkingTree(repoPath) {
+export function snapshotWorkingTree(repoPath, { excludePaths = [] } = {}) {
   const tempDir = mkdtempSync(join(tmpdir(), 'offload-index-'));
   const indexFile = join(tempDir, 'index');
   try {
@@ -28,7 +28,12 @@ export function snapshotWorkingTree(repoPath) {
     // from running while the temporary index is built.
     const hooksPath = join(tempDir, 'empty-hooks');
     mkdirSync(hooksPath);
-    git(repoPath, ['add', '-A'], { GIT_INDEX_FILE: indexFile }, { hooksPath });
+    git(
+      repoPath,
+      ['add', '-A', ...(excludePaths.length ? ['--', '.', ...excludePaths.map((path) => `:(exclude,literal)${path}`)] : [])],
+      { GIT_INDEX_FILE: indexFile },
+      { hooksPath },
+    );
     return git(repoPath, ['write-tree'], { GIT_INDEX_FILE: indexFile }, { hooksPath }).trim();
   } finally {
     rmSync(tempDir, { recursive: true, force: true });

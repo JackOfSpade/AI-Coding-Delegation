@@ -522,6 +522,11 @@ test(
     runGit(repo, ['commit', '-m', 'ignore deps']);
     await mkdir(join(repo, 'node_modules', 'dep-pkg'), { recursive: true });
     await writeFile(join(repo, 'node_modules', 'dep-pkg', 'index.js'), 'module.exports = "dep-ok";\n');
+    await mkdir(join(repo, 'node_modules', 'typescript', 'bin'), { recursive: true });
+    await writeFile(
+      join(repo, 'node_modules', 'typescript', 'bin', 'tsc'),
+      'if (process.argv[2] !== "--noEmit") process.exit(1); console.log("typescript-cli-ok");\n',
+    );
     await writeFile(join(repo, 'node_modules', 'dep-pkg', '.env'), 'TOKEN=should-not-be-readable\n');
     await mkdir(join(repo, 'node_modules', '.cache'), { recursive: true });
     await writeFile(join(repo, 'node_modules', '.cache', 'entry.json'), '{}\n');
@@ -544,10 +549,14 @@ test(
     assert.equal(read.sandbox, 'macos');
     assert.equal(read.code, 0, read.stderr);
     assert.match(read.stdout, /dep-ok/);
+    const cli = await run('node node_modules/typescript/bin/tsc --noEmit');
+    assert.equal(cli.code, 0, cli.stderr);
+    assert.equal(cli.stdout.trim(), 'typescript-cli-ok');
     // No write reaches the primary's node_modules by any route.
     const writes = await run(
       [
         `touch ../node_modules/dep-pkg/via-link; echo link:$?`,
+        `touch node_modules/dep-pkg/via-local-link; echo local:$?`,
         `touch ${shellQuote(join(primaryModules, 'dep-pkg', 'direct'))}; echo direct:$?`,
         `echo x > ${shellQuote(join(primaryModules, 'dep-pkg', 'index.js'))}; echo overwrite:$?`,
         `rm ${shellQuote(join(primaryModules, 'dep-pkg', 'index.js'))}; echo remove:$?`,
@@ -556,12 +565,27 @@ test(
         // Nor may it retarget or delete the server-owned link in the private root.
         `rm ../node_modules; echo unlink:$?`,
         `ln -sfn ${shellQuote(pwned)} ../node_modules; echo retarget:$?`,
+        `rm node_modules; echo local-unlink:$?`,
+        `ln -sfn ${shellQuote(pwned)} node_modules; echo local-retarget:$?`,
         `touch ../sibling; echo parent:$?`,
       ].join('\n'),
     );
-    for (const name of ['link', 'direct', 'overwrite', 'remove', 'worker-link', 'unlink', 'retarget', 'parent'])
+    for (const name of [
+      'link',
+      'local',
+      'direct',
+      'overwrite',
+      'remove',
+      'worker-link',
+      'unlink',
+      'retarget',
+      'local-unlink',
+      'local-retarget',
+      'parent',
+    ])
       assert.match(writes.stdout, new RegExp(`${name}:[1-9]`), `${name} must fail: ${writes.stdout}`);
     assert.equal(existsSync(join(primaryModules, 'dep-pkg', 'via-link')), false);
+    assert.equal(existsSync(join(primaryModules, 'dep-pkg', 'via-local-link')), false);
     assert.equal(existsSync(join(primaryModules, 'dep-pkg', 'direct')), false);
     assert.equal(existsSync(join(primaryModules, 'dep-pkg', 'via-worker-link')), false);
     assert.equal(await readFile(join(primaryModules, 'dep-pkg', 'index.js'), 'utf8'), 'module.exports = "dep-ok";\n');
@@ -569,6 +593,7 @@ test(
     assert.equal(existsSync(join(pwned, 'index.js')), false);
     // The link still points at the primary after the attempts.
     assert.equal(await realpath(join(dirname(workspace), 'node_modules')), await realpath(primaryModules));
+    assert.equal(await realpath(join(workspace, 'node_modules')), await realpath(primaryModules));
     // Credential-shaped files and dependency caches in the mount stay unreadable.
     const denied = await run(
       [

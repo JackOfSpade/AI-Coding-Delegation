@@ -416,6 +416,10 @@ export function macosProfile({
     ...writablePaths.map((path) => sandboxGlobFilter('allow', root, path)),
     ...write.map((path) => `(allow file-write* (subpath ${q(path)}))`),
     ...protectedGitPaths.flatMap((path) => denyPath('write', path)),
+    // Dependencies are a read capability, including the workspace-local
+    // server link used by literal CLI paths. Even a broad ** write scope may
+    // not remove/retarget it or mutate dependencies through any route.
+    ...denyPath('write', join(root, 'node_modules')),
     ...denyWrite.map((pattern) => denyFilter('write', root, pattern)),
     ...protectedRead.map((pattern) => denyFilter('read', root, pattern)),
     ...resolvedReadable.flatMap((readable) => EXTRA_READ_ROOT_DENY.map((pattern) => denyFilter('read', readable, pattern))),

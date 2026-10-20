@@ -109,6 +109,7 @@ const PRE_MUTATION_ERRORS = new Set([
 const ROUND_SCOPED_VERIFIER_STATE = Object.freeze({
   verify: undefined,
   workerAfter: undefined,
+  retainedDiffRecovery: undefined,
   verifyEnvironment: undefined,
   applyVerify: undefined,
 });
@@ -2067,11 +2068,18 @@ export class JobManager {
             if (workspace && job.mode !== 'report') {
               let workspaceAfter = await workspace.snapshot();
               let audited = await this.#classifyIsolatedWorkspace(job, workspace, workspaceAfter);
-              // A provider outage says nothing about the retained implementation.
-              // Audit before executing it, then audit again to catch verifier writes.
+              // A worker/protocol stop says nothing about the retained diff.
+              // Audit before executing it, then audit again for verifier writes.
+              // Most failures retain their status and continue/apply path. If
+              // redaction prevents replay, let verification decide the outcome
+              // without reopening the provider conversation or spending a repair.
+              const retainedWorkerStop =
+                safeFailureKind(job.failureKind) ||
+                safeProviderFailure(job.providerFailure) ||
+                retryableTranscriptFailure({ ...job, status: 'FAILED' });
               if (
                 job.finalStatus === 'FAILED' &&
-                safeProviderFailure(job.providerFailure) &&
+                retainedWorkerStop &&
                 job.testCommand &&
                 !job.verify &&
                 !controller.signal.aborted &&
@@ -2079,13 +2087,18 @@ export class JobManager {
                 !audited.violations.length &&
                 audited.revertPaths.length
               ) {
-                job = await this.store.update(id, { workerAfter: workspaceAfter });
+                const recoverRetained = job.transcriptReplayable === false && !continuationBlocker({ ...job, transcriptReplayable: true });
+                job = await this.store.update(id, {
+                  workerAfter: workspaceAfter,
+                  ...(recoverRetained ? { retainedDiffRecovery: true } : {}),
+                });
                 await this.#pinTrees(job, { before: job.before, workerAfter: workspaceAfter });
                 await this.store.update(id, stamp('verify'));
                 try {
-                  await this._verify(job, { diagnosticOnly: true });
+                  await this._verify(job, { diagnosticOnly: !recoverRetained, recoverRetained });
                 } catch (error) {
                   await this.store.update(id, {
+                    ...(recoverRetained ? { status: 'FINALIZING', finalStatus: 'VERIFY_FAILED', error: undefined } : {}),
                     verify: {
                       command: job.testCommand,
                       verdict: 'UNVERIFIED',
@@ -2685,7 +2698,7 @@ export class JobManager {
       await this.store.event(id, { type: 'verify-phase', ...event });
     } catch {}
   }
-  async _verify(job, { diagnosticOnly = false } = {}) {
+  async _verify(job, { diagnosticOnly = false, recoverRetained = false } = {}) {
     // Progress callbacks can durably advance a safety lifecycle while the
     // worker is running.  The object supplied by the caller predates those
     // callbacks, so verification must use the authenticated current record
@@ -2792,6 +2805,9 @@ export class JobManager {
     // repair round can address; ending here spends no further worker budget.
     const baselineInconclusive = verify.baseline?.status === 'inconclusive';
     const canRepair =
+      !diagnosticOnly &&
+      !recoverRetained &&
+      !continuationBlocker(job) &&
       verify.verdict !== 'PASS' &&
       !environment &&
       !sandboxRequirementFailed &&
@@ -2813,6 +2829,7 @@ export class JobManager {
       status: 'FINALIZING',
       finalStatus: diagnosticOnly ? 'FAILED' : status,
       verify,
+      ...(recoverRetained ? { error: undefined } : {}),
       // Always written: a later verification must not inherit an earlier round's classification.
       verifyEnvironment: environment || undefined,
       ...(!diagnosticOnly && finishRecoveryUnresolved && verify.verdict !== 'PASS'

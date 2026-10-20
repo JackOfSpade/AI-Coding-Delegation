@@ -602,7 +602,7 @@ function repoWithDependency() {
   return repo;
 }
 
-test('a private worktree resolves the primary node_modules through a link beside it, invisible to Git and scope checks', () => {
+test('a private worktree resolves primary dependencies through parent and local links, invisible to snapshots and scope checks', () => {
   const repo = repoWithDependency();
   let isolated;
   try {
@@ -612,9 +612,13 @@ test('a private worktree resolves the primary node_modules through a link beside
     const link = join(dirname(isolated.path), 'node_modules');
     assert.equal(lstatSync(link).isSymbolicLink(), true);
     assert.equal(realpathSync(link), realpathSync(join(repo, 'node_modules')));
-    assert.equal(existsSync(join(isolated.path, 'node_modules')), false, 'the workspace itself stays free of dependencies');
+    assert.equal(readlinkSync(join(isolated.path, 'node_modules')), '../node_modules');
+    assert.equal(
+      realpathSync(join(isolated.path, 'node_modules', 'dep-pkg', 'index.js')),
+      realpathSync(join(repo, 'node_modules', 'dep-pkg', 'index.js')),
+    );
     assert.deepEqual(isolatedDependencyReadPaths(isolated.path, repo), [realpathSync(join(repo, 'node_modules'))]);
-    // Neither the snapshot, the changed-file list, nor ignored-output accounting sees the link.
+    // Neither the snapshot, the changed-file list, nor ignored-output accounting sees the server link.
     assert.deepEqual(isolated.changes(isolated.snapshot()).files, []);
     assert.deepEqual(isolated.ignoredPaths(), []);
     // Reopening a persisted worktree reports the same state.
@@ -693,6 +697,11 @@ test('a retargeted or replaced dependency link grants no read path', () => {
     symlinkSync(outside, link, 'dir');
     assert.equal(readlinkSync(link), outside);
     assert.deepEqual(isolatedDependencyReadPaths(isolated.path, repo), [], 'a link to anything but the primary node_modules is ignored');
+    assert.deepEqual(
+      isolated.changes(isolated.snapshot()).files.map((file) => file.path),
+      ['node_modules'],
+      'a link with a changed target must enter the scope audit',
+    );
     rmSync(link);
     assert.deepEqual(isolatedDependencyReadPaths(isolated.path, repo), []);
     assert.deepEqual(isolatedDependencyReadPaths(isolated.path, join(outside, 'not-a-repo')), []);

@@ -298,6 +298,8 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     isolation,
     discarded,
     verify,
+    job.retainedDiffRecovery === true &&
+      'worker stop: verification attempted on retained diff after transcript redaction; provider replay and automatic repair were suppressed',
     baselineDiff,
     environment,
     appliedUnverified,

@@ -138,6 +138,40 @@ export function redact(value) {
   if (typeof value === 'string') return redactTokenShapes(value);
   return value;
 }
+
+// Tool inputs are JSON documents, not log lines. Redacting the encoded string
+// can consume its closing quote/brace (e.g. an Authorization header inside
+// write_file.content), leaving invalid native Anthropic tool_use input. Redact
+// decoded values, then encode again only if something actually changed; clean
+// provider protocol state must remain byte-for-byte identical.
+function redactToolInput(source, secrets) {
+  const text = (value) => redactText(redactTokenShapes(value), secrets);
+  try {
+    const parsed = JSON.parse(source);
+    const cleanKeys = (value) => {
+      if (Array.isArray(value)) return value.map(cleanKeys);
+      if (value && typeof value === 'object')
+        return Object.fromEntries(Object.entries(value).map(([key, item]) => [text(key), cleanKeys(item)]));
+      return value;
+    };
+    const clean = cleanKeys(foundationRedact(redact(parsed), secrets));
+    return JSON.stringify(clean) === JSON.stringify(parsed) ? source : JSON.stringify(clean);
+  } catch {
+    return text(source);
+  }
+}
+
+function redactMessage(message, secrets) {
+  const stored = foundationRedact(redact(message), secrets);
+  if (message.role !== 'assistant') return stored;
+  message.tool_calls?.forEach((call, index) => {
+    stored.tool_calls[index].function.arguments = redactToolInput(call.function.arguments, secrets);
+  });
+  message.anthropic_content?.forEach((block, index) => {
+    if (block.type === 'tool_use') stored.anthropic_content[index].input = redactToolInput(block.input, secrets);
+  });
+  return stored;
+}
 function validStoredReadStat(details, cap) {
   return (
     !!details &&
@@ -549,7 +583,7 @@ export class JobStore {
     const directory = await this.#assertJobDirectory(id);
     if (!Array.isArray(messages) || messages.length === 0 || messages.some((message) => !validMessage(message)))
       throw new Error('invalid transcript message');
-    const storedMessages = messages.map((message) => foundationRedact(redact(message), this.secrets));
+    const storedMessages = messages.map((message) => redactMessage(message, this.secrets));
     // Provider thinking/replay blocks are protocol state, not display text.
     // Durable artifacts must still redact credentials, so remember the
     // one-way fact that redaction changed either format rather than retaining

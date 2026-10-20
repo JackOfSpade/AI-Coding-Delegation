@@ -22,10 +22,13 @@ function sensitiveKey(key, value) {
 }
 const BEARER = /\b(Bearer)[ \t]+[A-Za-z0-9._~+\/-]+=*/gi;
 const ASSIGNMENT = /\b((?:(?:[A-Za-z_][A-Za-z0-9_]*_)?(?:TOKEN|SECRET|PASSWORD|API_KEY|KEY)|AUTHORIZATION|COOKIE))=([^\s'"`]+)/gi;
-const SENSITIVE_HEADER = /\b(?:(?:x-)?api[-_ ]?key|authorization|(?:set-)?cookie|token|secret|password)\s*:\s*[^\r\n]*/gi;
+// Bare `token`/`secret`/`password` also name ordinary source properties. Only
+// recognize those as headers at the start of a line, never inside source or
+// an encoded tool argument such as `return { token: match[1], rest };`.
+const SENSITIVE_HEADER = /(?:\b(?:(?:x-)?api[-_ ]?key|authorization|(?:set-)?cookie)|^[ \t]*(?:token|secret|password))\s*:\s*[^\r\n]*/gim;
 const ASSIGNMENT_SUFFIX = /(?:^|_)(?:TOKEN|SECRET|PASSWORD|API_KEY|KEY)$/i;
 const EXACT_ASSIGNMENT = /^(?:AUTHORIZATION|COOKIE)$/i;
-const HEADER_SUFFIX = /(?:^|[^A-Za-z0-9_])(?:(?:x-)?api[-_ ]?key|authorization|(?:set-)?cookie|token|secret|password)$/i;
+const HEADER_SUFFIX = /(?:(?:^|[^A-Za-z0-9_])(?:(?:x-)?api[-_ ]?key|authorization|(?:set-)?cookie)|^[ \t]*(?:token|secret|password))$/i;
 const WORD = /[A-Za-z0-9_]/;
 const IDENTIFIER = /[A-Za-z0-9_]/;
 const BEARER_VALUE = /^[A-Za-z0-9._~+\/=\-]$/;
@@ -46,7 +49,8 @@ const sensitiveAssignment = (identifier) => {
   const tail = identifier.slice(-64);
   return EXACT_ASSIGNMENT.test(identifier) || ASSIGNMENT_SUFFIX.test(tail);
 };
-const sensitiveHeader = (tail) => HEADER_SUFFIX.test(tail.trimEnd());
+const sensitiveHeader = (tail, prefixBlank = true) =>
+  HEADER_SUFFIX.test(tail.trimEnd()) && (prefixBlank || !/^[ \t]*(?:token|secret|password)$/i.test(tail.trimEnd()));
 
 /**
  * Project UTF-8 scalar tokens to terminal-safe, redacted output while
@@ -69,6 +73,7 @@ export class RedactionProjector {
   #previousWord = false;
   #identifier = '';
   #headerTail = '';
+  #headerPrefixBlank = true;
   #sensitiveHeaderPending = false;
 
   constructor(emit) {
@@ -92,6 +97,7 @@ export class RedactionProjector {
     else this.#identifier = '';
     if (char === '\n' || char === '\r') {
       this.#headerTail = '';
+      this.#headerPrefixBlank = true;
       // redactText's header grammar accepts folded whitespace. Retain an
       // already recognized sensitive field name through CR/LF as well, and
       // clear it only when a non-whitespace token proves this is not a colon.
@@ -103,8 +109,12 @@ export class RedactionProjector {
     // whitespace; controls/ANSI sequences call `skip` and therefore cannot
     // reset it.
     if (this.#sensitiveHeaderPending && !HEADER_WHITESPACE.test(char)) this.#sensitiveHeaderPending = false;
-    this.#headerTail = `${this.#headerTail}${char}`.slice(-96);
-    if (sensitiveHeader(this.#headerTail)) this.#sensitiveHeaderPending = true;
+    const tail = `${this.#headerTail}${char}`;
+    // A bounded tail must not invent a line boundary after dropping source.
+    // Leading header indentation can be arbitrarily long, however.
+    if (tail.length > 96 && /[^ \t]/.test(tail.slice(0, -96))) this.#headerPrefixBlank = false;
+    this.#headerTail = tail.slice(-96);
+    if (sensitiveHeader(this.#headerTail, this.#headerPrefixBlank)) this.#sensitiveHeaderPending = true;
   }
 
   #normal(token, { detectBearer = true } = {}) {
@@ -115,14 +125,16 @@ export class RedactionProjector {
       this.#identifier = '';
       this.#previousWord = false;
       this.#headerTail = `${this.#headerTail}${char}`.slice(-96);
+      this.#headerPrefixBlank = false;
       return;
     }
-    if (char === ':' && (this.#sensitiveHeaderPending || sensitiveHeader(this.#headerTail))) {
+    if (char === ':' && (this.#sensitiveHeaderPending || sensitiveHeader(this.#headerTail, this.#headerPrefixBlank))) {
       this.#mode = 'redaction';
       this.#redaction = { start, end, text: ': [REDACTED]', kind: 'header' };
       this.#identifier = '';
       this.#previousWord = false;
       this.#headerTail = '';
+      this.#headerPrefixBlank = false;
       this.#sensitiveHeaderPending = false;
       return;
     }
@@ -314,7 +326,11 @@ export class RedactionProjector {
  * both, or the two copies can differ by a credential.
  */
 export function redactTokenShapes(value) {
-  return String(value).replace(/\b(?:sk|rk|key|bearer)[-_A-Za-z0-9]{12,}\b/gi, '[REDACTED]');
+  // A prefix without a separator matches identifiers (keyboardShortcut) and
+  // random runs inside base64 Anthropic thinking signatures. Those signatures
+  // must survive byte-for-byte for replay. Known literal secrets are still
+  // removed independently, regardless of their shape.
+  return String(value).replace(/\b(?:sk|rk|key|bearer)[-_][-_A-Za-z0-9]{11,}\b/gi, '[REDACTED]');
 }
 export function redactText(value, secrets = []) {
   let text = String(value);

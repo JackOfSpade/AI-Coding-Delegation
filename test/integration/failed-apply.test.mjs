@@ -722,3 +722,168 @@ test('fixed assertion pass enforces file and USD boundaries on the worker', asyn
     }
   }
 });
+
+test('finish-protocol and no-finish stops verify retained in-scope work before reporting and preserve continuation/apply', async () => {
+  for (const kind of ['finish-protocol', 'no-finish']) {
+    for (const pass of [false, true]) {
+      const h = await harness({
+        worker: async (job, run, { appendMessages }) => {
+          const input = JSON.stringify({ path: 'src/a.js', content: 'return { token: match[1], rest };' });
+          await appendMessages([
+            {
+              role: 'assistant',
+              content: '',
+              tool_calls: [{ id: 'write', type: 'function', function: { name: 'write_file', arguments: input } }],
+              anthropic_content: [
+                {
+                  type: 'thinking',
+                  thinking: 'host.career.<kind>.<entity>.<n>',
+                  signature: 'AbCdEf+/skabcdefghijklmnop+/keyabcdefghijklmnop/AbCdEf==',
+                },
+                { type: 'tool_use', id: 'write', name: 'write_file', input },
+              ],
+            },
+            { role: 'tool', tool_call_id: 'write', content: 'WROTE: src/a.js' },
+          ]);
+          writeSrc(job, 'a.js', A_BYTES);
+          return failedProtocol({ failureKind: kind });
+        },
+        check: pass ? green : red,
+      });
+      try {
+        const { id, done } = await h.begin({ testCommand: 'node check.js' });
+        assert.equal(done.status, 'FAILED');
+        assert.equal(done.failureKind, kind);
+        assert.equal(h.counters.checks.length, 1);
+        assert.equal(h.counters.runs, 1, 'diagnostic verification cannot launch automatic repair');
+        assert.equal((await h.store.get(id)).transcriptReplayable, true);
+        assert.match(done.report, pass ? /verify:.*PASS/ : /verify:.*FAIL/);
+        assert.equal(existsSync(join(h.repo, 'src/a.js')), false);
+        assert.equal((await h.manager.apply(id)).dryRun, true);
+        await h.manager.continue(id, { launch: false });
+        assert.equal((await h.store.get(id)).status, 'QUEUED');
+        await h.manager.cancel(id);
+      } finally {
+        cleanup(h.repo);
+      }
+    }
+  }
+});
+
+test('redacted replay state cannot strand completed work: retained diff verification decides status without provider replay', async () => {
+  for (const kind of ['finish-protocol', 'no-finish', 'transcript-corruption']) {
+    for (const pass of [false, true]) {
+      const h = await harness({
+        worker: async (job) => {
+          writeSrc(job, 'a.js', A_BYTES);
+          await h.store.update(job.id, { transcriptReplayable: false });
+          return kind === 'transcript-corruption'
+            ? { status: 'FAILED', error: 'corrupt transcript: invalid interior JSON' }
+            : failedProtocol({ failureKind: kind });
+        },
+        check: pass ? green : red,
+      });
+      try {
+        const { id, done } = await h.begin({ testCommand: 'node check.js' });
+        assert.equal(done.status, pass ? 'DONE_VERIFIED' : 'VERIFY_FAILED');
+        assert.equal(h.counters.checks.length, 1);
+        assert.equal(h.counters.runs, 1, 'redacted reasoning never authorizes a repair request');
+        assert.match(done.report, /worker stop: verification attempted on retained diff after transcript redaction/);
+        assert.match(done.report, pass ? /verify:.*PASS/ : /verify:.*FAIL/);
+        assert.equal((await h.store.get(id)).error, undefined);
+        assert.equal(existsSync(join(h.repo, 'src/a.js')), pass);
+        if (pass) assert.equal(await readFile(join(h.repo, 'src/a.js'), 'utf8'), A_BYTES);
+        else assert.equal((await h.manager.apply(id)).dryRun, true);
+      } finally {
+        cleanup(h.repo);
+      }
+    }
+  }
+});
+
+test('a valid finish with redacted replay state verifies once and cannot queue automatic repair', async () => {
+  const h = await harness({
+    worker: async (job) => {
+      writeSrc(job, 'a.js', A_BYTES);
+      await h.store.update(job.id, { transcriptReplayable: false });
+      return { status: 'DONE', finish: { summary: 'done' } };
+    },
+    check: red,
+  });
+  try {
+    const { done } = await h.begin({ testCommand: 'node check.js' });
+    assert.equal(done.status, 'VERIFY_FAILED');
+    assert.equal(h.counters.checks.length, 1);
+    assert.equal(h.counters.runs, 1);
+  } finally {
+    cleanup(h.repo);
+  }
+});
+
+test('finish failure verification skips empty, out-of-scope, cancelled and invalid-accounting work', async () => {
+  for (const variant of ['empty', 'outside', 'cancelled', 'accounting']) {
+    const h = await harness({
+      worker: async (job) => {
+        await h.store.update(job.id, { transcriptReplayable: false });
+        if (variant !== 'empty') writeSrc(job, 'a.js', A_BYTES);
+        if (variant === 'outside') write(join(job.workspacePath, 'outside.js'), 'outside\n');
+        return failedProtocol({
+          ...(variant === 'cancelled' ? { status: 'CANCELLED' } : {}),
+          ...(variant === 'accounting' ? { costUsd: -1 } : {}),
+        });
+      },
+    });
+    try {
+      const { done } = await h.begin({ testCommand: 'node check.js' });
+      assert.equal(done.status, variant === 'cancelled' ? 'CANCELLED' : 'FAILED');
+      assert.equal(h.counters.checks.length, 0);
+      assert.equal(existsSync(join(h.repo, 'src/a.js')), false);
+    } finally {
+      cleanup(h.repo);
+    }
+  }
+});
+
+test('retained-diff recovery rejects verifier-authored changes even after a passing check', async () => {
+  const h = await harness({
+    worker: async (job) => {
+      writeSrc(job, 'a.js', A_BYTES);
+      await h.store.update(job.id, { transcriptReplayable: false });
+      return failedProtocol();
+    },
+    check: (command, options) => (write(join(options.cwd, 'src/a.js'), 'verifier authored\n'), green()),
+  });
+  try {
+    const { id, done } = await h.begin({ testCommand: 'node check.js' });
+    assert.equal(done.status, 'FAILED');
+    assert.deepEqual((await h.store.get(id)).verifierMutations, ['src/a.js']);
+    assert.equal(existsSync(join(h.repo, 'src/a.js')), false);
+    await assert.rejects(() => h.manager.apply(id), /scope|authorship/);
+  } finally {
+    cleanup(h.repo);
+  }
+});
+
+test('a retained-diff verifier exception reports VERIFY_FAILED with an UNVERIFIED check and keeps the diff reviewable', async () => {
+  const h = await harness({
+    worker: async (job) => {
+      writeSrc(job, 'a.js', A_BYTES);
+      await h.store.update(job.id, { transcriptReplayable: false });
+      return failedProtocol();
+    },
+    check: () => {
+      throw new Error('runner unavailable');
+    },
+  });
+  try {
+    const { id, done } = await h.begin({ testCommand: 'node check.js' });
+    assert.equal(done.status, 'VERIFY_FAILED');
+    assert.match(done.report, /verify:.*UNVERIFIED/);
+    assert.match(done.report, /Verifier could not run: runner unavailable/);
+    assert.equal(h.counters.runs, 1);
+    assert.equal(existsSync(join(h.repo, 'src/a.js')), false);
+    assert.equal((await h.manager.apply(id)).dryRun, true);
+  } finally {
+    cleanup(h.repo);
+  }
+});

@@ -832,3 +832,64 @@ test('transcript restarts refuse unreserved, valid, and differently corrupt conv
     cleanup(gitDir);
   }
 });
+
+test('base64 thinking signatures and source placeholders survive sealed storage byte-for-byte and remain replayable', async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir }).configureIntegrity({ requiredFor: () => true, keyForId: () => 'key' });
+    const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
+    const input = '{ "path": "src/parser.js", "content": "return { token: match[1], rest };" }';
+    const messages = [
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{ id: 'write', type: 'function', function: { name: 'write_file', arguments: input } }],
+        anthropic_content: [
+          {
+            type: 'thinking',
+            thinking: 'host.career.<kind>.<entity>.<n>\n- <catalog ID> - <reason>',
+            signature: 'AbCdEf+/skabcdefghijklmnop+/keyabcdefghijklmnop/AbCdEf==',
+          },
+          { type: 'tool_use', id: 'write', name: 'write_file', input },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'write', content: 'WROTE: src/parser.js' },
+    ];
+    await store.messagesBatch(job.id, messages);
+    assert.deepEqual(await store.readMessages(job.id), messages);
+    assert.deepEqual(new AgentContext(await store.readMessages(job.id)).snapshot(), messages);
+    assert.equal((await store.get(job.id)).transcriptReplayable, true);
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
+test('credential redaction preserves valid JSON and matching native/portable tool input while blocking replay', async () => {
+  const gitDir = tempDir();
+  const secret = 'known-literal-credential';
+  try {
+    const store = new JobStore({ gitDir, secrets: [secret] }).configureIntegrity({ requiredFor: () => true, keyForId: () => 'key' });
+    for (const content of ['Authorization: Bearer private-credential', `const value = "${secret}";`, 'TOKEN=private-credential']) {
+      const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
+      const input = JSON.stringify({ path: 'src/a.js', content });
+      await store.messagesBatch(job.id, [
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{ id: 'write', type: 'function', function: { name: 'write_file', arguments: input } }],
+          anthropic_content: [{ type: 'tool_use', id: 'write', name: 'write_file', input }],
+        },
+        { role: 'tool', tool_call_id: 'write', content: 'WROTE: src/a.js' },
+      ]);
+      const restored = await store.readMessages(job.id);
+      const args = restored[0].tool_calls[0].function.arguments;
+      assert.equal(restored[0].anthropic_content[0].input, args);
+      assert.equal(JSON.parse(args).path, 'src/a.js');
+      assert.match(JSON.parse(args).content, /\[REDACTED\]/);
+      assert.doesNotMatch(JSON.stringify(restored), /private-credential|known-literal-credential/);
+      assert.equal((await store.get(job.id)).transcriptReplayable, false);
+    }
+  } finally {
+    cleanup(gitDir);
+  }
+});

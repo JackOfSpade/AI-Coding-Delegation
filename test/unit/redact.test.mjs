@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { redact, redactError, redactText } from '../../src/redact.mjs';
+import { redact, redactError, redactText, redactTokenShapes, RedactionProjector } from '../../src/redact.mjs';
 
 test('redaction removes explicit secrets and credential-looking text', () => {
   const value = redactText('Authorization: Bearer abc.def SECRET_TOKEN=xyz', ['abc.def']);
@@ -74,4 +74,35 @@ test('cache-write accounting remains numeric through redaction while credential-
   assert.equal(redact({ cacheWriteTokens: 123 }).cacheWriteTokens, 123);
   assert.equal(redact({ cacheWriteTokens: 'secret' }).cacheWriteTokens, '[REDACTED]');
   assert.equal(redact({ cacheWriteTokens: -1 }).cacheWriteTokens, '[REDACTED]');
+});
+
+test('source token properties and placeholders are not credential headers', () => {
+  const source = 'return { token: match[1], rest };';
+  for (const value of [source, JSON.stringify({ content: source }), 'host.career.<kind>.<entity>.<n>', '- <catalog ID> - <reason>'])
+    assert.equal(redactText(value), value);
+  assert.equal(redactText('Token: actual-secret\nPassword: another-secret'), 'Token: [REDACTED]\nPassword: [REDACTED]');
+});
+
+test('token shapes require a credential separator and known secrets still redact in opaque signatures', () => {
+  const signature = 'AbCdEf+/skabcdefghijklmnop+/keyabcdefghijklmnop/AbCdEf==';
+  assert.equal(redactTokenShapes(signature), signature);
+  assert.equal(redactTokenShapes('keyboardShortcutConfiguration'), 'keyboardShortcutConfiguration');
+  assert.equal(redactText(redactTokenShapes(signature), ['skabcdefghijklmnop']), 'AbCdEf+/[REDACTED]+/keyabcdefghijklmnop/AbCdEf==');
+  for (const prefix of ['sk-', 'rk-', 'key_', 'bearer-']) assert.equal(redactTokenShapes(`${prefix}abcdefghijklmnop`), '[REDACTED]');
+});
+
+test('streaming header detection agrees with text redaction across long source prefixes and header indentation', () => {
+  for (const value of [
+    `return { ${' '.repeat(200)}token: match[1], rest };`,
+    `${' '.repeat(200)}Token: actual-secret`,
+    'return { token: match[1], rest };\nToken: actual-secret',
+  ]) {
+    let output = '';
+    const projector = new RedactionProjector((span) => {
+      output += span.text;
+    });
+    for (let index = 0; index < value.length; index++) projector.push(value[index], index, index + 1);
+    projector.finish(value.length);
+    assert.equal(output, redactText(value));
+  }
 });

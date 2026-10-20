@@ -63,7 +63,7 @@ const BUDGET_FINISH_RECOVERY_MESSAGE = 'Call the finish tool now.';
 const FINISH_ALONE_CORRECTION =
   'TOOL_ERROR: finish must be the only tool call in its turn; nothing in this turn was executed. The prior implementation may already be complete. On your next response, either call finish alone if no actual work remains, or make only the non-finish calls needed for remaining work; after their results, call finish alone in a later response. Do not repeat or pair a rejected call with finish.';
 const FINISH_ARGUMENTS_CORRECTION =
-  'finish arguments are invalid: summary is required (1-1500 characters); concerns and testsRun are optional arrays of up to 100 strings of up to 1000 characters; report is an optional string of up to 256000 characters';
+  'finish arguments are invalid: summary is required (1-1500 characters); concerns and testsRun are optional arrays of up to 100 strings of up to 1000 characters; report is an optional string of up to 256000 characters. Your edits are retained. Do not redo them. Shorten summary to 1-2 sentences and move details to report. Call finish alone, for example {"summary":"Implemented the requested changes."}';
 const MISSING_TOOL_RECOVERY_REMINDER =
   'Do not reply with prose only. Invoke one or more allowed non-finish tools to continue, or call finish as the sole tool call if complete.';
 // A provider-controlled name never reaches a durable record or the model. The
