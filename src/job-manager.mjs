@@ -26,6 +26,8 @@ import {
 } from './failure.mjs';
 import { isolatedDependencyReadPaths } from './worktree.mjs';
 import { classifyVerifierEnvironment, isVerifierEnvironmentKind } from './verify-env.mjs';
+import { continuationBlocker, promptCacheSummary } from './continuation.mjs';
+import { preflightVerifier } from './verifier-preflight.mjs';
 import { assertVerifierCommand } from './verifier-command.mjs';
 import {
   interpreterPathsOption,
@@ -161,7 +163,7 @@ const MAX_RESULT_TURNS = 1000,
   MAX_RESULT_COST = 10_000,
   MAX_USAGE = 1_000_000_000,
   MAX_REPORT_TEXT = 256_000;
-const USAGE_KEYS = ['inputTokens', 'outputTokens', 'cacheHitTokens', 'cacheMissTokens'];
+const USAGE_KEYS = ['inputTokens', 'outputTokens', 'cacheHitTokens', 'cacheMissTokens', 'cacheWriteTokens'];
 const finiteCount = (value) => Number.isSafeInteger(value) && value >= 0 && value <= MAX_USAGE;
 const filenameTokenCharacter = '[\\p{L}\\p{N}._-]';
 const escapeRegExp = (value) => value.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&');
@@ -220,6 +222,7 @@ const validUsage = (value) =>
   !Array.isArray(value) &&
   Object.keys(value).every((key) => USAGE_KEYS.includes(key)) &&
   USAGE_KEYS.every((key) => value[key] === undefined || finiteCount(value[key])) &&
+  (value.cacheWriteTokens ?? 0) <= (value.cacheMissTokens ?? 0) &&
   (value.inputTokens === undefined || (value.cacheHitTokens ?? 0) + (value.cacheMissTokens ?? 0) === value.inputTokens);
 const boundedString = (value, cap) => (typeof value === 'string' && value.length <= cap ? value : undefined);
 /** Take a UTF-8 byte prefix without turning a supplementary-plane character
@@ -1433,6 +1436,7 @@ export class JobManager {
       if (!this.isolated) throw new Error('baseline-diff verification requires an isolated private worktree');
     }
     if (input.profile && this.config.profiles && !this.config.profiles[input.profile]) throw new Error(`unknown profile: ${input.profile}`);
+    const verifierPreflight = preflightVerifier({ repoPath, testCommand: input.testCommand, denyRead: input.denyRead });
     const branch = this.config.git ? await this.config.git.branch(repoPath) : git(repoPath, ['branch', '--show-current']);
     const head = this.config.git ? await this.config.git.head(repoPath) : git(repoPath, ['rev-parse', 'HEAD']);
     // The built-in LeaseManager takes (jobId, paths); lightweight test/custom
@@ -1481,6 +1485,7 @@ export class JobManager {
       if (persistedInput.budget) delete persistedInput.budget.turnPolicy;
       job = await this.store.create({
         ...persistedInput,
+        ...(verifierPreflight ? { verifierPreflight } : {}),
         ...(sizing?.budgetSizing ? { budgetSizing: sizing.budgetSizing } : {}),
         ...(runtimePreflight ? { runtimePreflight: structuredClone(runtimePreflight) } : {}),
         repoPath,
@@ -1794,7 +1799,11 @@ export class JobManager {
               )
                 progress.turns = (job.turns || 0) + event.turn;
               if (validUsage(event?.usage)) {
-                const nextUsage = Object.fromEntries(USAGE_KEYS.map((key) => [key, (job.usage?.[key] || 0) + (event.usage[key] || 0)]));
+                const nextUsage = Object.fromEntries(
+                  USAGE_KEYS.filter(
+                    (key) => key !== 'cacheWriteTokens' || job.usage?.[key] !== undefined || event.usage[key] !== undefined,
+                  ).map((key) => [key, (job.usage?.[key] || 0) + (event.usage[key] || 0)]),
+                );
                 if (
                   Object.values(nextUsage).every(finiteCount) &&
                   nextUsage.cacheHitTokens + nextUsage.cacheMissTokens === nextUsage.inputTokens
@@ -1904,7 +1913,11 @@ export class JobManager {
           // the caller's outer control signal rather than provider ownership.
           if (providerFailure && workerStatus === 'WORKER_DONE')
             workerStatus = providerFailure.kind === 'attempt_timeout' ? 'TIMEOUT' : 'FAILED';
-          const candidateUsage = Object.fromEntries(USAGE_KEYS.map((key) => [key, (job.usage?.[key] || 0) + (safeUsage[key] || 0)]));
+          const candidateUsage = Object.fromEntries(
+            USAGE_KEYS.filter((key) => key !== 'cacheWriteTokens' || job.usage?.[key] !== undefined || safeUsage[key] !== undefined).map(
+              (key) => [key, (job.usage?.[key] || 0) + (safeUsage[key] || 0)],
+            ),
+          );
           const badAccounting =
             badResult ||
             !finiteCount((job.turns || 0) + resultTurns) ||
@@ -2837,6 +2850,11 @@ export class JobManager {
       // primary can cancel before spending budget on a testCommand that
       // imports a package the worktree cannot resolve.
       ...(job.mode !== 'report' ? publicVerifierDeps(job) : {}),
+      ...(job.verifierPreflight ? { verifierPreflight: job.verifierPreflight } : {}),
+      ...(promptCacheSummary(job.usage) ? { promptCache: promptCacheSummary(job.usage) } : {}),
+      ...(['BUDGET', 'TIMEOUT', 'FAILED'].includes(job.status) && continuationBlocker(job)
+        ? { continuation: { resumable: false, reason: continuationBlocker(job) } }
+        : {}),
       ...(job.mode !== 'report' ? publicVerifierInterpreter(job) : {}),
       ...(safeVerifyEnvironment(job.verifyEnvironment) ? { verifyEnvironment: safeVerifyEnvironment(job.verifyEnvironment) } : {}),
       ...(job.appliedUnverified ? { appliedUnverified: true } : {}),
@@ -3234,9 +3252,19 @@ export class JobManager {
     // A queued recovery has an intentionally constrained transcript and a
     // consumed recovery may already have issued a billable provider POST.
     // Never append a repair task to either ambiguity boundary.
-    if (job.cappedFinishRecovery === 'queued' || job.cappedFinishRecovery === 'consumed')
-      throw new Error('job has an unresolved capped implementation recovery; start a fresh job');
-    if (job.budgetFinishRecovery !== undefined) throw new Error('job has an unresolved budget finish recovery; start a fresh job');
+    if (continuationBlocker(job)) throw new Error(continuationBlocker(job));
+    // Legacy records without a replayability marker need inspection before
+    // accepting raised caps, consuming a repair round or recreating a workspace.
+    if (job.transcriptReplayable !== true) {
+      const messages = await this.store.readMessages?.(id);
+      if (
+        messages?.some(
+          (message) =>
+            message.role === 'assistant' && (Object.hasOwn(message, 'reasoning_content') || Object.hasOwn(message, 'anthropic_content')),
+        )
+      )
+        throw new Error('durable transcript reasoning is unavailable for safe provider replay; start a fresh job');
+    }
     if (job.applied === true) throw new Error('an applied job cannot be repaired; start a new job from the current primary tree');
     if (job.integrationIntent === true || job.revertIntent === true || job.integrationUncertain === true || job.revertUncertain === true)
       throw new Error('a job with an unresolved primary mutation outcome cannot be repaired; inspect the primary tree and start a new job');

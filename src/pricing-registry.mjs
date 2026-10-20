@@ -28,9 +28,8 @@ const DEEPSEEK_2026_10_01 = deepFreeze({
   },
 });
 
-// Current Claude Sonnet 5.5 public rates, transcribed on 2026-10-12. We do
-// not send cache-control directives, so cache writes are never requested; any
-// input that is not a cache read is conservatively billed at the base rate.
+// Claude cache writes use the default five-minute TTL (1.25x base input).
+// Cache reads, writes and ordinary input are metered separately.
 const ANTHROPIC_SONNET_2026_10_12 = deepFreeze({
   fetched_at: '2026-10-12T00:00Z',
   sources: ['https://platform.claude.com/docs/models/overview'],
@@ -39,6 +38,7 @@ const ANTHROPIC_SONNET_2026_10_12 = deepFreeze({
       usd_per_1m: {
         input_cache_hit: { off_peak: 0.2, peak: 0.2 },
         input_cache_miss: { off_peak: 2, peak: 2 },
+        input_cache_write: { off_peak: 2.5, peak: 2.5 },
         output: { off_peak: 10, peak: 10 },
       },
     },
@@ -53,6 +53,7 @@ const ANTHROPIC_2026_10_19 = deepFreeze({
       usd_per_1m: {
         input_cache_hit: { off_peak: 0.1, peak: 0.1 },
         input_cache_miss: { off_peak: 2, peak: 2 },
+        input_cache_write: { off_peak: 2.5, peak: 2.5 },
         output: { off_peak: 10, peak: 10 },
       },
     },
@@ -60,6 +61,7 @@ const ANTHROPIC_2026_10_19 = deepFreeze({
       usd_per_1m: {
         input_cache_hit: { off_peak: 0.2, peak: 0.2 },
         input_cache_miss: { off_peak: 4, peak: 4 },
+        input_cache_write: { off_peak: 5, peak: 5 },
         output: { off_peak: 20, peak: 20 },
       },
     },

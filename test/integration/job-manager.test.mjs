@@ -221,10 +221,8 @@ test('redacted durable reasoning blocks detached resume and repair before a work
   assert.equal(persisted.transcriptReplayable, false);
   assert.doesNotMatch(JSON.stringify(persisted), /sk-abcdefghijklmnop/);
 
-  await m.repair(started.jobId, ['continue safely']);
-  const repaired = await m.wait(started.jobId, { timeoutSec: 1 });
-  assert.equal(repaired.status, 'FAILED');
-  assert.match((await m.store.get(started.jobId)).error, /reasoning is unavailable for safe provider replay/);
+  await assert.rejects(() => m.repair(started.jobId, ['continue safely']), /reasoning is unavailable for safe provider replay/);
+  assert.deepEqual(await m.store.get(started.jobId), persisted, 'rejection must not mutate the job or consume a round');
   assert.equal(runs, 1, 'manual repair must fail before worker/provider invocation');
 
   const queued = await m.start(
@@ -2972,4 +2970,101 @@ test('direct JobManager starts cannot bypass tsx CLI preflight', async () => {
     () => m.start({ task: 'x', ownedPaths: ['src/**'], testCommand: 'npx tsx check.ts' }),
     (error) => error.code === 'E_VERIFIER_TSX_CLI' && error.message.includes('node --import tsx'),
   );
+});
+
+test('start echoes persisted static verifier warnings before the worker is launched', async (t) => {
+  const repo = makeRepo();
+  t.after(() => cleanup(repo));
+  write(join(repo, 'test/probe.mjs'), "import '../src/identity.mjs';\nconst dir = '/tmp/test';");
+  write(join(repo, 'src/identity.mjs'), "import { execFile } from 'node:child_process'; execFile('ps', ['-p', '1']);");
+  let calls = 0;
+  const m = await manager({
+    run: async () => {
+      calls++;
+      return {};
+    },
+  });
+  m.repoPath = await realpath(repo);
+  const result = await m.start(
+    { repoPath: repo, task: 'test preflight', ownedPaths: ['src/**'], testCommand: 'node --test test/probe.mjs' },
+    { launch: false },
+  );
+  assert.equal(calls, 0);
+  assert.equal(result.verifierPreflight.status, 'warning');
+  assert.equal(result.verifierPreflight.scannedFiles, 2);
+  assert.equal(result.verifierPreflight.warnings.length, 3);
+  assert.deepEqual((await m.store.get(result.jobId)).verifierPreflight, result.verifierPreflight);
+  const report = (await m.job(result.jobId)).report;
+  assert.match(report, /verifier warning:.*TMPDIR/);
+  assert.match(report, /verifier warning:.*spawn EPERM/);
+  assert.match(report, /process identity inspection/);
+});
+
+test('budget recovery and redacted turn-cap continuations reject before changing caps, rounds or launching', async () => {
+  for (const state of [
+    { budgetFinishRecovery: 'queued' },
+    { budgetFinishRecovery: 'consumed' },
+    { cappedFinishRecovery: 'queued' },
+    { cappedFinishRecovery: 'consumed' },
+    { transcriptReplayable: false },
+  ]) {
+    let runs = 0;
+    const m = await manager({
+      run: async () => {
+        runs++;
+        return {};
+      },
+    });
+    const start = await m.start({ task: 'stop safely', ownedPaths: ['src/**'], budget: { maxTurns: 80, maxUsd: 15 } }, { launch: false });
+    await m.store.update(start.jobId, {
+      status: 'BUDGET',
+      turns: 80,
+      costUsd: 14.27,
+      files: [{ path: 'src/a.mjs', status: 'M' }],
+      budgetStop: { cap: 'reservation', turns: 80, maxTurns: 80, costUsd: 14.27, maxUsd: 15 },
+      ...state,
+    });
+    const before = await m.store.get(start.jobId);
+    const shown = await m.job(start.jobId);
+    assert.equal(shown.continuation.resumable, false);
+    assert.match(shown.report, /continuation: BLOCKED.*Raising caps cannot fix/);
+    assert.doesNotMatch(shown.report, /next:.*continue|continue with extraUsd/);
+    await assert.rejects(() => m.continue(start.jobId, { extraTurns: 30, extraUsd: 5 }), /recovery|reasoning is unavailable/);
+    assert.deepEqual(await m.store.get(start.jobId), before);
+    assert.equal(runs, 0);
+  }
+});
+
+test('worker cache writes survive durable accounting and appear in public hit-rate diagnostics', async () => {
+  const m = await manager({
+    run: async (_job, api) => {
+      const usage = { inputTokens: 10000, cacheHitTokens: 8000, cacheMissTokens: 2000, cacheWriteTokens: 1500, outputTokens: 10 };
+      await api.progress({ turn: 1, usage, costUsd: 0.012 });
+      return { status: 'BUDGET', turns: 1, usage, costUsd: 0.012 };
+    },
+  });
+  const start = await m.start({ task: 'cache diagnostics', ownedPaths: ['src/**'] });
+  const done = await m.wait(start.jobId, { timeoutSec: 1 });
+  assert.deepEqual(done.promptCache, { inputTokens: 10000, cacheHitTokens: 8000, cacheWriteTokens: 1500, hitRate: 0.8 });
+  assert.equal((await m.store.get(start.jobId)).usage.cacheWriteTokens, 1500);
+  assert.match(done.report, /prompt cache: 80\.0%/);
+});
+
+test('continuation note limits accept 3600 characters and reject 3601 before dispatch', async () => {
+  const m = new JobManager({ store: {} });
+  let dispatched;
+  m.repair = async (_id, defects) => {
+    dispatched = defects;
+    return {};
+  };
+  await m.continue('job', { note: 'n'.repeat(3600) });
+  assert.equal(dispatched[1].length, 3600 + "Primary's note: ".length);
+  dispatched = undefined;
+  await assert.rejects(() => m.continue('job', { note: 'n'.repeat(3601) }), /up to 3600 characters/);
+  assert.equal(dispatched, undefined);
+  for (const name of ['offload_sonnet', 'offload_opus']) {
+    const skill = await readFile(new URL(`../../plugins/offload/skills/${name}/SKILL.md`, import.meta.url), 'utf8');
+    assert.match(skill, /offload_continue\.note.*3,600 characters/);
+    assert.match(skill, /maxLength: 3600/);
+  }
 });

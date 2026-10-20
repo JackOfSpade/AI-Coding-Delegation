@@ -4331,3 +4331,46 @@ test('invalid untouched-path confirmations cannot bypass the finish argument gat
     assert.equal(result.failureKind, 'finish-protocol');
   }
 });
+
+test('Claude worker reservations cover five-minute cache writes and stale snapshots refuse before provider spend', async (t) => {
+  const root = tempDir();
+  t.after(() => cleanup(root));
+  const model = 'claude-opus-5-5';
+  const pricing = {
+    models: {
+      [model]: {
+        usd_per_1m: {
+          input_cache_hit: { off_peak: 0.2, peak: 0.2 },
+          input_cache_miss: { off_peak: 4, peak: 4 },
+          input_cache_write: { off_peak: 5, peak: 5 },
+          output: { off_peak: 20, peak: 20 },
+        },
+      },
+    },
+  };
+  let request;
+  const provider = {
+    async *chat(options) {
+      request = options;
+      yield { toolCalls: [call('finish', '{"summary":"done"}', 'finish-cache')] };
+      yield { usage: { inputTokens: 100, cacheHitTokens: 0, cacheMissTokens: 100, cacheWriteTokens: 100, outputTokens: 1 } };
+    },
+  };
+  const tools = new LocalTools({ repoPath: root, ownedPaths: ['**'] });
+  const result = await new AgentLoop({ provider, tools, model, pricing, maxUsd: 0.1 }).run({ task: 'finish' });
+  assert.equal(result.status, 'DONE');
+  const tokens =
+    Buffer.byteLength(JSON.stringify({ messages: request.messages, tools: request.tools })) +
+    256 +
+    request.messages.length * 16 +
+    request.tools.length * 64;
+  assert.ok((tokens * 5 + request.max_tokens * 20) / 1e6 <= 0.1);
+  assert.equal(result.usage.cacheWriteTokens, 100);
+  assert.ok(Math.abs(result.costUsd - 0.00052) < 1e-12);
+  delete pricing.models[model].usd_per_1m.input_cache_write;
+  request = undefined;
+  const stale = await new AgentLoop({ provider, tools, model, pricing, maxUsd: 0.1 }).run({ task: 'finish' });
+  assert.equal(stale.status, 'BUDGET');
+  assert.equal(stale.pricingKnown, false);
+  assert.equal(request, undefined, 'an old snapshot cannot silently bill writes at ordinary input rates');
+});

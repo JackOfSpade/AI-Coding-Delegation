@@ -31,13 +31,17 @@ function normalizedUsage(input, output) {
   const count = (value) => Number.isSafeInteger(value) && value >= 0;
   if (!input || !count(input.input_tokens) || !count(output?.output_tokens)) throw new ProviderError('Invalid Anthropic usage record');
   const hit = input.cache_read_input_tokens ?? 0;
-  if (!count(hit) || hit > input.input_tokens) throw new ProviderError('Invalid Anthropic cache usage');
+  const write = input.cache_creation_input_tokens ?? 0;
+  // Anthropic's input_tokens excludes cache reads AND cache writes.
+  const totalInput = input.input_tokens + hit + write;
+  if (!count(hit) || !count(write) || !count(totalInput)) throw new ProviderError('Invalid Anthropic cache usage');
   return {
-    inputTokens: input.input_tokens,
+    inputTokens: totalInput,
     outputTokens: output.output_tokens,
     cacheHitTokens: hit,
-    cacheMissTokens: input.input_tokens - hit,
-    totalTokens: input.input_tokens + output.output_tokens,
+    cacheMissTokens: input.input_tokens + write,
+    ...(write ? { cacheWriteTokens: write } : {}),
+    totalTokens: totalInput + output.output_tokens,
   };
 }
 
@@ -283,6 +287,7 @@ export class AnthropicMessagesProvider {
       {
         model: requestModel,
         thinking: { type: 'adaptive' },
+        cache_control: { type: 'ephemeral' },
         max_tokens,
         stream: true,
         tools: wireTools(tools),

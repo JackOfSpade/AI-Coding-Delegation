@@ -105,3 +105,22 @@ test('shipped pricing tables cannot be mutated through the registry', () => {
   }, TypeError);
   assert.equal(loadPricing('deepseek-2026-10-01').models['deepseek-flash'].usd_per_1m.output.off_peak, 0.6);
 });
+
+test('Claude five-minute cache writes are priced separately and accumulate through later hits and fallback', () => {
+  const table = loadPricing('anthropic-2026-10-19');
+  const meter = new Meter({ table, model: 'claude-opus-5-5' });
+  const write = { inputTokens: 5010, cacheHitTokens: 0, cacheMissTokens: 5010, cacheWriteTokens: 5000, outputTokens: 3 };
+  const hit = { inputTokens: 5022, cacheHitTokens: 5000, cacheMissTokens: 22, cacheWriteTokens: 20, outputTokens: 3 };
+  meter.add(write);
+  meter.add(hit);
+  assert.equal(meter.usage.cacheWriteTokens, 5020);
+  assert.equal(meter.usage.inputTokens, 10032);
+  assert.ok(Math.abs(meter.usd - (5020 * 5 + 5000 * 0.2 + 12 * 4 + 6 * 20) / 1e6) < 1e-12);
+  meter.add({ inputTokens: 1, cacheMissTokens: 1, outputTokens: 0 });
+  assert.equal(meter.usage.cacheWriteTokens, 5020, 'a non-cached later record retains earlier writes');
+  assert.throws(() => meter.add({ inputTokens: 1, cacheMissTokens: 1, cacheWriteTokens: 2 }), /subset/);
+  assert.throws(() => priceUsage(loadPricing('deepseek-2026-10-01'), 'deepseek-flash', write), /cache write pricing/);
+  const broken = structuredClone(table);
+  broken.models['claude-opus-5-5'].usd_per_1m.input_cache_write.peak = -1;
+  assert.throws(() => validatePricingTable(broken), /non-negative/);
+});

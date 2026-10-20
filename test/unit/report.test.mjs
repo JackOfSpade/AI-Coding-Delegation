@@ -1354,3 +1354,44 @@ test('tsx IPC VERIFY_ENV_FAILED report refreshes a saved generic permission deni
     assert.match(unrelated, /original diagnosis/);
   }
 });
+
+test('both report detail modes expose cache token hit rate, writes and the zero-hit diagnosis', () => {
+  for (const detail of ['compact', 'full']) {
+    const report = compactReport(
+      { status: 'BUDGET', usage: { inputTokens: 10000, cacheHitTokens: 8000, cacheWriteTokens: 1000 } },
+      { detail },
+    );
+    assert.match(report, /prompt cache: 80\.0% token hit rate \(8000\/10000 input tokens; 1000 cache-write tokens\)/);
+    assert.match(
+      compactReport({ usage: { inputTokens: 100, cacheHitTokens: 0 } }, { detail }),
+      /no cache hits reported.*TTL and prefix changes/,
+    );
+  }
+});
+
+test('cap stop reports explain unsafe continuation before proposing a cap increase', () => {
+  for (const detail of ['compact', 'full'])
+    for (const state of [
+      { budgetFinishRecovery: 'queued' },
+      { budgetFinishRecovery: 'consumed' },
+      { cappedFinishRecovery: 'queued' },
+      { cappedFinishRecovery: 'consumed' },
+      { transcriptReplayable: false },
+    ]) {
+      const report = compactReport(
+        {
+          id: 'blocked',
+          status: 'BUDGET',
+          workspacePath: '/w',
+          testCommand: 'node test.mjs',
+          files: [{ path: 'a.mjs', status: 'M' }],
+          ...state,
+        },
+        { detail },
+      );
+      assert.match(report, /continuation: BLOCKED.*start a fresh job.*Raising caps cannot fix/);
+      assert.match(report, /configured verifier:.*Continuation is blocked/);
+      assert.doesNotMatch(report, /next:.*(?:repair|continue)/);
+      if (state.transcriptReplayable === false) assert.match(report, /credential redaction changed provider protocol state/);
+    }
+});

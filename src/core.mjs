@@ -907,8 +907,12 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
     // A finite job must not discover an unpriced newer model after a paid
     // request. Dynamic discovery is therefore paired with a price snapshot;
     // an unfamiliar release fails before a job, lease, or provider call.
-    for (const model of requiredModels)
-      if (!table || !resolveModel(table, model)) throw new Error(`pricing is unknown for selected model ${model}`);
+    for (const model of requiredModels) {
+      const spec = table && resolveModel(table, model);
+      if (!spec) throw new Error(`pricing is unknown for selected model ${model}`);
+      if (/^claude-/.test(model) && !spec.usd_per_1m.input_cache_write)
+        throw new Error(`cache write pricing is unknown for selected model ${model}; update the trusted pricing table before starting`);
+    }
     return {
       pricingId:
         tables

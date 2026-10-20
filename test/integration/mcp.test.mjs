@@ -59,6 +59,9 @@ test('MCP lists exact tools, initializes, pings and dispatches', async () => {
     verifierDeps: true,
     baselineVerifier: true,
     applyThenVerify: true,
+    verifierPreflight: true,
+    promptCaching: true,
+    continuationReadiness: true,
     budgetSizing: true,
     failureDiagnostics: true,
     timingBreakdown: true,
@@ -746,7 +749,7 @@ test('MCP exposes the canonical static skill with exact resources and safe reque
   assert.match(expectedText, /explicitly set `profile: "opus"`/);
   assert.match(expectedText, /provider or model name never triggers Offload or permits inferring, overriding, or inventing a profile/);
   assert.match(expectedText, /do \*\*not\*\* add `unsafePolicyOnlyVerifier` merely to get a worker test/);
-  assert.match(expectedText, /does not preflight or retry the command/);
+  assert.match(expectedText, /does not execute a preflight or retry the command/);
   assert.match(expectedText, /quoted globs, not bare directories/);
   const digest = `sha256:${createHash('sha256').update(Buffer.from(expectedText, 'utf8')).digest('hex')}`;
   const size = Buffer.byteLength(expectedText, 'utf8');

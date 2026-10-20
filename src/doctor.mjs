@@ -376,7 +376,7 @@ function worstReservation(table, model, messages, options = {}) {
     'utf8',
   );
   const inputTokens = wireBytes + LIVE_FRAMING_TOKENS;
-  const inputRate = Math.max(spec.usd_per_1m.input_cache_miss.off_peak, spec.usd_per_1m.input_cache_miss.peak);
+  const inputRate = Math.max(...Object.values(spec.usd_per_1m.input_cache_miss), ...Object.values(spec.usd_per_1m.input_cache_write ?? {}));
   const outputRate = Math.max(spec.usd_per_1m.output.off_peak, spec.usd_per_1m.output.peak);
   return { inputTokens, outputTokens: LIVE_MAX_TOKENS, usd: (inputTokens * inputRate + LIVE_MAX_TOKENS * outputRate) / 1_000_000 };
 }

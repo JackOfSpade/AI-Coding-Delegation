@@ -69,3 +69,9 @@ test('redaction removes complete authentication header values and error codes', 
   error.code = 'AUTHORIZATION=error-secret';
   assert.doesNotMatch(redactError(error).code, /error-secret/);
 });
+
+test('cache-write accounting remains numeric through redaction while credential-shaped values are scrubbed', () => {
+  assert.equal(redact({ cacheWriteTokens: 123 }).cacheWriteTokens, 123);
+  assert.equal(redact({ cacheWriteTokens: 'secret' }).cacheWriteTokens, '[REDACTED]');
+  assert.equal(redact({ cacheWriteTokens: -1 }).cacheWriteTokens, '[REDACTED]');
+});

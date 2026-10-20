@@ -47,6 +47,7 @@ test('Anthropic Messages provider translates the local transcript and normalizes
   assert.equal(request.redirect, 'error');
   assert.equal(request.headers['x-api-key'], 'test-key');
   assert.equal(request.body.model, 'claude-sonnet-5-5');
+  assert.deepEqual(request.body.cache_control, { type: 'ephemeral' });
   assert.deepEqual(request.body.thinking, { type: 'adaptive' });
   assert.equal(request.body.max_tokens, 16_384);
   assert.deepEqual(request.body.system, [{ type: 'text', text: 'local-only worker' }]);
@@ -54,7 +55,7 @@ test('Anthropic Messages provider translates the local transcript and normalizes
   assert.deepEqual(events, [
     { text: 'hello', model: 'claude-sonnet-5-5' },
     {
-      usage: { inputTokens: 11, outputTokens: 3, cacheHitTokens: 2, cacheMissTokens: 9, totalTokens: 14 },
+      usage: { inputTokens: 13, outputTokens: 3, cacheHitTokens: 2, cacheMissTokens: 11, totalTokens: 16 },
       model: 'claude-sonnet-5-5',
     },
     { providerFinishReason: 'stop' },
@@ -375,4 +376,68 @@ test('an unrelated provider 400 error is never a transcript-corruption retry', a
     },
     (error) => error.kind === 'http' && error.retryable === false,
   );
+});
+
+test('automatic worker caching retains the growing prefix and counts disjoint Anthropic cache tokens', async () => {
+  const requests = [];
+  const provider = new AnthropicMessagesProvider({
+    baseUrl: 'https://api.anthropic.com',
+    apiKey: 'test-key',
+    model: 'claude-opus-5-5',
+    retries: 0,
+    fetchImpl: async (_url, init) => {
+      requests.push(JSON.parse(init.body));
+      return sseResponse([
+        {
+          type: 'message_start',
+          message: {
+            model: 'claude-opus-5-5',
+            usage:
+              requests.length === 1
+                ? { input_tokens: 10, cache_creation_input_tokens: 5000 }
+                : { input_tokens: 2, cache_read_input_tokens: 5000, cache_creation_input_tokens: 20 },
+          },
+        },
+        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'ok' } },
+        { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 3 } },
+        { type: 'message_stop' },
+      ]);
+    },
+  });
+  const messages = [{ role: 'user', content: 'long stable prefix '.repeat(2000) }];
+  const usages = [];
+  for await (const event of provider.chat({ messages, tools: [] })) if (event.usage) usages.push(event.usage);
+  messages.push({ role: 'assistant', content: 'ok' }, { role: 'user', content: 'continue' });
+  for await (const event of provider.chat({ messages, tools: [] })) if (event.usage) usages.push(event.usage);
+  for (const request of requests) assert.deepEqual(request.cache_control, { type: 'ephemeral' });
+  assert.deepEqual(requests[1].messages.slice(0, 1), requests[0].messages);
+  assert.deepEqual(usages, [
+    { inputTokens: 5010, cacheHitTokens: 0, cacheMissTokens: 5010, cacheWriteTokens: 5000, outputTokens: 3, totalTokens: 5013 },
+    { inputTokens: 5022, cacheHitTokens: 5000, cacheMissTokens: 22, cacheWriteTokens: 20, outputTokens: 3, totalTokens: 5025 },
+  ]);
+});
+
+test('invalid Anthropic cache counters fail closed', async () => {
+  for (const usage of [
+    { input_tokens: 1, cache_creation_input_tokens: -1 },
+    { input_tokens: 1, cache_read_input_tokens: 1.5 },
+    { input_tokens: Number.MAX_SAFE_INTEGER, cache_read_input_tokens: 1 },
+  ]) {
+    const provider = new AnthropicMessagesProvider({
+      baseUrl: 'https://api.anthropic.com',
+      apiKey: 'test-key',
+      model: 'claude-opus-5-5',
+      retries: 0,
+      fetchImpl: async () =>
+        sseResponse([
+          { type: 'message_start', message: { model: 'claude-opus-5-5', usage } },
+          { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } },
+          { type: 'message_stop' },
+        ]),
+    });
+    await assert.rejects(async () => {
+      for await (const _ of provider.chat({ messages: [], tools: [] })) {
+      }
+    }, /cache usage/);
+  }
 });

@@ -1,3 +1,4 @@
+import { isAnthropicModel } from '../model-policy.mjs';
 import { AgentContext } from './context.mjs';
 import { DEFAULT_COMMAND_TIMEOUT_SEC, MAX_COMMAND_TIMEOUT_SEC, TOOL_DEFINITIONS, isReadOnlyTool, validUntouchedPaths } from './tools.mjs';
 import { Meter, resolveModel, samePricedModel } from '../pricing.mjs';
@@ -151,7 +152,7 @@ const normalizedUsage = (usage) => {
   const result = { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens };
   for (const name of ['inputTokens', 'outputTokens'])
     if (!Number.isSafeInteger(result[name]) || result[name] < 0) throw new Error('Provider yielded invalid usage');
-  for (const name of ['cacheHitTokens', 'cacheMissTokens']) {
+  for (const name of ['cacheHitTokens', 'cacheMissTokens', 'cacheWriteTokens']) {
     if (!Object.hasOwn(usage, name)) continue;
     if (!Number.isSafeInteger(usage[name]) || usage[name] < 0) throw new Error('Provider yielded invalid usage');
     result[name] = usage[name];
@@ -162,7 +163,11 @@ const normalizedUsage = (usage) => {
   // rejects them later in the same stream.
   result.cacheHitTokens ??= 0;
   result.cacheMissTokens ??= result.inputTokens - result.cacheHitTokens;
-  if (result.cacheMissTokens < 0 || result.cacheHitTokens + result.cacheMissTokens !== result.inputTokens)
+  if (
+    result.cacheMissTokens < 0 ||
+    result.cacheHitTokens + result.cacheMissTokens !== result.inputTokens ||
+    (result.cacheWriteTokens ?? 0) > result.cacheMissTokens
+  )
     throw new Error('Provider yielded invalid usage');
   if (
     Object.hasOwn(usage, 'totalTokens') &&
@@ -181,7 +186,7 @@ function reserveRequestBudget(table, model, messages, tools, remainingUsd, reque
   if (!spec) return null;
   const rates = spec.usd_per_1m;
   const worst = (kind) => Math.max(...Object.values(rates[kind] || {}).map(Number));
-  const inputRate = worst('input_cache_miss'),
+  const inputRate = Math.max(worst('input_cache_miss'), rates.input_cache_write ? worst('input_cache_write') : 0),
     outputRate = worst('output');
   if (!Number.isFinite(inputRate) || !Number.isFinite(outputRate)) return null;
   let serialized;
@@ -501,7 +506,8 @@ export class AgentLoop {
     };
     // A zero allowance cannot purchase even one token.  Likewise, a finite
     // cap with no exact model price cannot safely authorize a paid request.
-    const pricingKnown = !!(this.meter.table && resolveModel(this.meter.table, this.model));
+    const pricedSpec = this.meter.table && resolveModel(this.meter.table, this.model);
+    const pricingKnown = !!(pricedSpec && (!isAnthropicModel(this.model) || pricedSpec.usd_per_1m.input_cache_write));
     if (this.maxUsd !== Infinity && (this.maxUsd === 0 || !pricingKnown))
       return {
         status: 'BUDGET',

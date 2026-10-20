@@ -2,7 +2,7 @@
 // cache token counts are accounting data, not credentials.  Keep the
 // credential rule precise so persistence does not silently destroy metering.
 const USAGE_TOKEN_KEY =
-  /^(?:tokens|(?:input|output|prompt|completion|total|cached|cachehit|cachemiss|reasoning)(?:tokens?|tokencount)|minoutputtokens|conservativeinputtokens)$/i;
+  /^(?:tokens|(?:input|output|prompt|completion|total|cached|cachehit|cachemiss|cachewrite|reasoning)(?:tokens?|tokencount)|minoutputtokens|conservativeinputtokens)$/i;
 
 /**
  * Only numeric token accounting is safe to preserve under a token-shaped

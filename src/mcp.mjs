@@ -237,7 +237,13 @@ const TOOLS = [
       jobId,
       extraTurns: { type: 'integer', minimum: 1, maximum: 500 },
       extraUsd: { type: 'number', minimum: 0.01, maximum: 50 },
-      note: { type: 'string', minLength: 1, maxLength: 3_600 },
+      note: {
+        type: 'string',
+        minLength: 1,
+        maxLength: 3_600,
+        description:
+          'Optional continuation guidance, 1-3600 characters. Put longer instructions in scoped repository files and reference their paths.',
+      },
       ...repoHint,
     },
     ['jobId'],

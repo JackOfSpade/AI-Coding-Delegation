@@ -46,7 +46,7 @@ export function validatePricingTable(table) {
   for (const [model, spec] of Object.entries(table.models)) {
     if (!model || !spec || typeof spec !== 'object' || !spec.usd_per_1m || typeof spec.usd_per_1m !== 'object')
       throw new TypeError(`pricing model ${model || '(unnamed)'} is invalid`);
-    for (const kind of RATE_KINDS)
+    for (const kind of [...RATE_KINDS, ...(spec.usd_per_1m.input_cache_write !== undefined ? ['input_cache_write'] : [])])
       for (const tier of RATE_TIERS) {
         const rate = spec.usd_per_1m[kind]?.[tier];
         if (!Number.isFinite(rate) || rate < 0)
@@ -90,21 +90,25 @@ export function priceUsage(table, model, usage, now = new Date()) {
   const tier = peak ? 'peak' : 'off_peak';
   const hit = usage.cacheHitTokens ?? 0,
     miss = usage.cacheMissTokens ?? Math.max(0, (usage.inputTokens ?? 0) - hit),
-    output = usage.outputTokens ?? 0;
-  for (const [name, value] of Object.entries({ cacheHitTokens: hit, cacheMissTokens: miss, outputTokens: output }))
+    output = usage.outputTokens ?? 0,
+    write = usage.cacheWriteTokens ?? 0;
+  for (const [name, value] of Object.entries({ cacheHitTokens: hit, cacheMissTokens: miss, outputTokens: output, cacheWriteTokens: write }))
     if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`usage.${name} must be a non-negative safe integer`);
   if (
     usage.inputTokens !== undefined &&
     (!Number.isSafeInteger(usage.inputTokens) || usage.inputTokens < 0 || hit + miss !== usage.inputTokens)
   )
     throw new TypeError('usage cache token counts must equal inputTokens');
+  if (write > miss) throw new TypeError('cacheWriteTokens must be a subset of cacheMissTokens');
+  if (write && !rates.input_cache_write) throw new TypeError('cache write pricing is unavailable');
+  const inputCacheWriteUsd = (write * (rates.input_cache_write?.[tier] ?? 0)) / 1e6;
   const inputCacheHitUsd = (hit * rates.input_cache_hit[tier]) / 1e6;
-  const inputCacheMissUsd = (miss * rates.input_cache_miss[tier]) / 1e6;
+  const inputCacheMissUsd = ((miss - write) * rates.input_cache_miss[tier]) / 1e6;
   const outputUsd = (output * rates.output[tier]) / 1e6;
-  const usd = inputCacheHitUsd + inputCacheMissUsd + outputUsd;
+  const usd = inputCacheHitUsd + inputCacheMissUsd + inputCacheWriteUsd + outputUsd;
   if (![inputCacheHitUsd, inputCacheMissUsd, outputUsd, usd].every((value) => Number.isFinite(value) && value >= 0))
     throw new TypeError('priced usage is not finite');
-  return { usd, peak, known: true, inputCacheHitUsd, inputCacheMissUsd, outputUsd };
+  return { usd, peak, known: true, inputCacheHitUsd, inputCacheMissUsd, ...(write ? { inputCacheWriteUsd } : {}), outputUsd };
 }
 export class Meter {
   constructor({ table, model, now = () => new Date() } = {}) {
@@ -120,6 +124,7 @@ export class Meter {
   add(usage, model, at = this.now()) {
     if (!usage) return 0;
     const normalized = {
+      ...(usage.cacheWriteTokens !== undefined ? { cacheWriteTokens: usage.cacheWriteTokens } : {}),
       inputTokens: usage.inputTokens ?? 0,
       outputTokens: usage.outputTokens ?? 0,
       cacheHitTokens: usage.cacheHitTokens ?? 0,
@@ -129,13 +134,15 @@ export class Meter {
       if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`usage.${key} must be a non-negative safe integer`);
     if (normalized.cacheHitTokens + normalized.cacheMissTokens !== normalized.inputTokens)
       throw new TypeError('usage cache token counts must equal inputTokens');
+    if ((normalized.cacheWriteTokens ?? 0) > normalized.cacheMissTokens)
+      throw new TypeError('cacheWriteTokens must be a subset of cacheMissTokens');
     // Usage is provider-controlled data. Do not allow individually valid
     // records to overflow the durable/accounting representation after they
     // are accumulated: an imprecise total could otherwise pass a later budget
     // comparison and authorize tool execution.
     const nextUsage = {};
-    for (const key of Object.keys(this.usage)) {
-      const value = this.usage[key] + normalized[key];
+    for (const key of new Set([...Object.keys(this.usage), ...Object.keys(normalized)])) {
+      const value = (this.usage[key] ?? 0) + (normalized[key] ?? 0);
       if (!Number.isSafeInteger(value) || value < 0) throw new TypeError('cumulative usage exceeds safe integer range');
       nextUsage[key] = value;
     }

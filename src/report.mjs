@@ -1,3 +1,5 @@
+import { continuationBlocker, promptCacheSummary } from './continuation.mjs';
+import { verifierPreflightLines } from './verifier-preflight.mjs';
 import { redactText } from './redact.mjs';
 import {
   APPLY_ELIGIBLE_STATUSES,
@@ -43,6 +45,15 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     typeof job.usage === 'object' &&
     !Array.isArray(job.usage) &&
     `in ${scalar(job.usage.inputTokens ?? 0)} (cache hit ${scalar(job.usage.cacheHitTokens ?? 0)}) out ${scalar(job.usage.outputTokens ?? 0)}`;
+  const cache = promptCacheSummary(job.usage);
+  const cacheLine = cache
+    ? `prompt cache: ${(100 * cache.hitRate).toFixed(1)}% token hit rate (${cache.cacheHitTokens}/${cache.inputTokens} input tokens; ${cache.cacheWriteTokens} cache-write tokens)${cache.cacheHitTokens === 0 ? '; no cache hits reported; check prompt minimum, five-minute TTL and prefix changes' : ''}`
+    : '';
+  const continuationReason = continuationBlocker(job);
+  const continuationLine =
+    !reportMode && ['BUDGET', 'TIMEOUT', 'FAILED'].includes(job.status) && continuationReason
+      ? `continuation: BLOCKED — ${continuationReason}. Raising caps cannot fix this; review the retained diff or start a fresh job.`
+      : '';
   const configured = job.configuredModel || job.model;
   const responseModel = job.responseModel && job.responseModel !== configured ? `response ${scalar(job.responseModel)}` : '';
   const cost =
@@ -179,7 +190,9 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
   // evidence string.
   const skippedConfiguredVerifier =
     !reportMode && job.status === 'BUDGET' && typeof job.testCommand === 'string' && job.testCommand.trim() && !job.verify
-      ? 'configured verifier: not run because the worker reached its cap before finish. Continue to let the server run it; if you apply the reviewed diff instead, use applyThenVerify with the same focused check.'
+      ? continuationReason
+        ? 'configured verifier: not run because the worker reached its cap before finish. Continuation is blocked (see reason below); review the retained diff and check it in the primary.'
+        : 'configured verifier: not run because the worker reached its cap before finish. Continue to let the server run it; if you apply the reviewed diff instead, use applyThenVerify with the same focused check.'
       : '';
   // Only a turn-cap stop is explained by the cap, and only while the record
   // still describes the cap the job has (a continuation raises it).
@@ -215,6 +228,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
   // The same gates JobManager.repair() enforces, so a report never advertises
   // a next action the server will refuse.
   const roundAvailable =
+    !continuationReason &&
     (job.rounds || 0) < (job.maxRepairRounds ?? 2) &&
     job.budgetFinishRecovery === undefined &&
     job.cappedFinishRecovery !== 'queued' &&
@@ -272,6 +286,8 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     line1,
     meta,
     spendLine,
+    cacheLine,
+    ...verifierPreflightLines(job.verifierPreflight),
     remaining,
     ...timingLines(job, { lean, elapsed }),
     stallLine(stall),
@@ -295,8 +311,11 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     (!lean || failureDiagnostics) && providerFinishReason,
     (!lean || failureDiagnostics) && budgetReservation,
     failureDiagnostics && turnBudget,
-    failureDiagnostics && budgetStop,
+    failureDiagnostics &&
+      budgetStop &&
+      (continuationReason ? budgetStop.replace(/(?: Turns, not USD, stopped it:| Continue with|; continue with).*$/, '.') : budgetStop),
     skippedConfiguredVerifier,
+    continuationLine,
     // Directly before `error:`, which it explains.
     failureDiagnostics && failingCallLine(job.toolFailure),
     error,
