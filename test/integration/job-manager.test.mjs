@@ -21,6 +21,9 @@ const gitId = 'a'.repeat(40),
 // Keep these integration assertions about the terminal result, not an
 // incidental two-second host-performance budget.
 const WORKTREE_LIFECYCLE_TIMEOUT_SEC = 15;
+// These recovery cases assert durable lifecycle/accounting state, not a one-
+// second disk-performance SLA. Leave room for contended artifact publication.
+const RECOVERY_LIFECYCLE_TIMEOUT_SEC = 15;
 test('public job IDs share the durable Git-ref component boundary', () => {
   for (const id of ['_private', '-private', '', 'x'.repeat(129)]) assert.throws(() => validateJobId(id), /valid job id/);
   assert.equal(validateJobId('safe_job-1'), 'safe_job-1');
@@ -510,7 +513,7 @@ test('capped implementation recovery lifecycle settles after its durable respons
     },
   });
   const started = await m.start({ task: 'lifecycle', ownedPaths: ['src/**'], repoPath: process.cwd() });
-  const done = await m.wait(started.jobId, { timeoutSec: 1 });
+  const done = await m.wait(started.jobId, { timeoutSec: RECOVERY_LIFECYCLE_TIMEOUT_SEC });
   assert.equal(done.status, 'FAILED');
   const stored = await m.store.get(started.jobId);
   assert.equal(stored.cappedFinishRecovery, 'settled');
@@ -527,7 +530,7 @@ test('capped implementation recovery lifecycle settles after its durable respons
       .every((event) => !Object.hasOwn(event, 'turns') && !Object.hasOwn(event, 'costUsd')),
   );
   await m.repair(started.jobId, ['continue after the durable capped implementation response']);
-  const repaired = await m.wait(started.jobId, { timeoutSec: 1 });
+  const repaired = await m.wait(started.jobId, { timeoutSec: RECOVERY_LIFECYCLE_TIMEOUT_SEC });
   assert.equal(repaired.status, 'DONE_UNVERIFIED');
   assert.equal(runs, 2, 'a settled recovery is ordinary resolved history for a later repair run');
 
@@ -546,7 +549,7 @@ test('capped implementation recovery lifecycle settles after its durable respons
     },
   });
   const wrongStarted = await wrongOrder.start({ task: 'wrong transition', ownedPaths: ['src/**'], repoPath: process.cwd() });
-  const wrongDone = await wrongOrder.wait(wrongStarted.jobId, { timeoutSec: 1 });
+  const wrongDone = await wrongOrder.wait(wrongStarted.jobId, { timeoutSec: RECOVERY_LIFECYCLE_TIMEOUT_SEC });
   assert.equal(wrongDone.status, 'FAILED');
   assert.match((await wrongOrder.store.get(wrongStarted.jobId)).error, /invalid capped implementation recovery state transition/);
 });
@@ -576,7 +579,7 @@ test('a consumed capped implementation recovery suppresses automatic verifier re
     testCommand: 'fail',
     maxRepairRounds: 1,
   });
-  const done = await m.wait(started.jobId, { timeoutSec: 1 });
+  const done = await m.wait(started.jobId, { timeoutSec: RECOVERY_LIFECYCLE_TIMEOUT_SEC });
   const stored = await m.store.get(started.jobId);
 
   assert.equal(done.status, 'VERIFY_FAILED');
@@ -607,7 +610,7 @@ test('a queued capped implementation recovery also suppresses automatic verifier
     testCommand: 'fail',
     maxRepairRounds: 1,
   });
-  const done = await m.wait(started.jobId, { timeoutSec: 1 });
+  const done = await m.wait(started.jobId, { timeoutSec: RECOVERY_LIFECYCLE_TIMEOUT_SEC });
   const stored = await m.store.get(started.jobId);
 
   assert.equal(done.status, 'VERIFY_FAILED');
