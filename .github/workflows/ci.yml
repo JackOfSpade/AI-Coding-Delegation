@@ -17,7 +17,9 @@ jobs:
   test:
     name: Node ${{ matrix.node }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # Real Windows Git/Credential Locker integration cases take substantially
+    # longer than POSIX; keep the complete suite and a bounded diagnostic budget.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 20 }}
     strategy:
       fail-fast: false
       matrix:

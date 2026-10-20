@@ -136,6 +136,47 @@ test('strict test runner reviews Darwin temp aliases and sandbox dependency isol
   }
 });
 
+test('execution progress diagnostics preserve TAP skips and failing child exit status', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'offload-reporter-test-'));
+  const fixture = join(directory, 'fixture.test.mjs');
+  try {
+    await writeFile(
+      fixture,
+      [
+        "import test from 'node:test';",
+        "import assert from 'node:assert/strict';",
+        "test('fixture passes', () => assert.equal(1, 1));",
+        "test('fixture skip', { skip: 'unreviewed fixture reason' }, () => {});",
+        "test('fixture fails', () => assert.fail('fixture assertion'));",
+      ].join('\n'),
+    );
+    const environment = { ...process.env };
+    delete environment.NODE_TEST_CONTEXT;
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--test',
+        '--test-reporter=tap',
+        `--test-reporter=${new URL('../progress-reporter.mjs', import.meta.url).href}`,
+        '--test-reporter-destination=stdout',
+        '--test-reporter-destination=stderr',
+        fixture,
+      ],
+      { cwd: directory, env: environment, encoding: 'utf8', timeout: 10_000, windowsHide: true },
+    );
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /not ok \d+ - fixture fails/);
+    assert.doesNotMatch(result.stdout, /\[test progress/);
+    assert.match(result.stderr, /\[test progress .*fixture fails/);
+    assert.deepEqual(analyzeStrictSkips(result.stdout).unapprovedSkips, [
+      { number: 2, name: 'fixture skip', reason: 'unreviewed fixture reason' },
+    ]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('CI test launcher preserves a strict runner failure exit code', async () => {
   const calls = [];
   const child = {

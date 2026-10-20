@@ -267,7 +267,13 @@ export async function runSuite({
   // storage. A small fan-out avoids test-runner oversubscription turning
   // lifecycle timing into a host-load-dependent result.
   const args = ['--test', '--test-concurrency=4'];
-  if (strictLoopback) args.push('--test-reporter=tap');
+  if (strictLoopback)
+    args.push(
+      '--test-reporter=tap',
+      `--test-reporter=${new URL('./progress-reporter.mjs', import.meta.url).href}`,
+      '--test-reporter-destination=stdout',
+      '--test-reporter-destination=stderr',
+    );
   args.push(...files);
   const child = spawn(process.execPath, args, { stdio: strictLoopback ? ['ignore', 'pipe', 'pipe'] : 'inherit', windowsHide: true });
   let tapOutput = '';
