@@ -454,3 +454,27 @@ test('failedApplyRefusal names the exact reason for every record it must refuse'
     'the list is bounded',
   );
 });
+
+test('only specific local/provider transcript corruption qualifies for continuation, with ordinary safety gates', () => {
+  for (const cause of [
+    { error: 'corrupt transcript: invalid interior JSON' },
+    { error: 'Provider transcript was corrupt', providerFailure: { kind: 'transcript_corruption' } },
+  ]) {
+    const job = { status: 'FAILED', ...cause };
+    assert.equal(continuableFailure(job), true);
+    assert.match(failureContinueDefect(job), /Inspect each owned path/);
+    for (const unsafe of [
+      { status: 'CANCELLED' },
+      { mode: 'report' },
+      { applied: true },
+      { branchChanged: true },
+      { scopeViolations: ['secret'] },
+      { workspaceCleanupRequired: true },
+      { error: 'stored transcript integrity check failed' },
+      { providerFinishReason: 'content_filter' },
+      { providerFailure: { kind: 'http', status: 400 } },
+    ])
+      assert.equal(continuableFailure({ ...job, ...unsafe }), false, JSON.stringify(unsafe));
+  }
+  assert.equal(continuableFailure({ status: 'FAILED', error: 'corrupt transcript: invalid role/tool ordering' }), false);
+});

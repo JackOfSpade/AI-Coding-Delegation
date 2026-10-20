@@ -958,9 +958,9 @@ test('no-finish, output-cap and finish-protocol FAILED rounds are continuable an
   }
 });
 
-test('offload_continue stays refused for every FAILED cause that is not the worker looping', async () => {
+test('offload_continue stays refused for unrelated FAILED causes', async () => {
   const refused =
-    /only a job that stopped on BUDGET or TIMEOUT, or that FAILED in a continuable worker-side way \(tool-loop, no-finish, output-cap, finish-protocol\)/;
+    /only a job that stopped on BUDGET or TIMEOUT, or that FAILED on transcript corruption or in a continuable worker-side way \(tool-loop, no-finish, output-cap, finish-protocol\)/;
   const cases = [
     // The manager's own verdict outranks a label a worker attached to its result.
     [
@@ -1211,6 +1211,77 @@ test('include log is bounded by tail and limit, redacts, and rejects misuse', as
     await assert.rejects(() => h.manager.job(undefined, { tail: 5 }), /tail and limit require a jobId/);
     await assert.rejects(() => h.manager.job(jobId, { include: 'log', tail: -1 }), /tail must be an integer from 0 to 1000/);
     await assert.rejects(() => h.manager.job(jobId, { include: 'log', limit: 100 }), /limit must be an integer from 2000 to 60000/);
+  } finally {
+    cleanup(h.repo);
+  }
+});
+
+for (const partial of [false, true]) {
+  test(`provider transcript corruption can continue with cumulative limits (${partial ? 'partial work' : 'no edits yet'})`, async () => {
+    const h = await harness({
+      worker: async (job, round) => {
+        if (round === 1) {
+          if (partial) writeSrc(job, 'kept.js', 'keep this work\n');
+          return {
+            status: 'FAILED',
+            turns: 4,
+            costUsd: 0.1,
+            error: 'Provider transcript was corrupt',
+            providerFailure: { kind: 'transcript_corruption', attempts: 1 },
+          };
+        }
+        if (partial) assert.equal(await readFile(join(job.workspacePath, 'src/kept.js'), 'utf8'), 'keep this work\n');
+        writeSrc(job, 'completed.js');
+        return { status: 'DONE', turns: 2, costUsd: 0.05 };
+      },
+      verify: pass,
+    });
+    try {
+      const { started, done } = await startEnvJob(h, { budget: { maxTurns: 10, maxUsd: 1 }, maxRepairRounds: 1 });
+      assert.equal(done.status, 'FAILED');
+      assert.deepEqual(done.providerFailure, { kind: 'transcript_corruption', attempts: 1 });
+      assert.match(done.report, /next: .*continue/);
+      await h.manager.continue(started.jobId);
+      const completed = await h.settle(started.jobId);
+      assert.equal(completed.status, 'DONE_VERIFIED');
+      const persisted = await h.manager.store.get(started.jobId);
+      assert.equal(persisted.turns, 6);
+      assert.ok(Math.abs(persisted.costUsd - 0.15) < 1e-12);
+      assert.equal(completed.providerFailure, undefined);
+      assert.match(h.counters.defects[1][0], /transcript corruption/);
+      await assert.rejects(() => h.manager.continue(started.jobId), /only a job/);
+    } finally {
+      cleanup(h.repo);
+    }
+  });
+}
+
+test('the reported local transcript failure continues from preserved work with a fresh conversation', async () => {
+  let store;
+  const h = await harness({
+    worker: async (job, round, api) => {
+      if (round === 1) {
+        writeSrc(job, 'kept.js', 'keep this work\n');
+        write(join(store.root, job.id, 'messages.jsonl'), '{broken-json}\n');
+        throw new Error('corrupt transcript: invalid interior JSON');
+      }
+      assert.deepEqual(await store.readMessages(job.id), []);
+      assert.equal(await readFile(join(job.workspacePath, 'src/kept.js'), 'utf8'), 'keep this work\n');
+      await api.appendMessage({ role: 'user', content: 'fresh conversation' });
+      writeSrc(job, 'completed.js');
+      return { status: 'DONE', turns: 1 };
+    },
+    verify: pass,
+  });
+  store = h.manager.store;
+  try {
+    const { started, done } = await startEnvJob(h);
+    assert.equal(done.status, 'FAILED');
+    assert.match(done.report, /next: .*continue/);
+    await h.manager.continue(started.jobId);
+    assert.equal((await h.settle(started.jobId)).status, 'DONE_VERIFIED');
+    assert.deepEqual(await store.readMessages(started.jobId), [{ role: 'user', content: 'fresh conversation' }]);
+    assert.match(await readFile(join(store.root, started.jobId, 'messages.jsonl'), 'utf8'), /^\{broken-json\}\n/);
   } finally {
     cleanup(h.repo);
   }

@@ -10,7 +10,8 @@ import { redact, redactText, stripTerminalControls } from './redact.mjs';
  * The kinds below are the only FAILED causes a continuation may resume: the
  * worker, not the provider, the sandbox or the repository, ran out of road (or
  * broke the finish protocol twice, which the server corrected once already).
- * Everything else (a provider failure, a protocol fault, a scope violation, a
+ * Specific transcript-corruption failures also qualify through a separate gate.
+ * Everything else (other provider failures, a protocol fault, a scope violation, a
  * moved branch, a lost lease, ...) never receives a `failureKind` and so stays
  * default-deny.
  */
@@ -22,6 +23,12 @@ export const FAILURE_ERRORS = Object.freeze({
   'finish-protocol': 'finish must be the sole valid tool call in a turn',
 });
 export const FAILURE_KINDS = Object.freeze(Object.keys(FAILURE_ERRORS));
+
+export const LOCAL_TRANSCRIPT_CORRUPTION = 'corrupt transcript: invalid interior JSON';
+export const retryableTranscriptFailure = (job) =>
+  job?.status === 'FAILED' &&
+  ((!job.providerFailure && job.error === LOCAL_TRANSCRIPT_CORRUPTION) ||
+    (job.providerFailure?.kind === 'transcript_corruption' && job.error === 'Provider transcript was corrupt'));
 
 const TOOL_NAME = /^[A-Za-z0-9_.-]{1,64}$/;
 const ERROR_CODE = /^E[A-Z0-9_]{2,40}$/;
@@ -166,15 +173,24 @@ export const reportToolFailure = (value) => {
  * The single gate shared by `JobManager.repair()` (which enforces it) and the
  * report (which advertises `continue` only when it would be accepted). It is
  * default-deny: a FAILED job qualifies only when its durable `failureKind` is
- * one of ours AND `error` is still exactly that kind's canonical text, so a
+ * one of ours AND `error` is still exactly that kind's canonical text, or it
+ * matches the specific transcript-corruption gate below, so a
  * later scope, snapshot or repair-setup failure that overwrote `error` cannot
  * be resumed by accident.
  */
 export function continuableFailure(job) {
   if (!job || typeof job !== 'object' || job.mode === 'report' || job.status !== 'FAILED') return false;
   const kind = safeFailureKind(job.failureKind);
-  if (!kind || job.error !== FAILURE_ERRORS[kind]) return false;
-  if (job.providerFailure || job.branchChanged || job.integrationConflict || job.integrationUncertain || job.revertUncertain) return false;
+  const transcriptFailure = retryableTranscriptFailure(job);
+  if (!transcriptFailure && (!kind || job.error !== FAILURE_ERRORS[kind])) return false;
+  if (
+    (!transcriptFailure && job.providerFailure) ||
+    job.branchChanged ||
+    job.integrationConflict ||
+    job.integrationUncertain ||
+    job.revertUncertain
+  )
+    return false;
   if (job.workspaceCleanupRequired || job.applied === true) return false;
   if (job.scopeViolations?.length || job.verifierMutations?.length) return false;
   // A filtered response is deterministic: re-sending the same conversation spends another round for the same stop.
@@ -265,6 +281,8 @@ const DEFECT_LEAD = {
  * toolErrorHint would have given it, never the recorded error itself.
  */
 export function failureContinueDefect(job) {
+  if (retryableTranscriptFailure(job))
+    return 'The previous pass stopped on transcript corruption. Your partial work is already in the workspace. Inspect each owned path against the original task and acceptance criteria, complete the remaining work, then finish. Do not discard or redo completed work.';
   const kind = safeFailureKind(job?.failureKind);
   if (kind !== 'tool-loop') return DEFECT_LEAD[kind] ?? DEFECT_LEAD['no-finish'];
   const failure = safeToolFailure(job.toolFailure);

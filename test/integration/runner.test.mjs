@@ -1071,3 +1071,108 @@ test('Runner reports sandbox availability from its injectable probe and still pa
   assert.equal(verified.verdict, 'PASS');
   assert.deepEqual(seen[0].options, { sandbox: true, timeoutMs: 300_000, requireSandbox: true, writablePaths: [] });
 });
+
+test(
+  'socket permissions are explicitly limited to the per-run temp root',
+  { skip: process.platform === 'win32' && 'macOS Seatbelt profile paths use POSIX semantics' },
+  () => {
+    const profile = macosProfile({
+      repoPath: '/repo',
+      tempPath: '/private/tmp/one-run',
+      cachePaths: ['/outside-cache'],
+      readablePaths: ['/outside-read'],
+      allowTempSockets: true,
+    });
+    const socketRules = profile.split('\n').filter((line) => line.startsWith('(allow network'));
+    assert.deepEqual(socketRules, [
+      '(allow network-bind network-inbound (local unix-socket (subpath "/private/tmp/one-run")))',
+      '(allow network-outbound (remote unix-socket (subpath "/private/tmp/one-run")))',
+    ]);
+    assert.doesNotMatch(
+      macosProfile({ repoPath: '/repo', tempPath: '/tmp' }),
+      /allow network/,
+      'a general profile/probe does not implicitly grant sockets throughout system temp',
+    );
+    assert.doesNotMatch(macosProfile({ repoPath: '/repo', allowTempSockets: true }), /allow network/);
+    assert.throws(() => macosProfile({ repoPath: '/repo', allowTempSockets: 'yes' }), /boolean/);
+  },
+);
+
+test(
+  'macOS temp sockets support child IPC while outside sockets, symlink escapes and IP remain denied',
+  { skip: !HOMEBREW_NODE ? 'requires a Homebrew Node on macOS' : !sandboxAvailable() && MACOS_SANDBOX_SKIP_REASON },
+  async () => {
+    const { createServer } = await import('node:net');
+    const outside = await realpath(await mkdtemp('/tmp/oi-'));
+    const cwd = await mkdtemp(join(tmpdir(), 'offload-ipc-test-'));
+    const unix = createServer((socket) => socket.end('outside'));
+    const tcp = createServer((socket) => socket.end('outside'));
+    const listen = (server, address) =>
+      new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(address, resolve);
+      });
+    try {
+      await listen(unix, join(outside, 'host.sock'));
+      await listen(tcp, { port: 0, host: '127.0.0.1' });
+      const source = `
+        import net from 'node:net';
+        import dgram from 'node:dgram';
+        import { mkdir, symlink } from 'node:fs/promises';
+        import path from 'node:path';
+        import { spawn } from 'node:child_process';
+        const outside = process.argv[2], port = Number(process.argv[3]), temp = process.env.TMPDIR;
+        const dir = path.join(temp, 'tsx-' + process.getuid());
+        await mkdir(dir);
+        const pipe = path.join(dir, '1.pipe');
+        const server = net.createServer(c => c.end('ipc-ok'));
+        await new Promise((resolve, reject) => { server.once('error', reject); server.listen(pipe, resolve); });
+        const childSource = "const c=require('net').createConnection(process.argv[1]);c.on('data',b=>process.stdout.write(b));c.on('error',()=>process.exit(2));";
+        const child = spawn(process.execPath, ['-e', childSource, pipe], { env: process.env });
+        let inside = ''; child.stdout.on('data', chunk => inside += chunk);
+        const exit = await new Promise(resolve => child.on('exit', resolve));
+        await new Promise(resolve => server.close(resolve));
+        if (exit !== 0) throw new Error('child IPC failed');
+        const bind = address => new Promise(resolve => {
+          const s = net.createServer(); s.once('error', e => resolve(e.code));
+          s.listen(address, () => s.close(() => resolve('ALLOWED')));
+        });
+        const connect = address => new Promise(resolve => {
+          const c = net.createConnection(address); c.once('error', e => resolve(e.code));
+          c.once('connect', () => { c.destroy(); resolve('ALLOWED'); });
+        });
+        await symlink(outside, path.join(temp, 'escape'));
+        const udp = dgram.createSocket('udp4');
+        const udpBind = await new Promise(resolve => {
+          udp.once('error', e => { udp.close(); resolve(e.code); });
+          udp.bind(0, '127.0.0.1', () => udp.close(() => resolve('ALLOWED')));
+        });
+        console.log(JSON.stringify({ inside,
+          outsideBind: await bind(path.join(outside, 'new.sock')),
+          outsideConnect: await connect(path.join(outside, 'host.sock')),
+          aliasBind: await bind(path.join(temp, 'escape/new.sock')),
+          aliasConnect: await connect(path.join(temp, 'escape/host.sock')),
+          tcpBind: await bind({port: 0, host: '127.0.0.1'}),
+          tcpConnect: await connect({port, host: '127.0.0.1'}), udpBind, temp }));
+      `;
+      await writeFile(join(cwd, 'probe.mjs'), source);
+      const result = await runCommand(`node probe.mjs ${shellQuote(outside)} ${tcp.address().port}`, {
+        cwd,
+        requireSandbox: true,
+        allowNetwork: false,
+        cachePaths: [outside],
+        timeoutSec: 20,
+      });
+      assert.equal(result.code, 0, result.stderr);
+      const { inside, temp, ...denials } = JSON.parse(result.stdout);
+      assert.equal(inside, 'ipc-ok', 'tsx-shaped pipe supports IPC with a separate child');
+      for (const [name, code] of Object.entries(denials)) assert.match(code, /^(?:EPERM|EACCES)$/, name);
+      assert.equal(existsSync(temp), false, 'the socket directory is cleaned after the command');
+    } finally {
+      await new Promise((resolve) => unix.close(resolve));
+      await new Promise((resolve) => tcp.close(resolve));
+      await rm(outside, { recursive: true, force: true });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);

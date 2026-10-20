@@ -267,6 +267,16 @@ function resolveOne(declared, context) {
   const allowed = (context.allowlist || []).map((entry) => safeRealpath(entry) ?? resolve(entry));
   if (allowed.length && !allowed.some((entry) => within(location, entry)))
     throw reject(`${declared} is not under a configured verifier.interpreterRoots entry`, 'not-allowlisted');
+  // Seatbelt can check the lexical invocation path as well as its target.
+  // Canonical grants alone cannot authorize a uv installation alias outside
+  // those roots. Refuse before creating/spending a job rather than accepting
+  // a declaration whose testCommand will fail. Ordinary bin/python symlinks
+  // inside a granted venv/prefix remain supported.
+  if (!found.some((candidate) => within(lexical, candidate)))
+    throw reject(
+      `${declared} uses a symlink path outside the verifier grants; resolved path: ${safeRealpath(lexical)}. Declare the resolved path and use it in testCommand.`,
+      'symlink-path',
+    );
   return { declared, kind, interpreter, location, roots: found };
 }
 

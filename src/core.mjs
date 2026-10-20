@@ -64,6 +64,8 @@ import {
 } from './model-policy.mjs';
 import { resolveModel, validatePricingTable } from './pricing.mjs';
 import { readRegularFileSync } from './regular-file.mjs';
+import { matchesAny } from './glob.mjs';
+import { assertVerifierCommand } from './verifier-command.mjs';
 
 // Repository discovery must not pass provider credentials, ambient Git
 // redirects, filters, hooks, or fsmonitor helpers to a repository command.
@@ -531,6 +533,15 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           cappedFinishRecovery: job.cappedFinishRecovery,
           budgetFinishRecovery: job.budgetFinishRecovery,
           serverVerifierConfigured: job.mode !== 'report' && typeof job.testCommand === 'string' && job.testCommand.trim().length > 0,
+          ...(job.mode === 'report'
+            ? {}
+            : {
+                checkOwnedPaths: async () => {
+                  const after = await resolvedSnapshots.create(executionPath);
+                  const changed = await resolvedSnapshots.files(executionPath, job.before, after);
+                  return job.ownedPaths.filter((pattern) => !changed.some((file) => matchesAny(file.path, [pattern])));
+                },
+              }),
           pathAliases: failurePathAliases(executionPath, job.repoPath),
         });
         // The initial prompt is durable conversation state. A repair appends only
@@ -929,6 +940,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       // repository's durable store, integrity root, or recovery machinery.
       // JobManager repeats this after Core has added trusted config snapshots.
       validateJobRequest(input);
+      assertVerifierCommand(input.testCommand);
       // Health remains visible through offload_job, but stale runtime/skill
       // state is a hard boundary here: a client must not spend budget simply
       // because it skipped or overlooked the preflight response.
@@ -938,6 +950,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       if (closing) throw new Error('offload core is shutting down');
       const loaded = config.loaded || loadConfig({ configPath: config.configPath, repoPath: state.repoPath });
       if (loaded.disabled) throw new Error('offload is disabled for this repository');
+      if (input.mode !== 'report') assertVerifierCommand(input.testCommand ?? loaded.repoConfig.testCommand);
       if (input?.profile && !loaded.config.profiles[input.profile]) throw new Error(`unknown profile: ${input.profile}`);
       const profileName = input.profile || loaded.config.default;
       const profile = loaded.config.profiles[profileName];

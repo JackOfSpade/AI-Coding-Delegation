@@ -298,7 +298,9 @@ export function macosProfile({
   cachePaths = [],
   interpreterPaths = [],
   allowNetwork = false,
+  allowTempSockets = false,
 }) {
+  if (typeof allowTempSockets !== 'boolean') throw new TypeError('allowTempSockets must be boolean');
   if (!Array.isArray(denyRead) || denyRead.some((path) => typeof path !== 'string'))
     throw new TypeError('denyRead must be relative glob strings');
   if (!Array.isArray(denyWrite) || denyWrite.some((path) => typeof path !== 'string'))
@@ -418,6 +420,14 @@ export function macosProfile({
     ...protectedRead.map((pattern) => denyFilter('read', root, pattern)),
     ...resolvedReadable.flatMap((readable) => EXTRA_READ_ROOT_DENY.map((pattern) => denyFilter('read', readable, pattern))),
     ...resolvedInterpreter.flatMap((interpreter) => EXTRA_READ_ROOT_DENY.map((pattern) => denyFilter('read', interpreter, pattern))),
+    // IPC stays inside the disposable run directory. These grants never
+    // authorize TCP/UDP, outside Unix sockets, or caller cache/read roots.
+    ...(allowTempSockets && resolvedTemp
+      ? [
+          `(allow network-bind network-inbound (local unix-socket (subpath ${q(resolvedTemp)})))`,
+          `(allow network-outbound (remote unix-socket (subpath ${q(resolvedTemp)})))`,
+        ]
+      : []),
     ...(allowNetwork ? ['(allow network*)'] : []),
   ].join('\n');
 }
@@ -646,6 +656,7 @@ export async function runCommand(command, options = {}) {
             cachePaths: [...sandboxCachePaths, ...(options.tempPath ? [sandboxPath(options.tempPath)] : [])],
             interpreterPaths: sandboxInterpreterPaths,
             allowNetwork: options.allowNetwork === true,
+            allowTempSockets: true,
           })
         : undefined;
     const result = await new Promise((done, fail) => {

@@ -328,3 +328,51 @@ test('Opus discovery filters by line and uses provider release order across page
   assert.equal(model, 'claude-opus-5-5');
   assert.equal(new URL(urls[1]).searchParams.get('after_id'), 'claude-sonnet-5-5');
 });
+
+for (const streaming of [false, true]) {
+  test(`provider transcript corruption is classified without leaking its body (${streaming ? 'SSE' : 'HTTP'})`, async () => {
+    let requests = 0;
+    const body = { type: 'error', error: { type: 'api_error', message: 'corrupt transcript: invalid interior JSON private-body' } };
+    const provider = new AnthropicMessagesProvider({
+      baseUrl: 'https://api.anthropic.com',
+      apiKey: 'test-key',
+      model: 'claude-opus-5-5',
+      retries: 1,
+      fetchImpl: async () => {
+        requests++;
+        return streaming ? sseResponse([body]) : new Response(JSON.stringify(body), { status: 400 });
+      },
+    });
+    await assert.rejects(
+      async () => {
+        for await (const _ of provider.chat({ messages: [], tools: [], retryLimit: 0 })) {
+          /* finite jobs do not auto-spend */
+        }
+      },
+      (error) =>
+        error instanceof ProviderError &&
+        error.kind === 'transcript_corruption' &&
+        error.retryable === true &&
+        error.message === 'Provider transcript was corrupt',
+    );
+    assert.equal(requests, 1);
+  });
+}
+
+test('an unrelated provider 400 error is never a transcript-corruption retry', async () => {
+  const provider = new AnthropicMessagesProvider({
+    baseUrl: 'https://api.anthropic.com',
+    apiKey: 'test-key',
+    model: 'claude-opus-5-5',
+    retries: 1,
+    fetchImpl: async () => new Response(JSON.stringify({ error: { message: 'invalid request' } }), { status: 400 }),
+  });
+  await assert.rejects(
+    async () => {
+      for await (const _ of provider.chat({ messages: [], tools: [] })) {
+        /* consume */
+      }
+    },
+    (error) => error.kind === 'http' && error.retryable === false,
+  );
+});

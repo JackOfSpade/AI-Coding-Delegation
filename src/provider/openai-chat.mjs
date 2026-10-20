@@ -12,9 +12,17 @@ export class ProviderError extends Error {
     // These fields are intentionally a closed, small vocabulary. They cross
     // the worker boundary and must never contain a fetch/SSE error, endpoint,
     // request body, or provider response text.
-    this.kind = ['request', 'http', 'transport', 'attempt_timeout', 'redirect', 'sse_protocol', 'sse_limit', 'credit_exhausted'].includes(
-      kind,
-    )
+    this.kind = [
+      'request',
+      'http',
+      'transport',
+      'attempt_timeout',
+      'redirect',
+      'sse_protocol',
+      'sse_limit',
+      'credit_exhausted',
+      'transcript_corruption',
+    ].includes(kind)
       ? kind
       : 'request';
     if (Number.isSafeInteger(attempts) && attempts > 0 && attempts <= 16) this.attempts = attempts;

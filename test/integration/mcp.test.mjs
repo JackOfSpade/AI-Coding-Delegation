@@ -446,9 +446,11 @@ test('MCP exposes the bounded log window on offload_job, forwards it only when s
   const description = tools.find((candidate) => candidate.name === 'offload_continue').description;
   assert.match(
     description,
-    /FAILED in a worker-side way \(a repeated failing tool call, ending without finish, exhausting output-cap recovery, or putting finish in a turn with other tool calls twice\)/,
+    /FAILED on transcript corruption or in a worker-side way \(a repeated failing tool call, ending without finish, exhausting output-cap recovery, or putting finish in a turn with other tool calls twice\)/,
   );
-  assert.match(description, /Refused for provider or protocol failures, scope violations/);
+  assert.match(description, /Refused for other provider or protocol failures, integrity failures, scope violations/);
+  assert.match(description, /transcript corruption may be retried before any edits/);
+  assert.match(description, /preserved for audit while a fresh conversation starts/);
   assert.match(tools.find((candidate) => candidate.name === 'offload_job').description, /`toolFailure`/);
   await server.close();
 });

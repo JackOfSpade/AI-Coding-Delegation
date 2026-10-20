@@ -533,7 +533,7 @@ test('Core passes the current write-job turn allowance into the initial system p
   execFileSync('git', ['-C', path, 'commit', '-qm', 'notes']);
   let server;
   try {
-    server = await createMockOpenAIServer([{ chunks: [finishChunk('guided'), usageChunk] }]);
+    server = await createMockOpenAIServer([{ chunks: [finishChunk('guided', ['src/**']), usageChunk] }]);
   } catch (error) {
     if (error.code === 'EPERM') {
       t.skip('loopback networking is unavailable in this sandbox');
@@ -589,7 +589,7 @@ test('Core passes the current write-job turn allowance into the initial system p
     await rm(path, { recursive: true, force: true });
   }
 });
-const finishChunk = (summary = 'ok') => ({
+const finishChunk = (summary = 'ok', untouched = []) => ({
   model: 'mock-model',
   choices: [
     {
@@ -599,7 +599,18 @@ const finishChunk = (summary = 'ok') => ({
             index: 0,
             id: `finish-${summary}`,
             type: 'function',
-            function: { name: 'finish', arguments: JSON.stringify({ summary, concerns: [], testsRun: [] }) },
+            function: {
+              name: 'finish',
+              arguments: JSON.stringify({
+                summary,
+                concerns: [],
+                testsRun: [],
+                untouchedPaths: untouched.map((path) => ({
+                  path,
+                  reason: 'This fixture exercises worker lifecycle and requires no source change in this scope.',
+                })),
+              }),
+            },
           },
         ],
       },
@@ -644,6 +655,8 @@ test('Core restart of a queued budget finish uses only the trusted finish projec
       );
       const store = core.manager.store;
       const initial = await store.get(started.jobId);
+      await mkdir(join(initial.workspacePath, 'src'), { recursive: true });
+      await writeFile(join(initial.workspacePath, 'src/recovered.mjs'), 'SOURCE_MUST_NOT_REACH_PROVIDER');
       await store.messagesBatch(started.jobId, [
         {
           role: 'assistant',
@@ -694,7 +707,17 @@ test('manual repair gets a fresh worker timeout round after a stale original wal
   const sse = (chunks) => `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('')}data: [DONE]\n\n`;
   const responses = [
     () => new Response(JSON.stringify({ error: { message: 'mock error' } }), { status: 503 }),
-    () => new Response(sse([finishChunk('repaired'), usageChunk]), { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    () =>
+      new Response(
+        sse([
+          toolChunk('finish-repaired', 'finish', {
+            summary: 'repaired',
+            untouchedPaths: [{ path: 'src/**', reason: 'This provider retry checks lifecycle handling and needs no source changes.' }],
+          }),
+          usageChunk,
+        ]),
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      ),
   ];
   globalThis.fetch = async (url, options) => {
     requests.push({ url, options });
@@ -2044,7 +2067,15 @@ test('detached CLI worker inherits env keyRef without putting it in argv or outp
                       index: 0,
                       id: 'finish',
                       type: 'function',
-                      function: { name: 'finish', arguments: '{"summary":"ok","concerns":[],"testsRun":[]}' },
+                      function: {
+                        name: 'finish',
+                        arguments: JSON.stringify({
+                          summary: 'ok',
+                          concerns: [],
+                          testsRun: [],
+                          untouchedPaths: [{ path: 'src/**', reason: 'The credential inheritance fixture requires no source edits.' }],
+                        }),
+                      },
                     },
                   ],
                 },
@@ -2128,7 +2159,7 @@ test('detached worker remains alive across automatic repair and publishes the re
   let server;
   try {
     server = await createMockOpenAIServer([
-      { chunks: [finishChunk('first pass'), usageChunk] },
+      { chunks: [finishChunk('first pass', ['src/**']), usageChunk] },
       { chunks: [toolChunk('write-repair', 'write_file', { path: 'src/repaired.txt', content: 'ok\n' }), usageChunk] },
       { chunks: [finishChunk('repaired'), usageChunk] },
     ]);
@@ -2202,7 +2233,7 @@ test('child uses its accepted execution, policy, and pricing snapshot after conf
     home = await mkdtemp(join(tmpdir(), 'offload-cli-stable-home-'));
   let server;
   try {
-    server = await createMockOpenAIServer([{ chunks: [finishChunk('snapshot'), usageChunk] }]);
+    server = await createMockOpenAIServer([{ chunks: [finishChunk('snapshot', ['src/**', '.offload.json']), usageChunk] }]);
   } catch (error) {
     if (error.code === 'EPERM') {
       t.skip('loopback networking is unavailable in this sandbox');
@@ -2514,3 +2545,121 @@ for (const line of ['sonnet', 'opus'])
       await rm(path, { recursive: true, force: true });
     }
   });
+
+test('Core rejects the session-shaped one-of-five completion until every untouched owned file is explained', async () => {
+  const path = await repo('offload-core-owned-completion-');
+  const configured = structuredClone(loaded);
+  configured.config.providers.test.baseUrl = 'http://127.0.0.1:4321/v1';
+  configured.config.profiles.test.model = 'mock-model';
+  configured.config.limits.maxTurns = 5;
+  const requests = [];
+  const untouchedPaths = ['b.js', 'c.js', 'd.js', 'e.js'].map((name) => ({
+    path: `src/${name}`,
+    reason: `${name} already meets its acceptance criterion after the shared implementation change.`,
+  }));
+  const scripts = [
+    toolChunk('write-a', 'write_file', { path: 'src/a.js', content: 'export const done = true;\n' }),
+    finishChunk('Finished as requested'),
+    toolChunk('finish-confirmed', 'finish', { summary: 'Shared implementation completed; reviewed all five paths', untouchedPaths }),
+  ];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    const chunk = scripts.shift();
+    assert.ok(chunk, 'the completion should need exactly three provider turns');
+    return new Response([chunk, usageChunk].map((event) => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n', {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  };
+  const core = createCore({
+    config: {
+      loaded: configured,
+      resolveKey: () => 'credential',
+      pricingTable: {
+        fetched_at: '2026-10-01',
+        models: {
+          'mock-model': {
+            usd_per_1m: {
+              input_cache_hit: { off_peak: 0, peak: 0 },
+              input_cache_miss: { off_peak: 0, peak: 0 },
+              output: { off_peak: 0, peak: 0 },
+            },
+          },
+        },
+      },
+    },
+  });
+  try {
+    const started = await core.start({
+      task: 'Complete the feature across all five owned paths',
+      ownedPaths: ['src/a.js', 'src/b.js', 'src/c.js', 'src/d.js', 'src/e.js'],
+      repoPath: path,
+    });
+    const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15, detail: 'full' });
+    assert.equal(done.status, 'DONE_UNVERIFIED', JSON.stringify(done));
+    assert.equal(requests.length, 3);
+    assert.match(requests[2].messages.at(-1).content, /completion check/);
+    const persisted = await core.manager.store.get(started.jobId);
+    for (const { path: owned } of untouchedPaths) {
+      assert.ok(requests[2].messages.at(-1).content.includes(owned));
+      assert.ok(persisted.concerns.some((concern) => concern.startsWith(`Unchanged ${owned}:`)));
+    }
+    assert.deepEqual(
+      persisted.files.map((file) => file.path),
+      ['src/a.js'],
+    );
+    assert.match(await readFile(join(path, 'src/a.js'), 'utf8'), /done = true/);
+  } finally {
+    await core.shutdown();
+    globalThis.fetch = originalFetch;
+    await rm(path, { recursive: true, force: true });
+  }
+});
+
+test('tsx caller and repository verifier commands are refused before any worker, key or model discovery', async () => {
+  const path = await repo('offload-core-tsx-preflight-');
+  let workers = 0,
+    credentials = 0,
+    requests = 0;
+  const configured = structuredClone(loaded);
+  configured.repoConfig.testCommand = 'npx tsx scripts/check.ts';
+  const core = createCore({
+    config: {
+      loaded: configured,
+      resolveKey: () => {
+        credentials++;
+        return 'credential';
+      },
+      fetchImpl: async () => {
+        requests++;
+        throw new Error('must not discover a model');
+      },
+    },
+    worker: {
+      run: async () => {
+        workers++;
+        return { status: 'DONE' };
+      },
+    },
+  });
+  try {
+    for (const testCommand of ['npx tsx scripts/check.ts', 'tsx scripts/check.ts', undefined]) {
+      await assert.rejects(
+        () => core.start({ task: 'change', repoPath: path, ownedPaths: ['src/**'], ...(testCommand ? { testCommand } : {}) }),
+        (error) => error.code === 'E_VERIFIER_TSX_CLI' && error.message.includes('node --import tsx'),
+      );
+    }
+    assert.equal(workers, 0);
+    assert.equal(credentials, 0);
+    assert.equal(requests, 0);
+    assert.deepEqual((await core.job(undefined, { repoPath: path })).jobs, []);
+    const started = await core.start(
+      { task: 'change', repoPath: path, ownedPaths: ['src/**'], testCommand: 'node --import tsx scripts/check.ts' },
+      { launch: false },
+    );
+    assert.equal((await core.manager.store.get(started.jobId)).testCommand, 'node --import tsx scripts/check.ts');
+  } finally {
+    await core.shutdown();
+    await rm(path, { recursive: true, force: true });
+  }
+});

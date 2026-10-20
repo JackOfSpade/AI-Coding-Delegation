@@ -1,6 +1,7 @@
 import { realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { matchesAny } from './glob.mjs';
+import { TSX_LOADER_FIX } from './verifier-command.mjs';
 
 const MAX_SCAN_CHARS = 64 * 1024;
 const MAX_DETAIL = 200;
@@ -59,6 +60,19 @@ const NATIVE_SEGFAULT = /(?:\bSIGSEGV\b|Fatal Python error:\s*Segmentation fault
 const FAULTHANDLER_NATIVE_FRAME =
   /(?:^|\n)\s*(?:C\s+\[[^\n]*(?:\.dylib|\.so(?:\.\d+)?)|[^\n]*(?:\.dylib|\.so(?:\.\d+)?)[^\n]*\binitModule\b)/im;
 const NATIVE_LIBRARY = /(?:^|[\s\[/(])((?:lib)?[A-Za-z0-9_.-]+\.(?:dylib|so(?:\.\d+)*))(?:[\s\]+):]|$)/im;
+
+/** Also used when rendering a legacy job's stored generic permission denial. */
+export function tsxIpcEnvironment(verify) {
+  const result = verify?.result;
+  if (verify?.verdict !== 'FAIL' || !result || result.timedOut || result.cancelled) return null;
+  const text = `${result.stderr || ''}\n${result.stdout || ''}`.slice(-MAX_SCAN_CHARS);
+  if (
+    ASSERTION_FAILURE.test(text) ||
+    !/\blisten\s+(?:EPERM|EACCES)\b[^\n]*\/offload-sandbox-[A-Za-z0-9]+\/tsx-\d+\/[^\s'"`]+\.pipe\b/i.test(text)
+  )
+    return null;
+  return { kind: 'permission-denied', detail: `tsx CLI Unix-socket IPC was denied in TMPDIR; ${TSX_LOADER_FIX}` };
+}
 
 function nativeCrashModule(text) {
   const frame = text.match(FAULTHANDLER_NATIVE_FRAME)?.[0];
@@ -157,6 +171,9 @@ export function classifyVerifierEnvironment(verify, { workspacePath, writeScope 
   // logged EACCES): the text signals below must not mask it. An exit-127 or
   // "could not determine executable" run has no tests to have failed.
   const assertionFailure = ASSERTION_FAILURE.test(text);
+  // Wrappers (npm test) and older jobs can still reach this startup failure.
+  const tsxEnvironment = tsxIpcEnvironment(verify);
+  if (tsxEnvironment) return tsxEnvironment;
   if (!assertionFailure && GIT_SYSTEM_CONFIG_DENIED.test(text))
     return {
       kind: 'git-config-denied',

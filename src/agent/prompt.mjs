@@ -164,7 +164,7 @@ export async function buildSystemPrompt({
       : '',
     reportMode
       ? `You must call finish with a concise summary and your detailed findings in its report field (up to 256000 characters), plus concerns and testsRun. ${FINISH_ALONE_RULE}`
-      : `You must call finish with a concise summary, concerns, and testsRun when the task is complete. ${FINISH_ALONE_RULE}`,
+      : `You must call finish with a concise summary, concerns, and testsRun when the task is complete. Check every owned path against the task. If the server flags untouched paths, complete the missing work or confirm each in finish.untouchedPaths with {path, reason} explaining why it needs no edit. ${FINISH_ALONE_RULE}`,
   ];
   const local = conventions ?? (await repoConventions(repoPath));
   // `task` intentionally stays out of the system message.  It is sent once

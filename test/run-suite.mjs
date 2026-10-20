@@ -87,9 +87,11 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
       'a Python project start echoes interpreter readiness instead of a JavaScript not-applicable',
       'health reports verifierPython for a Python project, mirrors it into verifierDeps, and probes a declared interpreter',
       'the declared roots reach both the job verifier and applyThenVerify, and nothing else',
+      'uv symlink declarations are rejected before a job or paid worker starts',
     ].map((name) => [name, 'POSIX interpreter layouts are not applicable on Windows']),
     ...[
       'a symlinked venv interpreter pulls in the installation it points at',
+      'uv installation aliases outside canonical grants are refused with the resolved invocation path',
       'a symlinked skill copy is unreadable, never trusted as current',
     ].map((name) => [name, 'Windows symlink creation requires Developer Mode or elevation']),
     ...[
@@ -100,6 +102,11 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
       'macOS sandbox lets a verifier read and run a declared virtualenv but never write it, and undeclared interpreters stay denied',
       reason,
     ]),
+    ...['requires a Homebrew Node on macOS', 'requires an available macOS sandbox'].map((reason) => [
+      'macOS temp sockets support child IPC while outside sockets, symlink escapes and IP remain denied',
+      reason,
+    ]),
+    ['socket permissions are explicitly limited to the per-run temp root', 'macOS Seatbelt profile paths use POSIX semantics'],
     ['macOS Homebrew Node runs a dependency-free npm test inside the sandbox', 'requires a Homebrew Node on macOS'],
     ['macOS Homebrew Node runs a dependency-free npm test inside the sandbox', 'requires an available macOS sandbox'],
     ['macOS sandbox denies protected files through case-folded and Unicode-normalized root aliases', 'requires an available macOS sandbox'],

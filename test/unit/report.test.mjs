@@ -1323,3 +1323,34 @@ test('every terminal report shows remaining USD against maxUsd in both detail mo
     }
   }
 });
+
+test('tsx IPC VERIFY_ENV_FAILED report refreshes a saved generic permission denial with the loader fix', () => {
+  const verify = {
+    command: 'npm run check',
+    verdict: 'FAIL',
+    result: {
+      code: 1,
+      stderr: 'Error: listen EPERM: operation not permitted /private/tmp/offload-sandbox-a1b2/tsx-501/9988.pipe',
+    },
+  };
+  const report = compactReport({
+    id: 'tsx-ipc',
+    status: 'VERIFY_ENV_FAILED',
+    verify,
+    verifyEnvironment: { kind: 'permission-denied', detail: 'permission denied outside the job write scope' },
+  });
+  assert.match(report, /node --import tsx/);
+  assert.match(report, /tsx CLI Unix-socket IPC/);
+  assert.match(report, /no repair round was spent/);
+  assert.match(report, /applyThenVerify/);
+  for (const stderr of [verify.result.stderr.replace('tsx-501', 'other-tool'), `${verify.result.stderr}\nAssertionError: code failed`]) {
+    const unrelated = compactReport({
+      id: 'other',
+      status: 'VERIFY_ENV_FAILED',
+      verify: { ...verify, result: { ...verify.result, stderr } },
+      verifyEnvironment: { kind: 'permission-denied', detail: 'original diagnosis' },
+    });
+    assert.doesNotMatch(unrelated, /node --import tsx/);
+    assert.match(unrelated, /original diagnosis/);
+  }
+});

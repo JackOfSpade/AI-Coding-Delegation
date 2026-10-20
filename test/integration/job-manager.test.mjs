@@ -2965,3 +2965,11 @@ test('scope attribution retains a peer live at the baseline snapshot that releas
   assert.deepEqual(job.scopeViolations, []);
   assert.deepEqual(job.revertFiles, ['src/a.mjs']);
 });
+
+test('direct JobManager starts cannot bypass tsx CLI preflight', async () => {
+  const m = new JobManager({ store: { create: async () => assert.fail('must not create a job') } });
+  await assert.rejects(
+    () => m.start({ task: 'x', ownedPaths: ['src/**'], testCommand: 'npx tsx check.ts' }),
+    (error) => error.code === 'E_VERIFIER_TSX_CLI' && error.message.includes('node --import tsx'),
+  );
+});

@@ -306,3 +306,22 @@ test('a denied tool-cache write is a warning, not an environment failure, so a f
   assert.equal(other.kind, 'permission-denied');
   assert.match(other.detail, /out\.csv/);
 });
+
+test('tsx IPC permission failure names the exact loader substitution, including npm wrappers', () => {
+  const stderr =
+    'Error: listen EPERM: operation not permitted /private/var/folders/x/T/offload-sandbox-abc123/tsx-501/12345.pipe\n    at Server.listen (node:net:2000:1)';
+  for (const command of ['npx tsx scripts/check.ts', 'tsx scripts/check.ts', 'npm run check']) {
+    const diagnosis = classifyVerifierEnvironment({ ...failed(stderr), command });
+    assert.equal(diagnosis.kind, 'permission-denied');
+    assert.match(diagnosis.detail, /tsx CLI Unix-socket IPC/);
+    assert.match(diagnosis.detail, /node --import tsx/);
+    assert.doesNotMatch(diagnosis.detail, /12345|\/private\/var/);
+  }
+  for (const text of [
+    stderr.replace('EPERM', 'EADDRINUSE'),
+    stderr.replace('tsx-501', 'another-tool'),
+    stderr.replace('offload-sandbox-abc123', 'unrelated-temp'),
+    `${stderr}\nAssertionError [ERR_ASSERTION]: wrong value`,
+  ])
+    assert.doesNotMatch(classifyVerifierEnvironment(failed(text))?.detail ?? '', /node --import tsx/);
+});

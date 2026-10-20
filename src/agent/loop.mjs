@@ -1,5 +1,5 @@
 import { AgentContext } from './context.mjs';
-import { DEFAULT_COMMAND_TIMEOUT_SEC, MAX_COMMAND_TIMEOUT_SEC, TOOL_DEFINITIONS, isReadOnlyTool } from './tools.mjs';
+import { DEFAULT_COMMAND_TIMEOUT_SEC, MAX_COMMAND_TIMEOUT_SEC, TOOL_DEFINITIONS, isReadOnlyTool, validUntouchedPaths } from './tools.mjs';
 import { Meter, resolveModel, samePricedModel } from '../pricing.mjs';
 import { OpenAIChatProvider, PROVIDER_FINISH_REASONS, ProviderError, providerFailure } from '../provider/openai-chat.mjs';
 import { FAILURE_ERRORS, summarizeToolFailure, toolErrorHint } from '../failure.mjs';
@@ -28,7 +28,8 @@ const finishArgs = (value) =>
   value.summary.length <= 1500 &&
   (value.report === undefined || (typeof value.report === 'string' && value.report.length <= 256_000)) &&
   finishList(value.concerns) &&
-  finishList(value.testsRun);
+  finishList(value.testsRun) &&
+  validUntouchedPaths(value.untouchedPaths);
 const MAX_ASSISTANT_CHARS = 1_000_000;
 const MAX_TOOL_CALLS = 64;
 const MAX_TOOL_ARGUMENT_CHARS = 512_000;
@@ -263,6 +264,7 @@ export class AgentLoop {
     // finish. This affects only completion steering; it never changes the
     // tools a worker may execute or exposes the verifier command to it.
     serverVerifierConfigured = false,
+    checkOwnedPaths,
     // `[[absolutePrefix, label], ...]` applied to the failing call recorded when
     // the loop guard trips, so a temp or home directory never reaches a report.
     pathAliases = [],
@@ -287,6 +289,8 @@ export class AgentLoop {
     if (persistBudgetFinishRecovery !== undefined && typeof persistBudgetFinishRecovery !== 'function')
       throw new TypeError('persistBudgetFinishRecovery must be a function');
     if (typeof serverVerifierConfigured !== 'boolean') throw new TypeError('serverVerifierConfigured must be boolean');
+    if (checkOwnedPaths !== undefined && typeof checkOwnedPaths !== 'function') throw new TypeError('checkOwnedPaths must be a function');
+    this.checkOwnedPaths = checkOwnedPaths;
     if (
       !Array.isArray(pathAliases) ||
       pathAliases.length > 16 ||
@@ -1215,6 +1219,22 @@ export class AgentLoop {
         // Persist only a valid assistant tool-call turn.  This ensures a repair
         // never replays an OpenAI-invalid assistant message without matching
         // tool results.
+        if (finishIndex !== -1 && this.checkOwnedPaths) {
+          const untouched = await this.checkOwnedPaths();
+          const confirmed = new Set((parsed[finishIndex].untouchedPaths ?? []).map((entry) => entry.path));
+          const missing = untouched.filter((path) => !confirmed.has(path));
+          if (missing.length) {
+            const correction = `TOOL_ERROR: completion check: these owned paths have no changes: ${JSON.stringify(missing)}. Complete any missing work. Before finishing, confirm each still-untouched path in finish.untouchedPaths with {path, reason}, explaining specifically why no edit is needed. A generic completion summary is insufficient.`;
+            await this.context.addBatch([
+              assistant,
+              { role: 'tool', tool_call_id: calls[finishIndex].id, name: 'finish', content: correction },
+            ]);
+            await this.context.flush();
+            await settleCappedImplementationRecovery();
+            await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'owned_paths_completion_check' });
+            continue;
+          }
+        }
         this.context.add(assistant);
         await this.context.flush();
         let values;

@@ -571,7 +571,9 @@ export class JobStore {
         job = await this.#healPublicationsUnlocked(job, directory);
         const path = join(directory, 'messages.jsonl');
         const current = await this.#readTranscript(path, job);
-        const prior = this.#parseTranscript(current, { allowTornTail: !this.integrityRequired(job) });
+        const active = this.#activeTranscript(current, job);
+        const archived = current.slice(0, current.length - active.length);
+        const prior = this.#parseTranscript(active, { allowTornTail: !this.integrityRequired(job) });
         let retained = prior;
         if (!validTranscript([...prior, ...messages])) {
           // Resuming a crashed tool turn starts a new user/assistant turn, not a
@@ -586,7 +588,9 @@ export class JobStore {
         // Rebuild the accepted prefix before adding a new batch; concatenating
         // onto raw torn bytes would otherwise manufacture invalid JSONL.
         const prefix =
-          retained === prior && current.endsWith('\n') ? current : retained.map((message) => `${JSON.stringify(message)}\n`).join('');
+          retained === prior && active.endsWith('\n')
+            ? current
+            : archived + retained.map((message) => `${JSON.stringify(message)}\n`).join('');
         const text = `${prefix}${lines.join('')}`;
         const bytes = Buffer.byteLength(text);
         if (bytes > MAX_TRANSCRIPT_BYTES) throw new Error('transcript exceeds size limit');
@@ -627,9 +631,32 @@ export class JobStore {
     const directory = await this.#assertJobDirectory(id);
     const job = await this.get(id);
     const text = await this.#readTranscript(join(directory, 'messages.jsonl'), job);
-    const values = this.#parseTranscript(text, { allowTornTail: !this.integrityRequired(job) });
+    const values = this.#parseTranscript(this.#activeTranscript(text, job), { allowTornTail: !this.integrityRequired(job) });
     if (!validTranscript(values)) throw new Error('corrupt transcript: invalid role/tool ordering');
     return values;
+  }
+  /** Start a fresh conversation after the specific local parser failure.
+   * Keep every original byte for audit, under the same full-file integrity
+   * digest. Never skip an integrity failure or silently repair bad JSON. */
+  async restartCorruptTranscript(id) {
+    await this.init();
+    const directory = await this.#assertJobDirectory(id);
+    return this.#withJobLock(id, () =>
+      this.#serial(async () => {
+        let job = await this.get(id);
+        if (job.status !== 'REPAIRING' || job.error !== 'corrupt transcript: invalid interior JSON')
+          throw new Error('transcript restart requires a reserved corruption continuation');
+        job = await this.#healPublicationsUnlocked(job, directory);
+        const text = await this.#readTranscript(join(directory, 'messages.jsonl'), job);
+        try {
+          this.#parseTranscript(this.#activeTranscript(text, job));
+        } catch (error) {
+          if (error.message !== 'corrupt transcript: invalid interior JSON') throw error;
+          return this.#writeJob({ ...job, transcriptStartBytes: Buffer.byteLength(text), transcriptReplayable: true });
+        }
+        throw new Error('transcript is not corrupt; refusing to discard conversation state');
+      }),
+    );
   }
   async readArtifactBytes(id, name) {
     await this.init();
@@ -1182,6 +1209,12 @@ export class JobStore {
       throw new Error('stored transcript integrity check failed');
     if (committedMatches || (actual === pending && bytes === pendingBytes)) return text;
     throw new Error('stored transcript integrity check failed');
+  }
+  #activeTranscript(text, job) {
+    const start = job.transcriptStartBytes ?? 0;
+    const bytes = Buffer.from(text, 'utf8');
+    if (!Number.isSafeInteger(start) || start < 0 || start > bytes.length) throw new Error('invalid transcript restart boundary');
+    return bytes.subarray(start).toString('utf8');
   }
   #parseTranscript(text, { allowTornTail = false } = {}) {
     if (text === '') return [];

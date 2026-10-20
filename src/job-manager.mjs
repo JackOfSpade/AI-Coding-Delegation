@@ -14,16 +14,19 @@ import {
   APPLY_ELIGIBLE_STATUSES,
   FAILURE_ERRORS,
   FAILURE_KINDS,
+  LOCAL_TRANSCRIPT_CORRUPTION,
   continuableFailure,
   failedApplyRefusal,
   failureContinueDefect,
   loopedAgain,
   reportToolFailure,
+  retryableTranscriptFailure,
   safeFailureKind,
   safeToolFailure,
 } from './failure.mjs';
 import { isolatedDependencyReadPaths } from './worktree.mjs';
 import { classifyVerifierEnvironment, isVerifierEnvironmentKind } from './verify-env.mjs';
+import { assertVerifierCommand } from './verifier-command.mjs';
 import {
   interpreterPathsOption,
   normalizeInterpreterDeclaration,
@@ -258,6 +261,7 @@ const PROVIDER_FAILURE_KINDS = new Set([
   'sse_protocol',
   'sse_limit',
   'credit_exhausted',
+  'transcript_corruption',
 ]);
 const PROVIDER_FINISH_REASONS = new Set(['stop', 'length', 'tool_calls', 'function_call', 'content_filter', 'other']);
 const CAPPED_FINISH_RECOVERY_STATES = new Set(['queued', 'consumed', 'settled']);
@@ -355,6 +359,8 @@ const safeProviderFailure = (value) => {
 };
 const providerFailureMessage = (failure) => {
   switch (failure?.kind) {
+    case 'transcript_corruption':
+      return 'Provider transcript was corrupt';
     case 'attempt_timeout':
       return failure.timeoutMs ? `Provider request timed out after ${Math.floor(failure.timeoutMs / 1000)}s` : 'Provider request timed out';
     case 'redirect':
@@ -1381,6 +1387,7 @@ export class JobManager {
   }
   async start(input, { launch = true, turnBudget, runtimePreflight } = {}) {
     this.validate(input);
+    assertVerifierCommand(input.testCommand);
     if (runtimePreflight !== undefined && !validRuntimePreflight(runtimePreflight))
       throw new Error('runtime preflight metadata is invalid');
     const setupStartedMs = this.#nowMs();
@@ -3206,17 +3213,17 @@ export class JobManager {
       // tool (offload_repair names the defects), and a job with nothing in
       // scope has nothing worth keeping. A FAILED round is resumable only for
       // the worker-side causes the loop names (default-deny, see failure.mjs):
-      // a provider, protocol, scope or integrity failure is not the worker
-      // running out of road.
+      // specific transcript corruption is also recoverable; every other
+      // provider, protocol, scope or integrity failure stays default-deny.
       if (job.status === 'FAILED' && loopedAgain(job))
         throw new Error(
           'the same tool call looped again after an earlier round; use offload_repair with a concrete change of approach, or start a fresh job',
         );
       if (!['BUDGET', 'TIMEOUT'].includes(job.status) && !continuableFailure(job))
         throw new Error(
-          `only a job that stopped on BUDGET or TIMEOUT, or that FAILED in a continuable worker-side way (${FAILURE_KINDS.join(', ')}), can be continued (this one is ${job.status}); use offload_repair for defects`,
+          `only a job that stopped on BUDGET or TIMEOUT, or that FAILED on transcript corruption or in a continuable worker-side way (${FAILURE_KINDS.join(', ')}), can be continued (this one is ${job.status}); use offload_repair for defects`,
         );
-      if (!Array.isArray(job.files) || !job.files.length)
+      if ((!Array.isArray(job.files) || !job.files.length) && !retryableTranscriptFailure(job))
         throw new Error('job has no in-scope changes to continue from; start a fresh job');
       // A cap stop can happen below the nominal cap (a request reservation the
       // remaining budget cannot cover), so "not yet exhausted" is not proof
@@ -3316,6 +3323,10 @@ export class JobManager {
             : null;
       if (!reservation) throw new Error('job lifecycle ownership changed during repair setup');
       job = this.validatePersisted(reservation);
+      if (continuation && job.error === LOCAL_TRANSCRIPT_CORRUPTION && !job.providerFailure) {
+        if (typeof this.store.restartCorruptTranscript !== 'function') throw new Error('transcript restart is unavailable');
+        job = this.validatePersisted(await this.store.restartCorruptTranscript(id));
+      }
       if (this.isolated) {
         if (!validGitObjectId(job.before) || !validGitObjectId(job.workspaceAfter || job.before))
           throw new Error('isolated repair baseline is unavailable');

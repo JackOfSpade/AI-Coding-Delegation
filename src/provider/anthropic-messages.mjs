@@ -179,11 +179,19 @@ async function responseError(response) {
     // Never preserve or expose a provider response body in diagnostics.
   }
   const exhausted = creditExhaustedCode(body, response.status);
+  if (isTranscriptCorruption(body))
+    return new ProviderError('Provider transcript was corrupt', { kind: 'transcript_corruption', retryable: true });
   return new ProviderError(exhausted ? 'Claude promotional credit is exhausted' : `Chat request failed (HTTP ${response.status})`, {
     status: response.status,
     kind: exhausted ? 'credit_exhausted' : 'http',
     retryable: response.status === 429 || response.status >= 500,
   });
+}
+
+// Classify only a provider error envelope, never worker prose or a local
+// persistence error. Do not retain its body in diagnostics.
+function isTranscriptCorruption(body) {
+  return typeof body?.error?.message === 'string' && /\bcorrupt transcript\b.*\binvalid interior JSON\b/i.test(body.error.message);
 }
 
 /** Anthropic Messages adapter normalized to Offload's provider event contract. */
@@ -232,8 +240,12 @@ export class AnthropicMessagesProvider {
           maxAttemptBytes: MAX_SSE_ATTEMPT_BYTES,
         })) {
           try {
-            events.push(JSON.parse(event.data));
-          } catch {
+            const parsed = JSON.parse(event.data);
+            if (parsed?.type === 'error' && isTranscriptCorruption(parsed))
+              throw new ProviderError('Provider transcript was corrupt', { kind: 'transcript_corruption', retryable: true });
+            events.push(parsed);
+          } catch (error) {
+            if (error instanceof ProviderError) throw error;
             throw new ProviderError('Invalid JSON in SSE data', { kind: 'sse_protocol' });
           }
         }

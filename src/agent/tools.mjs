@@ -211,6 +211,20 @@ export const TOOL_DEFINITIONS = Object.freeze([
       report: { type: 'string', maxLength: 256_000, description: 'Optional detailed report text, used by read-only report jobs.' },
       concerns: { type: 'array', items: str, maxItems: 100 },
       testsRun: { type: 'array', items: str, maxItems: 100 },
+      untouchedPaths: {
+        type: 'array',
+        maxItems: 256,
+        description: 'After a completion check, confirm each untouched owned path with a specific reason why no edit is needed.',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            path: { type: 'string', minLength: 1, maxLength: 4096 },
+            reason: { type: 'string', minLength: 1, maxLength: 1000 },
+          },
+          required: ['path', 'reason'],
+        },
+      },
     },
     ['summary'],
   ),
@@ -954,7 +968,8 @@ export class LocalTools {
         args.summary.length <= 1500 &&
         (args.report === undefined || (typeof args.report === 'string' && args.report.length <= 256_000)) &&
         list(args.concerns) &&
-        list(args.testsRun);
+        list(args.testsRun) &&
+        validUntouchedPaths(args.untouchedPaths);
       if (!valid)
         throw new Error(
           'finish requires a 1-1500 character summary, optional 256000 character report, and up to 100 short string concerns/testsRun entries',
@@ -963,8 +978,9 @@ export class LocalTools {
         finish: {
           summary: args.summary,
           ...(args.report !== undefined ? { report: args.report } : {}),
-          concerns: args.concerns ?? [],
+          concerns: [...(args.concerns ?? []), ...(args.untouchedPaths ?? []).map(({ path, reason }) => `Unchanged ${path}: ${reason}`)],
           testsRun: args.testsRun ?? [],
+          ...(args.untouchedPaths ? { untouchedPaths: args.untouchedPaths } : {}),
         },
       };
     }
@@ -974,3 +990,20 @@ export class LocalTools {
   }
 }
 export const isReadOnlyTool = (name) => ['read_file', 'list_dir', 'glob', 'grep'].includes(name);
+
+export const validUntouchedPaths = (value) =>
+  value === undefined ||
+  (Array.isArray(value) &&
+    value.length <= 256 &&
+    value.every(
+      (entry) =>
+        entry &&
+        typeof entry.path === 'string' &&
+        entry.path.trim().length > 0 &&
+        entry.path.length <= 4096 &&
+        typeof entry.reason === 'string' &&
+        entry.reason.trim().length > 0 &&
+        entry.reason.length <= 1000 &&
+        Object.keys(entry).every((key) => ['path', 'reason'].includes(key)),
+    ) &&
+    new Set(value.map((entry) => entry.path)).size === value.length);

@@ -4233,3 +4233,101 @@ test('a provider timing-free tool batch still reports one timing per call, in co
   assert.equal(batch.toolTimings[0].name, 'list_dir');
   assert.ok(Number.isInteger(batch.toolTimings[0].ms) && batch.toolTimings[0].ms >= 0);
 });
+
+test('partial multi-file finish must confirm every untouched path, and explanations are surfaced', async () => {
+  const requests = [],
+    context = new AgentContext(),
+    invoked = [];
+  const reasons = [
+    { path: 'b.js', reason: 'The existing adapter already satisfies the requested interface.' },
+    { path: 'c.js', reason: 'The existing test covers the unchanged adapter contract.' },
+  ];
+  const tools = new LocalTools({ repoPath: process.cwd(), ownedPaths: [] });
+  const result = await new AgentLoop({
+    provider: scripted(
+      [
+        [call('finish', JSON.stringify({ summary: 'Finished as requested' }), 'f1')],
+        [call('finish', JSON.stringify({ summary: 'Finished as requested', untouchedPaths: reasons.slice(0, 1) }), 'f2')],
+        [call('finish', JSON.stringify({ summary: 'Complete', untouchedPaths: reasons }), 'f3')],
+      ],
+      requests,
+    ),
+    tools: {
+      execute: async (...args) => {
+        invoked.push(args[0]);
+        return tools.execute(...args);
+      },
+    },
+    context,
+    checkOwnedPaths: async () => ['b.js', 'c.js'],
+    maxTurns: 3,
+  }).run({ task: 'Own a.js, b.js and c.js.' });
+  assert.equal(result.status, 'DONE');
+  assert.deepEqual(invoked, ['finish'], 'neither incomplete finish was executed');
+  assert.match(requests[1].at(-1).content, /b.js.*c.js/);
+  assert.match(requests[2].at(-1).content, /\["c.js"\]/);
+  assert.deepEqual(result.finish.untouchedPaths, reasons);
+  assert.ok(result.finish.concerns.some((item) => item.includes('Unchanged b.js:')));
+  assertToolProtocol(context.snapshot());
+});
+
+test('completion cannot be accepted at the turn cap without per-path confirmation', async () => {
+  let invoked = 0;
+  const result = await new AgentLoop({
+    provider: providerFor([[call('finish', '{"summary":"Finished as requested"}')]]),
+    tools: {
+      execute: async () => {
+        invoked++;
+        return { finish: { summary: 'done' } };
+      },
+    },
+    checkOwnedPaths: async () => ['untouched.js'],
+    maxTurns: 1,
+  }).run({ task: 'Complete every owned path.' });
+  assert.equal(result.status, 'BUDGET');
+  assert.equal(invoked, 0);
+});
+
+test('completion rechecks current changes so editing the missing path satisfies the guard', async () => {
+  let missing = true;
+  const result = await new AgentLoop({
+    provider: providerFor([
+      [call('finish', '{"summary":"done"}', 'f1')],
+      [call('write_file', '{"path":"b.js","content":"complete"}', 'w')],
+      [call('finish', '{"summary":"done"}', 'f2')],
+    ]),
+    tools: {
+      execute: async (name) => {
+        if (name === 'write_file') {
+          missing = false;
+          return 'WROTE: b.js';
+        }
+        return { finish: { summary: 'done' } };
+      },
+    },
+    checkOwnedPaths: async () => (missing ? ['b.js'] : []),
+    maxTurns: 3,
+  }).run({ task: 'Own a.js and b.js.' });
+  assert.equal(result.status, 'DONE');
+});
+
+test('invalid untouched-path confirmations cannot bypass the finish argument gate', async () => {
+  for (const untouchedPaths of [
+    [{ path: 'b.js', reason: ' ' }],
+    [
+      { path: 'b.js', reason: 'ok' },
+      { path: 'b.js', reason: 'duplicate' },
+    ],
+    [{ path: 'b.js' }],
+    ['b.js'],
+  ]) {
+    const result = await new AgentLoop({
+      provider: providerFor([[call('finish', JSON.stringify({ summary: 'done', untouchedPaths }))]]),
+      tools: { execute: async () => assert.fail('invalid finish must never execute') },
+      checkOwnedPaths: async () => ['b.js'],
+      maxTurns: 1,
+    }).run({ task: 'x' });
+    assert.equal(result.status, 'FAILED');
+    assert.equal(result.failureKind, 'finish-protocol');
+  }
+});

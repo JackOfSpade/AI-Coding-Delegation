@@ -408,3 +408,28 @@ test('probing a declaration runs python -c inside the sandbox and reports each o
   const invalidImports = await probeVerifierInterpreter(join(root, 'venv'), { ...context, imports: ['torch; exploit'] });
   assert.deepEqual([invalidImports.status, invalidImports.reason, invalidImports.accepted], ['missing', 'invalid-imports', false]);
 });
+
+test(
+  'uv installation aliases outside canonical grants are refused with the resolved invocation path',
+  { skip: SYMLINK_SKIP || POSIX_SKIP },
+  async (t) => {
+    const { root, context } = await sandboxRoot(t);
+    const target = join(root, 'cpython-3.13.13-macos');
+    const real = await installation(target);
+    await symlink('python3.99', join(target, 'bin', 'python3'));
+    const alias = join(root, 'cpython-3.13-macos');
+    await symlink(target, alias);
+    for (const declared of [alias, join(alias, 'bin', 'python3.99')]) {
+      const error = refusal(() => resolveVerifierInterpreters(declared, context), 'symlink-path');
+      assert.ok(error.message.includes(await realpath(declared)), error.message);
+      assert.match(error.message, /Declare the resolved path and use it in testCommand/);
+    }
+    assert.deepEqual(resolveVerifierInterpreters(real, context).roots, [target]);
+    assert.deepEqual(resolveVerifierInterpreters(target, context).roots, [target]);
+    assert.equal(
+      resolveVerifierInterpreters(join(target, 'bin', 'python3'), context).grants.length,
+      1,
+      'a binary symlink within the granted installation remains usable',
+    );
+  },
+);

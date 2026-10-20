@@ -784,3 +784,51 @@ test('sealed transcripts and revert artifacts are bound before they are read', a
     cleanup(gitDir);
   }
 });
+
+test('corrupt transcript continuation archives every byte and starts a fresh sealed conversation', async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir }).configureIntegrity({ requiredFor: () => true, keyForId: () => 'key' });
+    const job = await store.create({ task: 'original', ownedPaths: ['src/**'] });
+    const path = join(gitDir, 'offload', 'jobs', job.id, 'messages.jsonl');
+    const corrupt = '{"role":"user","content":"audit café"}\n{invalid-json}\n';
+    // Model a malformed but authenticated publication from an older runtime.
+    writeFileSync(path, corrupt);
+    await store.update(job.id, {
+      status: 'REPAIRING',
+      error: 'corrupt transcript: invalid interior JSON',
+      transcriptDigest: createHash('sha256').update(corrupt).digest('hex'),
+      transcriptBytes: Buffer.byteLength(corrupt),
+    });
+    await assert.rejects(() => store.readMessages(job.id), /invalid interior JSON/);
+    const restarted = await store.restartCorruptTranscript(job.id);
+    assert.equal(restarted.transcriptStartBytes, Buffer.byteLength(corrupt));
+    assert.deepEqual(await store.readMessages(job.id), []);
+    await store.messages(job.id, { role: 'user', content: 'inspect retained work' });
+    assert.deepEqual(await store.readMessages(job.id), [{ role: 'user', content: 'inspect retained work' }]);
+    assert.ok(readFileSync(path, 'utf8').startsWith(corrupt), 'original malformed bytes are still auditable');
+    assert.equal(store.verifyJob(await store.get(job.id)), true);
+    await assert.rejects(() => store.restartCorruptTranscript(job.id), /not corrupt/);
+    writeFileSync(path, readFileSync(path, 'utf8').replace('audit', 'forge'));
+    await assert.rejects(() => store.restartCorruptTranscript(job.id), /integrity check failed/);
+    await assert.rejects(() => store.readMessages(job.id), /integrity check failed/);
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
+test('transcript restarts refuse unreserved, valid, and differently corrupt conversations', async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir });
+    const job = await store.create({ task: 'x' });
+    await assert.rejects(() => store.restartCorruptTranscript(job.id), /reserved corruption continuation/);
+    await store.update(job.id, { status: 'REPAIRING', error: 'corrupt transcript: invalid interior JSON' });
+    await store.messages(job.id, { role: 'user', content: 'valid' });
+    await assert.rejects(() => store.restartCorruptTranscript(job.id), /not corrupt/);
+    writeFileSync(join(gitDir, 'offload', 'jobs', job.id, 'messages.jsonl'), '\n');
+    await assert.rejects(() => store.restartCorruptTranscript(job.id), /empty interior record/);
+  } finally {
+    cleanup(gitDir);
+  }
+});

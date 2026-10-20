@@ -32,7 +32,20 @@ const usage = (prompt = 100_000, completion = 10_000) => ({
 const turn = (name, args, id = `${name}-${Math.random().toString(36).slice(2, 8)}`) => ({
   chunks: [modelChunk({ tool_calls: [{ index: 0, id, type: 'function', function: { name, arguments: JSON.stringify(args) } }] }), usage()],
 });
-const finish = (summary = 'done') => turn('finish', { summary, concerns: [], testsRun: [] }, `finish-${summary}`);
+const finish = (summary = 'done', untouched = []) =>
+  turn(
+    'finish',
+    {
+      summary,
+      concerns: [],
+      testsRun: [],
+      untouchedPaths: untouched.map((path) => ({
+        path,
+        reason: 'This fixture inspects server behavior and requires no source edit in this scope.',
+      })),
+    },
+    `finish-${summary}`,
+  );
 const writeFileTurn = (path, content) => turn('write_file', { path, content });
 // One provider response with several tool calls: [name, args, id] each.
 const calls = (...entries) => ({
@@ -298,7 +311,7 @@ test(
   'MCP e2e: a new server session lists only its own jobs, all:true reaches the old ones, and spend is cumulative',
   { skip: windowsSkip },
   async (t) => {
-    await withServer(t, { scripts: [finish('first'), finish('second')] }, async ({ repo, open }) => {
+    await withServer(t, { scripts: [finish('first', ['a/**']), finish('second', ['b/**'])] }, async ({ repo, open }) => {
       const first = await open();
       const a = await first.call('offload_start', { task: 'one', ownedPaths: ['a/**'], repoPath: repo });
       const doneA = await settled(first, a.jobId, repo);
@@ -348,8 +361,8 @@ test(
     const scripts = [
       turn('read_file', { path: 'notes.txt' }),
       turn('read_file', { path: 'README.md' }),
-      finish('looked'),
-      finish('ranged'),
+      finish('looked', ['src/big.js']),
+      finish('ranged', ['src/big.js']),
     ];
     await withServer(t, { repo, limits: { maxTurns: 20, timeoutMinutes: 30, maxUsd: 2 }, scripts }, async ({ server, open }) => {
       const mcp = await open();
@@ -943,7 +956,7 @@ test(
         command: `node -e "const fs=require('fs'),os=require('os'),p=require('path');fs.mkdtempSync(p.join(os.tmpdir(),'w-'));console.log('TMPDIR='+process.env.TMPDIR)"`,
       }),
       turn('run_command', { command: `node -e "require('fs').mkdtempSync('/tmp/w-')"` }),
-      finish('probed'),
+      finish('probed', ['src/**']),
     ];
     await withServer(t, { scripts }, async ({ server, repo, open }) => {
       const mcp = await open();

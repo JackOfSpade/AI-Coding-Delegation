@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, rmSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -165,7 +165,7 @@ const loaded = (extra = {}) => ({
 });
 const noInstalledSkill = (options) => installedSkillHealth({ ...options, home: join(tmpdir(), 'offload-no-installed-skill'), env: {} });
 async function pythonRepo(t, { files = { 'pyproject.toml': '[project]\nname = "x"\n' }, venv = true } = {}) {
-  const repo = makeRepo();
+  const repo = await realpath(makeRepo());
   t.after(() => cleanup(repo));
   for (const [name, content] of Object.entries(files)) write(join(repo, name), content);
   git(repo, ['add', '-A']);
@@ -553,4 +553,28 @@ test('the CLI passes a path or a JSON array as verifierInterpreter and refuses i
   const refused = await run(['job', 'oj-1', '--verifierInterpreter', '/opt/py/venv']);
   assert.equal(refused.code, 2);
   assert.match(refused.stderr, /health call/);
+});
+
+test('uv symlink declarations are rejected before a job or paid worker starts', { skip: posixSkip }, async (t) => {
+  const { repo, base } = await pythonRepo(t, { venv: false });
+  const target = join(base, 'cpython-3.13.13-macos');
+  await fakeVenv(target, join(base, 'python-base'));
+  const alias = join(base, 'cpython-3.13-macos');
+  await symlink(target, alias);
+  const core = coreFor();
+  t.after(() => core.shutdown({ timeoutMs: 2_000 }));
+  for (const declared of [alias, join(alias, 'bin/python3')]) {
+    await assert.rejects(
+      () =>
+        core.start({
+          task: 'x',
+          repoPath: repo,
+          ownedPaths: ['src/**'],
+          verifierInterpreter: declared,
+          testCommand: `${declared} -m pytest`,
+        }),
+      (error) => error.reason === 'symlink-path' && error.message.includes(target),
+    );
+  }
+  assert.deepEqual((await core.job(undefined, { repoPath: repo })).jobs, []);
 });

@@ -1,7 +1,14 @@
 import { redactText } from './redact.mjs';
-import { APPLY_ELIGIBLE_STATUSES, continuableFailure, failedApplyRefusal, safeFailureKind, safeToolFailure } from './failure.mjs';
+import {
+  APPLY_ELIGIBLE_STATUSES,
+  continuableFailure,
+  failedApplyRefusal,
+  retryableTranscriptFailure,
+  safeFailureKind,
+  safeToolFailure,
+} from './failure.mjs';
 import { formatDuration, sanitizeTiming, timingTotals } from './timing.mjs';
-import { isVerifierEnvironmentKind } from './verify-env.mjs';
+import { isVerifierEnvironmentKind, tsxIpcEnvironment } from './verify-env.mjs';
 
 const terminal = new Set([
   'DONE_VERIFIED',
@@ -127,18 +134,20 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
   // verifier could not run because of something the worker cannot supply
   // (it has no network and cannot write outside its scope). The server did not
   // spend a repair round on it and never retries automatically.
+  const environmentFailure =
+    job.verifyEnvironment?.kind === 'permission-denied' ? (tsxIpcEnvironment(job.verify) ?? job.verifyEnvironment) : job.verifyEnvironment;
   const environment =
-    !reportMode && isVerifierEnvironmentKind(job.verifyEnvironment?.kind)
-      ? `verifier environment: ${scalar(job.verifyEnvironment.detail || job.verifyEnvironment.kind)}. This is not a repair-able code failure; no repair round was spent and none will be started automatically.${
-          job.verifyEnvironment.kind === 'missing-package'
+    !reportMode && isVerifierEnvironmentKind(environmentFailure?.kind)
+      ? `verifier environment: ${scalar(environmentFailure.detail || environmentFailure.kind)}. This is not a repair-able code failure; no repair round was spent and none will be started automatically.${
+          environmentFailure.kind === 'missing-package'
             ? job.workspaceDependencies && job.workspaceDependencies !== 'linked'
               ? ` The primary checkout's node_modules was not linked (${scalar(job.workspaceDependencies)}): install dependencies there.`
               : ' Either it is not installed in the primary checkout, it lives in a nested/workspace package outside the linked root node_modules, or the worker imported a package that does not exist (check the diff).'
-            : job.verifyEnvironment.kind === 'temp-dir-denied'
+            : environmentFailure.kind === 'temp-dir-denied'
               ? ' Hard-coded /tmp is not writable in the verifier; tests must use os.tmpdir()/$TMPDIR and forward the environment to child processes. For a suite with such pre-existing failures, start with verifierMode "baseline-diff".'
-              : job.verifyEnvironment.kind === 'git-config-denied'
+              : environmentFailure.kind === 'git-config-denied'
                 ? ' A temporary Git-fixture test could not read host Git configuration in the verifier sandbox. This is an environment limitation, not a product-test failure; run that integration suite in the primary checkout.'
-                : job.verifyEnvironment.kind === 'native-module-crash'
+                : environmentFailure.kind === 'native-module-crash'
                   ? ' Run the import in the primary checkout to determine whether the verifier sandbox caused the crash.'
                   : ''
         }${
@@ -246,7 +255,14 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
   // output cap) is resumable too, by the same gate the server enforces.
   // Offered only when there is in-scope work worth keeping.
   const capStop = job.status === 'BUDGET' || job.status === 'TIMEOUT';
-  if (!reportMode && !violations.length && mutationSettled && (capStop || continuableFailure(job)) && files.length && roundAvailable) {
+  if (
+    !reportMode &&
+    !violations.length &&
+    mutationSettled &&
+    (capStop || continuableFailure(job)) &&
+    (files.length || retryableTranscriptFailure(job)) &&
+    roundAvailable
+  ) {
     nextActions.push(!capStop && budgetSpent ? 'continue (extraTurns/extraUsd needed: the cumulative budget is spent)' : 'continue');
   }
   // A FAILED job only through the gate offload_apply enforces on its retained diff.
