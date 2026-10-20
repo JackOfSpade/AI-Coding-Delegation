@@ -1014,7 +1014,8 @@ test(
         jobSignals(first).map((signal) => [signal.code, signal.job, signal.attributable]),
         [['protocol-failure-finish', bad.jobId, true]],
       );
-      assert.match(first.signals[0].evidence, /FAILED \(finish-protocol\) after 3 turns, \$0\.36, /);
+      assert.match(first.signals[0].evidence, /FAILED \(finish-protocol\) after 3 turns, \$0\.36(?:, |$)/);
+      assert.deepEqual([first.jobs[0].failureKind, first.jobs[0].turns, first.jobs[0].costUsd], ['finish-protocol', 3, 0.36]);
       assert.equal(first.maintainerPromptWarranted, true);
       assert.deepEqual([first.scope, first.project], ['jobs', { repo: basename(repo), profile: 'mock' }]);
       assert.deepEqual(first.jobs[0].files, 1, 'the retained diff is counted, so the spend is not called wasted');

@@ -1980,6 +1980,14 @@ test('detached finalization requires an affirmative exact-lease release before c
 test('wait does not publish terminal verification before slow snapshot finalization', async () => {
   const gitDir = await mkdtemp(`${tmpdir()}/offload-finalizing-`);
   let snapshots = 0;
+  let enterSnapshot;
+  let releaseSnapshot;
+  const snapshotEntered = new Promise((resolve) => {
+    enterSnapshot = resolve;
+  });
+  const snapshotGate = new Promise((resolve) => {
+    releaseSnapshot = resolve;
+  });
   const m = new JobManager({
     store: new JobStore({ gitDir }),
     worker: { run: async () => ({ status: 'DONE' }) },
@@ -1987,7 +1995,10 @@ test('wait does not publish terminal verification before slow snapshot finalizat
     snapshots: {
       create: async () => {
         snapshots += 1;
-        if (snapshots > 1) await pause(120);
+        if (snapshots > 1) {
+          enterSnapshot();
+          await snapshotGate;
+        }
         return snapshots === 1 ? gitId : nextGitId;
       },
       diff: async () => '',
@@ -1995,10 +2006,17 @@ test('wait does not publish terminal verification before slow snapshot finalizat
     config: { repoPath: process.cwd(), git: { branch: async () => 'main', head: async () => gitId } },
   });
   const started = await m.start({ task: 'slow finish', ownedPaths: ['src/**'], repoPath: process.cwd(), testCommand: 'ok' });
-  const early = await m.wait(started.jobId, { timeoutSec: 0.02 });
-  assert.equal(early.done, false);
-  assert.ok(['WORKER_DONE', 'FINALIZING'].includes(early.status));
-  assert.equal((await m.wait(started.jobId, { timeoutSec: 1 })).status, 'DONE_VERIFIED');
+  try {
+    // Wait for the exact boundary instead of assuming storage/scheduling has
+    // reached it within 20ms on a busy runner. Finalization cannot finish yet.
+    await snapshotEntered;
+    const early = await m.wait(started.jobId, { timeoutSec: 0.02 });
+    assert.equal(early.done, false);
+    assert.ok(['WORKER_DONE', 'FINALIZING'].includes(early.status));
+  } finally {
+    releaseSnapshot();
+  }
+  assert.equal((await m.wait(started.jobId, { timeoutSec: 5 })).status, 'DONE_VERIFIED');
 });
 test('terminal status and wait stay behind an in-flight owned cleanup attempt', async () => {
   const m = await manager({ run: async () => ({ status: 'FAILED' }) });

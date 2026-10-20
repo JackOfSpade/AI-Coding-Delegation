@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -69,3 +70,22 @@ jobs:
             coverage/coverage-summary.json
           if-no-files-found: warn
           retention-days: 7
+
+  required:
+    name: CI required
+    if: always()
+    needs: [test, quality]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every CI prerequisite to succeed
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          results = json.loads(os.environ["JOB_RESULTS"])
+          failed = [name for name, job in results.items() if job["result"] != "success"]
+          if not results or failed:
+              sys.exit("Unsuccessful prerequisites: " + ", ".join(failed))
+          PY

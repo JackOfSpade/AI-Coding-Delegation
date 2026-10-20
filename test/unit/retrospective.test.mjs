@@ -720,6 +720,13 @@ test('poisoned input: no secret, home path or brief text reaches the digest or t
   assert.match(task, /^Rotate keys in ~\/work\/shop\/\.env|^Rotate keys in <repo>\/\.env/);
 });
 
+test('short first-line briefs never include later instructions after path redaction', () => {
+  for (const newline of ['\n', '\r\n', '\u2028', '\u2029']) {
+    const facts = jobFacts(job('a', { repoPath: '/tmp/repo', task: `Fix /tmp/repo/src${newline}private later instruction` }));
+    assert.equal(facts.task, 'Fix <repo>/src');
+  }
+});
+
 test('every string leaves redacted even when a deriver forgot: tampered stored fields are scrubbed', () => {
   const record = poisoned({ profile: 'pro', status: 'FAILED', failureKind: 'tool-loop', costUsd: 0.5 });
   record.toolFailure = { tool: 'x', turn: 1, repeats: 3, error: `${SECRETS[0]} /Users/jane.doe/a` };

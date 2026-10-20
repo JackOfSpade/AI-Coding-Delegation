@@ -172,7 +172,11 @@ export function jobFacts(job, context = {}) {
   const set = (key, value) => value !== undefined && (facts[key] = value);
   set('profile', word(record.profile, 64));
   set('verdict', word(record.verify?.verdict, 16));
-  set('task', text(record.task, TASK_CHARS));
+  // Keep only the first brief line before normalizing whitespace. Short Linux
+  // paths must not let later instructions enter a digest that macOS happened
+  // to truncate before that point.
+  const taskLine = typeof record.task === 'string' ? record.task.split(/[\r\n\u2028\u2029]/, 1)[0] : undefined;
+  set('task', text(taskLine, TASK_CHARS));
   facts.rounds = count(record.rounds, 100) ?? 0;
   if (count(record.continuations, 100)) facts.continuations = record.continuations;
   set('turns', count(record.turns, 10_000));
