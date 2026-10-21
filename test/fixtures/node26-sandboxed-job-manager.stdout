@@ -1,0 +1,462 @@
+✔ public job IDs share the durable Git-ref component boundary (0.910208ms)
+✔ public job results expose cleanup errors without exposing a workspace path (0.464834ms)
+✔ public job results expose only bounded provider failure metadata (0.298375ms)
+✔ recovery never heals a job explicitly excluded as active (0.425584ms)
+✔ recovery converges after recording that an invalid lifecycle needs manual workspace cleanup (0.083667ms)
+✔ shutdown clears and unrefs its losing lifecycle timeout (0.101125ms)
+✖ extra writable scope is demonstrably disjoint from owned scope (13.580084ms)
+✔ direct Git patch application accepts only byte buffers (0.667958ms)
+✖ async start and server verification produce a durable final report (9.998041ms)
+✖ non-isolated verifier receives no private-worktree parent capability (7.708042ms)
+✖ provider failure classification is durable and replaces an injected raw error (7.897209ms)
+✖ redacted durable reasoning blocks detached resume and repair before a worker can invoke a provider (8.345042ms)
+✖ provider finish reasons persist as closed diagnostics and clear for repair (7.446375ms)
+✖ numeric reservation exhaustion propagates to progress, terminal event, public result, and report without accepting untrusted fields (8.505625ms)
+✖ a BUDGET stop records which cap tripped with the spend so far and publishes it in the report, event and public view (7.042292ms)
+✖ only a BUDGET job reports a budget stop, and public views drop a malformed stop or sizing record (6.518958ms)
+✖ relevantPaths accept :START-END ranges at the raw and persisted boundaries and reject malformed ones (7.258375ms)
+✖ a pending provider request clears the prior finish reason before the next response arrives (6.427458ms)
+✖ capped implementation recovery lifecycle settles after its durable response and permits repair (6.262667ms)
+✖ a consumed capped implementation recovery suppresses automatic verifier repair without spending another round (6.540708ms)
+✖ a queued capped implementation recovery also suppresses automatic verifier repair (6.490584ms)
+✖ budget-finish lifecycle transitions are durable, validated, and suppress repair (6.355ms)
+✖ a structured provider failure cannot be smuggled through as a successful worker result (6.051875ms)
+✖ isolated lifecycle keeps primary unchanged until verified integration and supports safe revert (63.08525ms)
+✖ an isolated verifier is granted only the primary node_modules read root, and the job records the dependency state (85.458459ms)
+✖ report jobs copy allowlisted scratch inputs read-only, return structured findings, and never integrate (99.714916ms)
+✖ report input rejection is actionable but creates no durable job or private-input artifact (69.329708ms)
+✖ report start restores private input permissions when durable record creation fails (60.46575ms)
+✖ isolated JobManager apply and revert preserve non-NUL invalid UTF-8 patch bytes (61.344375ms)
+✖ isolated ephemeral output is discarded while an outside-scope write blocks all primary integration (61.218791ms)
+✖ manual isolated repair reseeds accumulated workspace changes from the original baseline (59.791ms)
+✖ an index-only primary edit on an owned path blocks isolated integration (60.319292ms)
+✖ a verifier cannot silently author owned output after the worker completes (60.547667ms)
+✖ a failing verifier cannot seed its owned mutation into automatic or manual repair (60.670958ms)
+✖ isolated revert rejects selected-path index drift even when worktree bytes are unchanged (60.807333ms)
+✖ crash recovery reconciles a post-apply integration intent truthfully (60.428709ms)
+✖ recovery publishes a proven applied integration after a pre-publication crash (59.797584ms)
+✖ terminal revert journals are reconciled after a post-apply persistence failure (65.103833ms)
+✖ recovery applies the normal ignored-output audit and retries transient terminal cleanup (59.875583ms)
+✖ manual repair clears an old cleanup marker so a replacement workspace is recoverable (60.017708ms)
+✖ only one concurrent manual repair may reserve and clean a terminal workspace (0.986917ms)
+✖ default job identifiers carry at least 96 random bits (0.579167ms)
+✖ cancel preserves a terminal job and validation rejects unsafe scope (7.099833ms)
+✖ local cancellation marks and aborts promptly while its owner publishes terminal cleanup (61.277209ms)
+✖ start rejects path aliases and non-boolean capability flags before creating a job (1.114708ms)
+✖ persisted jobs cannot redirect repositories, Git revisions, or write scope (7.151292ms)
+✖ policy-only verifier failures never trigger or permit repair (7.183542ms)
+✖ verifier repair trusts only the actual macOS result, never start-time sandbox metadata (6.643584ms)
+✖ sealed lifecycle updates preserve transcript integrity across automatic repair (6.958ms)
+✖ automatic repair clears its per-round scheduling marker through the final allowed round (6.336208ms)
+✖ non-owner cancellation of a queued lifecycle only records its durable marker (6.225917ms)
+✖ detached finalization requires an affirmative exact-lease release before cleanup (6.249083ms)
+✖ wait does not publish terminal verification before slow snapshot finalization (6.328959ms)
+✖ terminal status and wait stay behind an in-flight owned cleanup attempt (6.454958ms)
+✖ shutdown cancellation suppresses an automatic repair queued at the scheduling boundary (6.32425ms)
+✖ shutdown retains worker ownership through blocked terminal report publication (6.371375ms)
+✖ manager enforces cumulative worker budgets and honors cancellation during finalization (6.240417ms)
+✖ revert permits unrelated changes but rejects a change to an owned patch path (0.515792ms)
+✖ recovery finalizes partial artifacts and releases the dead worker lease before visibility (0.445916ms)
+✖ recovery relaunches only a dead queued budget-finish worker through its private handoff (0.545666ms)
+✖ recovery never relaunches a consumed budget-finish lifecycle (0.848375ms)
+✖ recovery cannot overwrite a child handoff or clean after a stale release loses ownership (0.438417ms)
+✖ a delayed detached resume cannot resurrect a lifecycle recovery already finalized (0.495291ms)
+✖ recovery leaves a stale-heartbeat live detached child alone and the child resumes normally (0.429958ms)
+✖ recovery does not clean a terminal record while a different lease owner remains live (0.369209ms)
+✖ terminal cleanup retries under a live server only after proving its lease is absent (0.38025ms)
+✖ terminal recovery reservation cannot clean a manual repair workspace published at its CAS boundary (0.414875ms)
+✖ revert-journal recovery also leaves a newly assigned child workspace untouched (0.38175ms)
+✖ revert-journal recovery reserves the terminal record before cleanup so repair cannot replace its workspace (0.346292ms)
+✖ recovery uses injected time and authoritative snapshot file names (0.354083ms)
+✖ scope attribution retains owned changes and exempts a live disjoint lease (6.794541ms)
+✖ review diffs retain outside-scope changes while revert artifacts never do (6.278042ms)
+✖ scope attribution retains a disjoint peer that was queued first but began during this job (0.566791ms)
+✖ scope attribution retains a peer live at the baseline snapshot that releases before a later scan (0.418375ms)
+✔ direct JobManager starts cannot bypass tsx CLI preflight (0.144334ms)
+✖ start echoes persisted static verifier warnings before the worker is launched (61.570959ms)
+✖ budget recovery and redacted turn-cap continuations reject before changing caps, rounds or launching (6.673833ms)
+✖ worker cache writes survive durable accounting and appear in public hit-rate diagnostics (6.517459ms)
+✔ continuation note limits accept 3600 characters and reject 3601 before dispatch (1.013792ms)
+✔ wait blocks for unchanged RUNNING jobs, returns progress, and supports cancellation (1107.181833ms)
+✔ wait timeout uses elapsed time even if the wall clock jumps forward (402.743ms)
+ℹ tests 81
+ℹ suites 0
+ℹ pass 11
+ℹ fail 70
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 3116.061541
+
+✖ failing tests:
+
+test at test/integration/job-manager.test.mjs:113:1
+✖ extra writable scope is demonstrably disjoint from owned scope (13.580084ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:146:1
+✖ async start and server verification produce a durable final report (9.998041ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:160:1
+✖ non-isolated verifier receives no private-worktree parent capability (7.708042ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:171:1
+✖ provider failure classification is durable and replaces an injected raw error (7.897209ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:196:1
+✖ redacted durable reasoning blocks detached resume and repair before a worker can invoke a provider (8.345042ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:248:1
+✖ provider finish reasons persist as closed diagnostics and clear for repair (7.446375ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:274:1
+✖ numeric reservation exhaustion propagates to progress, terminal event, public result, and report without accepting untrusted fields (8.505625ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:323:1
+✖ a BUDGET stop records which cap tripped with the spend so far and publishes it in the report, event and public view (7.042292ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:397:1
+✖ only a BUDGET job reports a budget stop, and public views drop a malformed stop or sizing record (6.518958ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:426:1
+✖ relevantPaths accept :START-END ranges at the raw and persisted boundaries and reject malformed ones (7.258375ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:461:1
+✖ a pending provider request clears the prior finish reason before the next response arrives (6.427458ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:500:1
+✖ capped implementation recovery lifecycle settles after its durable response and permits repair (6.262667ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:553:1
+✖ a consumed capped implementation recovery suppresses automatic verifier repair without spending another round (6.540708ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:590:1
+✖ a queued capped implementation recovery also suppresses automatic verifier repair (6.490584ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:619:1
+✖ budget-finish lifecycle transitions are durable, validated, and suppress repair (6.355ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:670:1
+✖ a structured provider failure cannot be smuggled through as a successful worker result (6.051875ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:686:1
+✖ isolated lifecycle keeps primary unchanged until verified integration and supports safe revert (63.08525ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:737:1
+✖ an isolated verifier is granted only the primary node_modules read root, and the job records the dependency state (85.458459ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:785:1
+✖ report jobs copy allowlisted scratch inputs read-only, return structured findings, and never integrate (99.714916ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:932:1
+✖ report input rejection is actionable but creates no durable job or private-input artifact (69.329708ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /outside the caller scratch\/temp allowlist/. Input:
+  
+  'repoPath must be inside a git working tree'
+  
+      at Object.<anonymous> (file:///w/test/integration/job-manager.test.mjs:956:16)
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'repoPath must be inside a git working tree',
+    expected: /outside the caller scratch\/temp allowlist/,
+    operator: 'match',
+    diff: 'simple'
+  }
+
+test at test/integration/job-manager.test.mjs:975:1
+✖ report start restores private input permissions when durable record creation fails (60.46575ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /injected durable record failure/. Input:
+  
+  'Error: repoPath must be inside a git working tree'
+  
+      at async TestContext.<anonymous> (file:///w/test/integration/job-manager.test.mjs:1006:5)
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: Error: repoPath must be inside a git working tree
+        at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+    expected: /injected durable record failure/,
+    operator: 'rejects',
+    diff: 'simple'
+  }
+
+test at test/integration/job-manager.test.mjs:1018:1
+✖ isolated JobManager apply and revert preserve non-NUL invalid UTF-8 patch bytes (61.344375ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1053:1
+✖ isolated ephemeral output is discarded while an outside-scope write blocks all primary integration (61.218791ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1110:1
+✖ manual isolated repair reseeds accumulated workspace changes from the original baseline (59.791ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1153:1
+✖ an index-only primary edit on an owned path blocks isolated integration (60.319292ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1183:1
+✖ a verifier cannot silently author owned output after the worker completes (60.547667ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1219:1
+✖ a failing verifier cannot seed its owned mutation into automatic or manual repair (60.670958ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1262:1
+✖ isolated revert rejects selected-path index drift even when worktree bytes are unchanged (60.807333ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1294:1
+✖ crash recovery reconciles a post-apply integration intent truthfully (60.428709ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1347:1
+✖ recovery publishes a proven applied integration after a pre-publication crash (59.797584ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1399:1
+✖ terminal revert journals are reconciled after a post-apply persistence failure (65.103833ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1442:1
+✖ recovery applies the normal ignored-output audit and retries transient terminal cleanup (59.875583ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1505:1
+✖ manual repair clears an old cleanup marker so a replacement workspace is recoverable (60.017708ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1553:1
+✖ only one concurrent manual repair may reserve and clean a terminal workspace (0.986917ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:1627:1
+✖ default job identifiers carry at least 96 random bits (0.579167ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:1633:1
+✖ cancel preserves a terminal job and validation rejects unsafe scope (7.099833ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1645:1
+✖ local cancellation marks and aborts promptly while its owner publishes terminal cleanup (61.277209ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1720:1
+✖ start rejects path aliases and non-boolean capability flags before creating a job (1.114708ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:1798:1
+✖ persisted jobs cannot redirect repositories, Git revisions, or write scope (7.151292ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1823:1
+✖ policy-only verifier failures never trigger or permit repair (7.183542ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1852:1
+✖ verifier repair trusts only the actual macOS result, never start-time sandbox metadata (6.643584ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1879:1
+✖ sealed lifecycle updates preserve transcript integrity across automatic repair (6.958ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1910:1
+✖ automatic repair clears its per-round scheduling marker through the final allowed round (6.336208ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1927:1
+✖ non-owner cancellation of a queued lifecycle only records its durable marker (6.225917ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1951:1
+✖ detached finalization requires an affirmative exact-lease release before cleanup (6.249083ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:1980:1
+✖ wait does not publish terminal verification before slow snapshot finalization (6.328959ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:2003:1
+✖ terminal status and wait stay behind an in-flight owned cleanup attempt (6.454958ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:2032:1
+✖ shutdown cancellation suppresses an automatic repair queued at the scheduling boundary (6.32425ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:2068:1
+✖ shutdown retains worker ownership through blocked terminal report publication (6.371375ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:2106:1
+✖ manager enforces cumulative worker budgets and honors cancellation during finalization (6.240417ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:2148:1
+✖ revert permits unrelated changes but rejects a change to an owned patch path (0.515792ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:2194:1
+✖ recovery finalizes partial artifacts and releases the dead worker lease before visibility (0.445916ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:2232:1
+✖ recovery relaunches only a dead queued budget-finish worker through its private handoff (0.545666ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:2331:1
+✖ recovery never relaunches a consumed budget-finish lifecycle (0.848375ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:2360:1
+✖ recovery cannot overwrite a child handoff or clean after a stale release loses ownership (0.438417ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:2411:1
+✖ a delayed detached resume cannot resurrect a lifecycle recovery already finalized (0.495291ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:2462:1
+✖ recovery leaves a stale-heartbeat live detached child alone and the child resumes normally (0.429958ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:2523:1
+✖ recovery does not clean a terminal record while a different lease owner remains live (0.369209ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:2559:1
+✖ terminal cleanup retries under a live server only after proving its lease is absent (0.38025ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:2609:1
+✖ terminal recovery reservation cannot clean a manual repair workspace published at its CAS boundary (0.414875ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:2668:1
+✖ revert-journal recovery also leaves a newly assigned child workspace untouched (0.38175ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:2724:1
+✖ revert-journal recovery reserves the terminal record before cleanup so repair cannot replace its workspace (0.346292ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:2780:1
+✖ recovery uses injected time and authoritative snapshot file names (0.354083ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:2814:1
+✖ scope attribution retains owned changes and exempts a live disjoint lease (6.794541ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:2835:1
+✖ review diffs retain outside-scope changes while revert artifacts never do (6.278042ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:2872:1
+✖ scope attribution retains a disjoint peer that was queued first but began during this job (0.566791ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:2916:1
+✖ scope attribution retains a peer live at the baseline snapshot that releases before a later scan (0.418375ms)
+  Error: job storage ancestry is invalid
+      at #assertSafeGitAncestry (file:///w/src/store.mjs:941:15)
+
+test at test/integration/job-manager.test.mjs:2975:1
+✖ start echoes persisted static verifier warnings before the worker is launched (61.570959ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:3003:1
+✖ budget recovery and redacted turn-cap continuations reject before changing caps, rounds or launching (6.673833ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)
+
+test at test/integration/job-manager.test.mjs:3038:1
+✖ worker cache writes survive durable accounting and appear in public hit-rate diagnostics (6.517459ms)
+  Error: repoPath must be inside a git working tree
+      at JobManager.start (file:///w/src/job-manager.mjs:1510:13)

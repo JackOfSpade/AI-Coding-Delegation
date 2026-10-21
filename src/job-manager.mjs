@@ -28,7 +28,13 @@ import { isolatedDependencyReadPaths } from './worktree.mjs';
 import { classifyVerifierEnvironment, isVerifierEnvironmentKind } from './verify-env.mjs';
 import { continuationBlocker, promptCacheSummary } from './continuation.mjs';
 import { preflightVerifier } from './verifier-preflight.mjs';
-import { sessionVerifierFailures, verifierFailureFiles, verifierFiles } from './verifier-history.mjs';
+import {
+  expectedVerifierMs,
+  sessionVerifierFailures,
+  verifierDurationWarnings,
+  verifierFailureFiles,
+  verifierFiles,
+} from './verifier-history.mjs';
 import { assertVerifierCommand } from './verifier-command.mjs';
 import {
   interpreterPathsOption,
@@ -57,12 +63,16 @@ import {
 } from './budget-sizing.mjs';
 import { RoundClock, assessStall, mergeRound, sanitizeActivity, sanitizeTiming } from './timing.mjs';
 import {
+  DEFAULT_EXPECTED_MS_PER_KIB,
+  DEFAULT_MIN_DURATION_FRACTION,
   commandStopsEarly,
   compareFailureRuns,
   createFailureCollector,
   describeBaseline,
+  environmentDominated,
   outputWasTruncated,
   repairDefectText,
+  sizeExpectedMs,
 } from './verify-baseline.mjs';
 
 const allowedEffort = new Set(['normal', 'high']);
@@ -524,6 +534,28 @@ const safeVerifyEnvironment = (value) =>
       }
     : undefined;
 const BASELINE_STATUSES = new Set(['compared', 'skipped', 'inconclusive']);
+// Configured verifier duration thresholds (Config.verifier), recorded per job at start.
+const validVerifierDuration = (value) =>
+  !!value &&
+  typeof value === 'object' &&
+  !Array.isArray(value) &&
+  Object.getPrototypeOf(value) === Object.prototype &&
+  Object.keys(value).every((key) => key === 'minFraction' || key === 'msPerKiB') &&
+  (value.minFraction === undefined || (Number.isFinite(value.minFraction) && value.minFraction >= 0 && value.minFraction <= 1)) &&
+  (value.msPerKiB === undefined || (Number.isFinite(value.msPerKiB) && value.msPerKiB >= 0 && value.msPerKiB <= 100_000));
+const DURATION_RUNS = new Set(['result', 'snapshot']);
+const DURATION_SOURCES = new Set(['history', 'snapshot']);
+const safeDurationWarnings = (value) =>
+  (Array.isArray(value) ? value : [])
+    .filter((item) => DURATION_RUNS.has(item?.run) && DURATION_SOURCES.has(item.source))
+    .slice(0, 2)
+    .map((item) => ({
+      run: item.run,
+      durationMs: baselineCount(item.durationMs),
+      expectedMs: baselineCount(item.expectedMs),
+      source: item.source,
+      minFraction: Number.isFinite(item.minFraction) && item.minFraction > 0 && item.minFraction <= 1 ? item.minFraction : 0,
+    }));
 const baselineCount = (value) => (Number.isSafeInteger(value) && value >= 0 ? Math.min(value, 1_000_000_000) : 0);
 const baselineRunSummary = (value, { cached = false } = {}) =>
   value && typeof value === 'object'
@@ -534,6 +566,9 @@ const baselineRunSummary = (value, { cached = false } = {}) =>
         durationMs: baselineCount(value.durationMs),
         ...(cached ? { cached: value.cached === true } : {}),
         ...(Number.isSafeInteger(value.summaryFailed) && value.summaryFailed >= 0 ? { summaryFailed: value.summaryFailed } : {}),
+        ...(Number.isSafeInteger(value.passed) && value.passed >= 0 ? { passed: baselineCount(value.passed) } : {}),
+        ...(baselineCount(value.detailedFailures) ? { detailedFailures: baselineCount(value.detailedFailures) } : {}),
+        ...(baselineCount(value.deniedFailures) ? { deniedFailures: baselineCount(value.deniedFailures) } : {}),
       }
     : undefined;
 // A bounded projection of the baseline-diff comparison. Failing test names come
@@ -560,6 +595,7 @@ const safeVerifyBaseline = (value) => {
     newFailureCount: baselineCount(value.newFailureCount),
     newFailures: (Array.isArray(value.newFailures) ? value.newFailures : []).slice(0, 50).map((name) => text(name, 160)),
     ...(value.regression === true ? { regression: true } : {}),
+    ...(baselineCount(value.expectedMs) ? { expectedMs: baselineCount(value.expectedMs) } : {}),
   };
 };
 const publicVerifierDeps = (job) => {
@@ -619,6 +655,7 @@ const JOB_INPUT_KEYS = [
   'sandboxMode',
   'verifierMode',
   'verifierTimeoutSec',
+  'verifierDuration',
   'verifierInterpreter',
   'verifierInterpreterRoots',
 ];
@@ -749,6 +786,8 @@ export function validateJobRequest(input) {
       input.verifierTimeoutSec > MAX_VERIFIER_TIMEOUT_SEC)
   )
     throw new Error('verifierTimeoutSec must be an integer from 5 to 1800');
+  if (input.verifierDuration != null && !validVerifierDuration(input.verifierDuration))
+    throw new Error('verifierDuration must be { minFraction: 0-1, msPerKiB: 0-100000 }');
   // The baseline run exists to tolerate failures a snapshot already had, which
   // is only meaningful under a real sandbox and an authenticated private copy.
   if (input.verifierMode === 'baseline-diff' && input.unsafePolicyOnlyVerifier === true)
@@ -2735,6 +2774,26 @@ export class JobManager {
     }
     return outcome;
   }
+  /** Runs that finished in a small fraction of this command's expected time (advisory only). */
+  async #durationWarnings(job, verify, baselineRun) {
+    const minFraction = job.verifierDuration?.minFraction ?? DEFAULT_MIN_DURATION_FRACTION;
+    if (!(minFraction > 0)) return [];
+    const finished = (result) => result && !result.timedOut && !result.cancelled && Number.isFinite(result.durationMs);
+    const runs = [];
+    if (finished(verify.result)) runs.push({ run: 'result', durationMs: verify.result.durationMs });
+    const snapshotRan = baselineRun?.run?.code != null && !baselineRun.run.timedOut && !baselineRun.run.cancelled;
+    if (snapshotRan) runs.push({ run: 'snapshot', durationMs: baselineRun.durationMs });
+    if (!runs.length) return [];
+    const expectations = snapshotRan ? [{ source: 'snapshot', ms: baselineRun.durationMs }] : [];
+    try {
+      // Advisory only, so the unauthenticated operational listing is enough.
+      const list = this.store.listOperational || this.store.list;
+      const jobs = typeof list === 'function' ? await list.call(this.store, { limit: Number.MAX_SAFE_INTEGER }) : [];
+      const history = expectedVerifierMs(jobs, { repoPath: job.repoPath, testCommand: job.testCommand, excludeId: job.id });
+      if (history) expectations.push({ source: 'history', ms: history });
+    } catch {}
+    return verifierDurationWarnings(runs, expectations, minFraction);
+  }
   async #verifyPhase(id, event) {
     try {
       await this.store.event(id, { type: 'verify-phase', ...event });
@@ -2771,6 +2830,7 @@ export class JobManager {
     const sandboxRequirementFailed = job.requireSandbox === true && !sandboxed;
     let baselineRun;
     let baselineDecision;
+    let environmentDominatedBy;
     if (baselineMode) {
       const skipped = (reason) => ({ mode: 'baseline-diff', status: 'skipped', reason });
       const result = verify.result;
@@ -2790,7 +2850,27 @@ export class JobManager {
       else {
         const resultRun = this.#parsedRun(verify, resultCollector);
         baselineRun = await this.#baselineRun(job, { timeoutSec });
-        const decision = (baselineDecision = compareFailureRuns({ baseline: baselineRun.run, result: resultRun }));
+        let decision = compareFailureRuns({ baseline: baselineRun.run, result: resultRun });
+        // Identical sandbox denials in two implausibly fast runs are not
+        // evidence about the change, however cleanly they compare.
+        const dominated = environmentDominated(decision, {
+          baseline: baselineRun.run,
+          result: resultRun,
+          baselineMs: baselineRun.durationMs,
+          resultMs: verify.result?.durationMs,
+          expectedMs: sizeExpectedMs(job.verifierPreflight?.commandBytes, job.verifierDuration?.msPerKiB ?? DEFAULT_EXPECTED_MS_PER_KIB),
+          minFraction: job.verifierDuration?.minFraction ?? DEFAULT_MIN_DURATION_FRACTION,
+        });
+        if (dominated) {
+          decision = dominated;
+          const denied = resultRun.parsed.deniedFailures;
+          const detailed = resultRun.parsed.detailedFailures;
+          environmentDominatedBy = {
+            kind: 'sandbox-dominated',
+            detail: `${dominated.preexisting} identical failure(s) in the result and untouched-snapshot runs, ${denied} of ${detailed} with a sandbox denial as their error (spawn EPERM, Operation not permitted, unreadable .git), in runs far shorter than the ${Math.round(dominated.expectedMs / 100) / 10}s the tested files suggest`,
+          };
+        }
+        baselineDecision = decision;
         const baseline = describeBaseline(decision, {
           baseline: baselineRun.run,
           result: resultRun,
@@ -2811,6 +2891,8 @@ export class JobManager {
         verify = { ...verify, ...(decision.pass ? { verdict: 'PASS' } : {}), baseline };
       }
     }
+    const durationWarnings = await this.#durationWarnings(job, verify, baselineRun);
+    if (durationWarnings.length) verify = { ...verify, durationWarnings };
     // A policy-only verifier can report a verified result only after the
     // caller explicitly opted into it, but can never authorize another model
     // turn. Unknown/missing result.sandbox fails closed for repair as well.
@@ -2829,9 +2911,10 @@ export class JobManager {
     // let the primary decide. Classification is advisory about *cause*, not a
     // judgement of the worker's code.
     let environment =
-      verify.verdict !== 'PASS' && !sandboxRequirementFailed
+      environmentDominatedBy ??
+      (verify.verdict !== 'PASS' && !sandboxRequirementFailed
         ? classifyVerifierEnvironment(verify, { workspacePath: job.workspacePath ? executionPath : undefined, writeScope: writeScope(job) })
-        : null;
+        : null);
     // The same environmental noise in the untouched snapshot is not what made
     // the new failures: the worker can still fix those.
     const baselineEnvironment = baselineRun?.environment;
@@ -2914,6 +2997,9 @@ export class JobManager {
       ...(job.unsafePolicyOnlyVerifier === true ? { unsafePolicyOnlyVerifier: true } : {}),
       ...(job.verifierMode === 'baseline-diff' ? { verifierMode: 'baseline-diff' } : {}),
       ...(safeVerifyBaseline(job.verify?.baseline) ? { verifyBaseline: safeVerifyBaseline(job.verify.baseline) } : {}),
+      ...(safeDurationWarnings(job.verify?.durationWarnings).length
+        ? { verifyDurationWarnings: safeDurationWarnings(job.verify.durationWarnings) }
+        : {}),
       // Readiness of the verifier's dependencies, visible at start so a
       // primary can cancel before spending budget on a testCommand that
       // imports a package the worktree cannot resolve.

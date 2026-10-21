@@ -92,3 +92,52 @@ export function sessionVerifierFailures(jobs, { sessionStartedAt, repoPath } = {
   }
   return failures;
 }
+
+const RECENT_PASSES = 5;
+const finiteMs = (value) => (Number.isFinite(value) && value >= 0 ? value : undefined);
+
+/**
+ * How long this testCommand takes when it really runs: the median of the most
+ * recent sandboxed passing result runs of the same command in the same
+ * repository, other than `excludeId`. Undefined when there is no such run.
+ */
+export function expectedVerifierMs(jobs, { repoPath, testCommand, excludeId } = {}) {
+  if (!Array.isArray(jobs) || !repoPath || !testCommand) return undefined;
+  const passes = jobs
+    .filter(
+      (job) =>
+        job?.id !== excludeId &&
+        job?.repoPath === repoPath &&
+        job?.testCommand === testCommand &&
+        job.verify?.result?.code === 0 &&
+        job.verify.result.sandbox === 'macos' &&
+        job.verify.result.timedOut !== true &&
+        finiteMs(job.verify.result.durationMs) !== undefined,
+    )
+    .sort((a, b) => String(b.finishedAt || b.updatedAt || '').localeCompare(String(a.finishedAt || a.updatedAt || '')))
+    .slice(0, RECENT_PASSES)
+    .map((job) => job.verify.result.durationMs)
+    .sort((a, b) => a - b);
+  return passes.length ? passes[Math.floor(passes.length / 2)] : undefined;
+}
+
+/**
+ * Per-run duration sanity check: a run that finished in under `minFraction` of
+ * the time this command is expected to take may not have run the suite at all.
+ * `runs` is `[{ run, durationMs }]`; `expectations` is `[{ source, ms }]` and
+ * the longest applicable one is used (a run is never weighed against itself).
+ */
+export function verifierDurationWarnings(runs, expectations, minFraction) {
+  if (!(minFraction > 0)) return [];
+  const warnings = [];
+  for (const { run, durationMs } of runs) {
+    const ms = finiteMs(durationMs);
+    if (ms === undefined) continue;
+    const expected = expectations
+      .filter((entry) => entry.source !== run && finiteMs(entry.ms) > 0)
+      .reduce((best, entry) => (!best || entry.ms > best.ms ? entry : best), undefined);
+    if (expected && ms < expected.ms * minFraction)
+      warnings.push({ run, durationMs: Math.round(ms), expectedMs: Math.round(expected.ms), source: expected.source, minFraction });
+  }
+  return warnings;
+}

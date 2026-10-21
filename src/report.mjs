@@ -132,11 +132,14 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
   const viaBaseline =
     baseline?.status === 'compared' && job.verify?.verdict === 'PASS'
       ? ` via baseline-diff: ${scalar(baseline.preexisting ?? 0)} pre-existing failure(s) tolerated, ${scalar(baseline.newFailureCount ?? 0)} new`
-      : '';
+      : baseline?.status === 'inconclusive' && baseline.reason === 'environment-dominated'
+        ? ` · baseline-diff INCONCLUSIVE (environment-dominated): ${scalar(baseline.preexisting ?? 0)} identical failure(s) in both runs, ${scalar(baseline.result?.deniedFailures ?? 0)} of ${scalar(baseline.result?.detailedFailures ?? 0)} of them sandbox denials, so the comparison says nothing about the change`
+        : '';
   const verify = job.verify
     ? `verify: \`${scalar(job.verify.command || '')}\` ${scalar(job.verify.verdict || 'UNVERIFIED')}${job.verify.result?.code != null ? ` (exit ${scalar(job.verify.result.code)})` : ''}${viaBaseline}${job.verify.result?.sandbox ? ` · sandbox: ${scalar(job.verify.result.sandbox)}` : ''}${showDiagnostic ? `\n${verifierOutput(verifierDiagnostic, lean ? 20 : 40)}` : ''}`
     : 'verify: not run';
   const baselineDiff = !reportMode && baseline ? baselineLines(baseline, lean) : '';
+  const durationWarnings = !reportMode ? durationWarningLines(job.verify?.durationWarnings) : '';
   // The command is still running (or being reverted): the diff is in the
   // primary but nothing has decided whether it stays, so it is not yet a
   // revert candidate.
@@ -160,7 +163,9 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
                 ? ' A temporary Git-fixture test could not read host Git configuration in the verifier sandbox. This is an environment limitation, not a product-test failure; run that integration suite in the primary checkout.'
                 : environmentFailure.kind === 'native-module-crash'
                   ? ' Run the import in the primary checkout to determine whether the verifier sandbox caused the crash.'
-                  : ''
+                  : environmentFailure.kind === 'sandbox-dominated'
+                    ? " Most of the suite's child-process/Git fixtures cannot run in the verifier sandbox, so the runs are no evidence about the change: run that suite in the primary checkout, and give the next job a testCommand without those files."
+                    : ''
         }${
           // An applyThenVerify run is already acting on this very advice.
           applyRunning
@@ -304,6 +309,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     job.retainedDiffRecovery === true &&
       'worker stop: verification attempted on retained diff after transcript redaction; provider replay and automatic repair were suppressed',
     baselineDiff,
+    durationWarnings,
     environment,
     appliedUnverified,
     applyVerify,
@@ -463,7 +469,25 @@ const BASELINE_HINTS = {
   'unparsed-failures': 'The summary reports more failures than could be named.',
   'baseline-unavailable': 'The untouched snapshot could not be run.',
   'baseline-cancelled': 'The job was cancelled during the snapshot run.',
+  'environment-dominated':
+    'Both runs failed identically, mostly on sandbox denials (spawn EPERM, Operation not permitted, unreadable .git), with no more passing tests than failing ones, and finished far faster than the tested files suggest, so the comparison carried no evidence about the change.',
 };
+const DURATION_SOURCES = {
+  history: 'the median of recent passing runs of this command',
+  snapshot: 'the untouched-snapshot run',
+};
+/** One advisory line per verifier run that finished implausibly fast for this command. */
+function durationWarningLines(warnings) {
+  const seconds = (ms) => `${Math.round((Number.isFinite(ms) ? ms : 0) / 100) / 10}s`;
+  return (Array.isArray(warnings) ? warnings : [])
+    .filter((warning) => DURATION_SOURCES[warning?.source] && (warning.run === 'result' || warning.run === 'snapshot'))
+    .slice(0, 2)
+    .map(
+      (warning) =>
+        `verify duration warning: the ${warning.run === 'result' ? 'result' : 'untouched-snapshot'} run took ${seconds(warning.durationMs)}, under ${scalar(Math.round((Number.isFinite(warning.minFraction) ? warning.minFraction : 0) * 100))}% of the ${seconds(warning.expectedMs)} expected from ${DURATION_SOURCES[warning.source]}; the suite may not have run, so check its output before trusting the verdict.`,
+    )
+    .join('\n');
+}
 /** Nested, single-line names: a failing test's name is untrusted text and must not forge a report field. */
 function baselineLines(baseline, lean) {
   const seconds = (ms) => `${Math.round((Number.isFinite(ms) ? ms : 0) / 100) / 10}s`;
@@ -481,6 +505,8 @@ function baselineLines(baseline, lean) {
       `baseline-diff: ${scalar(baseline.result?.failures ?? 0)} failing now vs ${scalar(baseline.baseline?.failures ?? 0)} in the untouched snapshot · ${scalar(baseline.newFailureCount ?? 0)} new, ${scalar(baseline.preexisting ?? 0)} pre-existing, ${scalar(baseline.fixed ?? 0)} fixed · snapshot run ${seconds(baseline.baseline?.durationMs)}, result run ${seconds(baseline.result?.durationMs)}`,
       ...list,
     ].join('\n');
+  if (baseline.status === 'inconclusive' && baseline.reason === 'environment-dominated')
+    return `baseline-diff: INCONCLUSIVE (environment-dominated) - ${scalar(baseline.result?.failures ?? 0)} failing now vs ${scalar(baseline.baseline?.failures ?? 0)} in the untouched snapshot, ${scalar(baseline.result?.passed ?? 0)} passing · sandbox denials in ${scalar(baseline.result?.deniedFailures ?? 0)} of ${scalar(baseline.result?.detailedFailures ?? 0)} failure detail(s) now, ${scalar(baseline.baseline?.deniedFailures ?? 0)} of ${scalar(baseline.baseline?.detailedFailures ?? 0)} in the snapshot · snapshot run ${seconds(baseline.baseline?.durationMs)}, result run ${seconds(baseline.result?.durationMs)}, expected at least ${seconds(baseline.expectedMs)} for the tested files - treated as an environment failure; no repair round was spent. ${BASELINE_HINTS['environment-dominated']}`;
   if (baseline.status === 'inconclusive')
     return `baseline-diff: INCONCLUSIVE (${scalar(baseline.reason || 'unknown')}) - treated as a failure; no repair round was spent. ${BASELINE_HINTS[baseline.reason] || ''}`.trimEnd();
   if (baseline.status === 'skipped' && baseline.reason === 'result-timed-out')

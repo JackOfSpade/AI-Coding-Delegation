@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
+import { TOOL_CACHE } from './verify-env.mjs';
 
 /**
  * Pure helpers for the baseline-diff verifier: extract failing test identities
@@ -34,6 +35,39 @@ const DURATION = / ?\(\d+(?:\.\d+)? ?m?s\)$/;
 // node-tap and friends append `# time=12.3ms`; like DURATION it differs on every run.
 const TAP_DIRECTIVES = /(?: # [A-Za-z_]+=\S*)+$/;
 const TRUNCATION_MARKER = '… output truncated (';
+// What the verifier sandbox prints when it refuses a test's fixture: a child
+// process it may not spawn, a path it may not touch, Git metadata it hides. The
+// worktree's .git is unreadable in the verifier, so git reports `error reading
+// '<path>/.git'` or "not a git repository", and the tools that wrap it say the
+// path is not (inside) a git work tree.
+const SANDBOX_DENIAL = new RegExp(
+  [
+    String.raw`\bEPERM\b`,
+    'operation not permitted',
+    String.raw`\bnot a git repository\b`,
+    String.raw`\berror (?:reading|opening) '?[^'\s]{0,1024}\.git\b`,
+    String.raw`(?:cannot|can't|unable to|could not) (?:read|access|open)\b.{0,120}\.git\b`,
+    String.raw`\b(?:not (?:in|inside)|outside(?: of)?|must be (?:run )?(?:in|inside)) (?:a |the )?(?:git )?work(?:ing)? ?tree\b`,
+    String.raw`\bdeny\(\d+\)`,
+  ].join('|'),
+  'i',
+);
+// A failure whose own detail is an assertion is a test outcome, whatever else it
+// mentions: node:assert, jest/vitest matchers, pytest's assert rewriting, cargo.
+const ASSERTION =
+  /\bAssertionError\b|\bERR_ASSERTION\b|\bexpect\(|^(?:Expected|Received)(?: value)?:|^(?:E )?assert |\bassertion (?:`[^`]{0,200}` )?failed\b/;
+// An environment-dominated comparison needs, in both runs, a sandbox denial in
+// the detail of at least this share of the failures that printed any detail.
+const DENIAL_SHARE = 0.5;
+const MAX_BLOCKS = 5000;
+/** Default share of the expected duration below which a verifier run is suspiciously fast. */
+export const DEFAULT_MIN_DURATION_FRACTION = 0.25;
+/**
+ * Default time a run of the files the testCommand names is expected to take at
+ * the least, per KiB of those files. Only a corroborating signal: unit tests run
+ * far faster, so a fast run alone never classifies anything.
+ */
+export const DEFAULT_EXPECTED_MS_PER_KIB = 200;
 
 // Flags that stop a run at its first failure without printing anything that says
 // so (go `-failfast`, jest/vitest `--bail`, unittest `--failfast`). pytest and
@@ -106,6 +140,15 @@ export function createFailureCollector({
   let summaryFailed = null;
   let suitesFailed = null;
   let bytes = 0;
+  let summaryPassed = null;
+  // One record per failure header that printed detail: whether it came from the
+  // runner's full report (node:test's end-of-run recap, pytest's FAILURES
+  // section), whether a detail line was a sandbox denial, whether one was an
+  // assertion (which vetoes the denial), and whether it only rolls up other
+  // failures (a TAP suite, a test its parent cancelled). Headers, not names,
+  // are counted, so failures that share a name never merge.
+  const blocks = [];
+  let summaryCancelled = null;
   let parseMs = 0;
   let halted = false;
   // The runner stopped before running everything (pytest -x / collection abort,
@@ -139,6 +182,45 @@ export function createFailureCollector({
     complete = true;
     if (Number.isSafeInteger(failed)) summaryFailed = (summaryFailed ?? 0) + failed;
   };
+  // A pass count is evidence about the run, never a sign that it completed:
+  // only the summaries above may mark that.
+  const passes = (passed) => {
+    if (Number.isSafeInteger(passed)) summaryPassed = (summaryPassed ?? 0) + passed;
+  };
+  // Tests a failing hook cancelled did not run either.
+  const cancelled = (count) => {
+    if (Number.isSafeInteger(count)) summaryCancelled = (summaryCancelled ?? 0) + count;
+  };
+  // The lines indented below a failure's header, up to the next test entry or
+  // summary, are that failure's detail. Denial text anywhere else (a passing
+  // test's title, a later test's log, a tool-cache warning) says nothing about
+  // a failure. `sameIndent` is for runners that print captured output flush;
+  // `only` keeps just the lines that carry the error (pytest's `E ` lines).
+  const open = (state, indent, { preferred = false, sameIndent = false, tap = false, only } = {}) => {
+    state.block = { indent: sameIndent ? indent - 1 : indent, preferred, tap, only, record: undefined };
+  };
+  const close = (state) => {
+    state.block = undefined;
+  };
+  const detail = (state, indent, body) => {
+    const block = state.block;
+    if (!block || indent <= block.indent) return;
+    // Source code frames (jest, vitest) and stack frames quote code, not the error.
+    if (/^(?:> ?)?\d+ \|/.test(body) || body.startsWith('|') || /^at \S/.test(body)) return;
+    if (block.only && !block.only.test(body)) return;
+    if (!block.record) {
+      if (blocks.length >= MAX_BLOCKS) return;
+      blocks.push((block.record = { preferred: block.preferred, denied: false, assertion: false, rollup: false }));
+    }
+    const record = block.record;
+    if (
+      /^(?:failureType: '?(?:subtestsFailed|cancelledByParent)'?|type: '?suite'?)$/.test(body) ||
+      /\bdid not finish before its parent\b/.test(body)
+    )
+      record.rollup = true;
+    else if (ASSERTION.test(body)) record.assertion = true;
+    else if (SANDBOX_DENIAL.test(body) && !TOOL_CACHE.test(body)) record.denied = true;
+  };
 
   const newState = () => ({
     decoder: new StringDecoder('utf8'),
@@ -148,6 +230,8 @@ export function createFailureCollector({
     tap: [],
     recap: false,
     jestFile: undefined,
+    block: undefined,
+    pytestFailures: false,
   });
   const states = { stdout: newState(), stderr: newState() };
 
@@ -159,102 +243,200 @@ export function createFailureCollector({
     const indent = /^\s*/.exec(text)[0].length;
     const body = text.slice(indent).replace(/\s+/g, ' ').trimEnd();
     if (!body) return;
+    // A line no runner pattern claims belongs to the failure being printed, if any.
+    if (!entry(state, indent, body)) detail(state, indent, body);
+  }
 
+  /** Parse one runner line; true when it was a test entry, header or summary rather than detail. */
+  function entry(state, indent, body) {
     // node:test spec reporter.
     let match = /^(▶|✔|✖|﹣|⚠) (.*)$/.exec(body);
     if (match) {
       const label = match[2];
+      close(state);
       if (match[1] === '✖' && indent === 0 && label === 'failing tests:') {
         // The end-of-run recap re-lists every failure above it.
         state.recap = true;
-        return;
+        return true;
       }
       if (!state.recap) {
         while (state.spec.length && state.spec.at(-1).indent >= indent) state.spec.pop();
         if (match[1] === '▶') pushSuite(state.spec, indent, label);
         else if (match[1] === '✖' && !/ # (?:SKIP|TODO)\b/.test(label)) {
-          const name = label.replace(DURATION, '');
-          record([...state.spec.map((entry) => entry.name), normalize(name)].join(' > '), 'node-spec');
+          const name = [...state.spec.map((suite) => suite.name), normalize(label.replace(DURATION, ''))].join(' > ');
+          record(name, 'node-spec');
+          open(state, indent);
         }
-      }
-      return;
+        // Current node:test prints a failure's detail only here, under its leaf name.
+      } else if (match[1] === '✖') open(state, indent, { preferred: true });
+      return true;
     }
-    if ((match = /^ℹ fail (\d+)$/.exec(body))) return summary('node-spec', Number(match[1]));
+    if (body.startsWith('ℹ ')) {
+      close(state);
+      if ((match = /^ℹ fail (\d+)$/.exec(body))) summary('node-spec', Number(match[1]));
+      else if ((match = /^ℹ pass (\d+)$/.exec(body))) passes(Number(match[1]));
+      else if ((match = /^ℹ cancelled (\d+)$/.exec(body))) cancelled(Number(match[1]));
+      return true;
+    }
+    if (state.recap && /^test at \S/.test(body)) return (close(state), true);
 
     // TAP (node --test-reporter=tap and most TAP producers).
     if ((match = /^# Subtest: (.*)$/.exec(body))) {
+      close(state);
       while (state.tap.length && state.tap.at(-1).indent >= indent) state.tap.pop();
       pushSuite(state.tap, indent, match[1]);
-      return;
+      return true;
     }
     if ((match = /^not ok \d+(?: (?:- )?(.*))?$/.exec(body))) {
+      close(state);
       const raw = match[1] ?? '';
-      if (/ # (?:SKIP|TODO)\b/i.test(raw)) return;
+      if (/ # (?:SKIP|TODO)\b/i.test(raw)) return true;
       const label = raw.replace(TAP_DIRECTIVES, '');
-      const parents = state.tap.filter((entry) => entry.indent < indent).map((entry) => entry.name);
-      return record([...parents, label ? normalize(label) : '(unnamed)'].join(' > '), 'tap');
+      const parents = state.tap.filter((suite) => suite.indent < indent).map((suite) => suite.name);
+      const name = [...parents, label ? normalize(label) : '(unnamed)'].join(' > ');
+      record(name, 'tap');
+      open(state, indent, { tap: true });
+      return true;
     }
-    if ((match = /^# fail (\d+)$/.exec(body))) return summary('tap', Number(match[1]));
+    if (/^ok \d+(?: |$)/.test(body)) return (close(state), true);
+    if ((match = /^# fail (\d+)$/.exec(body))) return (close(state), summary('tap', Number(match[1])), true);
+    if ((match = /^# pass (\d+)$/.exec(body))) return (close(state), passes(Number(match[1])), true);
+    if ((match = /^# cancelled (\d+)$/.exec(body))) return (close(state), cancelled(Number(match[1])), true);
+    // The end of a TAP YAML diagnostic block, and TAP comments, are not detail.
+    if (body === '...' || body.startsWith('# ')) {
+      if (state.block?.tap) close(state);
+      return true;
+    }
 
     // jest / vitest.
-    if ((match = /^(?:✕|×) (.+)$/.exec(body))) return record(match[1].replace(DURATION, ''), 'jest', 'jestList');
-    if ((match = /^● (?!Console\b)(.+ › .+)$/.exec(body))) return record(match[1], 'jest', 'jestDetail');
-    if (body.startsWith('PASS ')) state.jestFile = undefined;
+    if ((match = /^(?:✕|×) (.+)$/.exec(body))) {
+      close(state);
+      record(match[1].replace(DURATION, ''), 'jest', 'jestList');
+      return true;
+    }
+    if (/^(?:✓|√) /.test(body)) return (close(state), true);
+    if ((match = /^● (?!Console\b)(.+ › .+)$/.exec(body))) {
+      record(match[1], 'jest', 'jestDetail');
+      open(state, indent);
+      return true;
+    }
+    if (body.startsWith('PASS ')) {
+      close(state);
+      state.jestFile = undefined;
+    }
     if (body.startsWith('FAIL ') && (match = /^FAIL (\S+(?: > .+?)?)(?: \(\d+(?:\.\d+)? ?m?s\))?$/.exec(body))) {
+      close(state);
       state.jestFile = match[1];
-      return record(match[1], 'jest', 'jestDetail');
+      record(match[1], 'jest', 'jestDetail');
+      return true;
     }
     // A file that no longer loads prints `FAIL <file>` (a name the baseline may
     // already hold for an ordinary failing test) and reports zero tests, so it
     // needs an identity of its own to count as new.
-    if (body === '● Test suite failed to run') return record(`${state.jestFile ?? '(unknown file)'}: failed to run`, 'jest');
+    if (body === '● Test suite failed to run') {
+      const name = `${state.jestFile ?? '(unknown file)'}: failed to run`;
+      record(name, 'jest');
+      open(state, indent);
+      return true;
+    }
     if ((match = /^Test Suites:? (.*)$/.exec(body)) && /\b\d+ (?:failed|passed|total|skipped)\b/.test(match[1])) {
+      close(state);
       const failed = /\b(\d+) failed\b/.exec(match[1]);
       formats.add('jest');
       suitesFailed = (suitesFailed ?? 0) + (failed ? Number(failed[1]) : 0);
-      return;
+      return true;
     }
     if ((match = /^Tests:? (.*)$/.exec(body)) && /\b\d+ (?:failed|passed|total|skipped)\b/.test(match[1])) {
+      close(state);
       const failed = /\b(\d+) failed\b/.exec(match[1]);
-      return summary('jest', failed ? Number(failed[1]) : 0);
+      const passed = /\b(\d+) passed\b/.exec(match[1]);
+      summary('jest', failed ? Number(failed[1]) : 0);
+      passes(passed ? Number(passed[1]) : 0);
+      return true;
     }
 
     // pytest.
     // A parametrize id may contain spaces (`test_p[a b]`); a message follows the first ` - `.
-    if ((match = /^(?:FAILED|ERROR) (\S+::.+?|\S+)(?: - .*)?$/.exec(body))) return record(match[1], 'pytest');
+    if ((match = /^(?:FAILED|ERROR) (\S+::.+?|\S+)(?: - (.*))?$/.exec(body))) {
+      close(state);
+      record(match[1], 'pytest');
+      open(state, indent);
+      // The short summary carries the exception on the same line.
+      if (match[2]) detail(state, indent + 1, match[2]);
+      return true;
+    }
     if (/^(?:=+ )?(?:\d+ [a-z]+(?:, )?)+ in [\d.]+s\b/.test(body)) {
+      close(state);
       // `N failed` excludes errors, but each `ERROR <id>` line is a named failure,
       // so the count must include them or it could never exceed the named total.
       const failed = /\b(\d+) failed\b/.exec(body);
       const errors = /\b(\d+) errors?\b/.exec(body);
-      return summary('pytest', (failed ? Number(failed[1]) : 0) + (errors ? Number(errors[1]) : 0));
+      const passed = /\b(\d+) passed\b/.exec(body);
+      summary('pytest', (failed ? Number(failed[1]) : 0) + (errors ? Number(errors[1]) : 0));
+      passes(passed ? Number(passed[1]) : 0);
+      return true;
+    }
+    // Section rules (`==== FAILURES ====`, `____ test_a ____`) separate blocks.
+    // Inside FAILURES/ERRORS each `____ name ____` section is one failure's full
+    // report; its `E ` lines carry the error the short summary cuts to fit.
+    if (/^={3,} (?:FAILURES|ERRORS) ={3,}$/.test(body)) return (close(state), (state.pytestFailures = true));
+    if (state.pytestFailures && /^_{3,} .+ _{3,}$/.test(body))
+      return (close(state), open(state, indent, { preferred: true, sameIndent: true, only: /^E / }), true);
+    if (/^(?:={3,}|_{3,})(?: |$)/.test(body)) {
+      close(state);
+      if (body.startsWith('=')) state.pytestFailures = false;
+      return true;
     }
 
     // A pytest run that stopped at a collection error (`Interrupted`), at `-x` or
     // `--maxfail`, or on Ctrl-C never reached the tests after that point.
     if (/^!+ (?:Interrupted:|stopping after \d+ failures?|KeyboardInterrupt)/.test(body)) {
+      close(state);
       stoppedEarly = true;
-      return;
+      return true;
     }
 
     // go test (its tab separators were collapsed to single spaces above).
-    if ((match = /^--- FAIL: (\S+)/.exec(body))) return record(match[1], 'go');
+    if ((match = /^--- FAIL: (\S+)/.exec(body))) {
+      close(state);
+      record(match[1], 'go');
+      open(state, indent);
+      return true;
+    }
+    if (/^(?:=== (?:RUN|PAUSE|CONT|NAME)|--- (?:PASS|SKIP):) /.test(body) || body === 'PASS' || body === 'FAIL')
+      return (close(state), true);
     if ((match = /^FAIL (\S+)(?: (\[(?:build|setup) failed\]))?/.exec(body))) {
+      close(state);
       // A package that stopped compiling keeps its suffix: it must not look
       // like the same package failing its ordinary tests.
       record(`package ${match[1]}${match[2] ? ` ${match[2]}` : ''}`, 'go');
-      return summary('go', undefined);
+      summary('go', undefined);
+      return true;
     }
-    if (/^ok \S+ (?:[\d.]+s|\(cached\))/.test(body)) return summary('go', undefined);
+    if (/^ok \S+ (?:[\d.]+s|\(cached\))/.test(body)) return (close(state), summary('go', undefined), true);
 
     // cargo test.
-    if ((match = /^test (\S+) \.\.\. FAILED$/.exec(body))) return record(match[1], 'cargo');
-    if ((match = /^test result: (?:ok|FAILED)\. \d+ passed; (\d+) failed/.exec(body))) return summary('cargo', Number(match[1]));
+    if ((match = /^test (\S+) \.\.\. FAILED$/.exec(body))) {
+      close(state);
+      record(match[1], 'cargo');
+      return true;
+    }
+    if (/^test \S+ \.\.\. (?:ok|ignored)\b/.test(body) || /^running \d+ tests?$/.test(body) || body === 'failures:')
+      return (close(state), true);
+    // A failing test's captured output is printed later, under its name.
+    if (/^---- \S+ stdout ----$/.test(body)) return (close(state), open(state, indent, { sameIndent: true }), true);
+    if ((match = /^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed/.exec(body))) {
+      close(state);
+      summary('cargo', Number(match[2]));
+      passes(Number(match[1]));
+      return true;
+    }
     // Default cargo stops at the first failing target and prints only the
     // per-target line below. `--no-fail-fast` runs every target and then adds
     // `error: N targets failed:`, which is what marks the run as complete.
-    if (/^error: (?:test|doctest) failed, to rerun pass /.test(body)) cargoFailFast = true;
-    else if (/^error: \d+ targets? failed:?$/.test(body)) cargoAllTargets = true;
+    if (/^error: (?:test|doctest) failed, to rerun pass /.test(body)) return (close(state), (cargoFailFast = true));
+    if (/^error: \d+ targets? failed:?$/.test(body)) return (close(state), (cargoAllTargets = true));
+    return false;
   }
 
   function feed(state, text) {
@@ -279,6 +461,23 @@ export function createFailureCollector({
       start = end + 1;
     }
   }
+
+  // Failures that printed any detail, and those whose detail is a sandbox denial
+  // (an assertion anywhere in the same detail vetoes the denial). When the
+  // runner printed a full report (node:test's recap, pytest's FAILURES), only
+  // that report is counted, so no failure counts twice; roll-ups never count.
+  const blockStats = () => {
+    const own = blocks.filter((block) => !block.rollup);
+    const preferred = own.some((block) => block.preferred);
+    let detailed = 0;
+    let denied = 0;
+    for (const block of own) {
+      if (block.preferred !== preferred) continue;
+      detailed += 1;
+      if (block.denied && !block.assertion) denied += 1;
+    }
+    return { detailedFailures: detailed, deniedFailures: denied };
+  };
 
   return {
     push(chunk, stream = 'stdout') {
@@ -315,14 +514,28 @@ export function createFailureCollector({
         complete,
         summaryFailed,
         suitesFailed,
+        summaryPassed,
+        summaryCancelled,
         bytes,
+        ...blockStats(),
       };
     },
   };
 }
 
 const parsedOf = (run) =>
-  run?.parsed ?? { failures: new Map(), total: 0, distinct: 0, truncated: false, stoppedEarly: false, format: 'none', complete: false };
+  run?.parsed ?? {
+    failures: new Map(),
+    total: 0,
+    distinct: 0,
+    truncated: false,
+    stoppedEarly: false,
+    format: 'none',
+    complete: false,
+    summaryPassed: null,
+    detailedFailures: 0,
+    deniedFailures: 0,
+  };
 const inconclusive = (reason, extra = {}) => ({ status: 'inconclusive', reason, pass: false, ...extra });
 
 /**
@@ -379,6 +592,53 @@ export function compareFailureRuns({ baseline, result } = {}) {
   return { status: 'compared', pass: newFailures.length === 0, newFailures, preexisting, fixed };
 }
 
+/** The least time a run of `bytes` of named test files is expected to take; 0 when unknown. */
+export const sizeExpectedMs = (bytes, msPerKiB = DEFAULT_EXPECTED_MS_PER_KIB) =>
+  Number.isFinite(bytes) && bytes > 0 && Number.isFinite(msPerKiB) && msPerKiB > 0 ? Math.round((bytes / 1024) * msPerKiB) : 0;
+
+/**
+ * A "no new failures" decision proves nothing when the same failures in both
+ * runs are the sandbox refusing the suite's fixtures (child processes, Git
+ * metadata): the tests never reached the code the worker changed. Such a
+ * decision is replaced by an `environment-dominated` inconclusive one when, in
+ * both runs: the failures are identical; the runner's summary says at least as
+ * many tests failed as passed (a suite whose tests mostly ran is real evidence,
+ * whatever a few of its fixtures could not do); a sandbox denial, and no
+ * assertion, is the detail of at least half of the failures that printed one;
+ * and the run finished far faster than the size of the files the testCommand
+ * names suggests. Returns undefined when any part fails or cannot be told.
+ */
+export function environmentDominated(
+  decision,
+  { baseline, result, baselineMs, resultMs, expectedMs, minFraction = DEFAULT_MIN_DURATION_FRACTION } = {},
+) {
+  if (decision?.status !== 'compared' || decision.pass !== true || decision.fixed || decision.newFailures?.length) return undefined;
+  const base = parsedOf(baseline);
+  const res = parsedOf(result);
+  if (!res.total || res.total !== base.total || decision.preexisting !== res.total) return undefined;
+  const dominatedRun = (run) =>
+    Number.isSafeInteger(run.summaryPassed) &&
+    (run.summaryFailed ?? run.total) + (run.summaryCancelled ?? 0) >= run.summaryPassed &&
+    run.detailedFailures > 0 &&
+    run.deniedFailures >= Math.ceil(run.detailedFailures * DENIAL_SHARE);
+  if (!dominatedRun(base) || !dominatedRun(res)) return undefined;
+  if (!(expectedMs > 0 && minFraction > 0)) return undefined;
+  const limit = expectedMs * minFraction;
+  if (![baselineMs, resultMs].every((ms) => Number.isFinite(ms) && ms >= 0 && ms < limit)) return undefined;
+  return inconclusive('environment-dominated', {
+    newFailures: [],
+    preexisting: decision.preexisting,
+    fixed: 0,
+    expectedMs: Math.round(expectedMs),
+  });
+}
+// What a run's summary and failure details showed, for the job record.
+const runEvidence = (parsed) => ({
+  ...(Number.isSafeInteger(parsed.summaryPassed) ? { passed: finiteCount(parsed.summaryPassed) } : {}),
+  ...(parsed.detailedFailures ? { detailedFailures: finiteCount(parsed.detailedFailures) } : {}),
+  ...(parsed.deniedFailures ? { deniedFailures: finiteCount(parsed.deniedFailures) } : {}),
+});
+
 const finiteCount = (value) => (Number.isSafeInteger(value) && value >= 0 ? Math.min(value, 1_000_000_000) : 0);
 const clean = (value, max) => stripText(String(value ?? '')).slice(0, max);
 const cleanName = (value) =>
@@ -408,6 +668,7 @@ export function describeBaseline(decision, { baseline, result, baselineMs, resul
                   durationMs: finiteCount(baselineMs),
                   cached: cached === true,
                   ...(base.summaryFailed != null ? { summaryFailed: base.summaryFailed } : {}),
+                  ...runEvidence(base),
                 },
               }
             : {}),
@@ -419,6 +680,7 @@ export function describeBaseline(decision, { baseline, result, baselineMs, resul
                   distinct: res.distinct,
                   durationMs: finiteCount(resultMs),
                   ...(res.summaryFailed != null ? { summaryFailed: res.summaryFailed } : {}),
+                  ...runEvidence(res),
                 },
               }
             : {}),
@@ -429,6 +691,7 @@ export function describeBaseline(decision, { baseline, result, baselineMs, resul
     newFailureCount: (decision.newFailures ?? []).length,
     newFailures,
     ...(decision.regression ? { regression: true } : {}),
+    ...(decision.expectedMs ? { expectedMs: finiteCount(decision.expectedMs) } : {}),
   };
 }
 

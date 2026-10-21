@@ -5,6 +5,7 @@ import { PathPolicy } from './policy.mjs';
 import { readRegularFileSync } from './regular-file.mjs';
 
 const SOURCE = /\.(?:[cm]?[jt]sx?|py|sh|json)$/;
+const TEST_CODE = /\.(?:[cm]?[jt]sx?|py)$/;
 const SKIP = new Set(['node_modules', '.git', '.venv', 'venv', 'coverage', 'dist', 'build']);
 const MAX_FILES = 256;
 const MAX_BYTES = 8_000_000;
@@ -222,6 +223,9 @@ export function preflightVerifier({ repoPath, testCommand, denyRead = [] }) {
     }
   };
   const commands = new Set();
+  // Files the command itself names (not their imports): what a run's duration
+  // is weighed against.
+  const named = new Set();
   const command = (text, depth = 0) => {
     if (commands.has(text) || depth > 8) {
       limited = true;
@@ -245,7 +249,10 @@ export function preflightVerifier({ repoPath, testCommand, denyRead = [] }) {
         if (!word || word.startsWith('-') || word.includes('..') || word.startsWith('/')) continue;
         for (const path of candidates) {
           try {
-            if (path === word || path.startsWith(`${word}/`) || matchesAny(path, [word])) enqueue(path, [words[0], ...words.slice(index)]);
+            if (path === word || path.startsWith(`${word}/`) || matchesAny(path, [word])) {
+              enqueue(path, [words[0], ...words.slice(index)]);
+              named.add(path);
+            }
           } catch {}
         }
       }
@@ -263,6 +270,7 @@ export function preflightVerifier({ repoPath, testCommand, denyRead = [] }) {
   command(testCommand);
   const resolvedFiles = new Set();
   const cache = new Map();
+  let commandBytes = 0;
   for (let index = 0; index < queue.length; index++) {
     if (resolvedFiles.size >= MAX_FILES || bytes >= MAX_BYTES) {
       limited = true;
@@ -277,6 +285,8 @@ export function preflightVerifier({ repoPath, testCommand, denyRead = [] }) {
       limited = true;
       continue;
     }
+    // Only test code is weighed; data and fixture files a named directory holds are not.
+    if (!resolvedFiles.has(path) && named.has(path) && TEST_CODE.test(path)) commandBytes += Buffer.byteLength(text);
     resolvedFiles.add(path);
     inspect(text, path);
     references(text, path, argv);
@@ -292,6 +302,7 @@ export function preflightVerifier({ repoPath, testCommand, denyRead = [] }) {
     status: warnings.length ? 'warning' : 'unknown',
     scannedFiles: resolvedFiles.size,
     resolvedFiles: [...resolvedFiles],
+    commandBytes,
     limited: limited || !resolvedFiles.size,
     warnings,
     note: 'Static advisory; dynamic imports, runner configuration and external packages are not fully analyzed. No test was run.',

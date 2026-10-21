@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { JobStore } from '../../src/store.mjs';
 import { JobManager, validateJobRequest } from '../../src/job-manager.mjs';
-import { gitPatchApplier, gitSnapshots } from '../../src/core.mjs';
+import { createCore, gitPatchApplier, gitSnapshots } from '../../src/core.mjs';
 import { Runner } from '../../src/runner.mjs';
 import { sandboxAvailable } from '../../src/sandbox.mjs';
 import { createIsolatedWorktree, openIsolatedWorktree, cleanupIsolatedWorktree } from '../../src/worktree.mjs';
@@ -860,5 +860,243 @@ test('a timed-out or unsandboxed result run skips the baseline and keeps the sta
     assert.match(done.report, /baseline-diff: skipped \(the verifier did not run under the macOS sandbox\)/);
   } finally {
     unsandboxed.finish();
+  }
+});
+
+/**
+ * `node --test` (Node 26) output for `denied` sandbox-refused fixture tests and
+ * `passing` tests: details appear only in the end-of-run recap.
+ */
+const denied = (count, durationMs, { passing = 0, code = 1 } = {}) => {
+  const names = Array.from({ length: count }, (_, index) => (index % 2 ? `fixture repo ${index}` : `spawns worker ${index}`));
+  const recap = names.flatMap((name, index) => [
+    `test at test/suite.test.mjs:${index + 3}:1`,
+    `✖ ${name} (1ms)`,
+    index % 2 ? '  Error: fatal: not a git repository (or any of the parent directories): .git' : '  Error: spawn git EPERM',
+    "    code: 'EPERM',",
+    '',
+  ]);
+  return {
+    command: 'verify',
+    verdict: code === 0 ? 'PASS' : 'FAIL',
+    result: {
+      code,
+      sandbox: 'macos',
+      durationMs,
+      stdout: [
+        ...names.map((name) => `✖ ${name} (1ms)`),
+        ...Array.from({ length: passing }, (_, index) => `✔ passes ${index} (1ms)`),
+        `ℹ tests ${count + passing}`,
+        `ℹ pass ${passing}`,
+        `ℹ fail ${count}`,
+        '',
+        '✖ failing tests:',
+        '',
+        ...recap,
+      ].join('\n'),
+      stderr: '',
+    },
+  };
+};
+// A 60 KiB test file: at the default 200 ms/KiB its runs are expected to take at least 12 s.
+const SUITE = 'node --test test/suite.test.mjs';
+const SUITE_SOURCE = `// fixture\n${'x'.repeat(60 * 1024)}\n`;
+const withSuite = () => {
+  const repo = makeRepo();
+  write(join(repo, 'test', 'suite.test.mjs'), SUITE_SOURCE);
+  return repo;
+};
+
+test('identical sandbox-denial failures that dominate two implausibly fast runs end VERIFY_ENV_FAILED, never DONE_VERIFIED', async () => {
+  const h = await harness({ repo: withSuite(), verify: () => denied(70, 40, { passing: 11 }) });
+  try {
+    const started = await start(h, { testCommand: SUITE });
+    const done = await h.m.wait(started.jobId, { timeoutSec: TIMEOUT_SEC });
+    assert.equal(done.status, 'VERIFY_ENV_FAILED');
+    const job = await h.m.store.get(started.jobId);
+    assert.equal(job.verify.verdict, 'FAIL', 'the plain "no new failures" comparison is not turned into a pass');
+    assert.equal(job.verify.baseline.status, 'inconclusive');
+    assert.equal(job.verify.baseline.reason, 'environment-dominated');
+    assert.equal(job.verify.baseline.preexisting, 70);
+    assert.equal(job.verify.baseline.expectedMs, Math.round((Buffer.byteLength(SUITE_SOURCE) / 1024) * 200));
+    assert.equal(job.verifyEnvironment.kind, 'sandbox-dominated');
+    assert.equal(job.applied, undefined, 'nothing is integrated on an environment failure');
+    assert.equal(h.workers.length, 1, 'no repair round is spent');
+    assert.equal(done.verifyBaseline.reason, 'environment-dominated');
+    assert.deepEqual(
+      [done.verifyBaseline.result.passed, done.verifyBaseline.result.detailedFailures, done.verifyBaseline.result.deniedFailures],
+      [11, 70, 70],
+    );
+    assert.equal(done.verifyEnvironment.kind, 'sandbox-dominated');
+    assert.match(
+      done.report,
+      /verify: `verify` FAIL \(exit 1\) · baseline-diff INCONCLUSIVE \(environment-dominated\): 70 identical failure\(s\)/,
+    );
+    assert.match(
+      done.report,
+      /baseline-diff: INCONCLUSIVE \(environment-dominated\) - 70 failing now vs 70 in the untouched snapshot, 11 passing/,
+    );
+    assert.doesNotMatch(done.report, /tolerated/);
+  } finally {
+    h.finish();
+  }
+});
+
+test('a fast suite whose tests mostly pass keeps tolerating its few sandbox-refused fixtures as DONE_VERIFIED', async () => {
+  const h = await harness({ repo: withSuite(), verify: () => denied(2, 110, { passing: 200 }) });
+  try {
+    const started = await start(h, { testCommand: SUITE });
+    const done = await h.m.wait(started.jobId, { timeoutSec: TIMEOUT_SEC });
+    assert.equal(done.status, 'DONE_VERIFIED');
+    assert.equal(done.verifyBaseline.status, 'compared');
+    assert.match(done.report, /via baseline-diff: 2 pre-existing failure\(s\) tolerated, 0 new/);
+    assert.doesNotMatch(done.report, /environment-dominated/);
+  } finally {
+    h.finish();
+  }
+});
+
+test('the same denial failures in runs that took as long as the files suggest still compare as DONE_VERIFIED', async () => {
+  const h = await harness({ repo: withSuite(), verify: () => denied(70, 5_000, { passing: 11 }) });
+  try {
+    const started = await start(h, { testCommand: SUITE });
+    const done = await h.m.wait(started.jobId, { timeoutSec: TIMEOUT_SEC });
+    assert.equal(done.status, 'DONE_VERIFIED');
+    assert.equal(done.verifyBaseline.status, 'compared');
+    assert.doesNotMatch(done.report, /environment-dominated|verify duration warning/);
+  } finally {
+    h.finish();
+  }
+});
+
+test('configured thresholds are validated and recorded per job, and a low msPerKiB keeps the comparison', async () => {
+  const h = await harness({ repo: withSuite(), verify: () => denied(70, 40, { passing: 11 }) });
+  try {
+    await assert.rejects(start(h, { testCommand: SUITE, verifierDuration: { minFraction: 2 } }), /verifierDuration must be/);
+    await assert.rejects(start(h, { testCommand: SUITE, verifierDuration: { other: 1 } }), /verifierDuration must be/);
+    // 60 KiB at 1 ms/KiB expects 60 ms; 25% of that is under the 40 ms runs.
+    const started = await start(h, { testCommand: SUITE, verifierDuration: { msPerKiB: 1 } });
+    const done = await h.m.wait(started.jobId, { timeoutSec: TIMEOUT_SEC });
+    assert.equal(done.status, 'DONE_VERIFIED');
+    assert.deepEqual((await h.m.store.get(started.jobId)).verifierDuration, { msPerKiB: 1 });
+  } finally {
+    h.finish();
+  }
+});
+
+test('a zero fraction turns off both the dominated check and the duration warnings', async () => {
+  const h = await harness({
+    repo: withSuite(),
+    verify: (call) => denied(70, call.isResult ? 40 : 2_000, { passing: 11 }),
+  });
+  try {
+    // At the default fraction the 40 ms result run would warn against the 2 s snapshot run.
+    const started = await start(h, { testCommand: SUITE, verifierDuration: { minFraction: 0 } });
+    const done = await h.m.wait(started.jobId, { timeoutSec: TIMEOUT_SEC });
+    assert.equal(done.status, 'DONE_VERIFIED');
+    assert.equal(done.verifyDurationWarnings, undefined);
+    assert.doesNotMatch(done.report, /verify duration warning|environment-dominated/);
+  } finally {
+    h.finish();
+  }
+});
+
+test('a result run far shorter than the untouched-snapshot run carries a duration warning', async () => {
+  const h = await harness({
+    verify: (call) => ({
+      ...spec(['suite > old A']),
+      result: { ...spec(['suite > old A']).result, durationMs: call.isResult ? 100 : 2_000 },
+    }),
+  });
+  try {
+    const started = await start(h);
+    const done = await h.m.wait(started.jobId, { timeoutSec: TIMEOUT_SEC });
+    assert.equal(done.status, 'DONE_VERIFIED', 'the warning is advisory');
+    assert.deepEqual(done.verifyDurationWarnings, [
+      { run: 'result', durationMs: 100, expectedMs: 2_000, source: 'snapshot', minFraction: 0.25 },
+    ]);
+    assert.match(
+      done.report,
+      /verify duration warning: the result run took 0\.1s, under 25% of the 2s expected from the untouched-snapshot run/,
+    );
+  } finally {
+    h.finish();
+  }
+});
+
+test('a passing run far shorter than recent passing runs of the same command warns; a timed-out run does not', async () => {
+  let next = { code: 0, durationMs: 40_000 };
+  const h = await harness({
+    verify: () => ({
+      command: 'verify',
+      verdict: next.code === 0 && !next.timedOut ? 'PASS' : 'FAIL',
+      result: { sandbox: 'macos', stdout: '', stderr: '', ...next },
+    }),
+  });
+  const run = async () => h.m.wait((await start(h, { verifierMode: 'standard', maxRepairRounds: 0 })).jobId, { timeoutSec: TIMEOUT_SEC });
+  try {
+    const first = await run();
+    assert.equal(first.status, 'DONE_VERIFIED');
+    assert.equal(first.verifyDurationWarnings, undefined, 'no history yet');
+    next = { code: 0, durationMs: 1_000 };
+    const second = await run();
+    assert.equal(second.status, 'DONE_VERIFIED');
+    assert.deepEqual(second.verifyDurationWarnings, [
+      { run: 'result', durationMs: 1_000, expectedMs: 40_000, source: 'history', minFraction: 0.25 },
+    ]);
+    assert.match(
+      second.report,
+      /verify duration warning: the result run took 1s, under 25% of the 40s expected from the median of recent passing runs/,
+    );
+    next = { code: null, durationMs: 1_000, timedOut: true };
+    const third = await run();
+    assert.notEqual(third.status, 'DONE_VERIFIED');
+    assert.equal(third.verifyDurationWarnings, undefined, 'a run that was stopped is not judged by its length');
+  } finally {
+    h.finish();
+  }
+});
+
+test('Core records Config.verifier thresholds on write jobs as server-derived settings, never on report jobs', async () => {
+  const repo = withSuite();
+  const config = {
+    default: 'test',
+    profiles: { test: { provider: 'test', model: 'test-model' } },
+    providers: { test: { type: 'openai-chat', keyRef: 'env:IGNORED', baseUrl: 'https://example.test' } },
+    limits: { maxTurns: 2, timeoutMinutes: 1, maxUsd: 1 },
+  };
+  const coreWith = (verifier) =>
+    createCore({
+      config: {
+        loaded: { disabled: false, repoConfig: {}, config: { ...config, ...(verifier ? { verifier } : {}) } },
+        probeVerifierTemp: async () => ({ status: 'writable' }),
+        isolation: { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree },
+      },
+      worker: { run: async () => ({ status: 'DONE', summary: 'ok' }) },
+      runner: { verify: async (command) => ({ command, verdict: 'PASS', result: { code: 0, sandbox: 'macos' } }) },
+    });
+  const configured = coreWith({ minDurationFraction: 0.1, expectedMsPerKiB: 40 });
+  const plain = coreWith();
+  try {
+    const job = await configured.start({ task: 'x', ownedPaths: ['src/**'], repoPath: repo, testCommand: SUITE });
+    await configured.wait(job.jobId, { repoPath: repo, timeoutSec: 10 });
+    assert.deepEqual((await configured.manager.store.get(job.jobId)).verifierDuration, { minFraction: 0.1, msPerKiB: 40 });
+    const report = await configured.start({ mode: 'report', task: 'analyze', repoPath: repo });
+    await configured.wait(report.jobId, { repoPath: repo, timeoutSec: 10 });
+    assert.equal((await configured.manager.store.get(report.jobId)).verifierDuration, undefined);
+    // A caller cannot supply its own thresholds.
+    const forged = await plain.start({
+      task: 'x',
+      ownedPaths: ['src/**'],
+      repoPath: repo,
+      testCommand: SUITE,
+      verifierDuration: { minFraction: 0 },
+    });
+    await plain.wait(forged.jobId, { repoPath: repo, timeoutSec: 10 });
+    assert.equal((await plain.manager.store.get(forged.jobId)).verifierDuration, undefined);
+  } finally {
+    await configured.shutdown({ timeoutMs: 2_000 });
+    await plain.shutdown({ timeoutMs: 2_000 });
+    cleanup(repo);
   }
 });

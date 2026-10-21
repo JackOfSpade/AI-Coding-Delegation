@@ -295,3 +295,19 @@ test('verifier.interpreterRoots is an optional bounded allowlist of absolute dir
   assert.deepEqual(example.verifier, { interpreterRoots: [] });
   assert.doesNotThrow(() => validateConfig(deepMerge(DEFAULT_CONFIG, example)));
 });
+
+test('verifier duration thresholds are optional bounded numbers', () => {
+  const withVerifier = (verifier) => deepMerge(DEFAULT_CONFIG, { verifier });
+  assert.deepEqual(validateConfig(withVerifier({ minDurationFraction: 0.1, expectedMsPerKiB: 40 })).verifier, {
+    minDurationFraction: 0.1,
+    expectedMsPerKiB: 40,
+  });
+  assert.equal(validateConfig(withVerifier({ minDurationFraction: 0 })).verifier.minDurationFraction, 0, '0 turns the warning off');
+  for (const bad of [
+    { minDurationFraction: 1.5 },
+    { minDurationFraction: -0.1 },
+    { minDurationFraction: '0.2' },
+    { expectedMsPerKiB: 1e6 },
+  ])
+    assert.throws(() => validateConfig(withVerifier(bad)), /verifier\.(?:minDurationFraction|expectedMsPerKiB)/, JSON.stringify(bad));
+});

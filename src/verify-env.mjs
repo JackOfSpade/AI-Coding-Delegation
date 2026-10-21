@@ -12,6 +12,9 @@ const ENVIRONMENT_KINDS = new Set([
   'temp-dir-denied',
   'git-config-denied',
   'native-module-crash',
+  // Set by the baseline-diff verifier, never by the classifier below: the same
+  // failures in both runs were the sandbox refusing the suite's fixtures.
+  'sandbox-dominated',
 ]);
 export const isVerifierEnvironmentKind = (kind) => ENVIRONMENT_KINDS.has(kind);
 
@@ -41,7 +44,7 @@ const PERMISSION = /(?:\bEACCES\b|\bEPERM\b|permission denied|operation not perm
 // so the write is denied, and the tool warns and carries on: that line says
 // nothing about why a run failed and must not turn a failing suite into an
 // environment failure that no repair round could address.
-const TOOL_CACHE =
+export const TOOL_CACHE =
   /PytestCacheWarning|[/\\](?:\.pytest_cache|__pycache__|\.mypy_cache|\.ruff_cache|\.hypothesis)(?:[/\\]|\b)|pytest-cache-files-[\w-]+/;
 // A Python interpreter or virtualenv outside the worktree is unreadable to the
 // verifier unless the caller declares it (verifierInterpreter). Its denial reads

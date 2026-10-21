@@ -73,6 +73,14 @@ const command = (repo, args) => snapshotGit(repo, args).trim();
 const MAX_PRICING_BYTES = 1024 * 1024;
 // The Offload checkout this server runs from: the one a maintainer prompt names.
 const PACKAGE_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
+// The configured verifier duration thresholds a job records at start; undefined keeps the defaults.
+const verifierDurationConfig = (verifier) => {
+  const value = {
+    ...(verifier?.minDurationFraction !== undefined ? { minFraction: verifier.minDurationFraction } : {}),
+    ...(verifier?.expectedMsPerKiB !== undefined ? { msPerKiB: verifier.expectedMsPerKiB } : {}),
+  };
+  return Object.keys(value).length ? value : undefined;
+};
 const parentHandoff = (job) => job?.status === 'QUEUED' && job.handoffState === 'PARENT_QUEUED';
 const handoffIdentity = (job) => ({
   status: job?.status,
@@ -1107,6 +1115,8 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           denyRead: [...new Set([...(input.denyRead || []), ...(loaded.repoConfig.denyRead || [])])],
           verifierInterpreter: interpreter?.declared,
           verifierInterpreterRoots: interpreter?.roots,
+          // Server configuration only: a caller cannot loosen the thresholds.
+          verifierDuration: reportMode ? undefined : verifierDurationConfig(loaded.config.verifier),
           sandboxMode: sandboxAvailable() ? 'macos' : 'policy-only',
           configuredModel: model,
           executionProfile,

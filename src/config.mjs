@@ -152,7 +152,15 @@ export function validateConfig(config) {
   if (config.verifier !== undefined) {
     if (!isPlainObject(config.verifier)) throw new ConfigError('Config.verifier must be an object');
     assertSafeKeys(config.verifier);
-    assertAllowedKeys(config.verifier, ['interpreterRoots'], 'Config.verifier');
+    assertAllowedKeys(config.verifier, ['interpreterRoots', 'minDurationFraction', 'expectedMsPerKiB'], 'Config.verifier');
+    // A verifier run under this share of its expected duration is reported as
+    // suspiciously fast (0 turns the warning off). The expected duration is a
+    // recent passing run of the same command, the untouched-snapshot run, or,
+    // for the baseline-diff environment-dominated check, expectedMsPerKiB per
+    // KiB of the files the testCommand names.
+    if (config.verifier.minDurationFraction !== undefined)
+      numeric(config.verifier.minDurationFraction, 'verifier.minDurationFraction', 0, 1);
+    if (config.verifier.expectedMsPerKiB !== undefined) numeric(config.verifier.expectedMsPerKiB, 'verifier.expectedMsPerKiB', 0, 100_000);
     const roots = config.verifier.interpreterRoots;
     // An allowlist of directories a caller may declare as `verifierInterpreter`
     // (a virtualenv or interpreter the sandbox may then read and execute). Empty

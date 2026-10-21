@@ -126,3 +126,21 @@ test('unresolved dynamic imports are incomplete, and resolved dynamic paths stil
   assert.equal(result.limited, true);
   assert.deepEqual(result.warnings, []);
 });
+
+test('verifier preflight sizes only the files the command names, not what they import', (t) => {
+  const { root, write } = fixture(t);
+  write('package.json', JSON.stringify({ scripts: { test: 'node --test "test/*.test.mjs"' } }));
+  write('test/a.test.mjs', `import '../src/big.mjs';\n${'x'.repeat(1000)}`);
+  write('test/b.test.mjs', 'y'.repeat(500));
+  write('src/big.mjs', 'z'.repeat(50_000));
+  write('test/fixtures/recorded.json', JSON.stringify({ blob: 'f'.repeat(200_000) }));
+  const result = preflightVerifier({ repoPath: root, testCommand: 'npm test' });
+  assert.equal(result.scannedFiles, 3);
+  assert.equal(result.commandBytes, Buffer.byteLength("import '../src/big.mjs';\n") + 1000 + 500);
+  assert.equal(preflightVerifier({ repoPath: root, testCommand: 'node --test test/b.test.mjs' }).commandBytes, 500);
+  // A named directory's data files are not test code.
+  assert.equal(
+    preflightVerifier({ repoPath: root, testCommand: 'node --test test' }).commandBytes,
+    Buffer.byteLength("import '../src/big.mjs';\n") + 1000 + 500,
+  );
+});

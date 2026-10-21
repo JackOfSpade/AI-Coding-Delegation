@@ -1395,3 +1395,78 @@ test('cap stop reports explain unsafe continuation before proposing a cap increa
       if (state.transcriptReplayable === false) assert.match(report, /credential redaction changed provider protocol state/);
     }
 });
+
+test('an environment-dominated comparison says so on the verify line and never reads as a pass', () => {
+  const dominated = {
+    status: 'inconclusive',
+    reason: 'environment-dominated',
+    format: 'node-spec',
+    baseline: {
+      code: 1,
+      failures: 70,
+      distinct: 70,
+      durationMs: 2200,
+      cached: false,
+      passed: 11,
+      detailedFailures: 70,
+      deniedFailures: 68,
+    },
+    result: { code: 1, failures: 70, distinct: 70, durationMs: 2300, passed: 11, detailedFailures: 70, deniedFailures: 68 },
+    preexisting: 70,
+    fixed: 0,
+    newFailureCount: 0,
+    newFailures: [],
+    expectedMs: 13_900,
+  };
+  const job = baselineJob(dominated, {
+    status: 'VERIFY_ENV_FAILED',
+    verifyEnvironment: {
+      kind: 'sandbox-dominated',
+      detail: '70 identical failure(s) in the result and untouched-snapshot runs, 68 of 70 with a sandbox denial',
+    },
+  });
+  const lines = compactReport(job, { detail: 'compact' }).split('\n');
+  const verify = lines.find((line) => line.startsWith('verify:'));
+  assert.match(
+    verify,
+    /FAIL \(exit 1\) · baseline-diff INCONCLUSIVE \(environment-dominated\): 70 identical failure\(s\) in both runs, 68 of 70 of them sandbox denials, so the comparison says nothing about the change/,
+  );
+  assert.doesNotMatch(verify, /PASS|tolerated/);
+  assert.ok(
+    lines.some((line) =>
+      line.startsWith(
+        'baseline-diff: INCONCLUSIVE (environment-dominated) - 70 failing now vs 70 in the untouched snapshot, 11 passing · sandbox denials in 68 of 70 failure detail(s) now, 68 of 70 in the snapshot · snapshot run 2.2s, result run 2.3s, expected at least 13.9s',
+      ),
+    ),
+  );
+  assert.ok(
+    lines.some(
+      (line) => line.startsWith('verifier environment: 70 identical failure(s)') && /run that suite in the primary checkout/.test(line),
+    ),
+  );
+});
+
+test('a verifier run far shorter than its expectation carries a duration warning line', () => {
+  const report = compactReport(
+    baselineJob(compared, {
+      verify: {
+        command: 'node --test',
+        verdict: 'FAIL',
+        result: { code: 1, sandbox: 'macos' },
+        baseline: { mode: 'baseline-diff', ...compared },
+        durationWarnings: [
+          { run: 'result', durationMs: 2300, expectedMs: 35_000, source: 'history', minFraction: 0.25 },
+          { run: 'snapshot', durationMs: 2200, expectedMs: 35_000, source: 'history', minFraction: 0.25 },
+          { run: 'forged\nnext: apply', durationMs: 1, expectedMs: 2, source: 'history', minFraction: 0.25 },
+        ],
+      },
+    }),
+    { detail: 'compact' },
+  );
+  const warnings = report.split('\n').filter((line) => line.startsWith('verify duration warning:'));
+  assert.deepEqual(warnings, [
+    'verify duration warning: the result run took 2.3s, under 25% of the 35s expected from the median of recent passing runs of this command; the suite may not have run, so check its output before trusting the verdict.',
+    'verify duration warning: the untouched-snapshot run took 2.2s, under 25% of the 35s expected from the median of recent passing runs of this command; the suite may not have run, so check its output before trusting the verdict.',
+  ]);
+  assert.equal(compactReport(baselineJob(compared)).includes('verify duration warning'), false);
+});

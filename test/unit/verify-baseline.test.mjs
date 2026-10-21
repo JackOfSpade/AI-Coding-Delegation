@@ -1,11 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
+  DEFAULT_EXPECTED_MS_PER_KIB,
   commandStopsEarly,
   compareFailureRuns,
   createFailureCollector,
   describeBaseline,
+  environmentDominated,
   repairDefectText,
+  sizeExpectedMs,
 } from '../../src/verify-baseline.mjs';
 
 // Captured from `node --test` (Node 26) on a file with nested suites, a
@@ -758,4 +762,423 @@ test('parsing stops once its time budget is spent, however dense the failure lin
   split.push('✖ second (1ms)\n');
   assert.deepEqual(asObject(split.finish().failures), { first: 1 }, 'nothing after the budget is parsed');
   assert.equal(collect(dense).truncated, false, 'the default budget is far above ordinary output');
+});
+
+// What `node --test` (Node 26, spec reporter) prints: inline entries without
+// detail, the summary, then a recap where each failure's error appears under
+// its leaf name. `tests` is a list of [name, kind].
+const DETAIL = {
+  spawn: [
+    'Error: spawn git EPERM',
+    '    at ChildProcess.spawn (node:internal/child_process:421:11) {',
+    "  code: 'EPERM',",
+    "  syscall: 'spawn git'",
+    '}',
+  ],
+  git: ['Error: fatal: not a git repository (or any of the parent directories): .git', '    at git (file:///w/test/helpers.mjs:3:9)'],
+  assert: ['AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:', '', '1 !== 2', '', "  code: 'ERR_ASSERTION',"],
+  // An assertion about an error code is a test outcome, not a denial.
+  assertEperm: ["AssertionError [ERR_ASSERTION]: Expected values to be strictly equal: 'EACCES' !== 'EPERM'", "  code: 'ERR_ASSERTION',"],
+};
+const node26 = (tests) => {
+  const failing = tests.filter(([, kind]) => kind !== 'pass');
+  return [
+    ...tests.map(([name, kind]) => `${kind === 'pass' ? '✔' : '✖'} ${name} (1.2ms)`),
+    `ℹ tests ${tests.length}`,
+    `ℹ pass ${tests.length - failing.length}`,
+    `ℹ fail ${failing.length}`,
+    'ℹ duration_ms 41.5',
+    '',
+    '✖ failing tests:',
+    '',
+    ...failing.flatMap(([name, kind], index) => [
+      `test at test/a.test.mjs:${index + 3}:1`,
+      `✖ ${name} (1.2ms)`,
+      ...DETAIL[kind].map((d) => `  ${d}`),
+      '',
+    ]),
+  ].join('\n');
+};
+const many = (count, kind, prefix = kind) => Array.from({ length: count }, (_, index) => [`${prefix} ${index}`, kind]);
+const runOf = (text, code = 1) => {
+  const collector = createFailureCollector();
+  collector.push(text);
+  return { code, sandboxed: true, parsed: collector.finish() };
+};
+// Both runs of the same transcript, timed and sized like the reported session.
+const judge = (baselineText, resultText = baselineText, extra = {}) => {
+  const baseline = runOf(baselineText);
+  const result = runOf(resultText);
+  const decision = compareFailureRuns({ baseline, result });
+  return environmentDominated(decision, {
+    baseline,
+    result,
+    baselineMs: 2200,
+    resultMs: 2300,
+    expectedMs: sizeExpectedMs(139 * 1024),
+    ...extra,
+  });
+};
+
+test('the collector attributes sandbox denials to the failure whose detail prints them', () => {
+  const parsed = runOf(
+    node26([
+      ['spawns git', 'spawn'],
+      ['passes mentioning EPERM and not a git repository', 'pass'],
+      ['plain assert', 'assert'],
+      ['top git', 'git'],
+      ['asserts the EPERM code', 'assertEperm'],
+    ]),
+  ).parsed;
+  assert.equal(parsed.detailedFailures, 4);
+  assert.equal(parsed.deniedFailures, 2, 'a passing title and an assertion about EPERM are not denials');
+  assert.equal(parsed.summaryPassed, 1);
+  assert.equal(parsed.summaryFailed, 4);
+});
+
+test('denial attribution works for TAP, pytest, jest and go output, and ignores tool-cache warnings', () => {
+  const tap = runOf(`TAP version 13
+# Subtest: spawns git
+not ok 1 - spawns git
+  ---
+  error: 'spawn git EPERM'
+  code: 'EPERM'
+  ...
+# Subtest: passes EPERM
+ok 2 - passes EPERM
+  ---
+  duration_ms: 0.05
+  ...
+# Subtest: plain assert
+not ok 3 - plain assert
+  ---
+  error: 'Expected values to be strictly equal'
+  code: 'ERR_ASSERTION'
+  ...
+1..3
+# pass 1
+# fail 2
+`).parsed;
+  assert.deepEqual([tap.detailedFailures, tap.deniedFailures, tap.summaryPassed], [2, 1, 1]);
+
+  const pytest = runOf(`tests/test_mod.py ..F.F
+=============================== warnings summary ===============================
+  PytestCacheWarning: could not create cache path /w/.pytest_cache/v/cache/nodeids: [Errno 1] Operation not permitted
+=========================== short test summary info ============================
+FAILED tests/test_mod.py::test_spawn - PermissionError: [Errno 1] Operation not permitted: 'git'
+FAILED tests/test_mod.py::test_math - assert 1 == 2
+==================== 2 failed, 3 passed, 1 warning in 0.21s ====================
+`).parsed;
+  assert.deepEqual([pytest.detailedFailures, pytest.deniedFailures, pytest.summaryPassed], [2, 1, 3]);
+
+  const jest = runOf(`FAIL src/a.test.js
+  ✓ maps EPERM (2 ms)
+  ✕ spawns (3 ms)
+  ● a › spawns
+
+    Error: spawn git EPERM
+
+Tests: 1 failed, 1 passed, 2 total
+`).parsed;
+  assert.deepEqual([jest.deniedFailures, jest.summaryPassed], [1, 1]);
+
+  const go = runOf(`--- FAIL: TestSpawn (0.00s)
+    spawn_test.go:9: fork/exec /usr/bin/git: operation not permitted
+--- PASS: TestEPERMName (0.00s)
+FAIL example.com/pkg 0.01s
+`).parsed;
+  assert.equal(go.deniedFailures, 1);
+});
+
+test('identical denial failures that dominate two implausibly fast runs are environment-dominated, never a pass', () => {
+  const text = node26([...many(35, 'spawn'), ...many(35, 'git'), ...many(11, 'pass')]);
+  const decision = compareFailureRuns({ baseline: runOf(text), result: runOf(text) });
+  assert.equal(decision.pass, true, 'the plain comparison sees no new failures');
+  const expectedMs = sizeExpectedMs(139 * 1024);
+  assert.equal(expectedMs, 139 * DEFAULT_EXPECTED_MS_PER_KIB);
+  const dominated = judge(text);
+  assert.equal(dominated.status, 'inconclusive');
+  assert.equal(dominated.reason, 'environment-dominated');
+  assert.equal(dominated.pass, false);
+  assert.equal(dominated.preexisting, 70);
+  const described = describeBaseline(dominated, { baseline: runOf(text), result: runOf(text), baselineMs: 2200, resultMs: 2300 });
+  assert.equal(described.status, 'inconclusive');
+  assert.equal(described.expectedMs, expectedMs);
+  assert.deepEqual(
+    [described.result.passed, described.result.detailedFailures, described.result.deniedFailures, described.baseline.deniedFailures],
+    [11, 70, 70, 70],
+  );
+});
+
+test('a suite whose tests mostly ran and passed is real evidence, however its few fixture failures look', () => {
+  // The baseline-diff use case: a couple of git-fixture tests the sandbox always refuses.
+  assert.equal(judge(node26([...many(2, 'spawn'), ...many(200, 'pass')]), undefined, { baselineMs: 110, resultMs: 117 }), undefined);
+  // Exactly as many passes as failures still counts as dominated; one more pass does not.
+  assert.ok(judge(node26([...many(10, 'spawn'), ...many(10, 'pass')])));
+  assert.equal(judge(node26([...many(10, 'spawn'), ...many(11, 'pass')])), undefined);
+  // A runner summary without a pass count cannot show that.
+  assert.equal(judge(node26(many(10, 'spawn')).replace(/^ℹ pass \d+\n/m, '')), undefined);
+});
+
+test('the denial share is counted per failure: half is enough, less is not, and both runs must show it', () => {
+  assert.ok(judge(node26([...many(5, 'spawn'), ...many(5, 'assert')])), '5 of 10');
+  assert.equal(judge(node26([...many(4, 'spawn'), ...many(6, 'assert')])), undefined, '4 of 10');
+  // Several denial lines in one failure's detail still count once.
+  assert.equal(judge(node26([...many(3, 'spawn'), ...many(7, 'assert')])), undefined, '3 of 10, 12 denial lines');
+  // Assertion failures, passing tests and assertions that mention EPERM are not denials.
+  assert.equal(judge(node26([['maps EPERM to a message', 'pass'], ...many(1, 'assert'), ...many(1, 'assertEperm')])), undefined);
+  // The same names failing in both runs, but with denials in only one of them.
+  const denied = node26(many(10, 'spawn', 'case'));
+  const plain = node26(many(10, 'assert', 'case'));
+  assert.equal(judge(denied, plain), undefined);
+  assert.equal(judge(plain, denied), undefined);
+});
+
+test('pytest cache-write warnings over ordinary assertion failures are not sandbox domination', () => {
+  const text = `tests/test_mod.py FF
+=============================== warnings summary ===============================
+  PytestCacheWarning: could not create cache path /w/.pytest_cache/v/cache/nodeids: [Errno 1] Operation not permitted
+  PytestCacheWarning: could not create cache path /w/.pytest_cache/v/cache/lastfailed: [Errno 1] Operation not permitted
+=========================== short test summary info ============================
+FAILED tests/test_mod.py::test_a - assert 1 == 2
+FAILED tests/test_mod.py::test_b - assert 3 == 4
+==================== 2 failed, 1 warning in 0.21s ====================
+`;
+  assert.equal(runOf(text).parsed.deniedFailures, 0);
+  assert.equal(judge(text), undefined);
+});
+
+test('an environment-dominated verdict needs a known size and both runs fast, and never hides a changed failure set', () => {
+  const text = node26(many(10, 'spawn'));
+  assert.ok(judge(text, text, { baselineMs: 200, resultMs: 300, expectedMs: 10_000 }));
+  // A run that took as long as the files suggest really ran.
+  assert.equal(judge(text, text, { baselineMs: 200, resultMs: 2500, expectedMs: 10_000 }), undefined);
+  assert.equal(judge(text, text, { baselineMs: 2500, resultMs: 300, expectedMs: 10_000 }), undefined);
+  // Without the size of the tested files there is nothing to weigh the runs against.
+  assert.equal(judge(text, text, { expectedMs: 0 }), undefined);
+  assert.equal(judge(text, text, { minFraction: 0 }), undefined, '0 turns the check off');
+  // A fixed failure means the runs differ: the comparison said something.
+  assert.equal(judge(text, node26(many(9, 'spawn'))), undefined);
+  // A new failure is never hidden behind the environment.
+  const more = node26(many(11, 'spawn'));
+  assert.equal(compareFailureRuns({ baseline: runOf(text), result: runOf(more) }).pass, false);
+  assert.equal(judge(text, more), undefined);
+});
+
+test('the size expectation is zero when the tested files are unknown', () => {
+  assert.equal(sizeExpectedMs(undefined), 0);
+  assert.equal(sizeExpectedMs(0), 0);
+  assert.equal(sizeExpectedMs(2048, 0), 0);
+  assert.equal(sizeExpectedMs(2048, 10), 20);
+});
+
+test('the reported session, captured from the real verifier sandbox, is environment-dominated', () => {
+  // `node --test test/integration/job-manager.test.mjs` under the macOS verifier
+  // profile (paths normalised, stack frames trimmed): its Git fixtures cannot
+  // read .git, so 50 tests fail on "must be inside a git working tree", 18 on
+  // the store that Git refusal leaves invalid, and 2 on assertions.
+  const text = readFileSync(new URL('../fixtures/node26-sandboxed-job-manager.stdout', import.meta.url), 'utf8');
+  const parsed = runOf(text).parsed;
+  assert.deepEqual(
+    [parsed.total, parsed.summaryPassed, parsed.summaryFailed, parsed.detailedFailures, parsed.deniedFailures],
+    [70, 11, 70, 70, 50],
+  );
+  const expectedMs = sizeExpectedMs(139_063);
+  assert.equal(judge(text, text, { baselineMs: 2_200, resultMs: 2_300, expectedMs })?.reason, 'environment-dominated');
+  assert.equal(judge(text, text, { baselineMs: 3_300, resultMs: 3_311, expectedMs })?.reason, 'environment-dominated');
+  assert.equal(judge(text, text, { baselineMs: 9_000, resultMs: 9_000, expectedMs }), undefined, 'a run that took long enough really ran');
+});
+
+test('git and its wrappers report a hidden .git in their own words, and those count as denials', () => {
+  for (const line of [
+    "fatal: error reading '/w/offload-worktree-1/workspace/.git'",
+    'Error: repoPath must be inside a git working tree',
+    'fatal: this operation must be run in a work tree',
+    'Error: /w is not inside a git work tree',
+  ]) {
+    const parsed = runOf(
+      `✖ case (1ms)\nℹ pass 0\nℹ fail 1\n\n✖ failing tests:\n\ntest at a.test.mjs:1:1\n✖ case (1ms)\n  ${line}\n`,
+    ).parsed;
+    assert.equal(parsed.deniedFailures, 1, line);
+  }
+});
+
+test('failures that share a leaf name in different suites are counted once each, never merged', () => {
+  // node:test's recap prints only the leaf, so 20 assertion failures named alike must stay 20.
+  const recap = [
+    ...Array.from({ length: 20 }, (_, index) => [
+      `test at a.test.mjs:${index + 1}:3`,
+      '✖ returns the parsed value (1ms)',
+      '  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:',
+    ]),
+    ...Array.from({ length: 2 }, (_, index) => [
+      `test at a.test.mjs:${index + 40}:3`,
+      `✖ spawns ${index} (1ms)`,
+      '  Error: spawnSync /usr/bin/git EPERM',
+    ]),
+  ].flat();
+  const text = ['ℹ tests 23', 'ℹ pass 1', 'ℹ fail 22', '', '✖ failing tests:', '', ...recap].join('\n');
+  const parsed = runOf(text).parsed;
+  assert.deepEqual([parsed.detailedFailures, parsed.deniedFailures], [22, 2]);
+  assert.equal(judge(text), undefined);
+});
+
+test("a later test's log at column 0 is not the detail of the failure printed before it", () => {
+  // Old node:test prints detail inline under ✖; a passing test's console output follows at column 0.
+  const text = [
+    ...Array.from({ length: 5 }, (_, index) => [
+      `✖ plain failure ${index} (1ms)`,
+      '  Error: plain failure',
+      `✔ logs ${index} (1ms)`,
+      "fatal: unable to access '/etc/gitconfig': Operation not permitted",
+    ]).flat(),
+    'ℹ tests 10',
+    'ℹ pass 5',
+    'ℹ fail 5',
+  ].join('\n');
+  const parsed = runOf(text).parsed;
+  assert.deepEqual([parsed.detailedFailures, parsed.deniedFailures], [5, 0]);
+  assert.equal(judge(text), undefined);
+  // The same holds for TAP: a YAML block ends at `...`, and a `# ` comment is not detail.
+  const tap = runOf(
+    "TAP version 13\nnot ok 1 - plain\n  ---\n  error: 'plain failure'\n  ...\n# fatal: unable to access '/etc/gitconfig': Operation not permitted\nspawn git EPERM\nok 2 - next\n# pass 1\n# fail 1\n",
+  ).parsed;
+  assert.deepEqual([tap.detailedFailures, tap.deniedFailures], [1, 0]);
+});
+
+test('jest, pytest and cargo assertion failures veto a denial their detail mentions', () => {
+  const jest = runOf(
+    'FAIL a.test.js\n  ● a › maps the error\n\n    expect(received).toBe(expected)\n\n    Expected: "EPERM"\n    Received: "EACCES"\n\nTests: 1 failed, 0 passed, 1 total\n',
+  ).parsed;
+  assert.deepEqual([jest.detailedFailures, jest.deniedFailures], [1, 0]);
+  const pytest = runOf(
+    "FAILED tests/test_a.py::test_code - assert 'EACCES' == 'EPERM'\n==================== 1 failed in 0.01s ====================\n",
+  ).parsed;
+  assert.deepEqual([pytest.detailedFailures, pytest.deniedFailures], [1, 0]);
+  const cargo = runOf(
+    "running 1 test\ntest t ... FAILED\n\nfailures:\n\n---- t stdout ----\nthread 't' panicked at src/lib.rs:3:5:\nassertion `left == right` failed: operation not permitted\n\nfailures:\n    t\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n",
+  ).parsed;
+  assert.deepEqual([cargo.detailedFailures, cargo.deniedFailures], [1, 0]);
+});
+
+test('a pass count never marks a crashed run complete', () => {
+  // Two TAP runs chained: the first passes, the second crashes after one failure with no summary.
+  const crashed = 'TAP version 13\nok 1 - a\nok 2 - b\n# pass 2\n# fail 0\nTAP version 13\nnot ok 1 - c\n';
+  const before = 'TAP version 13\nok 1 - a\nok 2 - b\n# pass 2\nTAP version 13\nnot ok 1 - c\nnot ok 2 - d\n# fail 2\n';
+  const passOnly = runOf('TAP version 13\nok 1 - a\n# pass 1\nnot ok 2 - c\n').parsed;
+  assert.equal(passOnly.complete, false, '`# pass` alone is not a summary');
+  assert.equal(passOnly.summaryPassed, 1);
+  const decision = compareFailureRuns({ baseline: runOf(before), result: runOf(crashed.replace('# fail 0\n', '')) });
+  assert.notEqual(decision.pass, true);
+});
+
+test("pytest's long-form E lines carry the denial its 80-column short summary cuts off", () => {
+  // Real pytest 8.4 layout under the verifier (no COLUMNS): source and stdlib
+  // frames, then `E ` lines; the short summary truncates the message.
+  const text = `test_repo_ops.py FF.                                                    [100%]
+
+=================================== FAILURES ===================================
+__________________________________ test_spawn __________________________________
+
+    def test_spawn():
+>       subprocess.run(["git", "status"], check=True)
+        assert True, "never reached: EPERM"
+
+/Library/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py:1038: in __init__
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+E       PermissionError: [Errno 1] Operation not permitted: 'git'
+
+subprocess.py:1972: PermissionError
+__________________________________ test_math ___________________________________
+
+    def test_math():
+>       assert 1 == 2
+E       assert 1 == 2
+
+test_repo_ops.py:9: AssertionError
+=========================== short test summary info ============================
+FAILED test_repo_ops.py::test_spawn - PermissionError: [Errno 1] Operation no...
+FAILED test_repo_ops.py::test_math - assert 1 == 2
+========================= 2 failed, 1 passed in 0.21s ==========================
+`;
+  const parsed = runOf(text).parsed;
+  assert.deepEqual([parsed.total, parsed.detailedFailures, parsed.deniedFailures, parsed.summaryPassed], [2, 2, 1, 1]);
+});
+
+test('jest code frames quote source, so neither a nearby expect( nor a nearby EPERM decides a failure', () => {
+  // Real jest 27 layout: the error, then a code frame, then the stack.
+  const frame = (message, source) => `  ● repo › ${message.name}
+
+    ${message.text}
+
+      4 |   test('${message.name}', () => {
+    > 5 |     ${source}
+        |                 ^
+      6 |     expect(out).toContain('main');
+
+      at Object.<anonymous> (__tests__/repo.test.js:5:17)
+`;
+  const denied = runOf(
+    `FAIL __tests__/repo.test.js\n${frame({ name: 'lists branches', text: "Command failed: git branch --list\n    fatal: error reading '/w/.git'" }, "const out = execFileSync('git', ['branch']);")}\nTests: 1 failed, 0 passed, 1 total\n`,
+  ).parsed;
+  assert.deepEqual([denied.detailedFailures, denied.deniedFailures], [1, 1], 'the expect( on the next source line does not veto');
+  const plain = runOf(
+    `FAIL __tests__/repo.test.js\n${frame({ name: 'formats', text: 'TypeError: helpers.formatX is not a function' }, "throw new Error('EPERM: operation not permitted');")}\nTests: 1 failed, 1 passed, 2 total\n`,
+  ).parsed;
+  assert.deepEqual([plain.detailedFailures, plain.deniedFailures], [1, 0], 'an EPERM in quoted source is not the error');
+});
+
+test('TAP suite roll-ups and tests a failing hook cancelled are not failures of their own', () => {
+  // node --test-reporter=tap with describe(): the suite line rolls up its subtests.
+  const tap = runOf(`TAP version 13
+# Subtest: group 0
+    # Subtest: spawns git
+    not ok 1 - spawns git
+      ---
+      failureType: 'testCodeFailure'
+      error: 'spawn git EPERM'
+      code: 'EPERM'
+      ...
+    1..1
+not ok 1 - group 0
+  ---
+  type: 'suite'
+  failureType: 'subtestsFailed'
+  error: '1 subtest failed'
+  ...
+# pass 0
+# fail 1
+`).parsed;
+  assert.deepEqual([tap.detailedFailures, tap.deniedFailures], [1, 1]);
+  // A before() hook refused by the sandbox: its tests are cancelled, not failed.
+  const hook = runOf(`▶ repo
+  ✖ lists branches (0.1ms)
+  ✖ reads HEAD (0.1ms)
+✖ repo (3ms)
+ℹ tests 2
+ℹ pass 0
+ℹ fail 0
+ℹ cancelled 2
+
+✖ failing tests:
+
+test at a.test.mjs:3:1
+✖ repo (3ms)
+  Error: spawn git EPERM
+
+test at a.test.mjs:4:3
+✖ lists branches (0.1ms)
+  'test did not finish before its parent and was cancelled'
+
+test at a.test.mjs:5:3
+✖ reads HEAD (0.1ms)
+  'test did not finish before its parent and was cancelled'
+`).parsed;
+  assert.deepEqual([hook.detailedFailures, hook.deniedFailures, hook.summaryCancelled], [1, 1, 2]);
+});
+
+test('a go package whose import path starts with digits is still a go summary', () => {
+  const parsed = runOf('--- FAIL: TestA (0.00s)\nFAIL\nok  \t163.com/num\t0.011s\n').parsed;
+  assert.equal(parsed.format, 'go');
+  assert.equal(parsed.complete, true);
 });
