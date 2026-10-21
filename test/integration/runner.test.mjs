@@ -118,6 +118,34 @@ test('sandbox probe distinguishes a host policy denial from missing binary or a 
   assert.equal(noisy.error, 'sandbox_apply: Operation not permitted');
   assert.equal(sandboxStatus('linux').reason, 'platform-not-darwin');
 });
+test('sandbox metadata traversal stops before POSIX, drive, and UNC roots', () => {
+  // Bound the subprocess so a synchronous stable-root loop produces a useful
+  // assertion rather than hanging the entire cross-platform suite.
+  const script = `
+    import { sandboxTraversalAncestors } from ${JSON.stringify(new URL('../../src/sandbox.mjs', import.meta.url).href)};
+    import { posix, win32 } from 'node:path';
+    const fixtures = ${JSON.stringify([
+      ['posix', '/repo/src'],
+      ['posix', '/'],
+      ['win32', 'C:\\repo\\src'],
+      ['win32', 'C:\\'],
+      ['win32', '\\\\server\\share\\repo\\src'],
+      ['win32', '\\\\server\\share\\'],
+    ])};
+    console.log(JSON.stringify(fixtures.map(([kind, path]) => sandboxTraversalAncestors(path, {posix, win32}[kind].dirname))));
+  `;
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  const result = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
+    encoding: 'utf8',
+    windowsHide: true,
+    env,
+    timeout: 5_000,
+  });
+  assert.equal(result.error, undefined, result.error?.message);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), [['/repo'], [], ['C:\\repo'], [], ['\\\\server\\share\\repo'], []]);
+});
 test('runner honors pre-abort and compiles globs to static sandbox roots', async () => {
   const controller = new AbortController();
   controller.abort();

@@ -287,6 +287,14 @@ const EXTRA_READ_ROOT_DENY = Object.freeze([
   '**/.cache',
   '**/.cache/**',
 ]);
+/** Exact ancestor metadata only; exclude the stable POSIX, drive, or UNC root. */
+export function sandboxTraversalAncestors(path, parentOf = dirname) {
+  const ancestors = [];
+  for (let parent = parentOf(path), next = parentOf(parent); parent !== next; parent = next, next = parentOf(parent))
+    ancestors.push(parent);
+  return ancestors;
+}
+
 export function macosProfile({
   repoPath,
   gitDir = join(repoPath, '.git'),
@@ -356,7 +364,7 @@ export function macosProfile({
     ...resolvedInterpreter,
     dirname(MACOS_SHELL_SELECTOR),
   ].filter(Boolean))
-    for (let parent = dirname(path); parent !== sep; parent = dirname(parent)) traversalMetadata.add(parent);
+    for (const parent of sandboxTraversalAncestors(path)) traversalMetadata.add(parent);
   // CPython resolves its own executable with realpath(3), which stats every
   // component starting at `/`: without the exact root node an interpreter dies
   // at startup ("realpath: ...: Operation not permitted"), even a system one.
