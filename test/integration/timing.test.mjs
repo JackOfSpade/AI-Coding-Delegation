@@ -471,7 +471,9 @@ test('a cancel during a command batch books the batch as tool time and the clean
   const h = await harness({
     worker: async (_job, api) => {
       await api.progress({ turn: 1, phase: 'tool', tools: ['run_command'], commandTimeoutSec: 60 });
-      await new Promise((resolve) => api.signal.addEventListener('abort', resolve, { once: true }));
+      // The test can see the tool phase and cancel before progress() returns:
+      // an abort that already fired is never dispatched to a later listener.
+      await new Promise((resolve) => (api.signal.aborted ? resolve() : api.signal.addEventListener('abort', resolve, { once: true })));
       h.cost.cleanupMs = 10_000;
       throw new Error('aborted');
     },

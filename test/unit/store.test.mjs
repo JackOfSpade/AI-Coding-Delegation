@@ -934,28 +934,32 @@ test("another live process's publication lock is still respected", async () => {
   }
 });
 
-test('a lock whose owner record cannot be read back is still released by its creator', { skip: process.platform === 'win32' }, async () => {
-  const gitDir = tempDir();
-  try {
-    const store = new JobStore({ gitDir });
-    const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
-    const lock = join(gitDir, 'offload', 'jobs', job.id, '.publication-lock');
-    // Make the owner read during release fail, as a transient open/read error would.
-    const get = store.get.bind(store);
-    store.get = async (id) => {
-      if (nodeFs.existsSync(lock)) chmodSync(lock, 0o000);
-      return get(id);
-    };
-    await store.update(job.id, { status: 'RUNNING' });
-    store.get = get;
-    assert.equal(nodeFs.existsSync(lock), false, 'the lock was not restored behind its released owner');
-    const started = Date.now();
-    await store.update(job.id, { status: 'CANCELLED' });
-    assert.ok(Date.now() - started < 5_000);
-  } finally {
-    cleanup(gitDir);
-  }
-});
+test(
+  'a lock whose owner record cannot be read back is still released by its creator',
+  { skip: process.platform === 'win32' && 'POSIX ownership/mode checks are not applicable on Windows' },
+  async () => {
+    const gitDir = tempDir();
+    try {
+      const store = new JobStore({ gitDir });
+      const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
+      const lock = join(gitDir, 'offload', 'jobs', job.id, '.publication-lock');
+      // Make the owner read during release fail, as a transient open/read error would.
+      const get = store.get.bind(store);
+      store.get = async (id) => {
+        if (nodeFs.existsSync(lock)) chmodSync(lock, 0o000);
+        return get(id);
+      };
+      await store.update(job.id, { status: 'RUNNING' });
+      store.get = get;
+      assert.equal(nodeFs.existsSync(lock), false, 'the lock was not restored behind its released owner');
+      const started = Date.now();
+      await store.update(job.id, { status: 'CANCELLED' });
+      assert.ok(Date.now() - started < 5_000);
+    } finally {
+      cleanup(gitDir);
+    }
+  },
+);
 
 test('a quarantine tombstone this process left behind does not block later writes', async () => {
   const gitDir = tempDir();

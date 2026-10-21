@@ -189,6 +189,10 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
     ['lease reader rejects a deterministic final-component symlink swap', 'Windows symlink creation requires Developer Mode or elevation'],
     ['POSIX lease storage rejects a non-sticky writable git ancestry', 'POSIX ownership/mode checks are not applicable on Windows'],
     [
+      'a lock whose owner record cannot be read back is still released by its creator',
+      'POSIX ownership/mode checks are not applicable on Windows',
+    ],
+    [
       'PathPolicy blocks canonical scope bypasses and hides nested sensitive paths',
       'Windows symlink creation requires Developer Mode or elevation',
     ],
