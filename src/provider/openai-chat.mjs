@@ -8,12 +8,19 @@ export const DEFAULT_ATTEMPT_TIMEOUT_MS = 300_000;
 // provider text: a closed lowercase alphabet with a hard length cap.
 const PROVIDER_FAILURE_REASON = /^[a-z][a-z0-9_]{0,63}$/;
 export const providerFailureReason = (message) => {
-  const slug = String(message ?? '')
+  // Split on non-alphanumeric runs rather than trimming underscores with an
+  // anchored regex, which backtracks polynomially on long separator runs.
+  const words = String(message ?? '')
+    .slice(0, 256)
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .slice(0, 64)
-    .replace(/_+$/, '');
+    .split(/[^a-z0-9]/)
+    .filter(Boolean);
+  let slug = '';
+  for (const word of words) {
+    const next = slug ? `${slug}_${word}` : word;
+    if (next.length > 64) break;
+    slug = next;
+  }
   return PROVIDER_FAILURE_REASON.test(slug) ? slug : undefined;
 };
 export const safeProviderFailureReason = (value) => (typeof value === 'string' && PROVIDER_FAILURE_REASON.test(value) ? value : undefined);
