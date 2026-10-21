@@ -862,12 +862,15 @@ test('client smoke validates a disposable registration lifecycle without touchin
   const executable = join(directory, process.platform === 'win32' ? 'claude.cmd' : 'claude');
   try {
     const fakeClaude =
-      'const fs=require("fs");const path=require("path");const args=process.argv.slice(1);if(args[0]==="--version")process.exit(0);const file=path.join(process.env.CLAUDE_CONFIG_DIR,".claude.json");const current=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,"utf8")):{};current.mcpServers||={};if(args[1]==="add"){const mark=args.indexOf("--");current.mcpServers.offload={type:"stdio",command:args[mark+1],args:args.slice(mark+2),env:{}};}else if(args[1]==="remove"){delete current.mcpServers.offload;}else process.exit(2);fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,JSON.stringify(current));';
+      'const fs=require("fs");const path=require("path");const args=process.argv.slice(2);if(args[0]==="--version")process.exit(0);const file=path.join(process.env.CLAUDE_CONFIG_DIR,".claude.json");const current=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,"utf8")):{};current.mcpServers||={};if(args[1]==="add"){const mark=args.indexOf("--");current.mcpServers.offload={type:"stdio",command:args[mark+1],args:args.slice(mark+2),env:{}};}else if(args[1]==="remove"){delete current.mcpServers.offload;}else process.exit(2);fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,JSON.stringify(current));';
+    const script = join(directory, 'fake-claude.cjs');
+    await writeFile(script, fakeClaude);
+    const shellQuote = (value) => `'${value.replaceAll("'", "'\"'\"'")}'`;
     await writeFile(
       executable,
       process.platform === 'win32'
-        ? `@echo off\r\nnode -e "${fakeClaude.replaceAll('"', '\\"')}" %*\r\n`
-        : `#!/bin/sh\nnode -e '${fakeClaude}' "$@"\n`,
+        ? `@echo off\r\n"${process.execPath}" "%~dp0fake-claude.cjs" %*\r\n`
+        : `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(script)} "$@"\n`,
     );
     if (process.platform !== 'win32') await chmod(executable, 0o755);
     const env = { ...process.env, PATH: `${directory}${delimiter}${process.env.PATH || process.env.Path || ''}` };

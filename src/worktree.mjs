@@ -380,9 +380,10 @@ export function linkPrimaryNodeModules(primaryPath, privateRoot) {
 function workspaceDependencyLink(workspacePath, repoPath) {
   try {
     const link = join(workspacePath, 'node_modules');
+    const target = readlinkSync(link);
     return (
       lstatSync(link).isSymbolicLink() &&
-      readlinkSync(link) === '../node_modules' &&
+      (process.platform === 'win32' ? target.replaceAll('\\', '/') : target) === '../node_modules' &&
       isolatedDependencyReadPaths(workspacePath, repoPath).length === 1
     );
   } catch {

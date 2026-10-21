@@ -884,7 +884,14 @@ const cliEnv = (home, extra = {}) => ({
   ...extra,
 });
 function cli(argv, env) {
-  return spawnSync(process.execPath, ['bin/offload.mjs', ...argv], { cwd: process.cwd(), encoding: 'utf8', env, timeout: 5_000 });
+  // These assertions concern durable CLI results, not process startup speed.
+  // Real Windows Git/Credential Locker I/O can exceed five seconds under CI.
+  return spawnSync(process.execPath, ['bin/offload.mjs', ...argv], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    env,
+    timeout: process.platform === 'win32' ? 15_000 : 5_000,
+  });
 }
 async function pollJob(id, path, env, predicate, attempts = 120) {
   let inspected;
@@ -2216,7 +2223,7 @@ test('cross-process cancel aborts a detached provider request and preserves the 
     await writeMockConfig(home, server);
     const env = cliEnv(home);
     const started = cli(['start', '--task', 'write then wait', '--ownedPaths', '["src/**"]', '--repoPath', path], env);
-    assert.equal(started.status, 0, started.stderr);
+    assert.equal(started.status, 0, JSON.stringify({ stderr: started.stderr, error: started.error?.code, signal: started.signal }));
     const id = JSON.parse(started.stdout).jobId;
     await pollJob(id, path, env, () => server.requests.length >= 2, 80);
     const cancelled = cli(['cancel', id, '--repoPath', path], env);

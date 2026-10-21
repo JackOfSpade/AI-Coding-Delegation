@@ -118,7 +118,7 @@ test('report input allowlist rejects sibling-prefix and directory-symlink escape
       () => copyReportInputs({ inputFiles: [join(sibling, secretName)], workspacePath: workspace, roots: [canonicalRoot] }),
       (error) => {
         assert.match(error.message, /outside the caller scratch\/temp allowlist/);
-        assert.match(error.message, new RegExp(canonicalRoot.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&')));
+        assert.ok(error.message.includes(JSON.stringify(canonicalRoot)), 'the exact canonical allowed root is JSON-quoted');
         assert.doesNotMatch(error.message, new RegExp(secretName.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&')));
         return true;
       },

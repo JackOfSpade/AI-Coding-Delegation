@@ -420,6 +420,7 @@ test('runner bounds a single oversized output chunk without retaining the whole 
 });
 test('required macOS sandbox refuses a failed exact profile before spawning a worker command', async () => {
   let spawned = false;
+  let compiledProfile;
   await assert.rejects(
     () =>
       runCommand('touch should-not-run', {
@@ -428,7 +429,19 @@ test('required macOS sandbox refuses a failed exact profile before spawning a wo
         requireSandbox: true,
         cwd: process.cwd(),
         writablePaths: ['src/**'],
-        sandboxProbe: () => false,
+        compileSandboxProfile(input) {
+          assert.deepEqual(input.writablePaths, ['src/**']);
+          // Native cwd/temp I/O stays on the host. Only this simulated Darwin
+          // profile receives POSIX fixtures, with its real scope preserved.
+          compiledProfile = macosProfile({ ...input, repoPath: '/repo', gitDir: '/repo/.git', tempPath: '/private/tmp/probe' });
+          assert.ok(compiledProfile.includes('(allow file-write* (regex #"^[/]repo[/]src[/].*$"))'));
+          return compiledProfile;
+        },
+        sandboxProbe(platform, profile) {
+          assert.equal(platform, 'darwin');
+          assert.equal(profile, compiledProfile, 'the exact scoped profile must fail its probe');
+          return false;
+        },
         spawnProcess: () => {
           spawned = true;
           throw new Error('must not spawn');
@@ -437,6 +450,11 @@ test('required macOS sandbox refuses a failed exact profile before spawning a wo
     /Required macOS sandbox is unavailable/,
   );
   assert.equal(spawned, false);
+  assert.equal(typeof compiledProfile, 'string');
+  await assert.rejects(
+    runCommand('must not run', { platform: 'darwin', compileSandboxProfile: 'serialized request data' }),
+    /compileSandboxProfile must be a function/,
+  );
 });
 test('required sandbox cannot be bypassed with sandbox:false or a policy-only platform', async () => {
   for (const options of [
@@ -812,7 +830,7 @@ test('the macOS verifier grants exactly one physical per-run temp directory thro
   assert.equal(existedWhileRunning, true);
   assert.equal(existsSync(temp), false, 'the per-run directory is removed when the command ends');
   // The write set is exactly that directory: no /tmp, /private/tmp or /var/folders grant, ever.
-  const writes = [...profile.matchAll(/^\(allow file-write\* \(subpath "([^"]*)"\)\)$/gm)].map((match) => match[1]);
+  const writes = [...profile.matchAll(/^\(allow file-write\* \(subpath "([^"]*)"\)\)$/gm)].map((match) => JSON.parse(`"${match[1]}"`));
   assert.deepEqual(writes, [temp]);
   for (const broad of ['/tmp', '/private/tmp', '/var/folders', '/private/var/folders', await realpath(tmpdir())])
     assert.equal(writes.includes(broad), false, `${broad} is never granted`);
@@ -1005,8 +1023,9 @@ test('the verifier temp probe reports each outcome as a bounded, path-free summa
     note: 'a verifier can create temp dirs under its per-run TMPDIR; a hard-coded /tmp is denied by design',
   });
   assert.equal(call.options.requireSandbox, true, 'the probe goes through the real sandboxed runner');
-  assert.equal(call.options.cwd, '/host/tmp/offload-probe-SCRATCH'.replace('/offload-probe-SCRATCH', '') + '/offload-probe-SCRATCH');
-  assert.deepEqual(writable.removed, ['/host/tmp/offload-probe-SCRATCH'], 'the host scratch directory is removed');
+  const scratch = join('/host/tmp', 'offload-probe-SCRATCH');
+  assert.equal(call.options.cwd, scratch);
+  assert.deepEqual(writable.removed, [scratch], 'the host scratch directory is removed');
   assert.match(call.script, /mktemp -d "\$\{TMPDIR:-\/nonexistent\}\/offload-probe\./);
 
   const denied = await probeWith({ run: async () => probeOutput('tmpdir=denied\nsystem-tmp=denied\ngit-init=failed\n') });
@@ -1055,7 +1074,7 @@ test('the verifier temp probe reports each outcome as a bounded, path-free summa
   assert.doesNotMatch(JSON.stringify(noisy.result), /private|secret/);
 
   for (const { removed } of [denied, regressed, forged, timedOut, unavailable, crashed])
-    assert.deepEqual(removed, ['/host/tmp/offload-probe-SCRATCH'], 'every outcome removes the scratch directory');
+    assert.deepEqual(removed, [scratch], 'every outcome removes the scratch directory');
 });
 
 test('the verifier temp probe reports an unwritable host temp root by error code only, and checks just the host without a macOS sandbox', async () => {
@@ -1087,7 +1106,7 @@ test('the verifier temp probe reports an unwritable host temp root by error code
   assert.equal(linux.result.systemTmp, 'unknown');
   assert.equal(linux.result.gitInit, 'unknown');
   assert.equal(ran, 0);
-  assert.deepEqual(linux.removed, ['/host/tmp/offload-probe-SCRATCH']);
+  assert.deepEqual(linux.removed, [join('/host/tmp', 'offload-probe-SCRATCH')]);
 });
 
 test(

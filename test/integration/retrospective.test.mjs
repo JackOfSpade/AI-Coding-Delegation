@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { JobManager } from '../../src/job-manager.mjs';
 import { createCore } from '../../src/core.mjs';
 import { createRetrospectiveLog, RETROSPECTIVE_FILE, RETROSPECTIVE_LOG_LIMITS } from '../../src/retrospective-log.mjs';
-import { buildRetrospective } from '../../src/retrospective.mjs';
+import { buildRetrospective, storedRecord } from '../../src/retrospective.mjs';
 import { cleanup, makeRepo, tempDir } from '../unit/helpers.mjs';
 
 const SESSION = '2026-10-06T12:00:00.000Z';
@@ -129,7 +129,7 @@ test('Core builds the digest for this session, the named jobs or the newest, and
       session.maintainerPromptSkeleton.includes('The Offload checkout to change is /opt/offload.'),
       'the configured maintainer checkout is named',
     );
-    assert.equal(session.project.repo, repo.split('/').at(-1));
+    assert.equal(session.project.repo, basename(repo));
     assert.ok(!JSON.stringify(session).includes(repo), 'the checkout path never reaches the digest');
 
     const named = await core.retrospective({ repoPath: repo, jobIds: [old, fresh] });
@@ -228,10 +228,17 @@ const record = (n, extra = {}) =>
     maintainerRoot: '/opt/offload',
   });
 
-test('the history is one bounded, private, rotating file that holds the digest and never the skeleton or the brief', () => {
+test('the history holds one private digest file on POSIX and refuses Windows persistence', () => {
   const dir = tempDir('offload-retro-');
   try {
     const log = createRetrospectiveLog({ dir });
+    if (process.platform === 'win32') {
+      log.append(record(1, { task: 'a private brief' }));
+      assert.equal(log.path, null);
+      assert.deepEqual(log.history(), { path: null, records: [], aggregate: { retrospectives: 0, warranted: 0, signals: [] } });
+      assert.deepEqual(readdirSync(dir), [], 'Windows never writes a history with unverified ACL privacy');
+      return;
+    }
     assert.equal(log.path, join(dir, RETROSPECTIVE_FILE));
     assert.deepEqual(log.history().records, [], 'no file yet is an empty history');
     log.append(record(1, { task: 'a private brief' }));
@@ -261,12 +268,18 @@ test('the history is one bounded, private, rotating file that holds the digest a
   }
 });
 
-test('the history rotates once at its size cap, so disk use is bounded however many digests are recorded', () => {
+test('the history rotates once at its size cap on POSIX and stays absent on Windows', () => {
   const dir = tempDir('offload-retro-');
   try {
     const limits = { ...RETROSPECTIVE_LOG_LIMITS, maxBytes: 6 * 1024 };
     const log = createRetrospectiveLog({ dir, limits });
     for (let n = 0; n < 60; n += 1) log.append(record(n));
+    if (process.platform === 'win32') {
+      assert.equal(log.path, null);
+      assert.deepEqual(readdirSync(dir), [], 'neither generation is created on Windows');
+      assert.deepEqual(log.history().records, []);
+      return;
+    }
     const live = statSync(log.path).size,
       rotated = statSync(`${log.path}.1`).size;
     assert.ok(live <= limits.maxBytes && rotated <= limits.maxBytes, `${live} and ${rotated} bytes`);
@@ -285,30 +298,77 @@ test('the history rotates once at its size cap, so disk use is bounded however m
   }
 });
 
+test('Windows private history does no filesystem work, including existing regular files and symlinks', () => {
+  const dir = tempDir('offload-retro-windows-');
+  try {
+    const missing = join(dir, 'missing', 'logs');
+    const absent = createRetrospectiveLog({ dir: missing, platform: 'win32' });
+    absent.append(record(1));
+    assert.equal(absent.path, null);
+    assert.deepEqual(absent.history().records, []);
+    assert.equal(existsSync(join(dir, 'missing')), false, 'not even the parent directory is created');
+    if (process.platform === 'win32') {
+      const override = createRetrospectiveLog({ dir: missing, platform: 'darwin' });
+      override.append(record(1));
+      assert.equal(override.path, null, 'a caller cannot override the actual Windows privacy boundary');
+      assert.equal(existsSync(join(dir, 'missing')), false);
+    }
+
+    const bytes = `${JSON.stringify(storedRecord(record(2)))}\n`;
+    const path = join(dir, RETROSPECTIVE_FILE);
+    writeFileSync(path, bytes);
+    const existing = createRetrospectiveLog({ dir, platform: 'win32' });
+    existing.append(record(3));
+    assert.deepEqual(existing.history().records, [], 'existing valid history is not read');
+    assert.equal(readFileSync(path, 'utf8'), bytes, 'existing history is not appended or rotated');
+    assert.equal(existsSync(`${path}.1`), false);
+
+    const linkedDir = join(dir, 'linked');
+    mkdirSync(linkedDir);
+    for (const suffix of ['', '.1']) symlinkSync(path, join(linkedDir, `${RETROSPECTIVE_FILE}${suffix}`));
+    const linked = createRetrospectiveLog({ dir: linkedDir, platform: 'win32' });
+    linked.append(record(4));
+    assert.equal(linked.path, null);
+    assert.deepEqual(linked.history().records, []);
+    assert.equal(readFileSync(path, 'utf8'), bytes, 'neither live nor rotated symlink is written through');
+    for (const suffix of ['', '.1']) assert.ok(lstatSync(join(linkedDir, `${RETROSPECTIVE_FILE}${suffix}`)).isSymbolicLink());
+  } finally {
+    cleanup(dir);
+  }
+});
+
 test('the history refuses a symlink, skips foreign or tampered lines, re-redacts what it reads, and is off with OFFLOAD_LOG=off', () => {
   const dir = tempDir('offload-retro-');
   try {
     const target = join(dir, 'elsewhere.txt');
     writeFileSync(target, 'untouched\n');
     const linked = createRetrospectiveLog({ dir });
-    symlinkSync(target, linked.path);
+    const linkedPath = join(dir, RETROSPECTIVE_FILE);
+    symlinkSync(target, linkedPath);
     linked.append(record(1));
     assert.equal(readFileSync(target, 'utf8'), 'untouched\n', 'a symlinked history is never written through');
     assert.deepEqual(linked.history().records, [], 'nor read');
-    assert.ok(lstatSync(linked.path).isSymbolicLink());
+    assert.ok(lstatSync(linkedPath).isSymbolicLink());
 
     const clean = tempDir('offload-retro-');
     try {
       const log = createRetrospectiveLog({ dir: clean });
       log.append(record(7));
-      const good = JSON.parse(readFileSync(log.path, 'utf8'));
+      const historyPath = join(clean, RETROSPECTIVE_FILE);
+      const good = process.platform === 'win32' ? storedRecord(record(7)) : JSON.parse(readFileSync(log.path, 'utf8'));
       const tampered = { ...good, reasons: ['token=hunter2hunter2 in /Users/jane.doe/work'], extra: 'dropped' };
-      writeFileSync(log.path, ['not json', '{"v":9}', JSON.stringify(tampered), '[1]', ''].join('\n'));
-      chmodSync(log.path, 0o600);
-      const [only, ...rest] = log.history().records;
-      assert.equal(rest.length, 0);
-      assert.ok(!JSON.stringify(only).includes('hunter2hunter2') && !JSON.stringify(only).includes('jane.doe'));
-      assert.equal(only.extra, undefined);
+      const bytes = ['not json', '{"v":9}', JSON.stringify(tampered), '[1]', ''].join('\n');
+      writeFileSync(historyPath, bytes);
+      if (process.platform === 'win32') {
+        assert.deepEqual(log.history().records, [], 'foreign and valid lines alike remain unread on Windows');
+        assert.equal(readFileSync(historyPath, 'utf8'), bytes);
+      } else {
+        chmodSync(log.path, 0o600);
+        const [only, ...rest] = log.history().records;
+        assert.equal(rest.length, 0);
+        assert.ok(!JSON.stringify(only).includes('hunter2hunter2') && !JSON.stringify(only).includes('jane.doe'));
+        assert.equal(only.extra, undefined);
+      }
 
       const off = createRetrospectiveLog({ dir: join(clean, 'off'), env: { OFFLOAD_LOG: 'off' } });
       off.append(record(8));

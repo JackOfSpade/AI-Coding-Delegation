@@ -62,6 +62,8 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
       'MCP e2e: a new server session lists only its own jobs, all:true reaches the old ones, and spend is cumulative',
       'MCP e2e: the turn cap is sized from file size, a line range reaches the worker as an offset, and the worker sees the dirty snapshot',
       'MCP e2e: a looping worker FAILS with its last failing call, the log is bounded by tail and limit, and offload_continue resumes it',
+      'MCP e2e: finish in a turn with other calls runs none of them, is corrected once, and the job still succeeds',
+      'MCP e2e: a repeated finish-protocol violation FAILS with its own kind, keeps the work, and offload_continue tells the worker to call finish alone',
       'MCP e2e: a job that FAILED the finish protocol after correct work is applied through offload_apply (dry run first) and reverted by offload_revert',
       'MCP e2e: a stalled provider request raises one advisory, polls collapse to unchanged, and the terminal report splits the wall clock',
       'MCP e2e: a turn-cap BUDGET stop names the cap, keeps the work, and offload_continue raises only that cap',
@@ -130,7 +132,14 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
       'POSIX process-group semantics are tested separately from Windows taskkill tree termination',
     ],
     ['snapshot patch carries binary blobs, executable modes and symlinks when supported', ''],
-    ['worktree materialization neither runs repository filters nor inherits provider credentials', ''],
+    [
+      'a glob entry is never statted, even when a file with that literal name exists',
+      'Windows cannot create wildcard-containing filenames',
+    ],
+    [
+      'grep accepts one authorized regular file while retaining directory, deny-list, and symlink safeguards',
+      'Windows symlink creation requires Developer Mode or elevation',
+    ],
     ['literal Git pathspecs preserve a POSIX backslash filename', 'backslash is a Windows separator, not a portable filename byte'],
     [
       'NUL name-status preserves literal unusual filenames without diff-header parsing',

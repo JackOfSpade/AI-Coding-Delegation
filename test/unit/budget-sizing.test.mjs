@@ -240,14 +240,20 @@ test('a plain relevantPaths entry is a whole-file read hint and widens a range i
   ]);
 });
 
-test('a glob entry is never statted, even when a file with that literal name exists', { skip: process.platform === 'win32' }, async () => {
-  const { dir, policy } = await repo();
-  await writeFile(path.join(dir, 'g*.js'), 'literal twin');
-  await writeFile(path.join(dir, 'h[1].js'), 'literal twin');
-  await writeFile(path.join(dir, 'plain.js'), 'x');
-  const files = await measureFiles({ policy, relevantPaths: ['g*.js', 'h[1].js', 'plain.js'], ownedPaths: ['g*.js'] });
-  assert.deepEqual(files, [{ path: 'plain.js', bytes: 1 }]);
-});
+test(
+  'a glob entry is never statted, even when a file with that literal name exists',
+  {
+    skip: process.platform === 'win32' && 'Windows cannot create wildcard-containing filenames',
+  },
+  async () => {
+    const { dir, policy } = await repo();
+    await writeFile(path.join(dir, 'g*.js'), 'literal twin');
+    await writeFile(path.join(dir, 'h[1].js'), 'literal twin');
+    await writeFile(path.join(dir, 'plain.js'), 'x');
+    const files = await measureFiles({ policy, relevantPaths: ['g*.js', 'h[1].js', 'plain.js'], ownedPaths: ['g*.js'] });
+    assert.deepEqual(files, [{ path: 'plain.js', bytes: 1 }]);
+  },
+);
 
 test('buildBudgetSizing and safeBudgetSizing keep only bounded, allow-listed arithmetic', () => {
   const resolved = resolveTurnBudget({ requested: 30, configured: 80, recommended: 54, readTurns: 31 });

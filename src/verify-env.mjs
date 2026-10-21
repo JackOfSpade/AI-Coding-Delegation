@@ -1,5 +1,5 @@
 import { realpathSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { posix, win32 } from 'node:path';
 import { matchesAny } from './glob.mjs';
 import { TSX_LOADER_FIX } from './verifier-command.mjs';
 
@@ -96,17 +96,22 @@ const interpreterDetail = (path) =>
 
 // The first absolute path named on a permission-error line, quoted or bare.
 function permissionPath(line) {
-  const quoted = line.match(/['"`](\/[^'"`\n]+)['"`]/);
+  const quoted = line.match(/['"`]((?:[A-Za-z]:[/\\]|\\\\|\/)[^'"`\n]+)['"`]/);
   if (quoted) return quoted[1];
-  const bare = line.match(/(?:^|[\s:(])(\/[^\s'"`:,)]+)/);
+  const bare = line.match(/(?:^|[\s:(])((?:[A-Za-z]:[/\\]|\\\\|\/)[^\s'"`:,)]+)/);
   return bare ? bare[1] : undefined;
 }
+
+// A diagnostic can name either platform's absolute path, regardless of the
+// host running the verifier. Do not turn a Windows drive or UNC prefix into a
+// relative POSIX filename, or treat slash-prefixed POSIX paths as drive-local.
+const pathApi = (path) => (/^(?:[A-Za-z]:[/\\]|\\\\)/.test(path) ? win32 : posix);
 
 // Error text may spell the worktree through either its symlinked or canonical
 // form (macOS temp roots are symlinks).
 function workspaceRoots(workspacePath) {
-  if (typeof workspacePath !== 'string' || !isAbsolute(workspacePath)) return [];
-  const roots = [resolve(workspacePath)];
+  if (typeof workspacePath !== 'string' || !pathApi(workspacePath).isAbsolute(workspacePath)) return [];
+  const roots = [pathApi(workspacePath).resolve(workspacePath)];
   try {
     roots.push(realpathSync(workspacePath));
   } catch {
@@ -117,6 +122,7 @@ function workspaceRoots(workspacePath) {
 
 // The same file, spelled as printed and as the filesystem names it.
 function spellings(path) {
+  const { basename, dirname, join } = pathApi(path);
   const found = [path];
   let probe = path,
     tail = '';
@@ -201,11 +207,13 @@ export function classifyVerifierEnvironment(verify, { workspacePath, writeScope 
     let insideWorkspace = false;
     search: for (const candidate of spellings(path)) {
       for (const root of roots) {
-        const rel = relative(root, candidate);
-        if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) continue;
+        const paths = pathApi(root);
+        if (pathApi(candidate) !== paths) continue;
+        const rel = paths.relative(root, candidate);
+        if (rel === '' || rel.startsWith('..') || paths.isAbsolute(rel)) continue;
         insideWorkspace = true;
         try {
-          ownedByWorker = matchesAny(rel.split(sep).join('/'), writeScope);
+          ownedByWorker = matchesAny(rel.split(paths.sep).join('/'), writeScope, { platform: paths === win32 ? 'win32' : 'linux' });
         } catch {
           ownedByWorker = false;
         }

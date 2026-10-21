@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, readdir, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { JobStore } from '../../src/store.mjs';
 import { JobManager, validateJobId, validateJobRequest } from '../../src/job-manager.mjs';
@@ -778,7 +778,8 @@ test('an isolated verifier is granted only the primary node_modules read root, a
       assert.equal(workerSawLink, withDependencies);
       const parent = verifierOptions.readablePaths[0];
       assert.equal(verifierOptions.readablePaths.length, withDependencies ? 2 : 1);
-      if (withDependencies) assert.equal(verifierOptions.readablePaths[1], await realpath(join(repo, 'node_modules')));
+      if (withDependencies)
+        assert.equal(realpathSync.native(verifierOptions.readablePaths[1]), realpathSync.native(join(repo, 'node_modules')));
       assert.match(parent, /offload-worktree-/);
     } finally {
       cleanup(repo);
@@ -957,7 +958,7 @@ test('report input rejection is actionable but creates no durable job or private
       () => m.start({ mode: 'report', task: 'analyze input 01', inputFiles: [input], repoPath: repo }),
       (error) => {
         assert.match(error.message, /outside the caller scratch\/temp allowlist/);
-        assert.match(error.message, new RegExp(canonicalRoot.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&')));
+        assert.ok(error.message.includes(JSON.stringify(canonicalRoot)), 'the exact canonical allowed root is JSON-quoted');
         assert.doesNotMatch(error.message, new RegExp(secretName.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&')));
         return true;
       },
@@ -1532,7 +1533,7 @@ test('manual repair clears an old cleanup marker so a replacement workspace is r
       },
     });
     const started = await m.start({ task: 'repair cleanup marker', ownedPaths: ['src/**'], repoPath: repo });
-    assert.equal((await m.wait(started.jobId, { timeoutSec: 2 })).status, 'FAILED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'FAILED');
     const failed = await m.store.get(started.jobId);
     assert.ok(failed.workspaceCleanedAt);
     await m.repair(started.jobId, ['continue'], { launch: false });
