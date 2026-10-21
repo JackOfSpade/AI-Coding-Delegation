@@ -20,7 +20,7 @@ import { Runner } from '../../src/runner.mjs';
 import { mkdtemp, access, mkdir, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, posix, win32 } from 'node:path';
 import { createIsolatedWorktree, snapshotPrimaryWorkingTree } from '../../src/worktree.mjs';
 import { isolatedWorkspaceReadablePaths } from '../../src/core.mjs';
 import { cleanup as removeTree, git as runGit, makeRepo } from '../unit/helpers.mjs';
@@ -803,14 +803,46 @@ function fakeChild() {
 }
 const COMMAND_LINE_TOOLS = '/Library/Developer/CommandLineTools';
 
+function darwinTempFixtureProfile(input) {
+  // The simulated Darwin profile uses POSIX paths; its fake child still uses
+  // native host temp I/O. Preserve each disposable directory's unique basename.
+  const windowsInput = win32.isAbsolute(input.tempPath) && !posix.isAbsolute(input.tempPath);
+  const tempPath = windowsInput ? posix.join('/private/tmp', win32.basename(input.tempPath)) : input.tempPath;
+  const profile = macosProfile(
+    windowsInput ? { ...input, repoPath: '/fixture/workspace', gitDir: '/fixture/workspace/.git', tempPath } : input,
+  );
+  return { profile, tempPath };
+}
+const profileWriteRoots = (profile) =>
+  [...profile.matchAll(/^\(allow file-write\* \(subpath "([^"]*)"\)\)$/gm)].map((match) => JSON.parse(`"${match[1]}"`));
+
+test('simulated Darwin temp profiles map Windows I/O to one unique POSIX write root', () => {
+  for (const name of ['offload-sandbox-ONE', 'offload-sandbox-TWO']) {
+    const tempPath = win32.join('C:\\Users\\runneradmin\\AppData\\Local\\Temp', name);
+    const input = { repoPath: 'D:\\work\\checkout', tempPath };
+    const mapped = darwinTempFixtureProfile(input);
+    assert.equal(mapped.tempPath, `/private/tmp/${name}`);
+    assert.deepEqual(profileWriteRoots(mapped.profile), [mapped.tempPath]);
+    assert.equal(input.tempPath, tempPath, 'mapping never changes native I/O input');
+    for (const broad of ['/tmp', '/private/tmp', '/var/folders', '/private/var/folders', win32.dirname(tempPath)])
+      assert.equal(profileWriteRoots(mapped.profile).includes(broad), false, `${broad} is never granted`);
+  }
+});
+
 test('the macOS verifier grants exactly one physical per-run temp directory through TMPDIR, TMP, TEMP and HOME', async () => {
   const child = fakeChild();
   let environment;
   let profile;
+  let profileTemp;
   let existedWhileRunning;
   await runCommand('true', {
     platform: 'darwin',
     sandboxProbe: () => true,
+    compileSandboxProfile(input) {
+      const compiled = darwinTempFixtureProfile(input);
+      profileTemp = compiled.tempPath;
+      return compiled.profile;
+    },
     cwd: tmpdir(),
     env: { PATH: '/bin', TMPDIR: '/caller/tmp', DEVELOPER_DIR: '/caller/evil', GIT_CONFIG_GLOBAL: '/caller/evil.cfg' },
     spawnProcess(_command, args, options) {
@@ -830,8 +862,9 @@ test('the macOS verifier grants exactly one physical per-run temp directory thro
   assert.equal(existedWhileRunning, true);
   assert.equal(existsSync(temp), false, 'the per-run directory is removed when the command ends');
   // The write set is exactly that directory: no /tmp, /private/tmp or /var/folders grant, ever.
-  const writes = [...profile.matchAll(/^\(allow file-write\* \(subpath "([^"]*)"\)\)$/gm)].map((match) => JSON.parse(`"${match[1]}"`));
-  assert.deepEqual(writes, [temp]);
+  const writes = profileWriteRoots(profile);
+  assert.deepEqual(writes, [profileTemp]);
+  if (process.platform !== 'win32') assert.equal(profileTemp, temp, 'native macOS grants its actual physical temp path');
   for (const broad of ['/tmp', '/private/tmp', '/var/folders', '/private/var/folders', await realpath(tmpdir())])
     assert.equal(writes.includes(broad), false, `${broad} is never granted`);
   // Caller-chosen values never survive the scrub.
