@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, readdir, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, realpathSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { JobStore } from '../../src/store.mjs';
 import { JobManager, validateJobId, validateJobRequest } from '../../src/job-manager.mjs';
@@ -10,6 +10,8 @@ import { terminalStatuses } from '../../src/report.mjs';
 import { gitPatchApplier, gitSnapshots } from '../../src/core.mjs';
 import { createIsolatedWorktree, openIsolatedWorktree, cleanupIsolatedWorktree } from '../../src/worktree.mjs';
 import { cleanup, git, makeRepo, write } from '../unit/helpers.mjs';
+import { OpenAIChatProvider } from '../../src/provider/openai-chat.mjs';
+import { createMockOpenAIServer } from '../mock-openai-server.mjs';
 
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 const gitId = 'a'.repeat(40),
@@ -2814,7 +2816,9 @@ test('recovery uses injected time and authoritative snapshot file names', async 
     head: gitId,
     before: gitId,
     status: 'RUNNING',
-    runnerPid: process.pid,
+    // A live owner in another process (this process's own pid with no task
+    // running here is an orphan, which recovery does take).
+    runnerPid: process.ppid,
     runnerHeartbeatAt: now.toISOString(),
   });
   const m = new JobManager({
@@ -3092,4 +3096,258 @@ test('continuation note limits accept 3600 characters and reject 3601 before dis
     assert.match(skill, /offload_continue\.note.*3,600 characters/);
     assert.match(skill, /maxLength: 3600/);
   }
+});
+
+/** A non-isolated manager with its own store, as `manager()` builds, plus config and timers. */
+async function plainManager(worker, { config = {}, now, setTimeoutFn, store } = {}) {
+  const gitDir = await mkdtemp(`${tmpdir()}/offload-jobs-`);
+  return new JobManager({
+    store: store ?? new JobStore({ gitDir, ...(now ? { now } : {}) }),
+    worker,
+    runner: { verify: async (command) => ({ command, verdict: 'PASS', result: { code: 0, sandbox: 'macos' } }) },
+    snapshots: { create: async () => gitId, diff: async () => 'patch', files: async () => [] },
+    ...(now ? { now } : {}),
+    ...(setTimeoutFn ? { setTimeoutFn } : {}),
+    config: { repoPath: process.cwd(), git: { branch: async () => 'main', head: async () => gitId }, ...config },
+  });
+}
+const eventTypes = async (m, id) =>
+  (await m.store.readArtifact(id, 'events.jsonl'))
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line).type);
+
+test('offload_cancel interrupts an in-flight provider request whose body hangs, and the job is CANCELLED within seconds', async (t) => {
+  let server;
+  try {
+    server = await createMockOpenAIServer([
+      { chunks: [{ choices: [{ delta: { content: 'partial' } }] }, { choices: [{ delta: {} }] }], hangAfterChunks: 1 },
+    ]);
+  } catch (error) {
+    if (error?.code === 'EPERM') return t.skip('loopback networking is unavailable in this sandbox');
+    throw error;
+  }
+  try {
+    const m = await plainManager({
+      run: async (_job, { signal }) => {
+        // The provider's own per-attempt limit is far away: only the cancel can end this.
+        const provider = new OpenAIChatProvider({ baseUrl: server.baseUrl, model: 'mock', timeoutMs: 300_000, retries: 0 });
+        for await (const _ of provider.chat({ messages: [], tools: [], signal })) {
+        }
+        return { status: 'DONE' };
+      },
+    });
+    const job = await m.start({ task: 'x', ownedPaths: ['src/**'], repoPath: process.cwd() });
+    // The request is in flight once the server has it (its body then hangs).
+    for (let waited = 0; !server.requests.length && waited < 5_000; waited += 10) await pause(10);
+    assert.equal(server.requests.length, 1);
+    await pause(50);
+    const started = Date.now();
+    const reply = await m.cancel(job.jobId);
+    // Either still pending (and flagged), or the abort already finished it.
+    assert.ok(reply.cancelRequested === true || reply.status === 'CANCELLED', JSON.stringify(reply.status));
+    const done = await m.wait(job.jobId, { timeoutSec: 10 });
+    assert.equal(done.status, 'CANCELLED');
+    assert.ok(Date.now() - started < 5_000, 'the request was aborted, not waited out');
+    assert.ok((await eventTypes(m, job.jobId)).includes('cancel_requested'), 'the cancel is in the job log');
+  } finally {
+    await server.close();
+  }
+});
+
+test('the wall-clock watchdog ends a round that cannot stop itself as TIMEOUT', async () => {
+  let observedReason;
+  const m = await plainManager(
+    {
+      // A round stuck on an await it does not time out itself: only an abort ends it.
+      run: async (_job, { signal }) => {
+        await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+        observedReason = signal.reason;
+        return { status: 'DONE' };
+      },
+    },
+    // limits.timeoutMinutes has a one-minute floor; compress the watchdog's delay for the test.
+    { setTimeoutFn: (fn, ms, ...rest) => setTimeout(fn, ms >= 60_000 ? 20 : ms, ...rest) },
+  );
+  const job = await m.start({ task: 'x', ownedPaths: ['src/**'], repoPath: process.cwd(), budget: { timeoutMinutes: 1 } });
+  const done = await m.wait(job.jobId, { timeoutSec: 10 });
+  assert.equal(done.status, 'TIMEOUT');
+  assert.equal(observedReason?.code, 'OFFLOAD_WALL_TIMEOUT');
+  assert.ok((await eventTypes(m, job.jobId)).includes('watchdog'));
+});
+
+test("a RUNNING round this process claimed but no task owns is finalized; another manager's live round is not", async () => {
+  let clock = Date.parse('2026-10-21T04:00:00.000Z');
+  const now = () => new Date(clock);
+  const gitDir = await mkdtemp(`${tmpdir()}/offload-orphan-`);
+  const store = new JobStore({ gitDir, now });
+  const orphan = (extra = {}) =>
+    store.create({
+      repoPath: process.cwd(),
+      task: 'orphan',
+      ownedPaths: ['src/**'],
+      branch: 'main',
+      head: gitId,
+      before: gitId,
+      status: 'RUNNING',
+      handoffState: 'RUNNING',
+      runnerPid: process.pid,
+      runnerHeartbeatAt: now().toISOString(),
+      ...extra,
+    });
+  let release;
+  const blocked = new Promise((resolve) => (release = resolve));
+  const owner = await plainManager({ run: async () => (await blocked, { status: 'DONE' }) }, { store, now });
+  const recoverer = await plainManager({ run: async () => ({ status: 'DONE' }) }, { store, now });
+  try {
+    const silent = await orphan();
+    const cancelled = await orphan();
+    // A cancel that reached the marker while no task was left to consume it.
+    await store.requestCancel(cancelled.id);
+    const live = await owner.start({ task: 'live', ownedPaths: ['lib/**'], repoPath: process.cwd() });
+    // Within the grace period nothing is touched.
+    assert.equal((await recoverer.wait(silent.id, { timeoutSec: 0 })).status, 'RUNNING');
+    clock += 61_000;
+    const failed = await recoverer.wait(silent.id, { timeoutSec: 0 });
+    assert.equal(failed.status, 'FAILED');
+    assert.match(failed.report, /worker round ended without publishing a terminal status/);
+    // Each call settles only its own job; this one's pending cancel is honoured.
+    assert.equal((await store.get(cancelled.id)).status, 'RUNNING');
+    assert.equal((await recoverer.job(cancelled.id)).status, 'CANCELLED');
+    // offload_cancel itself finishes an orphan it finds.
+    const later = await orphan();
+    clock += 61_000;
+    const reply = await recoverer.cancel(later.id);
+    assert.equal(reply.status, 'CANCELLED', 'a cancel of an orphaned round finishes it at once');
+    // The live round is owned by a task in this process, in another manager.
+    assert.equal((await store.get(live.jobId)).status, 'RUNNING');
+    release();
+    assert.equal((await owner.wait(live.jobId, { timeoutSec: 10 })).status, 'DONE_UNVERIFIED', 'it finished on its own terms');
+  } finally {
+    release();
+  }
+});
+
+test('offload_wait and offload_job show a pending cancel and how long ago it was requested', async () => {
+  let release;
+  const released = new Promise((resolve) => (release = resolve));
+  // Ignores the abort until released, so the cancel stays pending.
+  const m = await plainManager({ run: async () => (await released, { status: 'DONE' }) });
+  try {
+    const job = await m.start({ task: 'x', ownedPaths: ['src/**'], repoPath: process.cwd() });
+    const before = await m.wait(job.jobId, { timeoutSec: 0 });
+    assert.equal(before.progress.cancelRequested, undefined);
+    const reply = await m.cancel(job.jobId);
+    assert.equal(reply.status, 'RUNNING');
+    assert.equal(reply.cancelRequested, true);
+    assert.equal(typeof reply.cancelRequestedAt, 'string');
+    assert.ok(reply.cancelRequestedSec >= 0);
+    const waiting = await m.wait(job.jobId, { timeoutSec: 0 });
+    assert.equal(waiting.unchanged, undefined, 'a new cancel is a change, not the unchanged marker');
+    assert.equal(waiting.progress.cancelRequested, true);
+    assert.ok(Number.isInteger(waiting.progress.cancelRequestedSec));
+    const again = await m.wait(job.jobId, { timeoutSec: 0 });
+    assert.equal(again.unchanged, true);
+    assert.equal(again.progress.cancelRequested, true, 'the compact marker still says so');
+    const summary = await m.job(job.jobId);
+    assert.equal(summary.cancelRequested, true);
+    release();
+    const done = await m.wait(job.jobId, { timeoutSec: 10 });
+    assert.equal(done.status, 'CANCELLED');
+    assert.equal(done.cancelRequested, undefined, 'a finished job has no pending cancel');
+  } finally {
+    release();
+  }
+});
+
+test('an orphan whose worktree its own task removed is finished as CANCELLED, with nothing claimed retained', async () => {
+  let clock = Date.parse('2026-10-21T04:00:00.000Z');
+  const now = () => new Date(clock);
+  const gitDir = await mkdtemp(`${tmpdir()}/offload-orphan-iso-`);
+  const store = new JobStore({ gitDir, now });
+  const m = await plainManager(
+    { run: async () => ({ status: 'DONE' }) },
+    { store, now, config: { isolation: { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree } } },
+  );
+  const job = await store.create({
+    repoPath: process.cwd(),
+    task: 'orphan',
+    ownedPaths: ['src/**'],
+    branch: 'main',
+    head: gitId,
+    before: gitId,
+    status: 'RUNNING',
+    handoffState: 'RUNNING',
+    runnerPid: process.pid,
+    workspacePath: join(gitDir, 'offload-worktree-gone', 'workspace'),
+    workspaceBaseline: gitId,
+    workspaceSeed: gitId,
+    primaryIndexBefore: gitId,
+  });
+  clock += 61_000;
+  const reply = await m.cancel(job.id);
+  const stored = await store.get(job.id);
+  assert.equal(reply.status, 'CANCELLED', `${stored.error} | ${stored.workspaceCleanupError}`);
+  assert.equal(stored.workspaceRetained, undefined, 'no worktree is left to capture');
+  assert.equal(stored.error, undefined);
+});
+
+test('a queued round this process claimed locally is an orphan too; a parent-to-child handoff is not', async () => {
+  let clock = Date.parse('2026-10-21T04:00:00.000Z');
+  const now = () => new Date(clock);
+  const gitDir = await mkdtemp(`${tmpdir()}/offload-orphan-queued-`);
+  const store = new JobStore({ gitDir, now });
+  const m = await plainManager({ run: async () => ({ status: 'DONE' }) }, { store, now });
+  const record = (extra) =>
+    store.create({
+      repoPath: process.cwd(),
+      task: 'q',
+      ownedPaths: ['src/**'],
+      branch: 'main',
+      head: gitId,
+      before: gitId,
+      runnerPid: process.pid,
+      ...extra,
+    });
+  const repair = await record({ status: 'REPAIR_QUEUED', handoffState: 'LOCAL' });
+  const local = await record({ status: 'QUEUED', handoffState: 'LOCAL' });
+  const handoff = await record({ status: 'QUEUED', handoffState: 'PARENT_QUEUED' });
+  clock += 61_000;
+  assert.equal((await m.job(repair.id)).status, 'FAILED');
+  assert.equal((await m.job(local.id)).status, 'FAILED');
+  assert.equal((await m.job(handoff.id)).status, 'QUEUED', "a detached child's to run");
+});
+
+test("offload_wait stays bounded when another live process holds an orphan's job lock", async () => {
+  let clock = Date.parse('2026-10-21T04:00:00.000Z');
+  const now = () => new Date(clock);
+  const gitDir = await mkdtemp(`${tmpdir()}/offload-orphan-wedged-`);
+  const store = new JobStore({ gitDir, now });
+  const m = await plainManager({ run: async () => ({ status: 'DONE' }) }, { store, now });
+  const job = await store.create({
+    repoPath: process.cwd(),
+    task: 'wedged',
+    ownedPaths: ['src/**'],
+    branch: 'main',
+    head: gitId,
+    before: gitId,
+    status: 'RUNNING',
+    handoffState: 'RUNNING',
+    runnerPid: process.pid,
+  });
+  const lock = join(gitDir, 'offload', 'jobs', job.id, '.publication-lock');
+  write(lock, JSON.stringify({ pid: process.ppid, token: 'other-live-process' }));
+  clock += 61_000;
+  const started = Date.now();
+  const waited = await m.wait(job.id, { timeoutSec: 0 });
+  assert.ok(Date.now() - started < 10_000, `took ${Date.now() - started} ms`);
+  assert.equal(waited.status, 'RUNNING', 'reported as it stands while recovery waits for the lock');
+  // Once the other process lets go, the background settle finishes it.
+  rmSync(lock, { force: true });
+  let status;
+  for (let waitedMs = 0; waitedMs < 10_000 && status !== 'FAILED'; waitedMs += 50) {
+    await pause(50);
+    status = (await store.get(job.id)).status;
+  }
+  assert.equal(status, 'FAILED');
 });

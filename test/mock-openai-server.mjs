@@ -39,6 +39,10 @@ export async function createMockOpenAIServer(scripts = []) {
     for (const chunk of script.chunks ?? []) {
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       index++;
+      // `hangAfterChunks` never finishes the body: the response stays open until
+      // the client gives up (unlike `stallAfterChunks`, whose `stallMs` also
+      // delays the headers).
+      if (script.hangAfterChunks === index) return await new Promise((resolve) => res.on('close', resolve));
       if (script.stallAfterChunks === index) await wait(script.stallMs ?? 60_000, res);
       else if (script.delayMs) await wait(script.delayMs, res);
     }

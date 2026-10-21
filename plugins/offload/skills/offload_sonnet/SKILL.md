@@ -82,7 +82,7 @@ Use `mode: "report"` only for bounded read-and-report work whose external data i
 ## 3. Run
 
 - Start independent packages together; start dependent packages after prerequisites are accepted. Every `offload_start` must include the command-selected profile (`sonnet` or `opus`) and omit `effort`. Keep that profile for every package in the invocation. Do not substitute a model name in this field.
-- Wait until each returns a final report. `offload_cancel` is an idempotent durable request, not proof that a separately owned detached worker has already stopped; after cancelling, call `offload_wait` or `offload_job` until terminal `CANCELLED` before reusing its scope.
+- Wait until each returns a final report. `offload_cancel` is an idempotent durable request, not proof that a separately owned detached worker has already stopped; after cancelling, call `offload_wait` or `offload_job` until terminal `CANCELLED` before reusing its scope. Until then its replies carry `cancelRequested: true` with `cancelRequestedSec` (in `offload_wait`'s `progress`, top-level in `offload_cancel` and `offload_job`); a round whose owner task in this server is gone is finished by the next call, and a round past `limits.timeoutMinutes` is stopped as `TIMEOUT` even if it cannot stop itself.
 - While workers run you may read, plan and review finished packages. Do not edit under any running package's `ownedPaths`; integration will refuse a primary-path/index/branch/HEAD conflict rather than overwrite it.
 
 ## 4. Review (you, every time)

@@ -441,3 +441,76 @@ test('invalid Anthropic cache counters fail closed', async () => {
     }, /cache usage/);
   }
 });
+
+/** A 200 response whose SSE body sends one event and then never ends, until its request is aborted. */
+const hangingFetch =
+  (counter) =>
+  async (_url, { signal }) => {
+    counter.fetches += 1;
+    const encoder = new TextEncoder();
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify({ type: 'message_start', message: { usage: { input_tokens: 1 } } })}\n\n`),
+        );
+        signal.addEventListener('abort', () => controller.error(signal.reason ?? new Error('aborted')), { once: true });
+      },
+    });
+    return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  };
+const drain = async (provider, options = {}) => {
+  for await (const _ of provider.chat({ messages: [{ role: 'user', content: 'x' }], tools: [], ...options })) {
+  }
+};
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+test('Anthropic: a response body that hangs mid-stream ends at attemptTimeoutMs as attempt_timeout', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const counter = { fetches: 0 };
+  const provider = new AnthropicMessagesProvider({
+    baseUrl: 'https://api.anthropic.com',
+    apiKey: 'test-key',
+    model: 'claude-sonnet-5-5',
+    timeoutMs: 300_000,
+    retries: 0,
+    fetchImpl: hangingFetch(counter),
+  });
+  let outcome;
+  const pending = drain(provider).then(
+    () => (outcome = 'resolved'),
+    (error) => (outcome = error),
+  );
+  for (let index = 0; index < 5; index += 1) await settle();
+  assert.equal(counter.fetches, 1);
+  t.mock.timers.tick(299_999);
+  for (let index = 0; index < 5; index += 1) await settle();
+  assert.equal(outcome, undefined, 'still within the attempt limit');
+  t.mock.timers.tick(1);
+  await pending;
+  assert.ok(outcome instanceof ProviderError, String(outcome));
+  assert.equal(outcome.kind, 'attempt_timeout');
+  assert.equal(outcome.timeoutMs, 300_000);
+  assert.equal(outcome.attempts, 1);
+});
+
+test('Anthropic: an already-aborted signal sends no request, and a cancel mid-stream ends it at once', async () => {
+  const counter = { fetches: 0 };
+  const provider = new AnthropicMessagesProvider({
+    baseUrl: 'https://api.anthropic.com',
+    apiKey: 'test-key',
+    model: 'claude-sonnet-5-5',
+    timeoutMs: 300_000,
+    retries: 3,
+    fetchImpl: hangingFetch(counter),
+  });
+  const cancelled = new Error('job cancelled');
+  await assert.rejects(drain(provider, { signal: AbortSignal.abort(cancelled) }), (error) => error === cancelled);
+  assert.equal(counter.fetches, 0, 'nothing was sent after the cancel');
+  const controller = new AbortController();
+  const started = Date.now();
+  const pending = drain(provider, { signal: controller.signal });
+  setTimeout(() => controller.abort(cancelled), 50);
+  await assert.rejects(pending, (error) => error === cancelled, 'the cancel, not a retry or a timeout, ends the request');
+  assert.ok(Date.now() - started < 2_000);
+  assert.equal(counter.fetches, 1, 'a cancel is never retried');
+});

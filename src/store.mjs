@@ -27,6 +27,13 @@ const PUBLICATION_ARTIFACTS = new Set(['patch.diff', 'revert.diff', 'report.md']
 const LOCK_STALE_MS = 120_000;
 const LOCK_WAIT_MS = 25;
 const LOCK_TIMEOUT_MS = 120_000;
+// Every publication-lock token an in-flight #withJobLock call of this process
+// owns, shared by all JobStore instances. Tokens are random UUIDs, so they need
+// no path key. A lock file (or quarantine tombstone) naming this pid with a
+// token absent here was left behind by a call that already returned (or by an
+// earlier process that had this pid): no one in this process can ever release
+// it, so it is reclaimed at once instead of blocking every later write.
+const HELD_PUBLICATION_TOKENS = new Set();
 const WINDOWS_RENAME_ATTEMPTS = 8;
 const validId = validJobId;
 const lifecycleIdentity = (job) => ({
@@ -545,6 +552,14 @@ export class JobStore {
     const request = await readStoredFile(join(await this.#assertJobDirectory(id), 'cancel.request'), MAX_JOB_BYTES, null);
     return request !== null;
   }
+  /** When cancellation was first requested (the marker's own timestamp), or null. */
+  async cancelRequestedAt(id) {
+    await this.init();
+    const request = await readStoredFile(join(await this.#assertJobDirectory(id), 'cancel.request'), 256, null);
+    if (request === null) return null;
+    const at = Date.parse(request.trim());
+    return Number.isFinite(at) ? new Date(at).toISOString() : null;
+  }
   async clearCancel(id) {
     await this.init();
     await rm(join(await this.#assertJobDirectory(id), 'cancel.request'), { force: true });
@@ -1029,6 +1044,17 @@ export class JobStore {
     const lock = join(directory, '.publication-lock');
     const token = randomUUID();
     const deadline = Date.now() + LOCK_TIMEOUT_MS;
+    // Registered before the O_EXCL create, so the file can never name a token
+    // this process does not hold yet.
+    HELD_PUBLICATION_TOKENS.add(token);
+    try {
+      return await this.#lockedAction(lock, directory, token, deadline, action);
+    } finally {
+      HELD_PUBLICATION_TOKENS.delete(token);
+    }
+  }
+  async #lockedAction(lock, directory, token, deadline, action) {
+    let ownIdentity;
     for (;;) {
       if (await this.#publicationTombstonePending(directory)) {
         if (Date.now() >= deadline) throw new Error('job publication lock is busy');
@@ -1049,9 +1075,10 @@ export class JobStore {
         // and O_EXCL create.  Cooperating contenders never enter while its
         // tombstone remains, which closes that ABA window.
         if (await this.#publicationTombstonePending(directory)) {
-          await this.#retirePublicationLock(lock, { token });
+          await this.#retirePublicationLock(lock, { token, identity: createdIdentity, own: true });
           continue;
         }
+        ownIdentity = createdIdentity;
         break;
       } catch (error) {
         await handle?.close().catch(() => {});
@@ -1074,7 +1101,17 @@ export class JobStore {
         // A delayed stale reclaimer can quarantine then restore our own
         // just-created file. Recognize that token instead of waiting for
         // ourselves; a pending tombstone still prevents early entry.
-        if (owner?.token === token && !(await this.#publicationTombstonePending(directory))) break;
+        if (owner?.token === token && !(await this.#publicationTombstonePending(directory))) {
+          ownIdentity = { dev: details.dev, ino: details.ino };
+          break;
+        }
+        // Left behind by this process: its creating call has already returned.
+        // Its token is required as well as its inode: a filesystem that reuses
+        // inode numbers can give a newer live lock the same identity.
+        if (owner?.pid === process.pid && !HELD_PUBLICATION_TOKENS.has(owner.token)) {
+          await this.#retirePublicationLock(lock, { identity: { dev: details.dev, ino: details.ino }, token: owner.token });
+          continue;
+        }
         const ownerAlive = Number.isInteger(owner?.pid) && owner.pid > 0 && defaultPidAlive(owner.pid);
         // A newly-created lock can be observed before its owner JSON reaches
         // the file. Malformed/missing state is therefore busy until the same
@@ -1090,7 +1127,7 @@ export class JobStore {
     try {
       return await action();
     } finally {
-      await this.#retirePublicationLock(lock, { token });
+      await this.#retirePublicationLock(lock, { token, identity: ownIdentity, own: true });
     }
   }
   async #readPublicationOwner(path) {
@@ -1127,6 +1164,12 @@ export class JobStore {
         }
         if (!details.isFile() || details.isSymbolicLink()) throw new Error('job publication lock is invalid');
         const owner = await this.#readPublicationOwner(tombstone);
+        // A quarantine this process left behind (its restore lost a race, say)
+        // names a live pid forever; nothing here will restore or release it.
+        if (owner?.pid === process.pid && !HELD_PUBLICATION_TOKENS.has(owner.token)) {
+          await unlink(tombstone).catch(() => {});
+          continue;
+        }
         if ((!Number.isInteger(owner?.pid) || !defaultPidAlive(owner.pid)) && Date.now() - Number(details.mtimeMs) > LOCK_STALE_MS) {
           // Tombstones have unique names and are never a live lock pathname,
           // so their stale cleanup cannot erase a subsequent owner.
@@ -1140,7 +1183,7 @@ export class JobStore {
       await handle?.close().catch(() => {});
     }
   }
-  async #retirePublicationLock(lock, { identity, token } = {}) {
+  async #retirePublicationLock(lock, { identity, token, own = false } = {}) {
     const tombstone = `${lock}.${process.pid}.${randomUUID()}.retired`;
     try {
       await rename(lock, tombstone);
@@ -1156,7 +1199,10 @@ export class JobStore {
     const same =
       details.isFile() && !details.isSymbolicLink() && (!identity || (details.dev === identity.dev && details.ino === identity.ino));
     const owner = await this.#readPublicationOwner(tombstone);
-    if (same && (!token || owner?.token === token)) {
+    // The creator's own O_EXCL inode is its own even when its content cannot be
+    // read back (a transient open/read failure): restoring it would leave a lock
+    // nobody releases. Only the creator may rely on that; anyone else needs the token.
+    if (same && (!token || owner?.token === token || (own && identity && owner === null))) {
       await unlink(tombstone).catch(() => {});
       return true;
     }

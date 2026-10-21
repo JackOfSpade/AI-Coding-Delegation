@@ -215,6 +215,9 @@ export class AnthropicMessagesProvider {
     this.retries = retries;
   }
   async #collect(payload, signal, retryLimit = this.retries) {
+    // A cancel or deadline that already fired must not start a request, nor
+    // wait for the attempt timer to notice it.
+    if (signal?.aborted) throw signal.reason ?? new Error('Aborted');
     let last;
     for (let attempt = 0; attempt <= retryLimit; attempt++) {
       const controller = new AbortController();

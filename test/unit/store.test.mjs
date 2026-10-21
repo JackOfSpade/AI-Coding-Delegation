@@ -893,3 +893,84 @@ test('credential redaction preserves valid JSON and matching native/portable too
     cleanup(gitDir);
   }
 });
+
+test('a publication lock this process left behind is reclaimed at once, not after the busy timeout', async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir });
+    const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
+    const lock = join(gitDir, 'offload', 'jobs', job.id, '.publication-lock');
+    // What a live MCP server is left with when a call returned without retiring
+    // its lock: the file names this pid and a token no in-flight call holds.
+    writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'returned-call' }));
+    const started = Date.now();
+    await store.update(job.id, { status: 'CANCELLED' });
+    await store.event(job.id, { type: 'cancel_requested' });
+    assert.ok(Date.now() - started < 5_000, 'the write did not wait for the 120 s busy timeout');
+    assert.equal((await store.get(job.id)).status, 'CANCELLED');
+    assert.equal(nodeFs.existsSync(lock), false, 'the lock is released after the write');
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
+test("another live process's publication lock is still respected", async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir });
+    const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
+    const lock = join(gitDir, 'offload', 'jobs', job.id, '.publication-lock');
+    // The parent process is alive and is not this one.
+    writeFileSync(lock, JSON.stringify({ pid: process.ppid, token: 'live-other-process' }));
+    let done = false;
+    const update = store.update(job.id, { status: 'CANCELLED' }).then(() => (done = true));
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(done, false, 'the write waits for the live owner');
+    rmSync(lock);
+    await update;
+    assert.equal((await store.get(job.id)).status, 'CANCELLED');
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
+test('a lock whose owner record cannot be read back is still released by its creator', { skip: process.platform === 'win32' }, async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir });
+    const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
+    const lock = join(gitDir, 'offload', 'jobs', job.id, '.publication-lock');
+    // Make the owner read during release fail, as a transient open/read error would.
+    const get = store.get.bind(store);
+    store.get = async (id) => {
+      if (nodeFs.existsSync(lock)) chmodSync(lock, 0o000);
+      return get(id);
+    };
+    await store.update(job.id, { status: 'RUNNING' });
+    store.get = get;
+    assert.equal(nodeFs.existsSync(lock), false, 'the lock was not restored behind its released owner');
+    const started = Date.now();
+    await store.update(job.id, { status: 'CANCELLED' });
+    assert.ok(Date.now() - started < 5_000);
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
+test('a quarantine tombstone this process left behind does not block later writes', async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir });
+    const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
+    const directory = join(gitDir, 'offload', 'jobs', job.id);
+    // A reclaim whose restore lost a race leaves this behind, naming a live pid forever.
+    const tombstone = join(directory, `.publication-lock.${process.pid}.abandoned.retired`);
+    writeFileSync(tombstone, JSON.stringify({ pid: process.pid, token: 'returned-call' }));
+    const started = Date.now();
+    await store.update(job.id, { status: 'CANCELLED' });
+    assert.ok(Date.now() - started < 5_000, 'the write did not wait for the 120 s busy timeout');
+    assert.equal(nodeFs.existsSync(tombstone), false);
+  } finally {
+    cleanup(gitDir);
+  }
+});

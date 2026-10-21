@@ -9,7 +9,7 @@ import { LocalTools, availableToolDefinitions } from '../../src/agent/tools.mjs'
 import { buildSystemPrompt } from '../../src/agent/prompt.mjs';
 import { OpenAIChatProvider, ProviderError } from '../../src/provider/openai-chat.mjs';
 import { JobStore } from '../../src/store.mjs';
-import { FAILURE_ERRORS, continuableFailure } from '../../src/failure.mjs';
+import { FAILURE_ERRORS, continuableFailure, wallTimeoutError } from '../../src/failure.mjs';
 import { cleanup, tempDir } from './helpers.mjs';
 
 const call = (name, argText = '{}', id = 'id') => ({ id, name, arguments: argText });
@@ -4401,4 +4401,49 @@ test('finish contract teaches a short summary and recovers the real-session over
   assert.equal(definition.parameters.properties.summary.maxLength, 1500);
   assert.match(definition.parameters.properties.summary.description, /1500 characters/);
   assert.match(await buildSystemPrompt({ task: 'x' }), /Completion prose without a finish call does not finish the job/);
+});
+
+test('a progress write that never completes cannot hold the loop past a cancel or its deadline', async () => {
+  const stalledProvider = {
+    async *chat({ signal }) {
+      await new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+    },
+  };
+  // What a busy job lock does to every store write.
+  const stuck = () => new Promise(() => {});
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 50);
+  const started = Date.now();
+  const cancelled = await new AgentLoop({
+    provider: stalledProvider,
+    tools: { execute: async () => '' },
+    signal: controller.signal,
+    progress: stuck,
+  }).run({ task: 'x' });
+  assert.equal(cancelled.status, 'CANCELLED');
+  assert.ok(Date.now() - started < 2_000);
+  const timed = await new AgentLoop({ provider: stalledProvider, tools: { execute: async () => '' }, timeoutMs: 30, progress: stuck }).run({
+    task: 'x',
+  });
+  assert.equal(timed.status, 'TIMEOUT');
+});
+
+test("the manager's wall-clock watchdog abort ends the loop as TIMEOUT, not CANCELLED", async () => {
+  const stalledProvider = {
+    async *chat({ signal }) {
+      await new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+    },
+  };
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(wallTimeoutError()), 20);
+  const result = await new AgentLoop({ provider: stalledProvider, tools: { execute: async () => '' }, signal: controller.signal }).run({
+    task: 'x',
+  });
+  assert.equal(result.status, 'TIMEOUT');
+  const before = await new AgentLoop({
+    provider: stalledProvider,
+    tools: { execute: async () => '' },
+    signal: AbortSignal.abort(wallTimeoutError()),
+  }).run({ task: 'x' });
+  assert.equal(before.status, 'TIMEOUT', 'between turns too');
 });

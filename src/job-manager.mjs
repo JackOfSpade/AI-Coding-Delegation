@@ -1,4 +1,4 @@
-import { realpathSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { compactReport, terminalStatuses } from './report.mjs';
@@ -18,11 +18,13 @@ import {
   continuableFailure,
   failedApplyRefusal,
   failureContinueDefect,
+  isWallTimeout,
   loopedAgain,
   reportToolFailure,
   retryableTranscriptFailure,
   safeFailureKind,
   safeToolFailure,
+  wallTimeoutError,
 } from './failure.mjs';
 import { isolatedDependencyReadPaths } from './worktree.mjs';
 import { classifyVerifierEnvironment, isVerifierEnvironmentKind } from './verify-env.mjs';
@@ -76,6 +78,16 @@ import {
 } from './verify-baseline.mjs';
 
 const allowedEffort = new Set(['normal', 'high']);
+// Worker rounds an in-flight _launch task of this process owns, by job id and
+// shared by every JobManager in it. A RUNNING record naming this pid that no
+// task here owns can never be finished by anyone else, so recovery takes it.
+const LOCAL_WORKER_TASKS = new Map();
+// How long such a record must have been silent first: a task registers before
+// its claim is written, so this only absorbs windows nobody has foreseen.
+const DEFAULT_ORPHAN_GRACE_MS = 60_000;
+// The agent loop enforces limits.timeoutMinutes itself; the manager's watchdog
+// fires this much later, only for a round that could not stop on its own.
+const WALL_WATCHDOG_GRACE_MS = 30_000;
 const VERIFIER_MODES = new Set(['standard', 'baseline-diff']);
 const MIN_VERIFIER_TIMEOUT_SEC = 5,
   MAX_VERIFIER_TIMEOUT_SEC = 1800,
@@ -908,6 +920,8 @@ export class JobManager {
     // a restart or a manual repair simply recomputes, so there is no durable
     // baseline to tamper with or leave stale.
     this.baselineRuns = new Map();
+    // In-flight recoveries of this process's own orphaned rounds, by job id.
+    this.orphanSettles = new Map();
   }
   get isolated() {
     return !!(
@@ -1714,6 +1728,8 @@ export class JobManager {
   async _launch(id, reason, defects, expectedJob) {
     const controller = new AbortController();
     this.controllers.set(id, controller);
+    LOCAL_WORKER_TASKS.set(id, (LOCAL_WORKER_TASKS.get(id) || 0) + 1);
+    let localTask = true;
     // Keep the task registered through report publication, lease release, and
     // workspace cleanup. Shutdown is an ownership boundary: dropping it
     // earlier lets a caller exit while those durable transitions are pending.
@@ -1721,9 +1737,17 @@ export class JobManager {
     const unregister = () => {
       if (this.running.get(id) === task) this.running.delete(id);
       if (this.controllers.get(id) === controller) this.controllers.delete(id);
+      if (localTask) {
+        localTask = false;
+        const owners = (LOCAL_WORKER_TASKS.get(id) || 1) - 1;
+        if (owners > 0) LOCAL_WORKER_TASKS.set(id, owners);
+        else LOCAL_WORKER_TASKS.delete(id);
+      }
     };
+    // What an abort of this round's signal means for its terminal status.
+    const abortStatus = () => (isWallTimeout(controller.signal.reason) ? 'TIMEOUT' : 'CANCELLED');
     task = (async () => {
-      let heartbeat, cancellationWatch, leaseLost;
+      let heartbeat, cancellationWatch, leaseLost, watchdog;
       let job, ownerNonce, workspace, launchClaimed, clock;
       try {
         // A detached resume can read a queued handoff, then be delayed before
@@ -1799,6 +1823,8 @@ export class JobManager {
         workspace = this.#workspace(job);
         const cancelledAfterLaunch = await this.store.cancelRequested?.(id);
         if (controller.signal.aborted || cancelledAfterLaunch) {
+          // A marker from another process: this round is cancelled, not failed.
+          if (!controller.signal.aborted) controller.abort();
           if (!cancelledBeforeLaunch)
             job = await this.store.update(id, { status: 'FINALIZING', finalStatus: 'CANCELLED', handoffState: 'CANCELLED' });
           throw new Error('job cancelled before worker launch');
@@ -1858,6 +1884,24 @@ export class JobManager {
           let budgetFinishRecoveryState = job.budgetFinishRecovery;
           const workerJob =
             job.assertionRepair?.round === (job.rounds || 0) ? { ...job, ownedPaths: job.assertionRepair.paths, extraWritable: [] } : job;
+          // limits.timeoutMinutes bounds the worker round from its claim, as the
+          // agent loop's own deadline does. This watchdog backs that deadline up
+          // for a round that cannot stop itself (a stalled await the loop does
+          // not watch): it aborts the round's signal with a wall-clock reason.
+          const wallMs = Number(job.budget?.timeoutMinutes) * 60_000 - Math.max(0, this.#nowMs() - claimedAtMs);
+          if (Number.isFinite(wallMs)) {
+            watchdog = this.setTimeout(
+              () => {
+                if (controller.signal.aborted) return;
+                controller.abort(wallTimeoutError());
+                this.store
+                  .event(id, { type: 'watchdog', reason: 'timeoutMinutes', timeoutMinutes: job.budget.timeoutMinutes })
+                  .catch(() => {});
+              },
+              Math.max(0, wallMs) + WALL_WATCHDOG_GRACE_MS,
+            );
+            watchdog?.unref?.();
+          }
           const result = await this.worker.run(workerJob, {
             signal: controller.signal,
             defects,
@@ -1966,6 +2010,7 @@ export class JobManager {
                   appendMessages: (messages) => this.store.messagesBatch(id, messages),
                 }),
           });
+          if (watchdog) this.clearTimeout(watchdog);
           const allowedWorkerStatuses = new Set(['DONE', 'FAILED', 'TIMEOUT', 'BUDGET', 'CANCELLED']);
           const malformedResult = !result || typeof result !== 'object' || Array.isArray(result);
           const requestedStatus = malformedResult ? 'FAILED' : (result.status ?? 'DONE');
@@ -1975,7 +2020,7 @@ export class JobManager {
           let workerStatus = leaseLost
             ? 'FAILED'
             : controller.signal.aborted
-              ? 'CANCELLED'
+              ? abortStatus()
               : invalidStatus
                 ? 'FAILED'
                 : missingReport
@@ -2129,12 +2174,19 @@ export class JobManager {
             await this._verify(job);
           }
         } catch (error) {
+          if (watchdog) this.clearTimeout(watchdog);
           const aborted = controller.signal.aborted;
           const providerFailure = safeProviderFailure(error);
           job = await this.store.update(id, {
             ...(safeFinalizationError(error) ? { finalizationError: safeFinalizationError(error) } : {}),
             status: 'FINALIZING',
-            finalStatus: leaseLost ? 'FAILED' : aborted ? 'CANCELLED' : providerFailure?.kind === 'attempt_timeout' ? 'TIMEOUT' : 'FAILED',
+            finalStatus: leaseLost
+              ? 'FAILED'
+              : aborted
+                ? abortStatus()
+                : providerFailure?.kind === 'attempt_timeout'
+                  ? 'TIMEOUT'
+                  : 'FAILED',
             ...(providerFailure ? { providerFailure } : {}),
             error:
               job.mode === 'report'
@@ -2623,12 +2675,19 @@ export class JobManager {
         try {
           const current = await this.store.get(id);
           releaseNonce ||= current.leaseOwnerNonce;
-          const cancelled = controller.signal.aborted;
+          const aborted = controller.signal.aborted;
+          const status = aborted ? abortStatus() : 'FAILED';
           await this.store.update(id, {
             status: 'FINALIZING',
-            finalStatus: cancelled ? 'CANCELLED' : 'FAILED',
+            finalStatus: status,
             activity: undefined,
-            ...(cancelled ? {} : { error: `worker initialization failed: ${initialError.message || initialError}` }),
+            ...(status === 'CANCELLED'
+              ? {}
+              : {
+                  error: aborted
+                    ? 'job wall-clock limit (timeoutMinutes) exceeded'
+                    : `worker initialization failed: ${initialError.message || initialError}`,
+                }),
           });
         } catch {
         } finally {
@@ -2650,7 +2709,8 @@ export class JobManager {
       }
     })();
     this.running.set(id, task);
-    task.catch(() => {});
+    // However the task ends, it no longer owns the round.
+    task.then(unregister, unregister);
     return task;
   }
   /** The sandbox every verifier run of a job receives; the baseline-diff run of the untouched snapshot reuses it with its own worktree. */
@@ -3037,7 +3097,9 @@ export class JobManager {
     const rawTimeout = Number(timeoutSec);
     timeoutSec = Math.min(55, Math.max(0, Number.isFinite(rawTimeout) ? rawTimeout : 40));
     const stop = Date.now() + timeoutSec * 1000;
-    let job = await this.#settleOrphanedApplyVerify(await this.store.get(id));
+    let job = await this.#settleOrphanedWorker(await this.#settleOrphanedApplyVerify(await this.store.get(id)), {
+      budgetMs: Math.max(2_000, stop - Date.now()),
+    });
     // An applyThenVerify run holds a terminal job's status for as long as its
     // command runs (up to 15 minutes). That is progress, not completion, and
     // joining it would break this call's bounded-wait contract.
@@ -3046,7 +3108,7 @@ export class JobManager {
       job = await this.store.get(id);
     }
     if (signal?.aborted) throw new Error('request cancelled');
-    job = await this.#settleOrphanedApplyVerify(job);
+    job = await this.#settleOrphanedWorker(await this.#settleOrphanedApplyVerify(job), { budgetMs: 2_000 });
     const applying = this.#applyInFlight(job);
     // A local task keeps ownership through terminal publication and cleanup.
     // Do not expose its durable terminal status as fully complete while that
@@ -3067,6 +3129,7 @@ export class JobManager {
     const nowMs = this.#nowMs();
     const stall = applying ? undefined : assessStall(job, nowMs);
     const activity = applying ? undefined : sanitizeActivity(job.activity);
+    const cancel = await this.#cancelState(job);
     const progress = {
       turns: job.turns || 0,
       usage: job.usage,
@@ -3084,6 +3147,7 @@ export class JobManager {
           }
         : {}),
       ...(stall ? { stall } : {}),
+      ...(cancel || {}),
       ...(applying ? { applyThenVerify: publicApplyVerify(job.applyVerify) } : {}),
     };
     // A primary that polls a long job would otherwise pay input tokens for the
@@ -3097,6 +3161,7 @@ export class JobManager {
       progress.recentActions,
       job.applyVerify?.phase,
       stall ? [stall.kind, stall.level] : null,
+      !!cancel,
     ]);
     if (detail !== 'full' && this.lastWaitSignature.get(id) === signature)
       return {
@@ -3104,7 +3169,12 @@ export class JobManager {
         status: job.status,
         done: false,
         unchanged: true,
-        progress: { turns: progress.turns, costUsd: progress.costUsd, ...(stall ? { stalledSec: stall.sinceSec } : {}) },
+        progress: {
+          turns: progress.turns,
+          costUsd: progress.costUsd,
+          ...(stall ? { stalledSec: stall.sinceSec } : {}),
+          ...(cancel ? { cancelRequested: true, cancelRequestedSec: cancel.cancelRequestedSec } : {}),
+        },
       };
     this.lastWaitSignature.set(id, signature);
     return { ...this.public(job), done: false, progress };
@@ -3126,6 +3196,60 @@ export class JobManager {
    */
   #orphanedApplyVerify(job) {
     return job?.applyVerifyIntent === true && job.runnerPid === process.pid && !this.controllers.has(job.id);
+  }
+  /**
+   * A worker round this process claimed whose task is gone: it ended (a store
+   * write failed during its own terminal publication, for example) without
+   * publishing a terminal status. Its pid is alive because it is ours, so
+   * ordinary crash recovery would wait for it forever while it keeps its scope.
+   */
+  #orphanedWorker(job) {
+    // A queued round counts only once this process claimed it locally: a
+    // parent-to-child handoff is the child's to run.
+    const active =
+      ['RUNNING', 'REPAIRING', 'WORKER_DONE', 'FINALIZING', 'REPAIR_QUEUED'].includes(job?.status) ||
+      (job?.status === 'QUEUED' && job.handoffState === 'LOCAL');
+    if (!active || job.runnerPid !== process.pid) return false;
+    if (LOCAL_WORKER_TASKS.has(job.id) || this.running.has(job.id) || this.controllers.has(job.id)) return false;
+    // An integration or revert journal is reconciled by recovery like a dead
+    // owner's; an applyThenVerify journal has its own orphan path.
+    if (job.applyVerifyIntent === true) return false;
+    const last = Math.max(
+      ...[job.updatedAt, job.runnerHeartbeatAt, job.activity?.lastEventAt].map((value) => Date.parse(value || '')).filter(Number.isFinite),
+    );
+    return Number.isFinite(last) && this.#nowMs() - last >= (this.config.orphanGraceMs ?? DEFAULT_ORPHAN_GRACE_MS);
+  }
+  /**
+   * Finalize this process's own orphaned worker round through recovery of that
+   * job alone, waiting at most `budgetMs` (a busy job lock must not hold up the
+   * caller); recovery carries on in the background, once per job. Re-reads the job.
+   */
+  async #settleOrphanedWorker(job, { budgetMs = 5_000 } = {}) {
+    if (!this.#orphanedWorker(job)) return job;
+    let settling = this.orphanSettles.get(job.id);
+    if (!settling) {
+      settling = this.recover({ onlyIds: [job.id] })
+        .catch(() => {})
+        .finally(() => this.orphanSettles.delete(job.id));
+      this.orphanSettles.set(job.id, settling);
+    }
+    await Promise.race([settling, new Promise((resolve) => setTimeout(resolve, Math.max(0, budgetMs)).unref?.())]);
+    return this.store.get(job.id);
+  }
+  /** For a detached worker process: settle the job if its round here was orphaned. */
+  async settleOrphan(id) {
+    return this.#settleOrphanedWorker(await this.store.get(id));
+  }
+  /** A pending cancellation of a job that has not ended yet: when it was asked for. */
+  async #cancelState(job) {
+    if (final(job.status) && job.applyVerifyIntent !== true) return undefined;
+    const at = await this.store.cancelRequestedAt?.(job.id).catch(() => null);
+    if (!at) return undefined;
+    return {
+      cancelRequested: true,
+      cancelRequestedAt: at,
+      cancelRequestedSec: Math.max(0, Math.round((this.#nowMs() - Date.parse(at)) / 1000)),
+    };
   }
   /** Settle this process's own orphaned applyThenVerify journal from the live tree, then re-read the job. */
   async #settleOrphanedApplyVerify(job, { callerRuns = false } = {}) {
@@ -3297,7 +3421,7 @@ export class JobManager {
           verifierEnvironmentFailures: await this.verifierEnvironmentFailures(),
         },
       };
-    const job = await this.store.get(id);
+    const job = await this.#settleOrphanedWorker(await this.store.get(id));
     if (!['summary', 'diff', 'files', 'log'].includes(include)) throw new Error('include must be summary, diff, files, or log');
     if (windowed && include !== 'log') throw new Error('tail and limit apply only to include "log"');
     assertDetail(detail);
@@ -3311,10 +3435,12 @@ export class JobManager {
       return { ...lean, ...(await this.#jobLog(job, window)) };
     }
     const stall = assessStall(job, this.#nowMs());
+    const cancel = await this.#cancelState(job);
     const result = {
       ...this.public(job),
       report: await this.#interactiveReport(job, { detail, ...(stall ? { stall } : {}) }),
       ...(stall ? { stall } : {}),
+      ...(cancel || {}),
     };
     const timing = detail === 'full' && include === 'summary' ? sanitizeTiming(job.timing) : undefined;
     if (timing) result.timing = timing;
@@ -3338,14 +3464,28 @@ export class JobManager {
     // A terminal job whose applyThenVerify command is running is still being
     // acted on: its owner (possibly another process) polls this marker.
     const applyRunning = before.applyVerifyIntent === true;
-    if (!final(before.status) || applyRunning) await this.store.requestCancel?.(id);
+    const requested = !final(before.status) || applyRunning;
+    if (requested) await this.store.requestCancel?.(id);
     const controller = this.controllers.get(id);
     // Local cancellation is deliberately marker-first and asynchronous. The
     // owner task publishes the terminal state only after its normal cleanup;
     // waiting here would make a control-plane cancel block on an uncooperative
-    // worker and falsely imply that cancellation is already complete.
+    // worker and falsely imply that cancellation is already complete. The
+    // reply says so instead: `cancelRequested` and how long ago.
     if (controller) controller.abort();
+    // Logged after the abort, and without waiting long: a busy job lock must
+    // not delay the cancel itself.
+    if (requested)
+      await Promise.race([
+        Promise.resolve(this.store.event(id, { type: 'cancel_requested', status: before.status })).catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, 2_000).unref?.()),
+      ]);
     let job = await get(id);
+    // No task anywhere in this process owns a round it claimed: finish it now.
+    if (!controller && this.#orphanedWorker(job)) {
+      await this.#settleOrphanedWorker(job);
+      job = await get(id);
+    }
     // The run may have ended between the read above and the marker: nothing is
     // left to consume it, and a stale marker would refuse the next apply.
     if (applyRunning && job.applyVerifyIntent !== true && !this.controllers.has(id)) await this.store.clearCancel?.(id).catch(() => {});
@@ -3355,7 +3495,8 @@ export class JobManager {
     // here would race its authenticated owner. Resume/assign/recovery consume
     // the marker and perform the owned terminal cleanup.
     if (!final(job.status) && !controller && ['QUEUED', 'REPAIR_QUEUED'].includes(job.status)) job = await get(id);
-    return { ...this.public(job), report: this.report(job) };
+    const cancel = await this.#cancelState(job);
+    return { ...this.public(job), ...(cancel || {}), report: this.report(job) };
   }
   async continue(id, { extraTurns, extraUsd, note, launch = true } = {}) {
     if (extraTurns !== undefined && (!Number.isInteger(extraTurns) || extraTurns < 1 || extraTurns > MAX_CONTINUE_TURNS))
@@ -4525,7 +4666,8 @@ export class JobManager {
     const publishRecoveredTerminal = async (job, status, changes, event) => {
       const staged = await stageRecoveredTerminal(job, status, changes);
       if (!staged) return null;
-      if (!(await this.#recoveryMayClean(staged, get, { orphan: this.#orphanedApplyVerify(job) }))) return null;
+      if (!(await this.#recoveryMayClean(staged, get, { orphan: this.#orphanedApplyVerify(job) || this.#orphanedWorker(job) })))
+        return null;
       await this.cleanupWorkspace(job.id);
       const cleaned = await get(job.id);
       const done = {
@@ -4581,7 +4723,8 @@ export class JobManager {
       ...[...this.running.keys()].filter((id) => !options.ownerIds?.includes(id)),
       ...this.controllers.keys(),
     ]);
-    const jobs = await list({ limit: Number.MAX_SAFE_INTEGER });
+    const listed = await list({ limit: Number.MAX_SAFE_INTEGER });
+    const jobs = Array.isArray(options.onlyIds) ? listed.filter((job) => options.onlyIds.includes(job.id)) : listed;
     let recovered = 0;
     for (let job of jobs) {
       // An active local/detached owner is expressly excluded from recovery;
@@ -4628,7 +4771,8 @@ export class JobManager {
       // Do not fence a suspended worker merely because its heartbeat is old.
       // It can resume with the same lease nonce; treating that as dead would
       // let recovery delete its workspace and be overwritten afterwards.
-      const alive = Number.isInteger(job.runnerPid) && pidAlive(job.runnerPid) && !this.#orphanedApplyVerify(job);
+      const ownOrphan = this.#orphanedWorker(job);
+      const alive = Number.isInteger(job.runnerPid) && pidAlive(job.runnerPid) && !this.#orphanedApplyVerify(job) && !ownOrphan;
       // A terminal journal can retain a long-lived MCP server PID after a
       // post-apply record-write failure, so it must be reconciled promptly.
       // A live owner may still write any non-terminal lifecycle or unresolved
@@ -4822,12 +4966,18 @@ export class JobManager {
         if (await settleTerminalCleanupReservation(staged)) recovered += 1;
         continue;
       }
+      // This process's own abandoned round was not interrupted by a restart; a
+      // cancel aimed at it is honoured as one.
+      const orphanCancelled = ownOrphan && (await this.store.cancelRequested?.(job.id).catch(() => false)) === true;
+      const recoveredError = ownOrphan ? 'the worker round ended without publishing a terminal status' : 'server restarted';
       const finalJob = {
         ...job,
-        error: 'server restarted',
+        error: orphanCancelled ? undefined : recoveredError,
       };
+      // An orphaned round's own task may already have removed its worktree.
+      const workspaceGone = ownOrphan && !!job.workspacePath && !existsSync(job.workspacePath);
       try {
-        if (job.workspacePath && this.isolated && job.mode !== 'report') {
+        if (job.workspacePath && this.isolated && job.mode !== 'report' && !workspaceGone) {
           const workspace = this.#workspace(job);
           const workspaceAfter = workspace.snapshot({ pin: false });
           const audited = await this.#classifyIsolatedWorkspace(job, workspace, workspaceAfter);
@@ -4874,17 +5024,25 @@ export class JobManager {
           finalJob.scopeViolations = violations;
           finalJob.revertFiles = revertFiles;
         }
-        if (await publishRecoveredTerminal(job, 'FAILED', finalJob, { type: 'recovered', message: 'server restarted' })) recovered += 1;
+        if (
+          await publishRecoveredTerminal(job, orphanCancelled ? 'CANCELLED' : 'FAILED', finalJob, {
+            type: 'recovered',
+            message: orphanCancelled ? 'cancelled after its worker round ended' : recoveredError,
+          })
+        )
+          recovered += 1;
       } catch (error) {
         try {
           const published = await publishRecoveredTerminal(
             job,
-            'FAILED',
+            orphanCancelled ? 'CANCELLED' : 'FAILED',
             {
               ...finalJob,
               ...(job.workspacePath &&
               this.isolated &&
               job.mode !== 'report' &&
+              !workspaceGone &&
+              existsSync(job.workspacePath) &&
               !/patch containing configured secret/.test(String(error.message || error))
                 ? { workspaceRetained: true }
                 : {}),
@@ -4893,7 +5051,7 @@ export class JobManager {
             },
             {
               type: 'recovered',
-              message: 'server restarted',
+              message: recoveredError,
               ...(safeFinalizationError(error) ? { finalizationError: safeFinalizationError(error) } : {}),
             },
           );

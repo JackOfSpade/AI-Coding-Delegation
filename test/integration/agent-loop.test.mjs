@@ -150,3 +150,32 @@ test('provider honours cancellation during a mid-stream stall', async (t) => {
     await server.close();
   }
 });
+
+test('a provider body that hangs mid-stream ends at attemptTimeoutMs, and a cancel ends it at once', async (t) => {
+  const script = { chunks: [{ choices: [{ delta: { content: 'partial' } }] }, { choices: [{ delta: {} }] }], hangAfterChunks: 1 };
+  const server = await mockOrSkip(t, [script, script]);
+  if (!server) return;
+  try {
+    const timeoutMs = 300;
+    const timedOut = await new AgentLoop({
+      provider: new OpenAIChatProvider({ baseUrl: server.baseUrl, model: 'mock', timeoutMs, retries: 0 }),
+      tools: { execute: async () => '' },
+      maxUsd: Infinity,
+    }).run({ task: 'x' });
+    assert.equal(timedOut.status, 'TIMEOUT');
+    assert.equal(timedOut.providerFailure?.kind, 'attempt_timeout');
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 100);
+    const started = Date.now();
+    const cancelled = await new AgentLoop({
+      provider: new OpenAIChatProvider({ baseUrl: server.baseUrl, model: 'mock', timeoutMs: 60_000, retries: 0 }),
+      tools: { execute: async () => '' },
+      signal: controller.signal,
+    }).run({ task: 'x' });
+    assert.equal(cancelled.status, 'CANCELLED');
+    assert.ok(Date.now() - started < 3_000, 'the in-flight request was aborted, not waited out');
+    assert.equal(server.requests.length, 2);
+  } finally {
+    await server.close();
+  }
+});

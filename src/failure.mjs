@@ -204,6 +204,12 @@ export function continuableFailure(job) {
  * `failedApplyRefusal`, never by status alone; CANCELLED never does (the
  * primary stopped it on purpose).
  */
+const WALL_TIMEOUT_CODE = 'OFFLOAD_WALL_TIMEOUT';
+/** The abort reason JobManager's watchdog gives a round that outlived limits.timeoutMinutes. */
+export const wallTimeoutError = () =>
+  Object.assign(new Error('job wall-clock limit (timeoutMinutes) exceeded'), { code: WALL_TIMEOUT_CODE });
+/** True when a job signal was aborted by the wall-clock watchdog rather than by a cancel. */
+export const isWallTimeout = (reason) => reason?.code === WALL_TIMEOUT_CODE;
 export const APPLY_ELIGIBLE_STATUSES = Object.freeze(['VERIFY_ENV_FAILED', 'VERIFY_FAILED', 'BUDGET', 'TIMEOUT']);
 
 const GIT_OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;

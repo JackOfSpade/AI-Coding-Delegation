@@ -1321,6 +1321,9 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           )
         )
           return state.manager.job(id);
+        // This process's round ended without publishing (a store write that kept
+        // failing): finish it rather than poll a record no one will advance.
+        if (!state.manager.running.has(id)) await state.manager.settleOrphan(id);
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
     },

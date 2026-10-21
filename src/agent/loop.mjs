@@ -3,9 +3,34 @@ import { AgentContext } from './context.mjs';
 import { DEFAULT_COMMAND_TIMEOUT_SEC, MAX_COMMAND_TIMEOUT_SEC, TOOL_DEFINITIONS, isReadOnlyTool, validUntouchedPaths } from './tools.mjs';
 import { Meter, resolveModel, samePricedModel } from '../pricing.mjs';
 import { OpenAIChatProvider, PROVIDER_FINISH_REASONS, ProviderError, providerFailure } from '../provider/openai-chat.mjs';
-import { FAILURE_ERRORS, summarizeToolFailure, toolErrorHint } from '../failure.mjs';
+import { FAILURE_ERRORS, isWallTimeout, summarizeToolFailure, toolErrorHint } from '../failure.mjs';
 import { MAX_BATCH_COMMAND_SEC } from '../timing.mjs';
 import { anthropicContentMatchesAssistant, cloneAnthropicContent, validAnthropicContent } from '../anthropic-content.mjs';
+
+// Progress is advisory and goes to the job store, whose write can wait on a busy
+// publication lock. It must never hold a round past its deadline or a cancel:
+// once the signal aborts, the wait ends and the loop's own abort checks decide.
+// The write itself still runs to completion in the background.
+const untilAborted = (value, signal) => {
+  const pending = Promise.resolve(value);
+  pending.catch(() => {});
+  if (!signal) return pending;
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const stop = () => resolve();
+    signal.addEventListener('abort', stop, { once: true });
+    pending.then(
+      (result) => {
+        signal.removeEventListener('abort', stop);
+        resolve(result);
+      },
+      (error) => {
+        signal.removeEventListener('abort', stop);
+        reject(error);
+      },
+    );
+  });
+};
 
 const asToolCalls = (calls) => calls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } }));
 // Arguments originate with an untrusted provider response. Never persist a
@@ -524,12 +549,15 @@ export class AgentLoop {
     this.signal?.addEventListener('abort', onAbort, { once: true });
     if (this.signal?.aborted) deadline.abort(this.signal.reason ?? new Error('Aborted'));
     const timer = setTimeout(() => deadline.abort(new Error('Agent wall clock deadline exceeded')), this.timeoutMs);
+    const reportProgress = this.progress;
+    if (reportProgress) this.progress = (event) => untilAborted(reportProgress(event), deadline.signal);
+    // The job signal is a cancel, unless JobManager's wall-clock watchdog aborted it.
+    const stopped = () => (isWallTimeout(this.signal?.reason) ? 'TIMEOUT' : 'CANCELLED');
     try {
       for (let turn = 1; turn <= this.maxTurns; turn++) {
         providerFinishReason = undefined;
         await this.context.flush();
-        if (this.signal?.aborted)
-          return { status: 'CANCELLED', turn: turn - 1, usage: totalUsage, costUsd: this.meter.usd, ...modelMeta() };
+        if (this.signal?.aborted) return { status: stopped(), turn: turn - 1, usage: totalUsage, costUsd: this.meter.usd, ...modelMeta() };
         if (this.now() - started > this.timeoutMs)
           return { status: 'TIMEOUT', turn: turn - 1, usage: totalUsage, costUsd: this.meter.usd, ...modelMeta() };
         let text = '',
@@ -786,6 +814,9 @@ export class AgentLoop {
             budgetFinishRecoveryPending = false;
           }
           await this.progress?.({ turn, action: 'provider_request_pending', providerFinishReason: null });
+          // A cancel or deadline that fired while that progress was pending must
+          // not start the request, whatever the provider does with an aborted signal.
+          if (deadline.signal.aborted) throw deadline.signal.reason ?? new Error('Aborted');
           for await (const event of this.provider.chat({
             messages: messagesForTurn,
             tools: activeToolDefinitions,
@@ -888,7 +919,7 @@ export class AgentLoop {
           }
         } catch (error) {
           if (this.signal?.aborted)
-            return { status: 'CANCELLED', turn: turn - 1, usage: totalUsage, costUsd: this.meter.usd, ...modelMeta() };
+            return { status: stopped(), turn: turn - 1, usage: totalUsage, costUsd: this.meter.usd, ...modelMeta() };
           if (deadline.signal.aborted)
             return {
               status: 'TIMEOUT',
@@ -1277,7 +1308,7 @@ export class AgentLoop {
         try {
           values = await this.#execute(calls, deadline.signal, toolErrors, toolTimings);
         } catch (error) {
-          if (this.signal?.aborted) return { status: 'CANCELLED', turn, usage: totalUsage, costUsd: this.meter.usd, ...modelMeta() };
+          if (this.signal?.aborted) return { status: stopped(), turn, usage: totalUsage, costUsd: this.meter.usd, ...modelMeta() };
           if (deadline.signal.aborted)
             return {
               status: 'TIMEOUT',
@@ -1289,7 +1320,7 @@ export class AgentLoop {
             };
           throw error;
         }
-        if (this.signal?.aborted) return { status: 'CANCELLED', turn, usage: totalUsage, costUsd: this.meter.usd, ...modelMeta() };
+        if (this.signal?.aborted) return { status: stopped(), turn, usage: totalUsage, costUsd: this.meter.usd, ...modelMeta() };
         if (deadline.signal.aborted)
           return {
             status: 'TIMEOUT',
@@ -1407,6 +1438,7 @@ export class AgentLoop {
     } finally {
       clearTimeout(timer);
       this.signal?.removeEventListener('abort', onAbort);
+      this.progress = reportProgress;
     }
   }
 }
