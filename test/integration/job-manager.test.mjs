@@ -1906,7 +1906,10 @@ test('sealed lifecycle updates preserve transcript integrity across automatic re
     sandboxMode: 'macos',
     executionProfile: { type: 'openai-chat', baseUrl: 'https://provider.example.test/v1', keyRef: 'env:GOOD', model: 'model' },
   });
-  assert.equal((await m.wait(started.jobId, { timeoutSec: 2 })).status, 'VERIFY_FAILED');
+  assert.equal(
+    (await m.wait(started.jobId, { timeoutSec: process.platform === 'win32' ? WORKTREE_LIFECYCLE_TIMEOUT_SEC : 2 })).status,
+    'VERIFY_FAILED',
+  );
   assert.equal(runs, 2);
   assert.equal((await store.readMessages(started.jobId)).length, 2);
   assert.equal(store.verifyJob(await store.get(started.jobId)), true);
@@ -1923,7 +1926,7 @@ test('automatic repair clears its per-round scheduling marker through the final 
     maxRepairRounds: 2,
     sandboxMode: 'macos',
   });
-  const done = await m.wait(started.jobId, { timeoutSec: 2 });
+  const done = await m.wait(started.jobId, { timeoutSec: process.platform === 'win32' ? WORKTREE_LIFECYCLE_TIMEOUT_SEC : 2 });
   assert.equal(done.status, 'VERIFY_FAILED');
   assert.equal(runs, 3, 'the initial attempt plus every permitted automatic repair must finish');
   assert.equal(m.running.has(started.jobId), false, 'a capped repair lifecycle must not leave a worker task running');
@@ -2139,7 +2142,10 @@ test('manager enforces cumulative worker budgets and honors cancellation during 
     testCommand: 'test',
     budget: { maxTurns: 1, maxUsd: 1 },
   });
-  assert.equal((await overBudget.wait(started.jobId, { timeoutSec: 1 })).status, 'BUDGET');
+  assert.equal(
+    (await overBudget.wait(started.jobId, { timeoutSec: process.platform === 'win32' ? WORKTREE_LIFECYCLE_TIMEOUT_SEC : 1 })).status,
+    'BUDGET',
+  );
   assert.equal(verified, false);
 
   let creates = 0,
@@ -2306,7 +2312,7 @@ test('recovery relaunches only a dead queued budget-finish worker through its pr
     config: { repoPath: process.cwd(), git: { branch: async () => 'main', head: async () => gitId } },
   });
   assert.equal(await m.recover(), 4);
-  const done = await m.wait(restart.id, { timeoutSec: 1 });
+  const done = await m.wait(restart.id, { timeoutSec: process.platform === 'win32' ? WORKTREE_LIFECYCLE_TIMEOUT_SEC : 1 });
   assert.equal(done.status, 'DONE_UNVERIFIED');
   assert.deepEqual(runs, [{ id: restart.id, state: 'queued', defects: undefined }]);
   assert.equal((await store.get(restart.id)).budgetFinishRecovery, 'consumed');
