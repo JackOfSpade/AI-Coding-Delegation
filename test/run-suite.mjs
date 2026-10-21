@@ -263,6 +263,10 @@ export async function runSuite({
   const roots = suite === 'all' ? ['unit', 'integration'] : [suite];
   const files = (await Promise.all(roots.map((root) => discoverTests(resolve('test', root))))).flat().sort();
   if (!files.length) throw new Error(`no ${suite} tests found`);
+  // Package-gate tests publish generated artifacts while other files import
+  // identity.mjs, whose directory-change guard must remain strict. Create the
+  // output roots first so publication cannot change the checkout's ctime.
+  await Promise.all(['artifacts', 'coverage'].map((directory) => mkdir(resolve(directory), { recursive: true })));
   // Worktree integration tests invoke real Git processes and secure durable
   // storage. A small fan-out avoids test-runner oversubscription turning
   // lifecycle timing into a host-load-dependent result.

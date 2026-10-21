@@ -177,6 +177,41 @@ test('execution progress diagnostics preserve TAP skips and failing child exit s
   }
 });
 
+test('test runner prepares generated output roots before any concurrent test imports', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'offload-runner-outputs-'));
+  try {
+    const tests = join(directory, 'test', 'unit');
+    await mkdir(tests, { recursive: true });
+    await writeFile(
+      join(tests, 'output-roots.test.mjs'),
+      [
+        "import test from 'node:test';",
+        "import assert from 'node:assert/strict';",
+        "import { statSync } from 'node:fs';",
+        // Package-gate tests publish here while other files import the runtime.
+        // Creating these entries later changes the checkout directory ctime.
+        "const prepared = ['artifacts', 'coverage'].every((path) => statSync(path).isDirectory());",
+        "test('output roots existed before this module loaded', () => assert.equal(prepared, true));",
+      ].join('\n'),
+    );
+    const environment = { ...process.env, OFFLOAD_REQUIRE_LOOPBACK: '1' };
+    delete environment.NODE_TEST_CONTEXT;
+    delete environment.OFFLOAD_TEST_SUMMARY_FILE;
+    const result = spawnSync(process.execPath, [join(root, 'test', 'run-suite.mjs'), 'unit'], {
+      cwd: directory,
+      env: environment,
+      encoding: 'utf8',
+      timeout: 10_000,
+      windowsHide: true,
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /ok 1 - output roots existed before this module loaded/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('CI test launcher preserves a strict runner failure exit code', async () => {
   const calls = [];
   const child = {
