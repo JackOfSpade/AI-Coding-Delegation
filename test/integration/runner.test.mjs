@@ -20,7 +20,7 @@ import { Runner } from '../../src/runner.mjs';
 import { mkdtemp, access, mkdir, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, posix, win32 } from 'node:path';
 import { createIsolatedWorktree, snapshotPrimaryWorkingTree } from '../../src/worktree.mjs';
 import { isolatedWorkspaceReadablePaths } from '../../src/core.mjs';
 import { cleanup as removeTree, git as runGit, makeRepo } from '../unit/helpers.mjs';
@@ -117,6 +117,34 @@ test('sandbox probe distinguishes a host policy denial from missing binary or a 
   assert.equal(noisy.reason, 'sandbox-apply-not-permitted');
   assert.equal(noisy.error, 'sandbox_apply: Operation not permitted');
   assert.equal(sandboxStatus('linux').reason, 'platform-not-darwin');
+});
+test('sandbox metadata traversal stops before POSIX, drive, and UNC roots', () => {
+  // Bound the subprocess so a synchronous stable-root loop produces a useful
+  // assertion rather than hanging the entire cross-platform suite.
+  const script = `
+    import { sandboxTraversalAncestors } from ${JSON.stringify(new URL('../../src/sandbox.mjs', import.meta.url).href)};
+    import { posix, win32 } from 'node:path';
+    const fixtures = ${JSON.stringify([
+      ['posix', '/repo/src'],
+      ['posix', '/'],
+      ['win32', 'C:\\repo\\src'],
+      ['win32', 'C:\\'],
+      ['win32', '\\\\server\\share\\repo\\src'],
+      ['win32', '\\\\server\\share\\'],
+    ])};
+    console.log(JSON.stringify(fixtures.map(([kind, path]) => sandboxTraversalAncestors(path, {posix, win32}[kind].dirname))));
+  `;
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  const result = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
+    encoding: 'utf8',
+    windowsHide: true,
+    env,
+    timeout: 5_000,
+  });
+  assert.equal(result.error, undefined, result.error?.message);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), [['/repo'], [], ['C:\\repo'], [], ['\\\\server\\share\\repo'], []]);
 });
 test('runner honors pre-abort and compiles globs to static sandbox roots', async () => {
   const controller = new AbortController();
@@ -392,6 +420,7 @@ test('runner bounds a single oversized output chunk without retaining the whole 
 });
 test('required macOS sandbox refuses a failed exact profile before spawning a worker command', async () => {
   let spawned = false;
+  let compiledProfile;
   await assert.rejects(
     () =>
       runCommand('touch should-not-run', {
@@ -400,7 +429,19 @@ test('required macOS sandbox refuses a failed exact profile before spawning a wo
         requireSandbox: true,
         cwd: process.cwd(),
         writablePaths: ['src/**'],
-        sandboxProbe: () => false,
+        compileSandboxProfile(input) {
+          assert.deepEqual(input.writablePaths, ['src/**']);
+          // Native cwd/temp I/O stays on the host. Only this simulated Darwin
+          // profile receives POSIX fixtures, with its real scope preserved.
+          compiledProfile = macosProfile({ ...input, repoPath: '/repo', gitDir: '/repo/.git', tempPath: '/private/tmp/probe' });
+          assert.ok(compiledProfile.includes('(allow file-write* (regex #"^[/]repo[/]src[/].*$"))'));
+          return compiledProfile;
+        },
+        sandboxProbe(platform, profile) {
+          assert.equal(platform, 'darwin');
+          assert.equal(profile, compiledProfile, 'the exact scoped profile must fail its probe');
+          return false;
+        },
         spawnProcess: () => {
           spawned = true;
           throw new Error('must not spawn');
@@ -409,6 +450,11 @@ test('required macOS sandbox refuses a failed exact profile before spawning a wo
     /Required macOS sandbox is unavailable/,
   );
   assert.equal(spawned, false);
+  assert.equal(typeof compiledProfile, 'string');
+  await assert.rejects(
+    runCommand('must not run', { platform: 'darwin', compileSandboxProfile: 'serialized request data' }),
+    /compileSandboxProfile must be a function/,
+  );
 });
 test('required sandbox cannot be bypassed with sandbox:false or a policy-only platform', async () => {
   for (const options of [
@@ -757,14 +803,46 @@ function fakeChild() {
 }
 const COMMAND_LINE_TOOLS = '/Library/Developer/CommandLineTools';
 
+function darwinTempFixtureProfile(input) {
+  // The simulated Darwin profile uses POSIX paths; its fake child still uses
+  // native host temp I/O. Preserve each disposable directory's unique basename.
+  const windowsInput = win32.isAbsolute(input.tempPath) && !posix.isAbsolute(input.tempPath);
+  const tempPath = windowsInput ? posix.join('/private/tmp', win32.basename(input.tempPath)) : input.tempPath;
+  const profile = macosProfile(
+    windowsInput ? { ...input, repoPath: '/fixture/workspace', gitDir: '/fixture/workspace/.git', tempPath } : input,
+  );
+  return { profile, tempPath };
+}
+const profileWriteRoots = (profile) =>
+  [...profile.matchAll(/^\(allow file-write\* \(subpath "([^"]*)"\)\)$/gm)].map((match) => JSON.parse(`"${match[1]}"`));
+
+test('simulated Darwin temp profiles map Windows I/O to one unique POSIX write root', () => {
+  for (const name of ['offload-sandbox-ONE', 'offload-sandbox-TWO']) {
+    const tempPath = win32.join('C:\\Users\\runneradmin\\AppData\\Local\\Temp', name);
+    const input = { repoPath: 'D:\\work\\checkout', tempPath };
+    const mapped = darwinTempFixtureProfile(input);
+    assert.equal(mapped.tempPath, `/private/tmp/${name}`);
+    assert.deepEqual(profileWriteRoots(mapped.profile), [mapped.tempPath]);
+    assert.equal(input.tempPath, tempPath, 'mapping never changes native I/O input');
+    for (const broad of ['/tmp', '/private/tmp', '/var/folders', '/private/var/folders', win32.dirname(tempPath)])
+      assert.equal(profileWriteRoots(mapped.profile).includes(broad), false, `${broad} is never granted`);
+  }
+});
+
 test('the macOS verifier grants exactly one physical per-run temp directory through TMPDIR, TMP, TEMP and HOME', async () => {
   const child = fakeChild();
   let environment;
   let profile;
+  let profileTemp;
   let existedWhileRunning;
   await runCommand('true', {
     platform: 'darwin',
     sandboxProbe: () => true,
+    compileSandboxProfile(input) {
+      const compiled = darwinTempFixtureProfile(input);
+      profileTemp = compiled.tempPath;
+      return compiled.profile;
+    },
     cwd: tmpdir(),
     env: { PATH: '/bin', TMPDIR: '/caller/tmp', DEVELOPER_DIR: '/caller/evil', GIT_CONFIG_GLOBAL: '/caller/evil.cfg' },
     spawnProcess(_command, args, options) {
@@ -784,8 +862,9 @@ test('the macOS verifier grants exactly one physical per-run temp directory thro
   assert.equal(existedWhileRunning, true);
   assert.equal(existsSync(temp), false, 'the per-run directory is removed when the command ends');
   // The write set is exactly that directory: no /tmp, /private/tmp or /var/folders grant, ever.
-  const writes = [...profile.matchAll(/^\(allow file-write\* \(subpath "([^"]*)"\)\)$/gm)].map((match) => match[1]);
-  assert.deepEqual(writes, [temp]);
+  const writes = profileWriteRoots(profile);
+  assert.deepEqual(writes, [profileTemp]);
+  if (process.platform !== 'win32') assert.equal(profileTemp, temp, 'native macOS grants its actual physical temp path');
   for (const broad of ['/tmp', '/private/tmp', '/var/folders', '/private/var/folders', await realpath(tmpdir())])
     assert.equal(writes.includes(broad), false, `${broad} is never granted`);
   // Caller-chosen values never survive the scrub.
@@ -977,8 +1056,9 @@ test('the verifier temp probe reports each outcome as a bounded, path-free summa
     note: 'a verifier can create temp dirs under its per-run TMPDIR; a hard-coded /tmp is denied by design',
   });
   assert.equal(call.options.requireSandbox, true, 'the probe goes through the real sandboxed runner');
-  assert.equal(call.options.cwd, '/host/tmp/offload-probe-SCRATCH'.replace('/offload-probe-SCRATCH', '') + '/offload-probe-SCRATCH');
-  assert.deepEqual(writable.removed, ['/host/tmp/offload-probe-SCRATCH'], 'the host scratch directory is removed');
+  const scratch = join('/host/tmp', 'offload-probe-SCRATCH');
+  assert.equal(call.options.cwd, scratch);
+  assert.deepEqual(writable.removed, [scratch], 'the host scratch directory is removed');
   assert.match(call.script, /mktemp -d "\$\{TMPDIR:-\/nonexistent\}\/offload-probe\./);
 
   const denied = await probeWith({ run: async () => probeOutput('tmpdir=denied\nsystem-tmp=denied\ngit-init=failed\n') });
@@ -1027,7 +1107,7 @@ test('the verifier temp probe reports each outcome as a bounded, path-free summa
   assert.doesNotMatch(JSON.stringify(noisy.result), /private|secret/);
 
   for (const { removed } of [denied, regressed, forged, timedOut, unavailable, crashed])
-    assert.deepEqual(removed, ['/host/tmp/offload-probe-SCRATCH'], 'every outcome removes the scratch directory');
+    assert.deepEqual(removed, [scratch], 'every outcome removes the scratch directory');
 });
 
 test('the verifier temp probe reports an unwritable host temp root by error code only, and checks just the host without a macOS sandbox', async () => {
@@ -1059,7 +1139,7 @@ test('the verifier temp probe reports an unwritable host temp root by error code
   assert.equal(linux.result.systemTmp, 'unknown');
   assert.equal(linux.result.gitInit, 'unknown');
   assert.equal(ran, 0);
-  assert.deepEqual(linux.removed, ['/host/tmp/offload-probe-SCRATCH']);
+  assert.deepEqual(linux.removed, [join('/host/tmp', 'offload-probe-SCRATCH')]);
 });
 
 test(

@@ -726,7 +726,8 @@ test('installer leaves malformed or symlinked Claude MCP state untouched without
 });
 test('installer invokes a Windows Claude .cmd launcher through bounded cmd.exe quoting', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-home-`);
-  const executable = join(home, 'Program Files', 'Claude', 'claude.cmd');
+  const executable = join(home, 'Program Files (x86)', 'Claude', 'claude.cmd');
+  const claudeDir = join(home, 'private Claude config');
   const calls = [];
   const result = await install({
     root: process.cwd(),
@@ -734,7 +735,14 @@ test('installer invokes a Windows Claude .cmd launcher through bounded cmd.exe q
     configHome: join(home, 'config'),
     clients: ['claude'],
     platform: 'win32',
-    env: { Path: dirname(executable), ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+    env: {
+      Path: dirname(executable),
+      ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+      SystemRoot: 'C:\\Windows',
+      CLAUDE_CONFIG_DIR: claudeDir,
+      OFFLOAD_PROVIDER_SECRET: 'must-not-reach-child',
+      NODE_OPTIONS: '--require=must-not-reach-child',
+    },
     commandExists: async (path) => path === executable,
     runCommand: (command, args, options) => {
       calls.push({ command, args, options });
@@ -743,8 +751,56 @@ test('installer invokes a Windows Claude .cmd launcher through bounded cmd.exe q
   });
   assert.equal(result.claudeMcp.status, 'add-unconfirmed');
   assert.equal(calls[0].command, 'C:\\Windows\\System32\\cmd.exe');
-  assert.deepEqual(calls[0].args.slice(0, 3), ['/d', '/s', '/c']);
-  assert.match(calls[0].args[3], /".*claude\.cmd" "mcp" "add" "--scope" "user" "offload" "--"/);
+  const expectedArguments = [
+    executable,
+    'mcp',
+    'add',
+    '--scope',
+    'user',
+    'offload',
+    '--',
+    process.execPath,
+    join(process.cwd(), 'bin', 'offload.mjs'),
+    'mcp',
+  ];
+  assert.deepEqual(calls[0].args, ['/d', '/s', '/c', `"${expectedArguments.map((value) => `"${value}"`).join(' ')}"`]);
+  assert.equal(calls[0].options.windowsVerbatimArguments, true, 'libuv must not re-escape the already quoted cmd payload');
+  assert.equal(calls[0].options.shell, false, 'the explicit cmd.exe must not be wrapped in another shell');
+  assert.equal(calls[0].options.timeout, 10_000);
+  assert.equal(calls[0].options.maxBuffer, 64 * 1024);
+  assert.equal(calls[0].options.windowsHide, true);
+  assert.deepEqual(calls[0].options.env, {
+    Path: dirname(executable),
+    ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+    SystemRoot: 'C:\\Windows',
+    HOME: home,
+    USERPROFILE: home,
+    CLAUDE_CONFIG_DIR: claudeDir,
+  });
+  for (const metacharacter of ['\0', '\r', '\n', '"', '%', '^', '&', '|', '<', '>', '!']) {
+    const rejectedHome = await mkdtemp(`${tmpdir()}/offload-unsafe-claude-`);
+    const unsafeExecutable = join(rejectedHome, `bin${metacharacter}unsafe`, 'claude.cmd');
+    const unsafeCalls = [];
+    try {
+      const rejected = await install({
+        root: process.cwd(),
+        home: rejectedHome,
+        configHome: join(rejectedHome, 'config'),
+        clients: ['claude'],
+        platform: 'win32',
+        env: { Path: dirname(unsafeExecutable) },
+        commandExists: async (path) => path === unsafeExecutable,
+        runCommand: (...args) => {
+          unsafeCalls.push(args);
+          return { status: 0, stdout: '' };
+        },
+      });
+      assert.equal(rejected.claudeMcp.status, 'unavailable', JSON.stringify(metacharacter));
+      assert.deepEqual(unsafeCalls, [], 'an unsafe .cmd executable must never reach the command runner');
+    } finally {
+      await rm(rejectedHome, { recursive: true, force: true });
+    }
+  }
 });
 test('installer rejects invalid client JSON on uninstall and uses a Windows-safe hook command', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-home-`);
@@ -1737,11 +1793,12 @@ test('active or installer-owned conflicting plugins never receive a duplicate na
 });
 test('Codex plugin uses cmd.exe safely on Windows and Cursor never receives a global rule', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-plugin-`);
-  const executable = join(home, 'bin', 'codex.cmd');
+  const executable = join(home, 'Program Files (x86)', 'Codex', 'codex.cmd');
+  const codexHome = join(home, 'private Codex config');
   const calls = [];
-  const runCommand = (command, args) => {
-    calls.push({ command, args });
-    return args.includes('/c') && args.at(-1).includes('plugin list')
+  const runCommand = (command, args, options) => {
+    calls.push({ command, args, options });
+    return args.includes('/c') && args.at(-1).includes('"plugin" "list"')
       ? { status: 0, stdout: '{"installed":[]}' }
       : { status: 0, stdout: '{}' };
   };
@@ -1751,12 +1808,56 @@ test('Codex plugin uses cmd.exe safely on Windows and Cursor never receives a gl
     configHome: join(home, 'config'),
     clients: ['codex'],
     platform: 'win32',
-    env: { Path: dirname(executable), ComSpec: 'cmd.exe' },
+    env: {
+      Path: dirname(executable),
+      ComSpec: 'cmd.exe',
+      SystemRoot: 'C:\\Windows',
+      CODEX_HOME: codexHome,
+      OFFLOAD_PROVIDER_SECRET: 'must-not-reach-child',
+      NODE_OPTIONS: '--require=must-not-reach-child',
+    },
     commandExists: async (path) => path === executable,
     runCommand,
   });
-  assert.deepEqual(calls[0].args.slice(0, 3), ['/d', '/s', '/c']);
-  assert.match(calls[0].args[3], /^".*codex\.cmd" "plugin"/);
+  assert.equal(calls[0].command, 'cmd.exe');
+  assert.deepEqual(calls[0].args, ['/d', '/s', '/c', `""${executable}" "plugin" "list" "--json""`]);
+  assert.equal(calls[0].options.windowsVerbatimArguments, true);
+  assert.equal(calls[0].options.shell, false);
+  assert.equal(calls[0].options.timeout, 10_000);
+  assert.equal(calls[0].options.maxBuffer, 1_000_000);
+  assert.equal(calls[0].options.windowsHide, true);
+  assert.deepEqual(calls[0].options.env, {
+    Path: dirname(executable),
+    ComSpec: 'cmd.exe',
+    SystemRoot: 'C:\\Windows',
+    HOME: home,
+    USERPROFILE: home,
+    CODEX_HOME: codexHome,
+  });
+  for (const metacharacter of ['\0', '\r', '\n', '"', '%', '^', '&', '|', '<', '>', '!']) {
+    const rejectedHome = await mkdtemp(`${tmpdir()}/offload-unsafe-codex-`);
+    const unsafeExecutable = join(rejectedHome, `bin${metacharacter}unsafe`, 'codex.cmd');
+    const unsafeCalls = [];
+    try {
+      const rejected = await rawInstall({
+        root: process.cwd(),
+        home: rejectedHome,
+        configHome: join(rejectedHome, 'config'),
+        clients: ['codex'],
+        platform: 'win32',
+        env: { Path: dirname(unsafeExecutable) },
+        commandExists: async (path) => path === unsafeExecutable,
+        runCommand: (...args) => {
+          unsafeCalls.push(args);
+          return { status: 0, stdout: '{}' };
+        },
+      });
+      assert.equal(rejected.plugin.active, false, JSON.stringify(metacharacter));
+      assert.deepEqual(unsafeCalls, [], 'an unsafe .cmd executable must never reach the command runner');
+    } finally {
+      await rm(rejectedHome, { recursive: true, force: true });
+    }
+  }
   const cursorHome = await mkdtemp(`${tmpdir()}/offload-cursor-`);
   const oldRule = join(cursorHome, '.cursor', 'rules', 'offload.md');
   await mkdir(dirname(oldRule), { recursive: true });

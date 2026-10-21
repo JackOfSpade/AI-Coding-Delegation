@@ -121,6 +121,97 @@ test('strict test runner parses TAP skips and rejects every skip outside the rev
   assert.deepEqual(result.unapprovedSkips, [{ number: 4, name: 'newly skipped regression', reason: 'oops' }]);
 });
 
+test('strict test runner reviews Darwin temp aliases and sandbox dependency isolation by exact skip reason', () => {
+  const reviewed = [
+    ['Darwin default roots accept /private/tmp and its /tmp alias after canonicalization', 'requires Darwin /private/tmp alias semantics'],
+    [
+      'a sandboxed command in the worktree imports a primary dependency, read-only, and cannot reach other host files',
+      'requires an available macOS sandbox',
+    ],
+  ];
+  for (const [name, reason] of reviewed) {
+    assert.deepEqual(analyzeStrictSkips(`ok 1 - ${name} # SKIP ${reason}`).unapprovedSkips, []);
+    assert.equal(analyzeStrictSkips(`ok 1 - ${name} # SKIP`).unapprovedSkips.length, 1);
+    assert.equal(analyzeStrictSkips(`ok 1 - ${name} # SKIP unrelated reason`).unapprovedSkips.length, 1);
+  }
+});
+
+test('execution progress diagnostics preserve TAP skips and failing child exit status', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'offload-reporter-test-'));
+  const fixture = join(directory, 'fixture.test.mjs');
+  try {
+    await writeFile(
+      fixture,
+      [
+        "import test from 'node:test';",
+        "import assert from 'node:assert/strict';",
+        "test('fixture passes', () => assert.equal(1, 1));",
+        "test('fixture skip', { skip: 'unreviewed fixture reason' }, () => {});",
+        "test('fixture fails', () => assert.fail('fixture assertion'));",
+      ].join('\n'),
+    );
+    const environment = { ...process.env };
+    delete environment.NODE_TEST_CONTEXT;
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--test',
+        '--test-reporter=tap',
+        `--test-reporter=${new URL('../progress-reporter.mjs', import.meta.url).href}`,
+        '--test-reporter-destination=stdout',
+        '--test-reporter-destination=stderr',
+        fixture,
+      ],
+      { cwd: directory, env: environment, encoding: 'utf8', timeout: 10_000, windowsHide: true },
+    );
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /not ok \d+ - fixture fails/);
+    assert.doesNotMatch(result.stdout, /\[test progress/);
+    assert.match(result.stderr, /\[test progress .*fixture fails/);
+    assert.deepEqual(analyzeStrictSkips(result.stdout).unapprovedSkips, [
+      { number: 2, name: 'fixture skip', reason: 'unreviewed fixture reason' },
+    ]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('test runner prepares generated output roots before any concurrent test imports', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'offload-runner-outputs-'));
+  try {
+    const tests = join(directory, 'test', 'unit');
+    await mkdir(tests, { recursive: true });
+    await writeFile(
+      join(tests, 'output-roots.test.mjs'),
+      [
+        "import test from 'node:test';",
+        "import assert from 'node:assert/strict';",
+        "import { statSync } from 'node:fs';",
+        // Package-gate tests publish here while other files import the runtime.
+        // Creating these entries later changes the checkout directory ctime.
+        "const prepared = ['artifacts', 'coverage'].every((path) => statSync(path).isDirectory());",
+        "test('output roots existed before this module loaded', () => assert.equal(prepared, true));",
+      ].join('\n'),
+    );
+    const environment = { ...process.env, OFFLOAD_REQUIRE_LOOPBACK: '1' };
+    delete environment.NODE_TEST_CONTEXT;
+    delete environment.OFFLOAD_TEST_SUMMARY_FILE;
+    const result = spawnSync(process.execPath, [join(root, 'test', 'run-suite.mjs'), 'unit'], {
+      cwd: directory,
+      env: environment,
+      encoding: 'utf8',
+      timeout: 10_000,
+      windowsHide: true,
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /ok 1 - output roots existed before this module loaded/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('CI test launcher preserves a strict runner failure exit code', async () => {
   const calls = [];
   const child = {
@@ -771,12 +862,15 @@ test('client smoke validates a disposable registration lifecycle without touchin
   const executable = join(directory, process.platform === 'win32' ? 'claude.cmd' : 'claude');
   try {
     const fakeClaude =
-      'const fs=require("fs");const path=require("path");const args=process.argv.slice(1);if(args[0]==="--version")process.exit(0);const file=path.join(process.env.CLAUDE_CONFIG_DIR,".claude.json");const current=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,"utf8")):{};current.mcpServers||={};if(args[1]==="add"){const mark=args.indexOf("--");current.mcpServers.offload={type:"stdio",command:args[mark+1],args:args.slice(mark+2),env:{}};}else if(args[1]==="remove"){delete current.mcpServers.offload;}else process.exit(2);fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,JSON.stringify(current));';
+      'const fs=require("fs");const path=require("path");const args=process.argv.slice(2);if(args[0]==="--version")process.exit(0);const file=path.join(process.env.CLAUDE_CONFIG_DIR,".claude.json");const current=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,"utf8")):{};current.mcpServers||={};if(args[1]==="add"){const mark=args.indexOf("--");current.mcpServers.offload={type:"stdio",command:args[mark+1],args:args.slice(mark+2),env:{}};}else if(args[1]==="remove"){delete current.mcpServers.offload;}else process.exit(2);fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,JSON.stringify(current));';
+    const script = join(directory, 'fake-claude.cjs');
+    await writeFile(script, fakeClaude);
+    const shellQuote = (value) => `'${value.replaceAll("'", "'\"'\"'")}'`;
     await writeFile(
       executable,
       process.platform === 'win32'
-        ? `@echo off\r\nnode -e "${fakeClaude.replaceAll('"', '\\"')}" %*\r\n`
-        : `#!/bin/sh\nnode -e '${fakeClaude}' "$@"\n`,
+        ? `@echo off\r\n"${process.execPath}" "%~dp0fake-claude.cjs" %*\r\n`
+        : `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(script)} "$@"\n`,
     );
     if (process.platform !== 'win32') await chmod(executable, 0o755);
     const env = { ...process.env, PATH: `${directory}${delimiter}${process.env.PATH || process.env.Path || ''}` };

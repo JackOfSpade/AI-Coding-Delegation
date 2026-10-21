@@ -32,7 +32,7 @@ test('report input roots ignore relative ambient temp spellings rather than reso
 
 test(
   'Darwin default roots accept /private/tmp and its /tmp alias after canonicalization',
-  { skip: process.platform !== 'darwin' },
+  { skip: process.platform !== 'darwin' ? 'requires Darwin /private/tmp alias semantics' : false },
   async () => {
     const root = await mkdtemp('/private/tmp/offload-report-inputs-');
     const workspace = await mkdtemp(join(tmpdir(), 'offload-report-workspace-'));
@@ -118,7 +118,7 @@ test('report input allowlist rejects sibling-prefix and directory-symlink escape
       () => copyReportInputs({ inputFiles: [join(sibling, secretName)], workspacePath: workspace, roots: [canonicalRoot] }),
       (error) => {
         assert.match(error.message, /outside the caller scratch\/temp allowlist/);
-        assert.match(error.message, new RegExp(canonicalRoot.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&')));
+        assert.ok(error.message.includes(JSON.stringify(canonicalRoot)), 'the exact canonical allowed root is JSON-quoted');
         assert.doesNotMatch(error.message, new RegExp(secretName.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&')));
         return true;
       },

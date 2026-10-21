@@ -141,6 +141,38 @@ test("permission denied counts only outside the job's write scope, in either spe
   }
 });
 
+test('Windows drive and UNC permission diagnostics preserve owned-path classification on every host', () => {
+  for (const workspace of ['C:\\Users\\runneradmin\\project', '\\\\server\\share\\project']) {
+    const options = { workspacePath: workspace, writeScope: scope };
+    for (const path of [`${workspace}\\coverage\\lcov.info`, `${workspace}/coverage/lcov.info`]) {
+      const denied = classifyVerifierEnvironment(failed(`Error: EACCES: permission denied, open '${path}'`), options);
+      assert.equal(denied?.kind, 'permission-denied', path);
+      assert.ok(denied.detail.includes(path));
+    }
+    for (const path of [`${workspace}\\src\\a.js`, `${workspace}/test/deep/b.js`, `${workspace.toUpperCase()}\\SRC\\a.js`])
+      assert.equal(classifyVerifierEnvironment(failed(`Error: EPERM: operation not permitted, open '${path}'`), options), null, path);
+    assert.equal(
+      classifyVerifierEnvironment(failed(`EPERM: operation not permitted, open '${workspace}-other\\src\\a.js'`), options)?.kind,
+      'permission-denied',
+      'a shared string prefix is not a path inside the worktree',
+    );
+    assert.equal(
+      classifyVerifierEnvironment(
+        failed(`EACCES: permission denied, open '${workspace}\\coverage\\lcov.info'\nAssertionError: failed`),
+        options,
+      ),
+      null,
+      'an actual test assertion still wins over an incidental permission diagnostic',
+    );
+  }
+  assert.equal(classifyVerifierEnvironment(failed('EACCES: permission denied, open C:\\temp\\cache'))?.kind, 'permission-denied');
+  assert.equal(
+    classifyVerifierEnvironment(failed("EACCES: permission denied, open 'D:\\directory with spaces\\cache'"))?.kind,
+    'permission-denied',
+  );
+  assert.equal(classifyVerifierEnvironment(failed("EACCES: permission denied, open 'C:relative\\cache'")), null);
+});
+
 test('detail is bounded and control characters are neutralized', () => {
   const result = classifyVerifierEnvironment(failed(`Cannot find package '${'a'.repeat(400)}'`));
   assert.equal(result, null, 'an implausibly long specifier is not matched');
@@ -167,7 +199,7 @@ test('a hard-coded system temp path is a temp-dir-denied environment failure tha
     assert.ok(result.detail.includes(path), `the detail names ${path}`);
     assert.match(result.detail, /per-run TMPDIR/);
   }
-  // A look-alike prefix or a non-POSIX path is an ordinary permission denial or nothing.
+  // Look-alike POSIX prefixes and Windows absolute paths are ordinary permission denials.
   assert.equal(
     classifyVerifierEnvironment(failed("EPERM: operation not permitted, mkdir '/tmpfiles/x'"), { writeScope: scope }).kind,
     'permission-denied',
@@ -176,7 +208,10 @@ test('a hard-coded system temp path is a temp-dir-denied environment failure tha
     classifyVerifierEnvironment(failed("EPERM: operation not permitted, mkdir '/var/foldersx/y'"), { writeScope: scope }).kind,
     'permission-denied',
   );
-  assert.equal(classifyVerifierEnvironment(failed("EPERM: operation not permitted, mkdir 'C:\\temp\\x'"), { writeScope: scope }), null);
+  assert.equal(
+    classifyVerifierEnvironment(failed("EPERM: operation not permitted, mkdir 'C:\\temp\\x'"), { writeScope: scope }).kind,
+    'permission-denied',
+  );
 });
 
 test("a denial on a file under the verifier's own per-run TMPDIR is not blamed on a hard-coded system temp path", () => {

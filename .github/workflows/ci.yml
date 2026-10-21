@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -16,7 +17,9 @@ jobs:
   test:
     name: Node ${{ matrix.node }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # Real Windows Git/Credential Locker integration cases take substantially
+    # longer than POSIX; keep the complete suite and a bounded diagnostic budget.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 20 }}
     strategy:
       fail-fast: false
       matrix:
@@ -38,6 +41,9 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
+      - name: Validate Windows client registration
+        if: matrix.os == 'windows-latest'
+        run: node --test --test-name-pattern="client smoke validates a disposable registration lifecycle" test/unit/quality-scripts.test.mjs
       - run: npm run test:ci
       # package-gate chooses npm.cmd on Windows; exercise that launcher in CI
       # instead of relying solely on the Linux release-gate job.
@@ -47,7 +53,8 @@ jobs:
 
   quality:
     name: Release gate
-    needs: test
+    # This job has its own checkout and test run. Start it immediately so a
+    # queued platform runner cannot delay Linux coverage and package validation.
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -69,3 +76,29 @@ jobs:
             coverage/coverage-summary.json
           if-no-files-found: warn
           retention-days: 7
+
+  required:
+    name: CI required
+    if: ${{ always() }}
+    needs: ['test', 'quality', 'merge-policy']
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every prerequisite to succeed
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          results = json.loads(os.environ["JOB_RESULTS"])
+          failed = [name for name, job in results.items() if job["result"] != "success"]
+          if failed:
+              sys.exit("Unsuccessful prerequisites: " + ", ".join(failed))
+          PY
+  merge-policy:
+    name: Validate merge policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: python3 -m unittest discover -s .github/tests -p 'test_merge_validated_pr.py'

@@ -7,7 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   readlinkSync,
-  realpathSync,
+  realpathSync as fsRealpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -31,6 +31,16 @@ import {
 } from '../../src/worktree.mjs';
 import { runCommand, sandboxAvailable } from '../../src/sandbox.mjs';
 import { cleanup, git, makeRepo, tempDir, write } from './helpers.mjs';
+
+// Use the same filesystem identity as the worktree implementation. Windows'
+// legacy resolver can retain a TMP 8.3 alias after the native resolver expands it.
+const realpathSync = fsRealpathSync.native || fsRealpathSync;
+
+// Git executes configured filters through its shell, including Git for
+// Windows. Quote native Node/script paths for that shell without relying on
+// POSIX utilities inside the filter itself.
+const gitShellQuote = (value) => `'${(process.platform === 'win32' ? value.replaceAll('\\', '/') : value).replaceAll("'", "'\"'\"'")}'`;
+const nodeFilterCommand = (script) => `${gitShellQuote(process.execPath)} ${gitShellQuote(script)}`;
 
 function primaryMetadata(repo) {
   return {
@@ -86,36 +96,45 @@ test('isolated worktree is seeded from dirty and untracked baseline without touc
   }
 });
 
-test(
-  'worktree materialization neither runs repository filters nor inherits provider credentials',
-  { skip: process.platform === 'win32' },
-  () => {
-    const repo = makeRepo();
-    let isolated;
-    const marker = join(repo, 'filter-ran.txt');
-    const previous = process.env.OFFLOAD_PROVIDER_SECRET;
-    try {
-      write(join(repo, '.gitattributes'), 'payload.txt filter=offload-test\n');
-      write(join(repo, 'payload.txt'), 'safe payload\n');
-      git(repo, ['add', '.gitattributes', 'payload.txt']);
-      git(repo, ['commit', '-m', 'add filtered payload']);
-      // If read-tree/checkouts were allowed to run this command it would both
-      // prove execution and expose whether an inherited provider secret was
-      // available. The hardened worktree path disables all configured filters.
-      git(repo, ['config', 'filter.offload-test.smudge', `sh -c 'printf %s "$OFFLOAD_PROVIDER_SECRET" > "${marker}"'`]);
-      process.env.OFFLOAD_PROVIDER_SECRET = 'must-not-reach-git-child';
-      const baseline = snapshotPrimaryWorkingTree(repo);
-      isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
-      assert.equal(readFileSync(join(isolated.path, 'payload.txt'), 'utf8'), 'safe payload\n');
-      assert.equal(existsSync(marker), false);
-    } finally {
-      if (previous === undefined) delete process.env.OFFLOAD_PROVIDER_SECRET;
-      else process.env.OFFLOAD_PROVIDER_SECRET = previous;
-      isolated?.cleanup();
-      cleanup(repo);
-    }
-  },
-);
+test('worktree materialization neither runs repository filters nor inherits provider credentials', () => {
+  const repo = makeRepo();
+  const fixture = tempDir('offload-filter-');
+  let isolated;
+  const marker = join(repo, 'filter-ran.txt');
+  const previous = process.env.OFFLOAD_PROVIDER_SECRET;
+  try {
+    write(join(repo, '.gitattributes'), 'payload.txt filter=offload-test\n');
+    write(join(repo, 'payload.txt'), 'safe payload\n');
+    git(repo, ['add', '.gitattributes', 'payload.txt']);
+    git(repo, ['commit', '-m', 'add filtered payload']);
+    // If read-tree/checkouts were allowed to run this command it would both
+    // prove execution and expose whether an inherited provider secret was
+    // available. The hardened worktree path disables all configured filters.
+    const script = join(fixture, 'smudge.cjs');
+    write(
+      script,
+      `const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(marker)}, process.env.OFFLOAD_PROVIDER_SECRET ?? '');
+process.stdout.write(fs.readFileSync(0));
+`,
+    );
+    git(repo, ['config', 'filter.offload-test.smudge', nodeFilterCommand(script)]);
+    process.env.OFFLOAD_PROVIDER_SECRET = 'must-not-reach-git-child';
+    const baseline = snapshotPrimaryWorkingTree(repo);
+    isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
+    assert.equal(readFileSync(join(isolated.path, 'payload.txt'), 'utf8'), 'safe payload\n');
+    assert.equal(existsSync(marker), false);
+    rmSync(join(repo, 'payload.txt'));
+    git(repo, ['checkout', '--force', '--', 'payload.txt']);
+    assert.equal(readFileSync(marker, 'utf8'), 'must-not-reach-git-child', 'the unhardened fixture can run and see the fake host secret');
+  } finally {
+    if (previous === undefined) delete process.env.OFFLOAD_PROVIDER_SECRET;
+    else process.env.OFFLOAD_PROVIDER_SECRET = previous;
+    isolated?.cleanup();
+    cleanup(repo);
+    cleanup(fixture);
+  }
+});
 
 test('integration applies only worker-touched paths, preserves unrelated primary edits, and leaves index/HEAD exact', () => {
   const repo = makeRepo();
@@ -658,7 +677,7 @@ test('a private worktree resolves primary dependencies through parent and local 
     const link = join(dirname(isolated.path), 'node_modules');
     assert.equal(lstatSync(link).isSymbolicLink(), true);
     assert.equal(realpathSync(link), realpathSync(join(repo, 'node_modules')));
-    assert.equal(readlinkSync(join(isolated.path, 'node_modules')), '../node_modules');
+    assert.equal(readlinkSync(join(isolated.path, 'node_modules')).replaceAll('\\', '/'), '../node_modules');
     assert.equal(
       realpathSync(join(isolated.path, 'node_modules', 'dep-pkg', 'index.js')),
       realpathSync(join(repo, 'node_modules', 'dep-pkg', 'index.js')),
@@ -741,7 +760,7 @@ test('a retargeted or replaced dependency link grants no read path', () => {
     assert.equal(isolatedDependencyReadPaths(isolated.path, repo).length, 1);
     rmSync(link);
     symlinkSync(outside, link, 'dir');
-    assert.equal(readlinkSync(link), outside);
+    assert.equal(realpathSync(link), realpathSync(outside));
     assert.deepEqual(isolatedDependencyReadPaths(isolated.path, repo), [], 'a link to anything but the primary node_modules is ignored');
     assert.deepEqual(
       isolated.changes(isolated.snapshot()).files.map((file) => file.path),
@@ -759,9 +778,40 @@ test('a retargeted or replaced dependency link grants no read path', () => {
   }
 });
 
+test('a retargeted workspace dependency link remains visible to the scope audit', () => {
+  const repo = repoWithDependency();
+  const outside = tempDir('offload-outside-');
+  let isolated;
+  try {
+    isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotPrimaryWorkingTree(repo) });
+    const local = join(isolated.path, 'node_modules');
+    rmSync(local);
+    symlinkSync(outside, local, 'dir');
+    assert.deepEqual(
+      isolated.changes(isolated.snapshot()).files.map((file) => file.path),
+      ['node_modules'],
+      'an unauthenticated local link is not excluded as a server-created dependency link',
+    );
+    // On POSIX a backslash is a filename character, not a Windows separator.
+    // Normalizing it there would conceal a worker-retargeted dependency link.
+    if (process.platform !== 'win32') {
+      rmSync(local);
+      symlinkSync('..\\node_modules', local, 'dir');
+      assert.deepEqual(
+        isolated.changes(isolated.snapshot()).files.map((file) => file.path),
+        ['node_modules'],
+      );
+    }
+  } finally {
+    isolated?.cleanup();
+    cleanup(repo);
+    cleanup(outside);
+  }
+});
+
 test(
   'a sandboxed command in the worktree imports a primary dependency, read-only, and cannot reach other host files',
-  { skip: process.platform !== 'darwin' || !sandboxAvailable() },
+  { skip: process.platform !== 'darwin' || !sandboxAvailable() ? 'requires an available macOS sandbox' : false },
   async () => {
     const repo = repoWithDependency();
     const outside = tempDir('offload-outside-');
@@ -981,7 +1031,7 @@ test('workingTreeStatus counts staged, modified, untracked, renamed and deleted 
   }
 });
 
-test('workingTreeStatus counts a merge conflict', { skip: process.platform === 'win32' }, () => {
+test('workingTreeStatus counts a merge conflict', () => {
   const repo = makeRepo();
   try {
     const base = git(repo, ['rev-parse', '--abbrev-ref', 'HEAD']);
@@ -991,7 +1041,7 @@ test('workingTreeStatus counts a merge conflict', { skip: process.platform === '
     git(repo, ['checkout', base]);
     write(join(repo, 'tracked.txt'), 'main\n');
     git(repo, ['commit', '-am', 'main']);
-    assert.throws(() => git(repo, ['merge', 'side']));
+    assert.throws(() => git(repo, ['merge', '--no-edit', 'side']));
     const status = workingTreeStatus(repo);
     assert.equal(status.clean, false);
     assert.equal(status.conflicted, 1);
@@ -1033,12 +1083,33 @@ test('workingTreeStatus counts secret-shaped files but never names them, and sam
   }
 });
 
-test('workingTreeStatus keeps unicode and spaced names whole and strips control characters', { skip: process.platform === 'win32' }, () => {
+test('workingTreeStatus keeps unicode and spaced filesystem names whole', () => {
   const repo = makeRepo();
   try {
     write(join(repo, 'dir with space', 'caf\u00e9 \u2713.txt'), 'x\n');
-    write(join(repo, 'new\nline.txt'), 'x\n');
+    git(repo, ['add', 'dir with space']);
+    write(join(repo, 'another file.txt'), 'x\n');
     const status = workingTreeStatus(repo);
+    assert.equal(status.changed, 2);
+    assert.deepEqual(status.sample, ['A  dir with space/caf\u00e9 \u2713.txt', '?? another file.txt']);
+  } finally {
+    cleanup(repo);
+  }
+});
+
+test('workingTreeStatus counts NUL-delimited control-character names without echoing them', () => {
+  const repo = makeRepo();
+  try {
+    // Windows cannot create a newline filename. Feed the exact porcelain
+    // protocol bytes to the real parser on every host instead of skipping its
+    // security assertion on Windows.
+    const status = workingTreeStatus(repo, {
+      execFile: (_file, args) => {
+        if (args[0] === 'config') throw Object.assign(new Error('no filters'), { status: 1 });
+        assert.ok(args.includes('status') && args.includes('-z'));
+        return Buffer.from('?? dir with space/\0?? new\nline.txt\0');
+      },
+    });
     assert.equal(status.changed, 2, 'a newline in a name must not split one entry into two');
     assert.ok(status.sample.includes('?? dir with space/'), JSON.stringify(status.sample));
     // The newline name cannot be echoed (it is unnormalizable), so only the counts show it.
@@ -1115,21 +1186,32 @@ test('workingTreeStatus is read-only: a stat-dirty index is not refreshed', () =
   }
 });
 
-test('workingTreeStatus never runs a configured clean filter', { skip: process.platform === 'win32' }, () => {
+test('workingTreeStatus never runs a configured clean filter', () => {
   const repo = makeRepo();
-  const marker = join(repo, '..', `${basename(repo)}-filter-ran`);
+  const fixture = tempDir('offload-filter-');
+  const marker = join(fixture, 'filter-ran');
   try {
     write(join(repo, '.gitattributes'), 'tracked.txt filter=probe\n');
     git(repo, ['add', '.gitattributes']);
     git(repo, ['commit', '-m', 'attrs']);
-    git(repo, ['config', 'filter.probe.clean', `sh -c 'cat; touch "${marker}"'`]);
+    const script = join(fixture, 'clean.cjs');
+    write(
+      script,
+      `const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(marker)}, 'ran');
+process.stdout.write(fs.readFileSync(0));
+`,
+    );
+    git(repo, ['config', 'filter.probe.clean', nodeFilterCommand(script)]);
     // A stat-dirty file makes git run the clean filter to compare contents.
     const later = new Date(Date.now() + 60_000);
     utimesSync(join(repo, 'tracked.txt'), later, later);
     assert.equal(workingTreeStatus(repo).clean, true);
     assert.equal(existsSync(marker), false, 'the clean filter must not run');
+    git(repo, ['diff', '--', 'tracked.txt']);
+    assert.equal(readFileSync(marker, 'utf8'), 'ran', 'unhardened Git executes the configured fixture on the same file');
   } finally {
-    rmSync(marker, { force: true });
     cleanup(repo);
+    cleanup(fixture);
   }
 });

@@ -4,10 +4,12 @@ import { readRegularFileSync } from './regular-file.mjs';
 import { aggregateSignals, parseStoredRecord, storedRecord } from './retrospective.mjs';
 
 /**
- * Local history of retrospective digests, beside the diagnostic log and under the same rules: one bounded
- * file that rotates once (so disk use is at most twice `maxBytes`), mode 0600, written without following a
+ * Local history of retrospective digests on POSIX: one bounded file beside the diagnostic log
+ * that rotates once (so disk use is at most twice `maxBytes`), mode 0600, written without following a
  * symlink, never throwing, off with OFFLOAD_LOG=off, and never sent anywhere. It holds the redacted digest
  * only (no skeleton, no brief text), so `list` can show which signals keep coming back across sessions.
+ * Windows history is disabled: POSIX modes do not prove ACL privacy, so no history is read or written.
+ * The current retrospective digest remains available in memory.
  */
 export const RETROSPECTIVE_FILE = 'retrospectives.jsonl';
 export const RETROSPECTIVE_LOG_LIMITS = Object.freeze({
@@ -18,7 +20,22 @@ export const RETROSPECTIVE_LOG_LIMITS = Object.freeze({
 });
 const MAX_READ_BYTES = 2 * RETROSPECTIVE_LOG_LIMITS.maxBytes;
 
-export function createRetrospectiveLog({ dir = defaultLogDir(), env = process.env, now, limits = RETROSPECTIVE_LOG_LIMITS } = {}) {
+export function createRetrospectiveLog({
+  dir = defaultLogDir(),
+  env = process.env,
+  now,
+  limits = RETROSPECTIVE_LOG_LIMITS,
+  platform = process.platform,
+} = {}) {
+  // Match the file-secret boundary: chmod(0600) cannot establish Windows ACL
+  // privacy. Refuse persistence before constructing a logger or reading a path.
+  // The platform seam may tighten this policy for tests, never bypass the host.
+  if (process.platform === 'win32' || platform === 'win32')
+    return {
+      path: null,
+      append() {},
+      history: () => ({ path: null, records: [], aggregate: aggregateSignals([]) }),
+    };
   const log = createDiagnosticLog({ dir, env, file: RETROSPECTIVE_FILE, header: '', limits, ...(now ? { now } : {}) });
   return {
     path: log.path,

@@ -3,7 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve, sep, relative, isAbsolute } from 'node:path';
+import { dirname, join, resolve, sep, relative, isAbsolute, posix } from 'node:path';
 import { normalizePath } from './glob.mjs';
 import { DEFAULT_DENY_READ, DEFAULT_DENY_WRITE } from './policy.mjs';
 
@@ -250,6 +250,7 @@ export function caseInsensitiveGlob(value) {
     .join('/');
 }
 function sandboxGlobFilter(kind, repoPath, value) {
+  const { resolve, relative, isAbsolute } = posix;
   const root = resolve(repoPath);
   const raw = typeof value === 'string' ? value : String(value);
   seatbeltPath(raw);
@@ -260,6 +261,7 @@ function sandboxGlobFilter(kind, repoPath, value) {
   return `(${kind} file-write* (regex #"^${seatbeltString(seatbeltLiteral(root))}[/]${seatbeltString(source)}$"))`;
 }
 function denyFilter(kind, repoPath, pattern) {
+  const { resolve } = posix;
   const safePattern = normalizePath(pattern);
   // Seatbelt accepts scoped `(?i:...)` syntax but does not apply it when
   // matching `regex` path filters. Compile ordinary literal portions into
@@ -287,9 +289,17 @@ const EXTRA_READ_ROOT_DENY = Object.freeze([
   '**/.cache',
   '**/.cache/**',
 ]);
+/** Exact ancestor metadata only; exclude the stable POSIX, drive, or UNC root. */
+export function sandboxTraversalAncestors(path, parentOf = dirname) {
+  const ancestors = [];
+  for (let parent = parentOf(path), next = parentOf(parent); parent !== next; parent = next, next = parentOf(parent))
+    ancestors.push(parent);
+  return ancestors;
+}
+
 export function macosProfile({
   repoPath,
-  gitDir = join(repoPath, '.git'),
+  gitDir = posix.join(repoPath, '.git'),
   writablePaths = [],
   readablePaths = [],
   denyRead = [],
@@ -300,6 +310,9 @@ export function macosProfile({
   allowNetwork = false,
   allowTempSockets = false,
 }) {
+  // Seatbelt profiles describe macOS paths even when a diagnostic fixture is
+  // compiled on another host. Command execution and temp I/O remain native.
+  const { basename, dirname, join, resolve, sep, isAbsolute } = posix;
   if (typeof allowTempSockets !== 'boolean') throw new TypeError('allowTempSockets must be boolean');
   if (!Array.isArray(denyRead) || denyRead.some((path) => typeof path !== 'string'))
     throw new TypeError('denyRead must be relative glob strings');
@@ -356,7 +369,7 @@ export function macosProfile({
     ...resolvedInterpreter,
     dirname(MACOS_SHELL_SELECTOR),
   ].filter(Boolean))
-    for (let parent = dirname(path); parent !== sep; parent = dirname(parent)) traversalMetadata.add(parent);
+    for (const parent of sandboxTraversalAncestors(path, dirname)) traversalMetadata.add(parent);
   // CPython resolves its own executable with realpath(3), which stats every
   // component starting at `/`: without the exact root node an interpreter dies
   // at startup ("realpath: ...: Operation not permitted"), even a system one.
@@ -545,6 +558,11 @@ export async function runCommand(command, options = {}) {
     throw new TypeError('requireSandbox must be boolean');
   if (options.sandboxProbe !== undefined && typeof options.sandboxProbe !== 'function')
     throw new TypeError('sandboxProbe must be a function');
+  // Trusted host dependency injection, like spawnProcess/sandboxProbe. A
+  // serialized worker request cannot supply a JavaScript compiler function.
+  if (options.compileSandboxProfile !== undefined && typeof options.compileSandboxProfile !== 'function')
+    throw new TypeError('compileSandboxProfile must be a function');
+  const compileSandboxProfile = options.compileSandboxProfile || macosProfile;
   if (options.onOutput !== undefined && typeof options.onOutput !== 'function') throw new TypeError('onOutput must be a function');
   const profileInput = {
     repoPath: cwd,
@@ -558,7 +576,7 @@ export async function runCommand(command, options = {}) {
     interpreterPaths: options.interpreterPaths || [],
     allowNetwork: options.allowNetwork === true,
   };
-  const probeProfile = options.sandbox !== false && platform === 'darwin' ? macosProfile(profileInput) : undefined;
+  const probeProfile = options.sandbox !== false && platform === 'darwin' ? compileSandboxProfile(profileInput) : undefined;
   const canSandbox = probeProfile && (options.sandboxProbe || sandboxAvailable)(platform, probeProfile);
   // Worker shell calls are untrusted model output. A job-specific profile can
   // fail even after a general availability check passed, so never silently
@@ -646,7 +664,7 @@ export async function runCommand(command, options = {}) {
     }
     const sandboxProfile =
       sandbox === 'macos'
-        ? macosProfile({
+        ? compileSandboxProfile({
             repoPath: sandboxCwd,
             gitDir: sandboxGitDir,
             writablePaths: sandboxWritablePaths,

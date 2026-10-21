@@ -135,7 +135,8 @@ test('a passing applyThenVerify runs AFTER the apply, read-only, and leaves DONE
       assert.equal(seen.options.timeoutMs, 300_000);
       assert.equal(seen.options.allowNetwork, false);
       assert.deepEqual(seen.options.denyRead, ['secrets/**'], "the job's own read denials follow the command into the primary");
-      assert.equal(seen.options.cwd, realpathSync(h.repo), 'it runs in the primary checkout');
+      // Windows TMP may use an 8.3 alias while the verifier uses the long name.
+      assert.equal(realpathSync.native(seen.options.cwd), realpathSync.native(h.repo), 'it runs in the primary checkout');
       assert.ok(seen.options.signal instanceof AbortSignal);
       assert.match(seen.options.gitDir, /\.git$/);
       assert.equal(result.applied, true);
