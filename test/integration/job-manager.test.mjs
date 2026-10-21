@@ -3216,7 +3216,7 @@ test('the wall-clock watchdog ends a round that cannot stop itself as TIMEOUT', 
       },
     },
     // limits.timeoutMinutes has a one-minute floor; compress the watchdog's delay for the test.
-    { setTimeoutFn: (fn, ms, ...rest) => setTimeout(fn, ms >= 60_000 ? 20 : ms, ...rest) },
+    { setTimeoutFn: (fn) => setTimeout(fn, 20) },
   );
   const job = await m.start({ task: 'x', ownedPaths: ['src/**'], repoPath: process.cwd(), budget: { timeoutMinutes: 1 } });
   const done = await m.wait(job.jobId, { timeoutSec: 10 });
@@ -3278,10 +3278,12 @@ test("a RUNNING round this process claimed but no task owns is finalized; anothe
 });
 
 test('offload_wait and offload_job show a pending cancel and how long ago it was requested', async () => {
+  let clock = Date.parse('2026-10-21T04:00:00.000Z');
+  const now = () => new Date(clock);
   let release;
   const released = new Promise((resolve) => (release = resolve));
   // Ignores the abort until released, so the cancel stays pending.
-  const m = await plainManager({ run: async () => (await released, { status: 'DONE' }) });
+  const m = await plainManager({ run: async () => (await released, { status: 'DONE' }) }, { now });
   try {
     const job = await m.start({ task: 'x', ownedPaths: ['src/**'], repoPath: process.cwd() });
     const before = await m.wait(job.jobId, { timeoutSec: 0 });
@@ -3290,16 +3292,27 @@ test('offload_wait and offload_job show a pending cancel and how long ago it was
     assert.equal(reply.status, 'RUNNING');
     assert.equal(reply.cancelRequested, true);
     assert.equal(typeof reply.cancelRequestedAt, 'string');
-    assert.ok(reply.cancelRequestedSec >= 0);
+    assert.equal(reply.cancelRequestedSec, 0);
+    clock += 12_000;
     const waiting = await m.wait(job.jobId, { timeoutSec: 0 });
     assert.equal(waiting.unchanged, undefined, 'a new cancel is a change, not the unchanged marker');
     assert.equal(waiting.progress.cancelRequested, true);
-    assert.ok(Number.isInteger(waiting.progress.cancelRequestedSec));
+    assert.equal(waiting.progress.cancelRequestedSec, 12);
+    assert.equal(waiting.cancelRequestedSec, 12);
+    clock += 5_000;
     const again = await m.wait(job.jobId, { timeoutSec: 0 });
     assert.equal(again.unchanged, true);
     assert.equal(again.progress.cancelRequested, true, 'the compact marker still says so');
+    assert.equal(again.progress.cancelRequestedSec, 17);
+    assert.equal(again.cancelRequestedSec, 17);
+    const repeated = await m.cancel(job.jobId);
+    assert.equal(repeated.cancelRequestedAt, reply.cancelRequestedAt, 'a repeated request keeps the original timestamp');
+    assert.equal(repeated.cancelRequestedSec, 17);
     const summary = await m.job(job.jobId);
     assert.equal(summary.cancelRequested, true);
+    assert.equal(summary.cancelRequestedSec, 17);
+    assert.equal((await m.job(job.jobId, { include: 'log' })).cancelRequestedSec, 17);
+    assert.equal((await m.wait(job.jobId, { timeoutSec: 0, detail: 'full' })).progress.cancelRequestedSec, 17);
     release();
     const done = await m.wait(job.jobId, { timeoutSec: 10 });
     assert.equal(done.status, 'CANCELLED');

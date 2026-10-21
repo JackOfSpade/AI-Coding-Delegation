@@ -289,9 +289,28 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
   }
   // A FAILED job only through the gate offload_apply enforces on its retained diff.
   const appliable = APPLY_ELIGIBLE.has(job.status) || (job.status === 'FAILED' && !failedApplyRefusal(job));
-  if (!reportMode && !violations.length && mutationSettled && appliable && files.length) nextActions.push('apply (after your own check)');
+  const verifiedNoFinish =
+    !reportMode &&
+    job.status === 'FAILED' &&
+    job.failureKind === 'no-finish' &&
+    mutationSettled &&
+    appliable &&
+    files.length > 0 &&
+    typeof job.testCommand === 'string' &&
+    job.testCommand.trim() &&
+    job.verify?.command === job.testCommand &&
+    job.verify.verdict === 'PASS' &&
+    job.verify.result?.code === 0 &&
+    !job.verify.result.timedOut &&
+    !job.verify.result.cancelled &&
+    !isVerifierEnvironmentKind(environmentFailure?.kind);
+  if (verifiedNoFinish) nextActions.unshift('offload_apply with applyThenVerify (recommended after diff review)');
+  else if (!reportMode && !violations.length && mutationSettled && appliable && files.length)
+    nextActions.push('apply (after your own check)');
   const raw = [
     line1,
+    verifiedNoFinish &&
+      'retained diff: configured verifier PASSED (exit 0); worker omitted finish. Review the diff; apply recommended with offload_apply + applyThenVerify. Completion of every requested edit still needs review.',
     meta,
     spendLine,
     cacheLine,

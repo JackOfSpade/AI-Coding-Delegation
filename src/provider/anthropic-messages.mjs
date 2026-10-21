@@ -1,4 +1,5 @@
 import { sseEvents } from './sse.mjs';
+import { abortableBody, fetchAbortable } from './abort.mjs';
 import { ProviderError } from './openai-chat.mjs';
 import { assertModelAllowed, isAnthropicModel, modelPolicyViolation } from '../model-policy.mjs';
 import { anthropicContentMatchesAssistant, cloneAnthropicContent, validAnthropicContent } from '../anthropic-content.mjs';
@@ -174,11 +175,17 @@ function creditExhaustedCode(body, status) {
   );
 }
 
-async function responseError(response) {
+async function responseError(response, signal) {
   let body;
   try {
-    const text = await response.text();
-    if (text.length <= 65_536) body = JSON.parse(text);
+    const chunks = [];
+    let bytes = 0;
+    for await (const chunk of abortableBody(response.body, signal)) {
+      bytes += chunk.byteLength;
+      if (bytes > 65_536) break;
+      chunks.push(chunk);
+    }
+    if (bytes <= 65_536) body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
   } catch {
     // Never preserve or expose a provider response body in diagnostics.
   }
@@ -229,7 +236,7 @@ export class AnthropicMessagesProvider {
       const abort = () => controller.abort(signal?.reason ?? new Error('Aborted'));
       signal?.addEventListener('abort', abort, { once: true });
       try {
-        const response = await this.fetch(new URL('v1/messages', `${this.baseUrl}/`).href, {
+        const response = await fetchAbortable(this.fetch, new URL('v1/messages', `${this.baseUrl}/`).href, {
           method: 'POST',
           signal: controller.signal,
           redirect: 'error',
@@ -240,9 +247,10 @@ export class AnthropicMessagesProvider {
           },
           body: JSON.stringify(payload),
         });
-        if (!response.ok) throw await responseError(response);
+        if (!response.ok) throw await responseError(response, controller.signal);
         const events = [];
         for await (const event of sseEvents(response.body, {
+          signal: controller.signal,
           maxEventBytes: MAX_SSE_EVENT_BYTES,
           maxAttemptBytes: MAX_SSE_ATTEMPT_BYTES,
         })) {

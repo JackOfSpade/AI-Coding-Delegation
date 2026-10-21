@@ -1,4 +1,5 @@
 import { sseJson } from './sse.mjs';
+import { bestEffort, fetchAbortable } from './abort.mjs';
 import { assertModelAllowed, modelPolicyViolation } from '../model-policy.mjs';
 
 export const DEFAULT_ATTEMPT_TIMEOUT_MS = 300_000;
@@ -298,7 +299,7 @@ export class OpenAIChatProvider {
         // documented base is the origin while OpenAI-compatible deployments
         // commonly supply a path ending in `/v1`; append only the operation.
         const endpoint = new URL('chat/completions', `${this.baseUrl}/`).href;
-        const response = await this.fetch(endpoint, {
+        const response = await fetchAbortable(this.fetch, endpoint, {
           method: 'POST',
           signal: controller.signal,
           redirect: 'error',
@@ -312,11 +313,7 @@ export class OpenAIChatProvider {
         // Provider response bodies may contain an echoed prompt, credentials,
         // or other untrusted data.  Never put them in an error/log path.
         if (!response.ok) {
-          try {
-            await response.body?.cancel?.();
-          } catch {
-            /* best-effort connection release */
-          }
+          bestEffort(() => response.body?.cancel?.());
           throw new ProviderError(`Chat request failed (HTTP ${response.status})`, {
             status: response.status,
             retryable: response.status === 429 || response.status >= 500,
@@ -325,6 +322,7 @@ export class OpenAIChatProvider {
         }
         const chunks = [];
         for await (const chunk of sseJson(response.body, {
+          signal: controller.signal,
           maxEventBytes: this.maxSseEventBytes,
           maxAttemptBytes: this.maxSseAttemptBytes,
         }))

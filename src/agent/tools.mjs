@@ -205,7 +205,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   ),
   schema(
     'finish',
-    'Finish the job with this mandatory tool call, not completion prose. Use only after every other needed tool result has returned, in a response containing exactly this one tool call; pairing it with another call rejects the entire response. Keep summary to 1-2 short sentences, at most 1500 characters. Put details in report. Minimal call: {"summary":"Implemented the requested changes."}.',
+    'Finish the job with this mandatory tool call, not completion prose. Once the requested edits or analysis and necessary checks are complete, invoke this tool in your next response; do not end with a Markdown summary or print a tool-call example instead of invoking it. If a check is blocked or unavailable, record that in concerns and list only checks actually run in testsRun; still call finish when your in-scope work is ready. The server runs any configured verifier after this call. Use only after every other needed tool result has returned, in a response containing exactly this one tool call; pairing it with another call rejects the entire response. Keep summary to 1-2 short sentences, at most 1500 characters. Put details in report. Minimal call: {"summary":"Implemented the requested changes."}.',
     {
       summary: {
         type: 'string',

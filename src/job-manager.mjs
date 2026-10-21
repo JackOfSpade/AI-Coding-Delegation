@@ -85,9 +85,6 @@ const LOCAL_WORKER_TASKS = new Map();
 // How long such a record must have been silent first: a task registers before
 // its claim is written, so this only absorbs windows nobody has foreseen.
 const DEFAULT_ORPHAN_GRACE_MS = 60_000;
-// The agent loop enforces limits.timeoutMinutes itself; the manager's watchdog
-// fires this much later, only for a round that could not stop on its own.
-const WALL_WATCHDOG_GRACE_MS = 30_000;
 const VERIFIER_MODES = new Set(['standard', 'baseline-diff']);
 const MIN_VERIFIER_TIMEOUT_SEC = 5,
   MAX_VERIFIER_TIMEOUT_SEC = 1800,
@@ -1898,7 +1895,7 @@ export class JobManager {
                   .event(id, { type: 'watchdog', reason: 'timeoutMinutes', timeoutMinutes: job.budget.timeoutMinutes })
                   .catch(() => {});
               },
-              Math.max(0, wallMs) + WALL_WATCHDOG_GRACE_MS,
+              Math.max(0, wallMs),
             );
             watchdog?.unref?.();
           }
@@ -3171,6 +3168,7 @@ export class JobManager {
       return {
         jobId: job.id,
         status: job.status,
+        ...(cancel || {}),
         done: false,
         unchanged: true,
         progress: {
@@ -3181,7 +3179,7 @@ export class JobManager {
         },
       };
     this.lastWaitSignature.set(id, signature);
-    return { ...this.public(job), done: false, progress };
+    return { ...this.public(job), ...(cancel || {}), done: false, progress };
   }
   /**
    * An applyThenVerify run still owns this job. Liveness is the journal owner's
@@ -3433,7 +3431,7 @@ export class JobManager {
     // for the report again: the caller has normally just read it. The full
     // legacy envelope stays available with detail: "full".
     if (include !== 'summary' && detail !== 'full') {
-      const lean = { jobId: job.id, status: job.status };
+      const lean = { jobId: job.id, status: job.status, ...((await this.#cancelState(job)) || {}) };
       if (include === 'diff') return { ...lean, diff: await this.store.readArtifact(id, 'patch.diff') };
       if (include === 'files') return { ...lean, files: job.files || [] };
       return { ...lean, ...(await this.#jobLog(job, window)) };

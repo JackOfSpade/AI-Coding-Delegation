@@ -13,6 +13,10 @@ const RANGE_ENTRY = /:\d{1,7}-\d{1,7}(?: \(read_file offset |$)/;
 // Standing instruction added to every worker brief (write and report): weak
 // tests that pass for the wrong reason are the commonest quality miss.
 export const WORKER_TEST_QUALITY_RULE = 'Assertions must be falsifiable; no substring checks that match unrelated text.';
+// Keep the terminal protocol after repository conventions too: a normal
+// assistant summary ends an Anthropic turn, but does not complete an Offload job.
+export const WORKER_COMPLETION_RULE =
+  'Completion protocol: After the requested edits or analysis and necessary checks are complete, invoke the finish tool as the only tool call in your next response. Do not end with a Markdown summary, completion prose, or a printed example of a finish call. Put the short summary in finish.summary and detailed findings in finish.report. If a check is blocked or unavailable, state that honestly in finish.concerns and list only checks actually run in finish.testsRun; blocked checks do not prevent calling finish when your in-scope work is ready. The server runs any configured verifier after finish. A normal end-of-turn or provider stop without this tool call is a protocol failure, even when every edit is correct.';
 // A finish that shares its response with another call is rejected unrun (the loop allows one correction).
 const FINISH_ALONE_RULE =
   'Use finish only after every other needed tool result has returned. Its response must contain exactly one tool call: finish. Pairing finish with any other tool rejects the entire response, including its writes. Keep summary to 1-2 short sentences (at most 1500 characters); put detailed findings in report, not summary. A minimal valid final call is finish({"summary":"Implemented the requested changes."}). Completion prose without a finish call does not finish the job.';
@@ -183,6 +187,7 @@ export async function buildSystemPrompt({
       : '',
     acceptanceCriteria.length ? `Acceptance criteria:\n${acceptanceCriteria.map((x) => `- ${x}`).join('\n')}` : '',
     local,
+    WORKER_COMPLETION_RULE,
   ]
     .filter(Boolean)
     .join('\n\n');

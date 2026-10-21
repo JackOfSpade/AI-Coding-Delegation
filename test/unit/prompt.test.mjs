@@ -3,8 +3,14 @@ import assert from 'node:assert/strict';
 import { mkdtemp, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { LocalTools } from '../../src/agent/tools.mjs';
-import { WORKER_TEST_QUALITY_RULE, annotateRelevantPaths, buildSystemPrompt, repoConventions } from '../../src/agent/prompt.mjs';
+import { LocalTools, availableToolDefinitions } from '../../src/agent/tools.mjs';
+import {
+  WORKER_COMPLETION_RULE,
+  WORKER_TEST_QUALITY_RULE,
+  annotateRelevantPaths,
+  buildSystemPrompt,
+  repoConventions,
+} from '../../src/agent/prompt.mjs';
 
 test('prompt keeps the task in the user turn rather than duplicating it in system rules', async () => {
   const prompt = await buildSystemPrompt({
@@ -140,5 +146,34 @@ test('both worker prompts explain that a mixed finish rejects every call in its 
     assert.equal(sentences.length, 1, JSON.stringify(options));
     assert.match(sentences[0], /response must contain exactly one tool call: finish/);
     assert.match(sentences[0], /rejects the entire response, including its writes/);
+  }
+});
+
+test('completion protocol follows repository conventions and addresses the Opus prose-only stop with blocked checks', async () => {
+  for (const options of [
+    { ownedPaths: ['src/**'] },
+    { ownedPaths: ['src/**'], allowCommand: false, remainingTurns: 80 },
+    { ownedPaths: ['src/**'], serverVerifierConfigured: true },
+    { mode: 'report' },
+  ]) {
+    const prompt = await buildSystemPrompt({
+      ...options,
+      conventions: 'Repository conventions: End your response with a Markdown summary of changes and tests.',
+    });
+    assert.equal(prompt.split('\n\n').at(-1), WORKER_COMPLETION_RULE, 'completion protocol remains last after local conventions');
+    const rule = prompt.split('\n\n').at(-1);
+    assert.match(rule, /invoke the finish tool as the only tool call in your next response\./);
+    assert.match(rule, /Do not end with a Markdown summary, completion prose, or a printed example/);
+    assert.match(rule, /blocked or unavailable, state that honestly in finish.concerns/);
+    assert.match(rule, /list only checks actually run in finish.testsRun/);
+    assert.match(rule, /blocked checks do not prevent calling finish when your in-scope work is ready/);
+    assert.match(rule, /normal end-of-turn or provider stop without this tool call is a protocol failure/);
+  }
+  for (const options of [{}, { allowCommand: false }, { readOnly: true }]) {
+    const finish = availableToolDefinitions(options).find((tool) => tool.function.name === 'finish').function;
+    assert.match(finish.description, /invoke this tool in your next response/);
+    assert.match(finish.description, /do not end with a Markdown summary or print a tool-call example/);
+    assert.match(finish.description, /record that in concerns and list only checks actually run in testsRun/);
+    assert.match(finish.description, /server runs any configured verifier after this call/);
   }
 });

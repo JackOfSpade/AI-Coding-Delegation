@@ -896,6 +896,56 @@ const appliable = (extra = {}) =>
     ...extra,
   });
 
+test('a verified retained no-finish diff prominently recommends review and apply without declaring the task complete', () => {
+  const job = appliable({
+    failureKind: 'no-finish',
+    error: FAILURE_ERRORS['no-finish'],
+    providerFinishReason: 'stop',
+    testCommand: 'node check.js',
+    verify: { command: 'node check.js', verdict: 'PASS', result: { code: 0, sandbox: 'macos' } },
+  });
+  for (const detail of ['compact', 'full']) {
+    const lines = compactReport(job, { detail }).split('\n');
+    assert.equal(lines[0], 'JOB oj-loop  FAILED');
+    assert.equal(
+      lines[1],
+      'retained diff: configured verifier PASSED (exit 0); worker omitted finish. Review the diff; apply recommended with offload_apply + applyThenVerify. Completion of every requested edit still needs review.',
+    );
+    assert.match(lines.at(-1), /^next: offload_apply with applyThenVerify \(recommended after diff review\)/);
+    assert.ok(lines.includes(`error: ${FAILURE_ERRORS['no-finish']}`));
+  }
+  for (const extra of [
+    { verify: undefined },
+    { testCommand: undefined },
+    { verify: { command: 'different check', verdict: 'PASS', result: { code: 0 } } },
+    ...[
+      { verdict: 'FAIL', result: { code: 1 } },
+      { verdict: 'UNVERIFIED', result: { code: 0 } },
+      { verdict: 'PASS', result: { code: 1 }, baseline: { status: 'compared', preexisting: 1, newFailureCount: 0 } },
+      { verdict: 'PASS', result: { code: 0, timedOut: true } },
+      { verdict: 'PASS', result: { code: 0, cancelled: true } },
+    ].map((verify) => ({ verify: { command: 'node check.js', ...verify } })),
+    { status: 'CANCELLED' },
+    { failureKind: 'finish-protocol' },
+    { scopeViolations: ['outside.txt'] },
+    { verifierMutations: ['src/a.js'] },
+    { files: [] },
+    { patchRound: 1 },
+    { workspaceCleanupRequired: true },
+    { verifyEnvironment: { kind: 'permission-denied' } },
+    { applied: true },
+    { applyVerifyIntent: true },
+    { mode: 'report' },
+  ]) {
+    for (const detail of ['compact', 'full'])
+      assert.doesNotMatch(
+        compactReport({ ...job, ...extra }, { detail }),
+        /apply recommended|recommended after diff review/,
+        JSON.stringify(extra),
+      );
+  }
+});
+
 test('report lists apply for a FAILED job only when the shared gate would accept its retained diff', () => {
   const next = (job) =>
     compactReport(job)

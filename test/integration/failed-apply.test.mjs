@@ -941,6 +941,14 @@ test('finish-protocol and no-finish stops verify retained in-scope work before r
         assert.equal(h.counters.runs, 1, 'diagnostic verification cannot launch automatic repair');
         assert.equal((await h.store.get(id)).transcriptReplayable, true);
         assert.match(done.report, pass ? /verify:.*PASS/ : /verify:.*FAIL/);
+        const recommendation = pass && kind === 'no-finish';
+        for (const detail of ['compact', 'full']) {
+          for (const view of [await h.manager.wait(id, { timeoutSec: 0, detail }), await h.manager.job(id, { detail })]) {
+            assert.equal(view.status, 'FAILED');
+            assert.equal(view.report.includes('retained diff: configured verifier PASSED (exit 0)'), recommendation);
+            assert.equal(view.report.includes('apply recommended with offload_apply + applyThenVerify'), recommendation);
+          }
+        }
         assert.equal(existsSync(join(h.repo, 'src/a.js')), false);
         assert.equal((await h.manager.apply(id)).dryRun, true);
         await h.manager.continue(id, { launch: false });

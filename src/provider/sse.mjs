@@ -1,3 +1,5 @@
+import { abortableBody } from './abort.mjs';
+
 /** Dependency-free SSE decoding. TextDecoder streaming preserves split UTF-8
  * sequences; parsing CR, LF, and CRLF after chunks avoids treating split CRLF
  * as two breaks. */
@@ -6,7 +8,7 @@ const bounded = (value, name, fallback) => {
   if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`${name} must be a positive integer`);
   return value;
 };
-export async function* sseEvents(body, { maxEventBytes, maxAttemptBytes } = {}) {
+export async function* sseEvents(body, { maxEventBytes, maxAttemptBytes, signal } = {}) {
   if (!body) throw new Error('SSE response has no body');
   maxEventBytes = bounded(maxEventBytes, 'maxEventBytes', 1_000_000);
   maxAttemptBytes = bounded(maxAttemptBytes, 'maxAttemptBytes', 8_000_000);
@@ -55,7 +57,7 @@ export async function* sseEvents(body, { maxEventBytes, maxAttemptBytes } = {}) 
       if (event) yield event;
     }
   };
-  for await (const chunk of body) {
+  for await (const chunk of abortableBody(body, signal)) {
     attemptBytes += chunk.byteLength ?? Buffer.byteLength(chunk);
     if (attemptBytes > maxAttemptBytes) throw new Error('SSE attempt exceeds configured size limit');
     pending += decoder.decode(chunk, { stream: true });
