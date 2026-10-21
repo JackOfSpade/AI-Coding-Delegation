@@ -32,27 +32,34 @@ function run(command, args, label) {
     encoding: 'utf8',
     maxBuffer: 64 * 1024,
     timeout: 10_000,
-    // The disposable smoke clients are .cmd launchers on Windows. Node's
-    // direct spawn cannot execute batch files, while every command and
-    // argument here is fixed by the validated client list above.
-    shell: process.platform === 'win32',
+    // Only the fixed client --version probes need Windows batch lookup.
+    // Invoke Node directly so spaces in its path never enter cmd.exe parsing.
+    shell: process.platform === 'win32' && command !== process.execPath,
     windowsHide: true,
   });
   if (result.error?.code === 'ENOENT') throw new Error(`${label} is unavailable on this self-hosted runner`);
   if (result.error) throw new Error(`${label} could not start: ${result.error.code || result.error.message}`);
   if (result.status !== 0) throw new Error(`${label} failed with exit ${result.status ?? 'unknown'}`);
+  return result;
 }
-function assertRegistrations(expected) {
+function assertRegistrations(expected, installerResult) {
   const registration = doctor({ root, home, repoPath: root, env: cleanEnv }).registration;
   const mismatched = clients.filter((client) => registration[client] !== expected);
-  if (mismatched.length) throw new Error(`client registration state is invalid for ${mismatched.join(', ')}`);
+  if (mismatched.length) {
+    let claudeStatus = 'unknown';
+    try {
+      const status = JSON.parse(installerResult.stdout).claudeMcp?.status;
+      if (typeof status === 'string' && /^[a-z-]{1,32}$/.test(status)) claudeStatus = status;
+    } catch {}
+    throw new Error(`client registration state is invalid for ${mismatched.join(', ')} (Claude installer status: ${claudeStatus})`);
+  }
 }
 try {
   for (const client of clients) run(commands[client], ['--version'], `${client} --version`);
-  run(process.execPath, ['install.mjs', '--skip-key', `--clients=${requested}`], 'disposable-home install');
-  assertRegistrations(true);
-  run(process.execPath, ['install.mjs', '--uninstall', `--clients=${requested}`], 'disposable-home uninstall');
-  assertRegistrations(false);
+  const installed = run(process.execPath, ['install.mjs', '--skip-key', `--clients=${requested}`], 'disposable-home install');
+  assertRegistrations(true, installed);
+  const uninstalled = run(process.execPath, ['install.mjs', '--uninstall', `--clients=${requested}`], 'disposable-home uninstall');
+  assertRegistrations(false, uninstalled);
   process.stdout.write(`client smoke passed install, registration, and uninstall for ${clients.join(', ')} using a disposable home\n`);
 } finally {
   await rm(home, { recursive: true, force: true });

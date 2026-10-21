@@ -699,10 +699,20 @@ function windowsCmdQuote(value) {
   if (!text || /[\0\r\n"%^&|<>!]/.test(text)) throw new Error('unsafe Windows Codex plugin command argument');
   return `"${text}"`;
 }
+function runWindowsCmd(runCommand, executable, args, options, env) {
+  const command = [executable, ...args].map(windowsCmdQuote).join(' ');
+  const comspec = env.ComSpec || env.COMSPEC || 'cmd.exe';
+  // cmd.exe /s removes the outer envelope. Keep the inner per-argument quotes
+  // intact, and prevent libuv from applying a second CRT quoting pass to them.
+  return runCommand(comspec, ['/d', '/s', '/c', `"${command}"`], {
+    ...options,
+    shell: false,
+    windowsVerbatimArguments: true,
+  });
+}
 function runCodexPlugin(runCommand, executable, args, options, env, platform) {
   if (platform === 'win32' && /\.cmd$/i.test(executable)) {
-    const comspec = env.ComSpec || env.COMSPEC || 'cmd.exe';
-    return runCommand(comspec, ['/d', '/s', '/c', [executable, ...args].map(windowsCmdQuote).join(' ')], options);
+    return runWindowsCmd(runCommand, executable, args, options, env);
   }
   return runCommand(executable, args, options);
 }
@@ -834,8 +844,7 @@ async function findClaudeExecutable(env, platform, commandExists) {
 }
 function runClaudeMcp(runCommand, executable, args, options, env, platform) {
   if (platform === 'win32' && /\.cmd$/i.test(executable)) {
-    const comspec = env.ComSpec || env.COMSPEC || 'cmd.exe';
-    return runCommand(comspec, ['/d', '/s', '/c', [executable, ...args].map(windowsCmdQuote).join(' ')], options);
+    return runWindowsCmd(runCommand, executable, args, options, env);
   }
   return runCommand(executable, args, options);
 }
