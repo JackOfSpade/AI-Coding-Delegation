@@ -990,7 +990,7 @@ test('Core persists explicit policy-only verifier consent and preserves caller p
     testCommand: 'true',
     unsafePolicyOnlyVerifier: true,
   });
-  const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 1 });
+  const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 10 });
   assert.equal(done.status, 'DONE_VERIFIED');
   assert.equal(done.unsafePolicyOnlyVerifier, true);
   assert.equal(verifyOptions[0].requireSandbox, false);

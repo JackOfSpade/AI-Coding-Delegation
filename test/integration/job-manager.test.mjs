@@ -3222,6 +3222,10 @@ test('the wall-clock watchdog ends a round that cannot stop itself as TIMEOUT', 
   const done = await m.wait(job.jobId, { timeoutSec: 10 });
   assert.equal(done.status, 'TIMEOUT');
   assert.equal(observedReason?.code, 'OFFLOAD_WALL_TIMEOUT');
+  // The watchdog aborts first and logs afterwards, so a busy job lock never
+  // delays the abort; the round can publish TIMEOUT before that line lands.
+  const deadline = Date.now() + 5_000;
+  while (!(await eventTypes(m, job.jobId)).includes('watchdog') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
   assert.ok((await eventTypes(m, job.jobId)).includes('watchdog'));
 });
 
