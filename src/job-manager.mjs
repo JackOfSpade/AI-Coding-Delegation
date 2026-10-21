@@ -3096,15 +3096,27 @@ export class JobManager {
     assertDetail(detail);
     const rawTimeout = Number(timeoutSec);
     timeoutSec = Math.min(55, Math.max(0, Number.isFinite(rawTimeout) ? rawTimeout : 40));
-    const stop = Date.now() + timeoutSec * 1000;
+    const stop = performance.now() + timeoutSec * 1000;
     let job = await this.#settleOrphanedWorker(await this.#settleOrphanedApplyVerify(await this.store.get(id)), {
-      budgetMs: Math.max(2_000, stop - Date.now()),
+      budgetMs: Math.max(2_000, stop - performance.now()),
     });
     // An applyThenVerify run holds a terminal job's status for as long as its
     // command runs (up to 15 minutes). That is progress, not completion, and
     // joining it would break this call's bounded-wait contract.
-    while ((!final(job.status) || this.#applyInFlight(job)) && Date.now() < stop && !signal?.aborted) {
-      await new Promise((r) => setTimeout(r, 100));
+    const signatureOf = (value, cancelRequested = false) => {
+      const stall = this.#applyInFlight(value) ? undefined : assessStall(value, this.#nowMs());
+      return JSON.stringify([
+        value.status,
+        value.turns || 0,
+        value.costUsd,
+        value.recentActions || [],
+        value.applyVerify?.phase,
+        stall ? [stall.kind, stall.level] : null,
+        cancelRequested,
+      ]);
+    };
+    while ((!final(job.status) || this.#applyInFlight(job)) && performance.now() < stop && !signal?.aborted) {
+      await new Promise((r) => setTimeout(r, Math.min(100, Math.max(0, stop - performance.now()))));
       job = await this.store.get(id);
     }
     if (signal?.aborted) throw new Error('request cancelled');
@@ -3154,15 +3166,7 @@ export class JobManager {
     // same progress payload every time. When nothing observable changed since
     // the last payload this process handed out for the job, say so in a few
     // tokens instead of repeating it. `detail: "full"` always repeats.
-    const signature = JSON.stringify([
-      progress.status,
-      progress.turns,
-      progress.costUsd,
-      progress.recentActions,
-      job.applyVerify?.phase,
-      stall ? [stall.kind, stall.level] : null,
-      !!cancel,
-    ]);
+    const signature = signatureOf(job, !!cancel);
     if (detail !== 'full' && this.lastWaitSignature.get(id) === signature)
       return {
         jobId: job.id,

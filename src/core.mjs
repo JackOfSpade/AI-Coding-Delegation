@@ -531,6 +531,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           pricing,
           model: profile.model,
           maxTurns: remainingTurns,
+          reportMode: job.mode === 'report',
           timeoutMs: remainingTimeoutMs,
           maxUsd: remainingUsd,
           now: nowMs,

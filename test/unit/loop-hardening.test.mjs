@@ -4403,6 +4403,79 @@ test('finish contract teaches a short summary and recovers the real-session over
   assert.match(await buildSystemPrompt({ task: 'x' }), /Completion prose without a finish call does not finish the job/);
 });
 
+test('report reserves a finish-only turn with gathered findings before reservation exhaustion', async () => {
+  const rates = { peak: 1, off_peak: 1 };
+  const pricing = {
+    models: {
+      mock: {
+        usd_per_1m: {
+          input_cache_hit: rates,
+          input_cache_miss: rates,
+          output: rates,
+        },
+      },
+    },
+  };
+  const requests = [];
+  const findings = 'Evidence from the survey. '.repeat(4800);
+  const provider = {
+    async *chat(request) {
+      requests.push(request);
+      yield {
+        model: 'mock',
+        toolCalls:
+          requests.length === 1
+            ? [call('read_file', '{"path":"survey.txt"}')]
+            : [call('finish', '{"summary":"Partial survey","report":"Saved survey findings; more reading remains."}')],
+      };
+      yield { usage: { inputTokens: 100, outputTokens: 20 } };
+    },
+  };
+  const result = await new AgentLoop({
+    provider,
+    model: 'mock',
+    pricing,
+    maxUsd: 0.2,
+    maxTurns: 80,
+    reportMode: true,
+    toolDefinitions: availableToolDefinitions({ readOnly: true }),
+    tools: { execute: async (name, args) => (name === 'finish' ? { finish: args } : findings) },
+  }).run({ task: 'Survey the repository' });
+  assert.equal(result.status, 'DONE');
+  assert.equal(requests.length, 2);
+  assert.deepEqual(
+    requests[1].tools.map((tool) => tool.function.name),
+    ['finish'],
+  );
+  assert.ok(requests[1].messages.some((message) => message.content === findings));
+  assert.match(requests[1].messages.at(-1).content, /Stop reading now/);
+  assert.match(result.finish.report, /Saved survey findings/);
+  assert.ok(result.costUsd <= 0.2);
+});
+
+test('report uses its last allowed turn to finish even with unlimited USD', async () => {
+  const requests = [];
+  const result = await new AgentLoop({
+    reportMode: true,
+    maxTurns: 1,
+    toolDefinitions: availableToolDefinitions({ readOnly: true }),
+    provider: {
+      async *chat(request) {
+        requests.push(request);
+        yield { toolCalls: [call('finish', '{"summary":"Partial","report":"Only preliminary findings available."}')] };
+      },
+    },
+    tools: { execute: async (_name, args) => ({ finish: args }) },
+  }).run({ task: 'Survey' });
+  assert.equal(result.status, 'DONE');
+  assert.equal(result.turn, 1);
+  assert.deepEqual(
+    requests[0].tools.map((tool) => tool.function.name),
+    ['finish'],
+  );
+  assert.match(result.finish.report, /preliminary/);
+});
+
 test('a progress write that never completes cannot hold the loop past a cancel or its deadline', async () => {
   const stalledProvider = {
     async *chat({ signal }) {

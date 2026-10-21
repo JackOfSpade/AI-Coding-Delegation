@@ -172,7 +172,7 @@ const TOOLS = [
   ],
   [
     'offload_wait',
-    'Read local progress or the report for a delegated job. `timeoutSec` is 0-55; to wait longer, call again (an unchanged running job returns a few-token `unchanged` marker). Compact by default (status, cost, scope, one verify line with a short failure tail, next actions). Pass detail "full" for the complete report. A running job whose provider request, tool call, queue wait, workspace setup or wall-clock use is abnormal carries `progress.stall` (a new or worse stall is returned once, then `unchanged: true` with `progress.stalledSec`); a terminal report includes a one-line `time:` breakdown (queue, provider, tools, verify, finalize), and detail "full" adds per-round lines and a `timing` object.',
+    'Read local progress or the report for a delegated job. `timeoutSec` is 0-55; An active job blocks until completion or the timeout; to wait longer, call again. An unchanged running job returns a few-token `unchanged` marker only after waiting. Compact by default (status, cost, scope, one verify line with a short failure tail, next actions). Pass detail "full" for the complete report. A running job whose provider request, tool call, queue wait, workspace setup or wall-clock use is abnormal carries `progress.stall` (a new or worse stall is returned once, then `unchanged: true` with `progress.stalledSec`); a terminal report includes a one-line `time:` breakdown (queue, provider, tools, verify, finalize), and detail "full" adds per-round lines and a `timing` object.',
     { jobId, timeoutSec: { type: 'number', minimum: 0, maximum: 55 }, detail, ...repoHint },
     ['jobId'],
   ],

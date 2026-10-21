@@ -3098,6 +3098,55 @@ test('continuation note limits accept 3600 characters and reject 3601 before dis
   }
 });
 
+test('wait blocks for unchanged RUNNING jobs, returns progress, and supports cancellation', async () => {
+  let job = { id: 'long-poll', status: 'RUNNING', turns: 1, costUsd: 0, recentActions: [] };
+  const m = new JobManager({ store: { get: async () => structuredClone(job) } });
+  await m.wait(job.id, { timeoutSec: 0 });
+  for (let i = 0; i < 2; i++) {
+    const started = performance.now();
+    const result = await m.wait(job.id, { timeoutSec: 0.3 });
+    assert.equal(result.unchanged, true);
+    assert.ok(performance.now() - started >= 280, 'unchanged must not bypass the wait');
+  }
+  const timer = setTimeout(() => {
+    job = { ...job, turns: 2 };
+  }, 120);
+  try {
+    const started = performance.now();
+    const result = await m.wait(job.id, { timeoutSec: 0.3 });
+    assert.equal(result.progress.turns, 2);
+    assert.ok(performance.now() - started < 2000, 'progress is returned within the bounded wait');
+  } finally {
+    clearTimeout(timer);
+  }
+  const controller = new AbortController();
+  const abort = setTimeout(() => controller.abort(), 120);
+  try {
+    await assert.rejects(m.wait(job.id, { timeoutSec: 55, signal: controller.signal }), /cancelled/);
+  } finally {
+    clearTimeout(abort);
+  }
+});
+
+test('wait timeout uses elapsed time even if the wall clock jumps forward', async (t) => {
+  const wallNow = Date.now();
+  let reads = 0;
+  t.mock.method(Date, 'now', () => wallNow + (reads > 1 ? 60_000 : 0));
+  const job = { id: 'clock-jump', status: 'RUNNING', turns: 1, costUsd: 0 };
+  const m = new JobManager({
+    store: {
+      get: async () => {
+        reads++;
+        return job;
+      },
+    },
+  });
+  const started = performance.now();
+  const result = await m.wait(job.id, { timeoutSec: 0.4 });
+  assert.equal(result.done, false);
+  assert.ok(performance.now() - started >= 380, 'a wall-clock adjustment must not shorten a blocking wait');
+});
+
 /** A non-isolated manager with its own store, as `manager()` builds, plus config and timers. */
 async function plainManager(worker, { config = {}, now, setTimeoutFn, store } = {}) {
   const gitDir = await mkdtemp(`${tmpdir()}/offload-jobs-`);

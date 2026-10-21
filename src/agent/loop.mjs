@@ -77,6 +77,8 @@ const CAPPED_IMPLEMENTATION_RECOVERY_REMINDER = 'Continue implementation using a
 // appended to the durable transcript. It is the entire trusted request after
 // that transcript can no longer fit the remaining finite budget.
 const BUDGET_FINISH_RECOVERY_MESSAGE = 'Call the finish tool now.';
+const REPORT_FINISH_MESSAGE =
+  'The report budget is nearly exhausted. Stop reading now. Call finish as the sole tool call with a detailed report of findings already gathered, including uncertainties and unfinished work. Put the findings in report, even if incomplete.';
 // A finish call that shares its turn with other calls, or whose arguments are
 // invalid, is never run, and neither is anything beside it: finishing is the
 // end of the job, so a turn that also mutates cannot be told apart from a
@@ -294,6 +296,7 @@ export class AgentLoop {
     // finish. This affects only completion steering; it never changes the
     // tools a worker may execute or exposes the verifier command to it.
     serverVerifierConfigured = false,
+    reportMode = false,
     checkOwnedPaths,
     // `[[absolutePrefix, label], ...]` applied to the failing call recorded when
     // the loop guard trips, so a temp or home directory never reaches a report.
@@ -350,6 +353,10 @@ export class AgentLoop {
     this.persistBudgetFinishRecovery = persistBudgetFinishRecovery;
     this.cappedFinishRecovery = cappedFinishRecovery;
     this.budgetFinishRecovery = budgetFinishRecovery;
+    if (typeof reportMode !== 'boolean') throw new TypeError('reportMode must be boolean');
+    if (reportMode && names.some((name) => ['write_file', 'edit_file'].includes(name)))
+      throw new TypeError('reportMode requires read-only tools');
+    this.reportMode = reportMode;
     this.serverVerifierConfigured = serverVerifierConfigured;
   }
   async #execute(calls, signal, errors = [], timings = []) {
@@ -517,6 +524,7 @@ export class AgentLoop {
         message.tool_calls?.length &&
         (message.reasoning_content === undefined || message.reasoning_content === null || message.reasoning_content === ''),
     );
+    let reportFinalizationUsed = false;
     let totalUsage = this.meter.usage;
     const responseModels = new Set();
     let providerFinishReason;
@@ -573,6 +581,39 @@ export class AgentLoop {
           unauthorizedResponseModel,
           modelConflict = false;
         const usageCharges = [];
+        // Keep half the remaining allowance for synthesizing findings. A
+        // report transcript is ephemeral, so a later continuation cannot
+        // recover this reading. Spend the last logical turn on finish only.
+        if (reportFinalizationUsed)
+          return {
+            status: 'BUDGET',
+            turn: turn - 1,
+            usage: totalUsage,
+            costUsd: this.meter.usd,
+            error: 'Report finalization did not finish',
+            budgetCap: 'reservation',
+            ...modelMeta(),
+          };
+        const reportReadReservation =
+          this.reportMode && this.maxUsd !== Infinity
+            ? reserveRequestBudget(
+                this.meter.table,
+                this.model,
+                this.context.snapshot(),
+                this.toolDefinitions,
+                (this.maxUsd - this.meter.usd) / 2,
+              )
+            : undefined;
+        const reportFinalizing =
+          this.reportMode &&
+          (turn === this.maxTurns ||
+            (this.maxUsd !== Infinity && (!reportReadReservation || reportReadReservation.maxTokens < MAX_FINITE_REQUEST_OUTPUT_TOKENS)));
+        if (reportFinalizing) {
+          reportFinalizationUsed = true;
+          this.context.add({ role: 'user', content: REPORT_FINISH_MESSAGE });
+          await this.context.flush();
+          await this.progress?.({ turn, action: 'report_budget_finalize' });
+        }
         const rawMessagesForTurn = this.context.snapshot();
         let messagesForTurn = rawMessagesForTurn;
         let maxTokens;
@@ -592,9 +633,10 @@ export class AgentLoop {
         const forcedImplementationFocus = implementationFocus && forcedFocusCapable;
         const forcedBudgetFinishRecovery = budgetFinishRecovery && forcedFocusCapable;
         const nonThinkingDeepSeekReplay = deepSeekNonThinkingReplay && forcedFocusCapable;
-        let activeToolDefinitions = budgetFinishRecovery
-          ? this.toolDefinitions.filter((tool) => tool.function.name === 'finish')
-          : this.toolDefinitions;
+        let activeToolDefinitions =
+          budgetFinishRecovery || reportFinalizing
+            ? this.toolDefinitions.filter((tool) => tool.function.name === 'finish')
+            : this.toolDefinitions;
         let activeToolNames = new Set(activeToolDefinitions.map((tool) => tool.function.name));
         // DeepSeek rejects required/named tool selection while thinking is
         // enabled. Its official route explicitly advertises this capability,
@@ -768,6 +810,8 @@ export class AgentLoop {
               : (maxTokens ??
                 (forcedImplementationFocus ? Math.min(reservation.maxTokens, MAX_FINITE_REQUEST_OUTPUT_TOKENS) : reservation.maxTokens));
         }
+        if (reportReadReservation && !reportFinalizing)
+          maxTokens = Math.min(maxTokens ?? MAX_REQUEST_OUTPUT_TOKENS, reportReadReservation.maxTokens);
         try {
           // A request can spend its whole provider-attempt timeout without a
           // streamed token or tool result. Mark that safe waiting state before
