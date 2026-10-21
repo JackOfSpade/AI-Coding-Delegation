@@ -745,7 +745,7 @@ test('manual repair gets a fresh worker timeout round after a stale original wal
       const started = await core.start({ task: 'retry provider failure', ownedPaths: ['src/**'], repoPath: path });
       const failed = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
       assert.equal(failed.status, 'FAILED');
-      assert.deepEqual(failed.providerFailure, { kind: 'http', attempts: 1, status: 503 });
+      assert.deepEqual(failed.providerFailure, { kind: 'http', retryable: true, attempts: 1, status: 503 });
       // This is the observed failure mode: a repair requested much later than
       // the original wall start must still run its own active worker round.
       // Simulate a durable record created before attemptTimeoutMs was added;
@@ -766,7 +766,7 @@ test('manual repair gets a fresh worker timeout round after a stale original wal
       assert(events.some((event) => event.type === 'started' && event.reason === 'repair'));
       assert(events.some((event) => event.type === 'progress' && event.recentActions?.includes('repair_queued')));
       const providerFinished = events.find((event) => event.type === 'finished' && event.providerFailure?.kind === 'http');
-      assert.deepEqual(providerFinished.providerFailure, { kind: 'http', attempts: 1, status: 503 });
+      assert.deepEqual(providerFinished.providerFailure, { kind: 'http', retryable: true, attempts: 1, status: 503 });
       assert.doesNotMatch(JSON.stringify(providerFinished), /127\.0\.0\.1|mock error/i);
     } finally {
       await core.shutdown();
@@ -1701,7 +1701,7 @@ test('Core forwards the accepted provider attempt timeout to the worker adapter'
     const started = await core.start({ repoPath: path, task: 'forward provider timeout', ownedPaths: ['src/**'] });
     const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 5 });
     assert.equal(done.status, 'TIMEOUT');
-    assert.deepEqual(done.providerFailure, { kind: 'attempt_timeout', attempts: 1, timeoutMs: 45_000 });
+    assert.deepEqual(done.providerFailure, { kind: 'attempt_timeout', retryable: true, attempts: 1, timeoutMs: 45_000 });
     assert.ok(seenDelays.includes(45_000));
   } finally {
     globalThis.fetch = originalFetch;

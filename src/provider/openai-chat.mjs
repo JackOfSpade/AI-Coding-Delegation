@@ -4,6 +4,20 @@ import { assertModelAllowed, modelPolicyViolation } from '../model-policy.mjs';
 
 export const DEFAULT_ATTEMPT_TIMEOUT_MS = 300_000;
 
+// A provider failure's `reason` is a slug of our own constant message, never
+// provider text: a closed lowercase alphabet with a hard length cap.
+const PROVIDER_FAILURE_REASON = /^[a-z][a-z0-9_]{0,63}$/;
+export const providerFailureReason = (message) => {
+  const slug = String(message ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64)
+    .replace(/_+$/, '');
+  return PROVIDER_FAILURE_REASON.test(slug) ? slug : undefined;
+};
+export const safeProviderFailureReason = (value) => (typeof value === 'string' && PROVIDER_FAILURE_REASON.test(value) ? value : undefined);
+
 export class ProviderError extends Error {
   constructor(message = 'Provider request failed', { status, retryable = false, kind = 'request', attempts, timeoutMs } = {}) {
     super(message);
@@ -15,6 +29,7 @@ export class ProviderError extends Error {
     // request body, or provider response text.
     this.kind = [
       'request',
+      'response',
       'http',
       'transport',
       'attempt_timeout',
@@ -26,6 +41,9 @@ export class ProviderError extends Error {
     ].includes(kind)
       ? kind
       : 'request';
+    // `request` and `response` are catch-all kinds; keep which of our own
+    // checks failed so the cause survives past the worker boundary.
+    if (this.kind === 'request' || this.kind === 'response') this.reason = providerFailureReason(message);
     if (Number.isSafeInteger(attempts) && attempts > 0 && attempts <= 16) this.attempts = attempts;
     if (this.kind === 'attempt_timeout' && Number.isSafeInteger(timeoutMs) && timeoutMs >= 30_000 && timeoutMs <= 600_000)
       this.timeoutMs = timeoutMs;
@@ -34,12 +52,14 @@ export class ProviderError extends Error {
 
 export function providerFailure(error) {
   if (!(error instanceof ProviderError)) return undefined;
-  const result = { kind: error.kind };
+  const result = { kind: error.kind, retryable: error.retryable === true };
   if (Number.isSafeInteger(error.attempts) && error.attempts > 0 && error.attempts <= 16) result.attempts = error.attempts;
   if (error.kind === 'attempt_timeout' && Number.isSafeInteger(error.timeoutMs) && error.timeoutMs >= 30_000 && error.timeoutMs <= 600_000)
     result.timeoutMs = error.timeoutMs;
   if (error.kind === 'http' && Number.isSafeInteger(error.status) && error.status >= 100 && error.status <= 599)
     result.status = error.status;
+  const reason = safeProviderFailureReason(error.reason);
+  if (reason) result.reason = reason;
   return result;
 }
 // Remove the listener on both paths. Retries can be numerous and long-lived;
@@ -484,14 +504,23 @@ export class OpenAIChatProvider {
         yield { usage: normalizeUsage(chunk.usage), model: echoedModel, ...conflict };
       }
     }
-    const toolCalls = [...calls.entries()].sort(([left], [right]) => left - right).map(([, call]) => call);
-    for (const call of toolCalls) {
-      if (!call.id || !call.name) throw new ProviderError('Incomplete tool call: missing id or function name');
-      try {
-        JSON.parse(call.arguments || '{}');
-      } catch {
-        throw new ProviderError('Incomplete tool JSON');
-      }
+    const toolCalls = [];
+    for (const [, call] of [...calls.entries()].sort(([left], [right]) => left - right)) {
+      let complete = Boolean(call.id && call.name);
+      if (complete)
+        try {
+          JSON.parse(call.arguments || '{}');
+        } catch {
+          complete = false;
+        }
+      if (complete) toolCalls.push(call);
+      // An output cap can cut a tool call mid-arguments. That is a completed,
+      // billed `length` response, not a malformed one: drop the unexecutable
+      // fragment and let the loop's output-cap recovery see the finish reason.
+      else if (providerFinishReason !== 'length')
+        throw new ProviderError(call.id && call.name ? 'Incomplete tool JSON' : 'Incomplete tool call: missing id or function name', {
+          kind: 'response',
+        });
     }
     if (toolCalls.length) {
       if (modelConflict) conflictReported = true;

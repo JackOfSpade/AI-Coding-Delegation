@@ -107,7 +107,8 @@ for (const stop of ['local cancel', 'peer cancel', 'attempt deadline', 'round de
       assert.equal(cancels, 1);
       assert.equal(requests, 1);
       assert.equal(leases.list().length, 0, 'ownedPaths is available before wait reports done');
-      if (stop === 'attempt deadline') assert.deepEqual(done.providerFailure, { kind: 'attempt_timeout', attempts: 1, timeoutMs: 30_000 });
+      if (stop === 'attempt deadline')
+        assert.deepEqual(done.providerFailure, { kind: 'attempt_timeout', retryable: true, attempts: 1, timeoutMs: 30_000 });
       else assert.equal(done.providerFailure, undefined, 'outer deadlines and cancels retain their classification');
       if (stop === 'round deadline') assert.ok(watchdogMs <= 60_000 && watchdogMs > 59_000, `deadline ${watchdogMs}`);
       if (stop.endsWith('cancel')) assert.match(await store.readArtifact(job.jobId, 'events.jsonl'), /cancel_requested/);

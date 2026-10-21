@@ -603,7 +603,7 @@ function budgetReservationLine(value) {
 }
 function providerFailureLine(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
-  const kinds = new Set(['request', 'http', 'transport', 'attempt_timeout', 'redirect', 'sse_protocol', 'sse_limit']);
+  const kinds = new Set(['request', 'response', 'http', 'transport', 'attempt_timeout', 'redirect', 'sse_protocol', 'sse_limit']);
   if (!kinds.has(value.kind)) return '';
   const attempt =
     Number.isSafeInteger(value.attempts) && value.attempts > 0 && value.attempts <= 16
@@ -617,7 +617,14 @@ function providerFailureLine(value) {
     value.kind === 'attempt_timeout' && Number.isSafeInteger(value.timeoutMs) && value.timeoutMs >= 30_000 && value.timeoutMs <= 600_000
       ? ` (${Math.floor(value.timeoutMs / 1000)}s limit)`
       : '';
-  return `provider failure: ${scalar(value.kind)}${status}${attempt}${timeout}`;
+  const reason =
+    (value.kind === 'request' || value.kind === 'response') &&
+    typeof value.reason === 'string' &&
+    /^[a-z][a-z0-9_]{0,63}$/.test(value.reason)
+      ? ` (${value.reason})`
+      : '';
+  const retry = typeof value.retryable === 'boolean' ? ` · ${value.retryable ? 'transient' : 'not retryable'}` : '';
+  return `provider failure: ${scalar(value.kind)}${reason}${status}${attempt}${timeout}${retry}`;
 }
 function parseTimestamp(value) {
   return typeof value === 'string' || value instanceof Date ? Date.parse(value) : NaN;
