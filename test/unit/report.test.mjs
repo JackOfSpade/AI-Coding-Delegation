@@ -1520,3 +1520,19 @@ test('a verifier run far shorter than its expectation carries a duration warning
   ]);
   assert.equal(compactReport(baselineJob(compared)).includes('verify duration warning'), false);
 });
+
+test('a catch-all provider failure line names its redacted reason and retryability', () => {
+  const line = (providerFailure) =>
+    compactReport(loopFailed({ failureKind: undefined, error: 'Provider response was invalid', providerFailure }))
+      .split('\n')
+      .find((text) => text.startsWith('provider failure:'));
+  assert.equal(
+    line({ kind: 'response', reason: 'incomplete_anthropic_tool_json', retryable: false }),
+    'provider failure: response (incomplete_anthropic_tool_json) · not retryable',
+  );
+  assert.equal(
+    line({ kind: 'http', status: 503, attempts: 1, retryable: true }),
+    'provider failure: http HTTP 503 after 1 attempt · transient',
+  );
+  assert.equal(line({ kind: 'request', reason: 'Has Spaces' }), 'provider failure: request');
+});

@@ -3222,6 +3222,10 @@ test('the wall-clock watchdog ends a round that cannot stop itself as TIMEOUT', 
   const done = await m.wait(job.jobId, { timeoutSec: 10 });
   assert.equal(done.status, 'TIMEOUT');
   assert.equal(observedReason?.code, 'OFFLOAD_WALL_TIMEOUT');
+  // The watchdog aborts first and logs afterwards, so a busy job lock never
+  // delays the abort; the round can publish TIMEOUT before that line lands.
+  const deadline = Date.now() + 5_000;
+  while (!(await eventTypes(m, job.jobId)).includes('watchdog') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
   assert.ok((await eventTypes(m, job.jobId)).includes('watchdog'));
 });
 
@@ -3280,12 +3284,16 @@ test("a RUNNING round this process claimed but no task owns is finalized; anothe
 test('offload_wait and offload_job show a pending cancel and how long ago it was requested', async () => {
   let clock = Date.parse('2026-10-21T04:00:00.000Z');
   const now = () => new Date(clock);
-  let release;
+  let release, launched;
   const released = new Promise((resolve) => (release = resolve));
+  const running = new Promise((resolve) => (launched = resolve));
   // Ignores the abort until released, so the cancel stays pending.
-  const m = await plainManager({ run: async () => (await released, { status: 'DONE' }) }, { now });
+  const m = await plainManager({ run: async () => (launched(), await released, { status: 'DONE' }) }, { now });
   try {
     const job = await m.start({ task: 'x', ownedPaths: ['src/**'], repoPath: process.cwd() });
+    // A cancel that lands before the worker launches settles the round as
+    // CANCELLED at once; this test is about a worker that ignores the abort.
+    await running;
     const before = await m.wait(job.jobId, { timeoutSec: 0 });
     assert.equal(before.progress.cancelRequested, undefined);
     const reply = await m.cancel(job.jobId);

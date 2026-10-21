@@ -19,6 +19,7 @@ test('provider attempt timeout defaults and exposes only bounded numeric metadat
   );
   assert.deepEqual(providerFailure(new ProviderError('timeout', { kind: 'attempt_timeout', attempts: 1, timeoutMs: 300_000 })), {
     kind: 'attempt_timeout',
+    retryable: false,
     attempts: 1,
     timeoutMs: 300_000,
   });
@@ -26,7 +27,7 @@ test('provider attempt timeout defaults and exposes only bounded numeric metadat
     providerFailure(
       new ProviderError('timeout', { kind: 'attempt_timeout', attempts: 1, timeoutMs: 1, endpoint: 'https://secret.invalid' }),
     ),
-    { kind: 'attempt_timeout', attempts: 1 },
+    { kind: 'attempt_timeout', retryable: false, attempts: 1 },
   );
 });
 
@@ -795,4 +796,48 @@ test('a keep-alive drip cannot stretch one attempt past its timeout', async () =
   );
   assert.ok(Date.now() - started < 1_500, 'the request ended near its 100 ms limit, not when the stream did');
   assert.equal(fetches, 1);
+});
+
+test('OpenAI chat: a length finish mid tool arguments drops the fragment; without a cap it is a response failure', async () => {
+  const stream = (finishReason) => async () =>
+    new Response(
+      [
+        { model: 'm', choices: [{ delta: { content: 'Writing.' } }] },
+        {
+          model: 'm',
+          choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', function: { name: 'write_file', arguments: '{"path":"a' } }] } }],
+        },
+        { model: 'm', choices: [{ delta: {}, finish_reason: finishReason }] },
+        { model: 'm', choices: [], usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } },
+      ]
+        .map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`)
+        .join('') + 'data: [DONE]\n\n',
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    );
+  const run = async (finishReason) => {
+    const events = [];
+    const provider = new OpenAIChatProvider({ baseUrl: 'https://example.test', model: 'm', retries: 0, fetchImpl: stream(finishReason) });
+    for await (const event of provider.chat({ messages: [{ role: 'user', content: 'go' }], tools: [] })) events.push(event);
+    return events;
+  };
+  const capped = await run('length');
+  assert.equal(
+    capped.some((event) => event.toolCalls),
+    false,
+  );
+  assert.deepEqual(capped.at(-1), { providerFinishReason: 'length' });
+  await assert.rejects(run('tool_calls'), (error) => {
+    assert.deepEqual(providerFailure(error), { kind: 'response', retryable: false, reason: 'incomplete_tool_json' });
+    return true;
+  });
+});
+
+test('catch-all provider failures keep a bounded reason slug and never provider text', () => {
+  assert.deepEqual(providerFailure(new ProviderError('Invalid Anthropic SSE event', { kind: 'response' })), {
+    kind: 'response',
+    retryable: false,
+    reason: 'invalid_anthropic_sse_event',
+  });
+  assert.equal(providerFailure(new ProviderError('timeout', { kind: 'transport', retryable: true })).reason, undefined);
+  assert.match(providerFailure(new ProviderError(`x ${'y'.repeat(500)} <script>`)).reason, /^[a-z][a-z0-9_]{0,63}$/);
 });

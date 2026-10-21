@@ -3006,7 +3006,7 @@ test('missing-tool recovery reuses normal budget and provider-failure boundaries
   }).run({ task: 'x' });
   assert.equal(failureCalls, 3);
   assert.equal(failureResult.status, 'FAILED');
-  assert.deepEqual(failureResult.providerFailure, { kind: 'http', attempts: 1, status: 503 });
+  assert.deepEqual(failureResult.providerFailure, { kind: 'http', retryable: false, attempts: 1, status: 503 });
 });
 
 test('capped reasoning continuation is one-shot and requires a conclusive provider length signal', async () => {
@@ -3959,7 +3959,7 @@ test('finite-budget turns disable ambiguous upstream retries', async () => {
   const loop = new AgentLoop({ provider, tools: { execute: async () => '' }, model: 'm', pricing: priceTable(['m']), maxUsd: 1 });
   const result = await loop.run({ task: 'x' });
   assert.equal(result.status, 'FAILED');
-  assert.deepEqual(result.providerFailure, { kind: 'sse_protocol', attempts: 1 });
+  assert.deepEqual(result.providerFailure, { kind: 'sse_protocol', retryable: true, attempts: 1 });
   assert.equal(result.error, 'Chat request failed');
   assert.equal(attempts, 1, 'a failed stream may have been billed, so a capped job must not replay it');
 });
@@ -3990,7 +3990,7 @@ test('provider attempt timeout is safe, visible, and distinct from the outer dea
   }).run({ task: 'x' });
   assert.equal(result.status, 'TIMEOUT');
   assert.equal(result.error, 'Provider request timed out');
-  assert.deepEqual(result.providerFailure, { kind: 'attempt_timeout', attempts: 1 });
+  assert.deepEqual(result.providerFailure, { kind: 'attempt_timeout', retryable: true, attempts: 1 });
   assert.equal(attempts, 1, 'finite-budget jobs never replay an ambiguous timed-out POST');
   assert.ok(progress.some((event) => event.action === 'provider_request_pending' && event.turn === 1));
   assert.doesNotMatch(JSON.stringify(result), /secret\.invalid|must-not-persist/i);

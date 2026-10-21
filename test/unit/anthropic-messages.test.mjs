@@ -5,7 +5,7 @@ import {
   resolveLatestAnthropicSonnet,
   resolveLatestAnthropicOpus,
 } from '../../src/provider/anthropic-messages.mjs';
-import { ProviderError } from '../../src/provider/openai-chat.mjs';
+import { ProviderError, providerFailure } from '../../src/provider/openai-chat.mjs';
 import { CreditFallbackProvider } from '../../src/provider/fallback.mjs';
 import { resolveLatestDeepSeekFlash } from '../../src/core.mjs';
 
@@ -513,4 +513,96 @@ test('Anthropic: an already-aborted signal sends no request, and a cancel mid-st
   await assert.rejects(pending, (error) => error === cancelled, 'the cancel, not a retry or a timeout, ends the request');
   assert.ok(Date.now() - started < 2_000);
   assert.equal(counter.fetches, 1, 'a cancel is never retried');
+});
+
+// Regression: oj-20261021-458f1a7c. A capped continuation that ran out of
+// max_tokens mid tool_use failed as an opaque `request` provider failure
+// instead of reaching the loop's output-cap recovery.
+const cappedProvider = (events) =>
+  new AnthropicMessagesProvider({
+    baseUrl: 'https://api.anthropic.com',
+    apiKey: 'test-key',
+    model: 'claude-opus-5-5',
+    retries: 0,
+    fetchImpl: async () => sseResponse(events),
+  });
+const collect = async (provider, messages = [{ role: 'user', content: 'Edit a.js.' }]) => {
+  const events = [];
+  for await (const event of provider.chat({
+    messages,
+    tools: [{ type: 'function', function: { name: 'write_file', description: 'write a file', parameters: { type: 'object' } } }],
+  }))
+    events.push(event);
+  return events;
+};
+const truncatedToolUse = (stopReason) => [
+  { type: 'message_start', message: { model: 'claude-opus-5-5', usage: { input_tokens: 10 } } },
+  { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } },
+  { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'Write the file.' } },
+  { type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'sig' } },
+  { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'toolu_write', name: 'write_file' } },
+  { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"path":"a.js","content":"export const' } },
+  { type: 'message_delta', delta: { stop_reason: stopReason }, usage: { output_tokens: 16_384 } },
+  { type: 'message_stop' },
+];
+
+test('Anthropic: max_tokens mid tool_use drops the fragment and reports a length finish', async () => {
+  const events = await collect(cappedProvider(truncatedToolUse('max_tokens')));
+  assert.equal(
+    events.some((event) => event.toolCalls),
+    false,
+  );
+  assert.deepEqual(events.find((event) => event.anthropicContent)?.anthropicContent, [
+    { type: 'thinking', thinking: 'Write the file.', signature: 'sig' },
+  ]);
+  assert.deepEqual(events.at(-1), { providerFinishReason: 'length' });
+});
+
+test('Anthropic: incomplete tool JSON without a cap is a non-retryable response failure with a redacted reason', async () => {
+  await assert.rejects(collect(cappedProvider(truncatedToolUse('tool_use'))), (error) => {
+    assert.ok(error instanceof ProviderError);
+    assert.deepEqual(providerFailure(error), {
+      kind: 'response',
+      retryable: false,
+      reason: 'incomplete_anthropic_tool_json',
+    });
+    return true;
+  });
+});
+
+test('Anthropic: an unsigned thinking block cut by max_tokens is dropped and never replayed as an empty turn', async () => {
+  const events = await collect(
+    cappedProvider([
+      { type: 'message_start', message: { model: 'claude-opus-5-5', usage: { input_tokens: 10 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'Still planning' } },
+      { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 16_384 } },
+      { type: 'message_stop' },
+    ]),
+  );
+  assert.equal(
+    events.some((event) => event.anthropicContent || event.text || event.toolCalls),
+    false,
+  );
+  assert.deepEqual(events.at(-1), { providerFinishReason: 'length' });
+  let request;
+  const replay = new AnthropicMessagesProvider({
+    baseUrl: 'https://api.anthropic.com',
+    apiKey: 'test-key',
+    model: 'claude-opus-5-5',
+    retries: 0,
+    fetchImpl: async (_url, init) => {
+      request = JSON.parse(init.body);
+      return sseResponse(truncatedToolUse('max_tokens'));
+    },
+  });
+  await collect(replay, [
+    { role: 'user', content: 'Edit a.js.' },
+    { role: 'assistant', content: '' },
+    { role: 'user', content: 'Continue using an allowed tool call.' },
+  ]);
+  assert.deepEqual(request.messages, [
+    { role: 'user', content: 'Edit a.js.' },
+    { role: 'user', content: 'Continue using an allowed tool call.' },
+  ]);
 });

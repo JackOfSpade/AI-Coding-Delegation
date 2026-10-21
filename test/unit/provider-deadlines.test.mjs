@@ -45,7 +45,7 @@ for (const Provider of [OpenAIChatProvider, AnthropicMessagesProvider]) {
       await flush();
       if (Provider === OpenAIChatProvider && phase === 'error body') {
         await pending;
-        assert.deepEqual(providerFailure(outcome), { kind: 'http', attempts: 1, status: 500 });
+        assert.deepEqual(providerFailure(outcome), { kind: 'http', retryable: true, attempts: 1, status: 500 });
         assert.equal(cancels, 1, 'HTTP failure does not await hanging body cleanup');
         return;
       }
@@ -57,7 +57,7 @@ for (const Provider of [OpenAIChatProvider, AnthropicMessagesProvider]) {
       assert.ok(outcome, 'the timeout must settle even if abort does not settle fetch/read/cancel');
       await pending;
       assert.equal(requestSignal.aborted, true);
-      assert.deepEqual(providerFailure(outcome), { kind: 'attempt_timeout', attempts: 1, timeoutMs: 30_000 });
+      assert.deepEqual(providerFailure(outcome), { kind: 'attempt_timeout', retryable: true, attempts: 1, timeoutMs: 30_000 });
       if (releaseHeaders) {
         releaseHeaders(new Response(body));
         await flush();

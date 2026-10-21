@@ -30,12 +30,13 @@ function checkedBaseUrl(baseUrl) {
 
 function normalizedUsage(input, output) {
   const count = (value) => Number.isSafeInteger(value) && value >= 0;
-  if (!input || !count(input.input_tokens) || !count(output?.output_tokens)) throw new ProviderError('Invalid Anthropic usage record');
+  if (!input || !count(input.input_tokens) || !count(output?.output_tokens))
+    throw new ProviderError('Invalid Anthropic usage record', { kind: 'response' });
   const hit = input.cache_read_input_tokens ?? 0;
   const write = input.cache_creation_input_tokens ?? 0;
   // Anthropic's input_tokens excludes cache reads AND cache writes.
   const totalInput = input.input_tokens + hit + write;
-  if (!count(hit) || !count(write) || !count(totalInput)) throw new ProviderError('Invalid Anthropic cache usage');
+  if (!count(hit) || !count(write) || !count(totalInput)) throw new ProviderError('Invalid Anthropic cache usage', { kind: 'response' });
   return {
     inputTokens: totalInput,
     outputTokens: output.output_tokens,
@@ -152,7 +153,10 @@ function wireMessages(messages) {
             : (() => {
                 throw new ProviderError('Anthropic assistant replay does not match tool transaction');
               })();
-      wire.push({ role: 'assistant', content: content.length ? content : '' });
+      // A capped response whose only output was an unexecutable fragment has
+      // nothing to replay, and Anthropic rejects an empty assistant turn; the
+      // API merges the now-adjacent user turns.
+      if (content.length) wire.push({ role: 'assistant', content });
       continue;
     }
   }
@@ -316,14 +320,15 @@ export class AnthropicMessagesProvider {
     const blocks = new Map();
     for (const event of events) {
       if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.type !== 'string')
-        throw new ProviderError('Invalid Anthropic SSE event');
+        throw new ProviderError('Invalid Anthropic SSE event', { kind: 'response' });
       if (event.type === 'message_start') {
-        if (!isAnthropicModel(event.message?.model)) throw new ProviderError('Invalid Anthropic response model');
+        if (!isAnthropicModel(event.message?.model)) throw new ProviderError('Invalid Anthropic response model', { kind: 'response' });
         modelName = event.message.model;
         inputUsage = event.message.usage;
       } else if (event.type === 'content_block_start') {
         const index = event.index;
-        if (!Number.isSafeInteger(index) || index < 0 || blocks.has(index)) throw new ProviderError('Invalid Anthropic content block');
+        if (!Number.isSafeInteger(index) || index < 0 || blocks.has(index))
+          throw new ProviderError('Invalid Anthropic content block', { kind: 'response' });
         const block = event.content_block;
         if (block?.type === 'text' && validText(block.text ?? '')) blocks.set(index, { type: 'text', text: block.text ?? '' });
         else if (block?.type === 'tool_use' && validId(block.id, 512) && validId(block.name, 128))
@@ -332,27 +337,29 @@ export class AnthropicMessagesProvider {
           blocks.set(index, { type: 'thinking', thinking: block.thinking ?? '', signature: block.signature ?? '' });
         else if (block?.type === 'redacted_thinking' && validText(block.data ?? '') && block.data.length > 0)
           blocks.set(index, { type: 'redacted_thinking', data: block.data });
-        else throw new ProviderError('Unsupported Anthropic content block');
+        else throw new ProviderError('Unsupported Anthropic content block', { kind: 'response' });
       } else if (event.type === 'content_block_delta') {
         const block = blocks.get(event.index);
-        if (!block || !event.delta || typeof event.delta !== 'object') throw new ProviderError('Invalid Anthropic content delta');
+        if (!block || !event.delta || typeof event.delta !== 'object')
+          throw new ProviderError('Invalid Anthropic content delta', { kind: 'response' });
         if (block.type === 'text' && event.delta.type === 'text_delta' && validText(event.delta.text ?? '')) {
           block.text += event.delta.text ?? '';
-          if (!validText(block.text)) throw new ProviderError('Anthropic text exceeds size limit');
+          if (!validText(block.text)) throw new ProviderError('Anthropic text exceeds size limit', { kind: 'response' });
         } else if (
           block.type === 'tool_use' &&
           event.delta.type === 'input_json_delta' &&
           validText(event.delta.partial_json ?? '', MAX_TOOL_ARGUMENT_CHARS)
         ) {
           block.input += event.delta.partial_json ?? '';
-          if (block.input.length > MAX_TOOL_ARGUMENT_CHARS) throw new ProviderError('Tool arguments exceed size limit');
+          if (block.input.length > MAX_TOOL_ARGUMENT_CHARS)
+            throw new ProviderError('Tool arguments exceed size limit', { kind: 'response' });
         } else if (block.type === 'thinking' && event.delta.type === 'thinking_delta' && validText(event.delta.thinking ?? '')) {
           block.thinking += event.delta.thinking ?? '';
-          if (!validText(block.thinking)) throw new ProviderError('Anthropic thinking exceeds size limit');
+          if (!validText(block.thinking)) throw new ProviderError('Anthropic thinking exceeds size limit', { kind: 'response' });
         } else if (block.type === 'thinking' && event.delta.type === 'signature_delta' && validText(event.delta.signature ?? '')) {
           block.signature += event.delta.signature ?? '';
-          if (!validText(block.signature)) throw new ProviderError('Anthropic thinking signature exceeds size limit');
-        } else throw new ProviderError('Unsupported Anthropic content delta');
+          if (!validText(block.signature)) throw new ProviderError('Anthropic thinking signature exceeds size limit', { kind: 'response' });
+        } else throw new ProviderError('Unsupported Anthropic content delta', { kind: 'response' });
       } else if (event.type === 'message_delta') {
         stop = finishReason(event.delta?.stop_reason);
         outputUsage = event.usage;
@@ -373,12 +380,20 @@ export class AnthropicMessagesProvider {
           const parsed = JSON.parse(block.input || '{}');
           if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('invalid');
         } catch {
-          throw new ProviderError('Incomplete Anthropic tool JSON');
+          // max_tokens can cut a tool call mid-input. That is a completed,
+          // billed `length` response, not a malformed one: drop the
+          // unexecutable fragment and let output-cap recovery see the reason.
+          if (stop === 'length') continue;
+          throw new ProviderError('Incomplete Anthropic tool JSON', { kind: 'response' });
         }
         toolCalls.push({ id: block.id, name: block.name, arguments: block.input || '{}' });
         anthropicContent.push({ type: 'tool_use', id: block.id, name: block.name, input: block.input || '{}' });
       } else if (block.type === 'thinking') {
-        if (!block.signature) throw new ProviderError('Incomplete Anthropic thinking signature');
+        if (!block.signature) {
+          // An unsigned (capped) thinking block cannot be replayed; drop it.
+          if (stop === 'length') continue;
+          throw new ProviderError('Incomplete Anthropic thinking signature', { kind: 'response' });
+        }
         hasThinking = true;
         anthropicContent.push({ type: 'thinking', thinking: block.thinking, signature: block.signature });
       } else {

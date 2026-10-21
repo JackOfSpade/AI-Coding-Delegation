@@ -5,6 +5,7 @@ import { compactReport, terminalStatuses } from './report.mjs';
 import { matchesAny, normalizePath, pathsOverlap } from './glob.mjs';
 import { parseKeyRef } from './secrets.mjs';
 import { modelPolicyViolation } from './model-policy.mjs';
+import { safeProviderFailureReason } from './provider/openai-chat.mjs';
 import { diffTreeFiles, diffTrees, git as snapshotGit } from './git-snapshot.mjs';
 import { copyReportInputs, prepareReportInputsForCleanup, reportInputRoots, validateReportInputFiles } from './report-inputs.mjs';
 import { redactText, redactTokenShapes, redactedSummary, stripTerminalControls } from './redact.mjs';
@@ -284,6 +285,7 @@ const safeReportError = (value) =>
   safeReportString(typeof value === 'string' ? value : String(value || ''), 1500) || 'report worker failed';
 const PROVIDER_FAILURE_KINDS = new Set([
   'request',
+  'response',
   'http',
   'transport',
   'attempt_timeout',
@@ -394,6 +396,8 @@ const safeProviderFailure = (value) => {
     failure.status = value.status;
   if (value.kind === 'attempt_timeout' && Number.isSafeInteger(value.timeoutMs) && value.timeoutMs >= 30_000 && value.timeoutMs <= 600_000)
     failure.timeoutMs = value.timeoutMs;
+  if ((value.kind === 'request' || value.kind === 'response') && safeProviderFailureReason(value.reason)) failure.reason = value.reason;
+  if (typeof value.retryable === 'boolean') failure.retryable = value.retryable;
   return failure;
 };
 const providerFailureMessage = (failure) => {
@@ -410,8 +414,10 @@ const providerFailureMessage = (failure) => {
       return 'Provider response stream was invalid';
     case 'sse_limit':
       return 'Provider response stream exceeded a safety limit';
+    case 'response':
+      return failure.reason ? `Provider response was invalid (${failure.reason})` : 'Provider response was invalid';
     default:
-      return 'Provider request failed';
+      return failure?.reason ? `Provider request failed (${failure.reason})` : 'Provider request failed';
   }
 };
 const safeReportList = (value) =>
