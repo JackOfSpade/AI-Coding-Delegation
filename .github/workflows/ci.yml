@@ -50,7 +50,8 @@ jobs:
 
   quality:
     name: Release gate
-    needs: test
+    # This job has its own checkout and test run. Start it immediately so a
+    # queued platform runner cannot delay Linux coverage and package validation.
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
