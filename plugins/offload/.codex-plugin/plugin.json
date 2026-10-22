@@ -1,6 +1,6 @@
 {
   "name": "offload",
-  "version": "0.1.0+codex.c7338b4c11e9f586",
+  "version": "0.1.0+codex.d3a0e7b4b51a771b",
   "description": "Runs only after an explicit /offload_sonnet or /offload_opus slash-command invocation; ordinary prose does not invoke it.",
   "author": {
     "name": "Offload"
