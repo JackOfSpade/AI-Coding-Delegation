@@ -40,7 +40,7 @@ const startProps = {
     maxItems: 32,
     items: { type: 'string', minLength: 1, maxLength: 4096 },
     description:
-      'Report-mode only: absolute regular files under the server OS temp root; macOS also accepts /private/tmp (and its /tmp alias). Configured server scratch roots may also apply. Files are size-limited, copied read-only into the private worktree, and returned only by private relative paths in reportResult. A rejected call reports canonical allowed roots before any job is created.',
+      'Report-mode only: UTF-8 text (no NUL bytes), not images or other binary formats; workers have no image decoder. Absolute regular files under the server OS temp root; macOS also accepts /private/tmp (and its /tmp alias). Configured server scratch roots may also apply. Files are size-limited, copied read-only into the private worktree, and returned only by private relative paths in reportResult. A rejected call reports canonical allowed roots before any job is created.',
   },
   relevantPaths: {
     type: 'array',

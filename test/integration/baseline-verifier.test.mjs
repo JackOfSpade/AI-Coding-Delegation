@@ -8,6 +8,7 @@ import { JobStore } from '../../src/store.mjs';
 import { JobManager, validateJobRequest } from '../../src/job-manager.mjs';
 import { createCore, gitPatchApplier, gitSnapshots } from '../../src/core.mjs';
 import { Runner } from '../../src/runner.mjs';
+import { installedSkillHealth } from '../../src/skill-health.mjs';
 import { sandboxAvailable } from '../../src/sandbox.mjs';
 import { createIsolatedWorktree, openIsolatedWorktree, cleanupIsolatedWorktree } from '../../src/worktree.mjs';
 import { cleanup, git, makeRepo, write } from '../unit/helpers.mjs';
@@ -1069,6 +1070,7 @@ test('Core records Config.verifier thresholds on write jobs as server-derived se
     createCore({
       config: {
         loaded: { disabled: false, repoConfig: {}, config: { ...config, ...(verifier ? { verifier } : {}) } },
+        skillHealth: (options) => installedSkillHealth({ ...options, home: repo, env: {} }),
         probeVerifierTemp: async () => ({ status: 'writable' }),
         isolation: { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree },
       },

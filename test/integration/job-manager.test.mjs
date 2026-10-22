@@ -968,6 +968,12 @@ test('report input rejection is actionable but creates no durable job or private
         return true;
       },
     );
+    const binaryInput = join(scratch, 'private-image.png');
+    write(binaryInput, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+    await assert.rejects(
+      () => m.start({ mode: 'report', task: 'analyze input 01', inputFiles: [binaryInput], repoPath: repo }),
+      /report input 1.*unsupported binary.*no image decoder/,
+    );
     assert.deepEqual(await store.list(), [], 'a rejected source never gains a durable job record');
     assert.deepEqual(
       await readdir(join(gitDir, 'offload', 'jobs')).catch((error) => (error.code === 'ENOENT' ? [] : Promise.reject(error))),

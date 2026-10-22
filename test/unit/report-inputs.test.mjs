@@ -65,7 +65,7 @@ test('report inputs reject duplicate paths, final symlinks, and size limits with
   await writeFile(target, 'target');
   await symlink(target, linked);
   await writeFile(oversized, Buffer.alloc(MAX_REPORT_INPUT_FILE_BYTES + 1));
-  for (const file of totalFiles) await writeFile(file, Buffer.alloc(7 * 1024 * 1024));
+  for (const file of totalFiles) await writeFile(file, Buffer.alloc(7 * 1024 * 1024, 'a'));
   try {
     const roots = [await realpath(root)];
     assert.throws(() => validateReportInputFiles([good, good]), /duplicates/);
@@ -131,4 +131,30 @@ test('report input allowlist rejects sibling-prefix and directory-symlink escape
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
+});
+
+test('report inputs reject PNG, NUL and invalid UTF-8 bytes without leaking names or retaining partial copies', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'offload-report-binary-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, 'workspace');
+  await mkdir(workspace);
+  const good = join(root, 'text.txt');
+  const input = join(root, 'private-customer-name.txt');
+  await writeFile(good, 'Unicode text: café 🐈');
+  for (const bytes of [Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), Buffer.from('a\0b'), Buffer.from([0xc3, 0x28])]) {
+    await writeFile(input, bytes);
+    await assert.rejects(
+      async () => copyReportInputs({ inputFiles: [good, input], workspacePath: workspace, roots: [await realpath(root)] }),
+      (error) => {
+        assert.match(error.message, /report input 2.*unsupported binary or invalid UTF-8/);
+        assert.match(error.message, /no image decoder/);
+        assert.doesNotMatch(error.message, /private-customer-name/);
+        return true;
+      },
+    );
+    assert.equal(existsSync(join(workspace, REPORT_INPUT_DIRECTORY)), false);
+  }
+  const manifest = await copyReportInputs({ inputFiles: [good], workspacePath: workspace, roots: [await realpath(root)] });
+  assert.equal(await readFile(join(workspace, manifest[0].path), 'utf8'), 'Unicode text: café 🐈');
+  await prepareReportInputsForCleanup(workspace);
 });

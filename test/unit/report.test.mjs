@@ -1536,3 +1536,25 @@ test('a catch-all provider failure line names its redacted reason and retryabili
   );
   assert.equal(line({ kind: 'request', reason: 'Has Spaces' }), 'provider failure: request');
 });
+
+test('late apply primary pass preserves the earlier native crash without repeating stale apply advice', () => {
+  const job = {
+    id: 'oj-native',
+    status: 'DONE_UNVERIFIED',
+    applied: true,
+    verify: { command: 'python -m pytest', verdict: 'FAIL', result: { code: 139, sandbox: 'macos' } },
+    verifyEnvironment: { kind: 'native-module-crash', detail: "native module 'torch' crashed" },
+    appliedUnverified: { previousStatus: 'VERIFY_ENV_FAILED', applyThenVerify: true },
+    applyVerify: { outcome: 'PASSED', exitCode: 0, command: 'python -m pytest', ranUnder: 'policy-only' },
+  };
+  for (const detail of ['compact', 'full']) {
+    const report = compactReport(job, { detail });
+    assert.match(report, /earlier sandbox run; primary verification recorded below/);
+    assert.match(report, /applyThenVerify PASSED/);
+    assert.match(report, /DONE_UNVERIFIED, not server-verified/);
+    assert.doesNotMatch(report, /Run the import in the primary|then use offload_apply to integrate/);
+    const before = compactReport({ ...job, status: 'VERIFY_ENV_FAILED', applied: false, applyVerify: undefined });
+    assert.match(before, /accepted interpreter declaration.*does not prove imports work/);
+    assert.match(before, /then use offload_apply/);
+  }
+});

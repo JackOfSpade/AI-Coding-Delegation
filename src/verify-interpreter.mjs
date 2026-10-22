@@ -338,6 +338,7 @@ export function publicVerifierInterpreter(job) {
       declared: job.verifierInterpreter,
       ...(Array.isArray(job.verifierInterpreterRoots) ? { readExecRoots: job.verifierInterpreterRoots } : {}),
       appliesTo: 'verifier',
+      note: 'Acceptance grants read and exec access; it does not verify interpreter startup, imports or tests',
       sandboxed: job.sandboxMode === 'macos',
       writable: false,
     },
@@ -405,9 +406,16 @@ export function verifierPythonStatus(repoPath, context = {}) {
 
 const shellQuote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
 const VERSION_MARKER = '__OFFLOAD_PYTHON_VERSION__=';
+const IMPORT_MARKER = '__OFFLOAD_PYTHON_IMPORT__=';
+const IMPORTS_COMPLETE = '__OFFLOAD_PYTHON_IMPORTS_COMPLETE__';
 const probeScript = (imports) =>
   imports.length
-    ? `-c ${shellQuote(`import importlib, sys; [importlib.import_module(name) for name in ${JSON.stringify(imports)}]; print(${JSON.stringify(VERSION_MARKER)} + sys.version)`)}`
+    ? `-X faulthandler -c ${shellQuote(`import importlib, sys
+print(${JSON.stringify(VERSION_MARKER)} + sys.version.replace('\\n', ' '), flush=True)
+for name in ${JSON.stringify(imports)}:
+ print(${JSON.stringify(IMPORT_MARKER)} + name, flush=True)
+ importlib.import_module(name)
+print(${JSON.stringify(IMPORTS_COMPLETE)}, flush=True)`)}`
     : '-c "import sys; print(sys.version)"';
 
 /**
@@ -453,19 +461,25 @@ export async function probeVerifierInterpreter(
           imports.length ? lines.findLast((line) => line.startsWith(VERSION_MARKER))?.slice(VERSION_MARKER.length) : lines[0],
           120,
         );
-        if (result?.code === 0 && !result.timedOut && version) interpreters.push({ ...entry, status: 'ok', version });
+        if (result?.code === 0 && !result.timedOut && version && (!imports.length || lines.includes(IMPORTS_COMPLETE)))
+          interpreters.push({ ...entry, status: 'ok', version });
         else {
           const environment = classifyVerifierEnvironment({ command, verdict: 'FAIL', result });
+          const importing = lines.findLast((line) => line.startsWith(IMPORT_MARKER))?.slice(IMPORT_MARKER.length);
+          const importCrashed = !!version && imports.includes(importing) && (result?.code === 139 || result?.signal === 'SIGSEGV');
           interpreters.push({
             ...entry,
             status: 'failed',
+            phase: version && imports.length ? 'imports' : 'startup',
+            ...(version ? { version } : {}),
+            ...(imports.includes(importing) ? { importing } : {}),
             reason: result?.timedOut
               ? 'probe-timed-out'
-              : environment?.kind === 'native-module-crash'
+              : environment?.kind === 'native-module-crash' || importCrashed
                 ? 'native-module-crash'
                 : 'probe-failed',
             ...(Number.isInteger(result?.code) ? { exitCode: result.code } : {}),
-            ...(environment?.module ? { module: environment.module } : {}),
+            ...(environment?.module ? { module: environment.module } : importCrashed ? { module: importing } : {}),
             ...(environment?.nativeModule ? { nativeModule: environment.nativeModule } : {}),
             detail: clip(
               String(result?.stderr ?? '')
@@ -495,7 +509,11 @@ export async function probeVerifierInterpreter(
     readExecRoots: resolved.roots,
     ...(imports.length ? { imports } : {}),
     note: failed
-      ? 'the declaration was accepted but the interpreter did not run inside the verifier sandbox; a testCommand using it would fail the same way'
-      : 'the declared interpreter runs inside the verifier sandbox (read and exec only, never write); call it by this absolute path in testCommand',
+      ? failed.phase === 'imports'
+        ? 'the declaration was accepted and Python started, but an import probe failed inside the verifier sandbox; check the same imports in the primary before spending. This is not a verdict on the code'
+        : 'the declaration was accepted but the interpreter did not run inside the verifier sandbox; inspect the probe failure before spending'
+      : imports.length
+        ? 'the declared interpreter and requested imports ran inside the verifier sandbox; this probes only those imports, not the test suite'
+        : 'the declared interpreter runs inside the verifier sandbox (read and exec only, never write); native imports and the test suite are untested. Use verifierImports before spending on tests with native dependencies',
   };
 }

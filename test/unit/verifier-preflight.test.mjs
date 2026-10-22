@@ -144,3 +144,17 @@ test('verifier preflight sizes only the files the command names, not what they i
     Buffer.byteLength("import '../src/big.mjs';\n") + 1000 + 500,
   );
 });
+
+test('native import warnings follow local Python imports and inline commands without executing them', (t) => {
+  const { root, write } = fixture(t);
+  write('tests/test_native.py', 'from helper import check\n');
+  write('tests/helper.py', 'import os, torch\nraise RuntimeError("must never execute")\n');
+  write('unrelated.py', 'import tensorflow\n');
+  const result = preflightVerifier({ repoPath: root, testCommand: 'python tests/test_native.py' });
+  assert.deepEqual(result.warnings, [{ code: 'native-import', path: 'tests/helper.py' }]);
+  assert.match(verifierPreflightLines(result).join('\n'), /accepted interpreter.*verifierImports before spending/);
+  const inline = preflightVerifier({ repoPath: root, testCommand: 'python -c "import torch"' });
+  assert.ok(inline.warnings.some((warning) => warning.code === 'native-import'));
+  const denied = preflightVerifier({ repoPath: root, testCommand: 'python tests/test_native.py', denyRead: ['tests/helper.py'] });
+  assert.deepEqual(denied.warnings, []);
+});

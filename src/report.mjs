@@ -150,9 +150,10 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
   // spend a repair round on it and never retries automatically.
   const environmentFailure =
     job.verifyEnvironment?.kind === 'permission-denied' ? (tsxIpcEnvironment(job.verify) ?? job.verifyEnvironment) : job.verifyEnvironment;
+  const primaryChecked = job.applied === true && (job.applyVerify?.outcome === 'PASSED' || !!job.appliedUnverified?.verifiedBy);
   const environment =
     !reportMode && isVerifierEnvironmentKind(environmentFailure?.kind)
-      ? `verifier environment: ${scalar(environmentFailure.detail || environmentFailure.kind)}. This is not a repair-able code failure; no repair round was spent and none will be started automatically.${
+      ? `verifier environment${primaryChecked ? ' (earlier sandbox run; primary verification recorded below)' : ''}: ${scalar(environmentFailure.detail || environmentFailure.kind)}. This is not a repair-able code failure; no repair round was spent and none will be started automatically.${
           environmentFailure.kind === 'missing-package'
             ? job.workspaceDependencies && job.workspaceDependencies !== 'linked'
               ? ` The primary checkout's node_modules was not linked (${scalar(job.workspaceDependencies)}): install dependencies there.`
@@ -162,13 +163,15 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
               : environmentFailure.kind === 'git-config-denied'
                 ? ' A temporary Git-fixture test could not read host Git configuration in the verifier sandbox. This is an environment limitation, not a product-test failure; run that integration suite in the primary checkout.'
                 : environmentFailure.kind === 'native-module-crash'
-                  ? ' Run the import in the primary checkout to determine whether the verifier sandbox caused the crash.'
+                  ? primaryChecked
+                    ? ' The earlier native import crash remains recorded separately from the primary check.'
+                    : ' Run the import in the primary checkout to determine whether the verifier sandbox caused the crash. An accepted interpreter declaration grants read and exec; it does not prove imports work.'
                   : environmentFailure.kind === 'sandbox-dominated'
                     ? " Most of the suite's child-process/Git fixtures cannot run in the verifier sandbox, so the runs are no evidence about the change: run that suite in the primary checkout, and give the next job a testCommand without those files."
                     : ''
         }${
           // An applyThenVerify run is already acting on this very advice.
-          applyRunning
+          applyRunning || job.applied === true
             ? ''
             : ' Review the diff, then use offload_apply to integrate it: applyThenVerify "<your check>" applies it, runs the check in the primary checkout and reverts it if the check fails (or pass verifiedBy for a check you ran yourself), or start a fresh job.'
         }`

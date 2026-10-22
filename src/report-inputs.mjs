@@ -121,6 +121,16 @@ export async function copyReportInputs({ inputFiles = [], workspacePath, roots =
       total += bytes.length;
       if (total > MAX_REPORT_INPUT_TOTAL_BYTES)
         throw new Error(`report inputs exceed the ${MAX_REPORT_INPUT_TOTAL_BYTES} byte total limit`);
+      // Match the worker's text reader before sizing or creating a durable job.
+      // File extensions are caller-controlled; inspect the bounded bytes instead.
+      try {
+        if (bytes.includes(0)) throw new Error('binary');
+        new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      } catch {
+        throw new Error(
+          `report input ${index + 1} is unsupported binary or invalid UTF-8; report workers read UTF-8 text only and have no image decoder. Extract text or provide a textual summary before starting a job`,
+        );
+      }
       // Never carry caller-controlled source names into durable job metadata,
       // prompts, or public results. The ordinal remains stable for a job.
       const name = `input-${String(index + 1).padStart(2, '0')}`;

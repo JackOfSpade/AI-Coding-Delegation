@@ -173,6 +173,14 @@ export function preflightVerifier({ repoPath, testCommand, denyRead = [] }) {
     warnings.push({ code, path });
   };
   const inspect = (text, path) => {
+    // Advisory only: common native dependencies can fail at import time even
+    // when the interpreter declaration is accepted. Never import repo code here.
+    if (
+      /(?:^|[;\n])\s*(?:from\s+(?:torch|numpy|scipy|tensorflow|jax|cv2|pandas)(?:[.\s])|import\s+[^;\n#]*\b(?:torch|numpy|scipy|tensorflow|jax|cv2|pandas)\b)/.test(
+        text,
+      )
+    )
+      warn('native-import', path);
     if (/(?:^|[\s'"`=])\/(?:private\/)?(?:tmp(?:\/|\b)|var\/folders(?:\/|\b))/m.test(text)) warn('system-temp', path);
     if (/\bchild_process\b|\b(?:execFile(?:Sync)?|spawn(?:Sync)?)\s*\(|\bsubprocess\b|\bos\.(?:system|popen)\s*\(/.test(text))
       warn('child-process', path);
@@ -239,7 +247,7 @@ export function preflightVerifier({ repoPath, testCommand, denyRead = [] }) {
       const script = /\b(?:npm|pnpm|yarn)\s+(?:run\s+)?([\w:-]+)/.exec(words.join(' '))?.[1];
       for (let index = 0; index < words.length; index++) {
         const word = words[index].replace(/^--(?:import|require|loader)=/, '').replace(/^\.\//, '');
-        if (['-e', '--eval', '-p', '--print'].includes(words[index])) {
+        if (['-e', '--eval', '-p', '--print', '-c'].includes(words[index])) {
           const inline = words[++index] ?? '';
           inspect(inline, 'testCommand');
           references(inline, 'testCommand');
@@ -312,6 +320,8 @@ export function preflightVerifier({ repoPath, testCommand, denyRead = [] }) {
 export function verifierPreflightLines(value) {
   if (!value || !Array.isArray(value.warnings)) return [];
   const advice = {
+    'native-import':
+      'native Python imports may crash inside the verifier sandbox even with an accepted interpreter declaration; probe the dependencies with health verifierInterpreter + verifierImports before spending, and compare failures in the primary',
     'system-temp': 'hard-coded system temp path may fail with EPERM; use TMPDIR / os.tmpdir() / tempfile',
     'child-process': 'child-process use may fail with spawn EPERM under verifier restrictions; check in the primary before spending',
     'process-inspection':

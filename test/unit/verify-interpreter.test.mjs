@@ -256,6 +256,7 @@ test('a job contributes interpreter paths only when it declared roots', { skip: 
       declared: ['/a'],
       readExecRoots: ['/a'],
       appliesTo: 'verifier',
+      note: 'Acceptance grants read and exec access; it does not verify interpreter startup, imports or tests',
       sandboxed: true,
       writable: false,
     },
@@ -328,6 +329,7 @@ test('probing a declaration runs python -c inside the sandbox and reports each o
     run: run({ code: 0, stdout: '3.99.0 (main) [fake]\nignored\n', stderr: '' }),
   });
   assert.equal(ok.status, 'ok');
+  assert.match(ok.note, /native imports and the test suite are untested/);
   assert.equal(ok.reason, 'declared-interpreter-runs');
   assert.equal(ok.interpreters[0].version, '3.99.0 (main) [fake]');
   assert.equal(ok.interpreter, venvPython);
@@ -381,23 +383,59 @@ test('probing a declaration runs python -c inside the sandbox and reports each o
   const imported = await probeVerifierInterpreter(join(root, 'venv'), {
     ...context,
     imports: ['torch', 'package.submodule', 'torch'],
-    run: run({ code: 139, stdout: '', stderr: 'Fatal Python error: Segmentation fault\nC  [libtorch_python.dylib] initModule\n' }),
+    run: run({
+      code: 139,
+      stdout: '__OFFLOAD_PYTHON_VERSION__=3.99\n__OFFLOAD_PYTHON_IMPORT__=torch\n',
+      stderr: 'Fatal Python error: Segmentation fault\nC  [libtorch_python.dylib] initModule\n',
+    }),
   });
   assert.equal(imported.status, 'partial');
   assert.equal(imported.reason, 'native-module-crash');
   assert.deepEqual(imported.imports, ['torch', 'package.submodule']);
   assert.equal(imported.interpreters[0].module, 'torch');
   assert.equal(imported.interpreters[0].nativeModule, 'libtorch_python.dylib');
+  assert.match(calls.at(-1).command, /-X faulthandler/);
+  assert.equal(imported.accepted, true);
+  assert.equal(imported.interpreters[0].phase, 'imports');
+  assert.equal(imported.interpreters[0].version, '3.99');
+  assert.equal(imported.interpreters[0].importing, 'torch');
+  assert.match(imported.note, /Python started.*import probe failed/);
+  assert.match(calls.at(-1).command, /flush=True/);
   assert.match(calls.at(-1).command, /importlib\.import_module/);
   assert.match(calls.at(-1).command, /torch/);
+
+  const pythonStackCrash = await probeVerifierInterpreter(join(root, 'venv'), {
+    ...context,
+    imports: ['torch'],
+    run: run({
+      code: 139,
+      stdout: '__OFFLOAD_PYTHON_VERSION__=3.99\n__OFFLOAD_PYTHON_IMPORT__=torch\n',
+      stderr: 'Fatal Python error: Segmentation fault\nCurrent thread: importlib.import_module\n',
+    }),
+  });
+  assert.equal(pythonStackCrash.reason, 'native-module-crash');
+  assert.equal(pythonStackCrash.interpreters[0].module, 'torch');
+  assert.equal(pythonStackCrash.interpreters[0].nativeModule, undefined, 'do not invent a native library name');
 
   const noisyImport = await probeVerifierInterpreter(join(root, 'venv'), {
     ...context,
     imports: ['noisy_module'],
-    run: run({ code: 0, stdout: 'module startup message\n__OFFLOAD_PYTHON_VERSION__=3.99.0 (main) [fake]\n', stderr: '' }),
+    run: run({
+      code: 0,
+      stdout: 'module startup message\n__OFFLOAD_PYTHON_VERSION__=3.99.0 (main) [fake]\n__OFFLOAD_PYTHON_IMPORTS_COMPLETE__\n',
+      stderr: '',
+    }),
   });
   assert.equal(noisyImport.status, 'ok');
   assert.equal(noisyImport.interpreters[0].version, '3.99.0 (main) [fake]');
+  const earlyExit = await probeVerifierInterpreter(join(root, 'venv'), {
+    ...context,
+    imports: ['torch'],
+    run: run({ code: 0, stdout: '__OFFLOAD_PYTHON_VERSION__=3.99\n__OFFLOAD_PYTHON_IMPORT__=torch\n', stderr: '' }),
+  });
+  assert.equal(earlyExit.status, 'partial', 'a module exiting zero must not pretend all imports completed');
+  assert.equal(earlyExit.interpreters[0].phase, 'imports');
+
   const noVersion = await probeVerifierInterpreter(join(root, 'venv'), {
     ...context,
     imports: ['noisy_module'],

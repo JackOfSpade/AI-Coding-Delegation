@@ -13,7 +13,7 @@ import { JobManager } from '../../src/job-manager.mjs';
 import { JobStore } from '../../src/store.mjs';
 import { macosProfile, runCommand, sandboxAvailable } from '../../src/sandbox.mjs';
 import { installedSkillHealth } from '../../src/skill-health.mjs';
-import { resolveVerifierInterpreters } from '../../src/verify-interpreter.mjs';
+import { probeVerifierInterpreter, resolveVerifierInterpreters } from '../../src/verify-interpreter.mjs';
 import { cleanupIsolatedWorktree, createIsolatedWorktree, integrateRecordedTree, openIsolatedWorktree } from '../../src/worktree.mjs';
 import { cleanup, git, makeRepo, write } from '../unit/helpers.mjs';
 
@@ -120,6 +120,17 @@ test(
     assert.equal(module.code, 0, module.stderr);
     assert.match(module.stdout, /"a": 1/);
     assert.equal((await run(`${python} -m unittest -h`)).code, 0);
+
+    // Exercise the generated health script with real imports under the sandbox.
+    const importProbe = await probeVerifierInterpreter(venv, { repoPath: repo, imports: ['sqlite3', 'ssl'] });
+    assert.equal(importProbe.status, 'ok', JSON.stringify(importProbe));
+    assert.match(importProbe.note, /requested imports ran/);
+    const missingImport = await probeVerifierInterpreter(venv, { repoPath: repo, imports: ['offload_nonexistent_probe_module'] });
+    assert.equal(missingImport.accepted, true);
+    assert.equal(missingImport.status, 'partial');
+    assert.equal(missingImport.interpreters[0].phase, 'imports');
+    assert.equal(missingImport.interpreters[0].importing, 'offload_nonexistent_probe_module');
+    assert.match(missingImport.note, /Python started/);
 
     // Read and exec, never write: shell and interpreter writes into the venv, and into its base installation.
     denied(await run(`echo x > ${shellQuote(join(venv, 'zz'))}`), 'shell write into the venv');
