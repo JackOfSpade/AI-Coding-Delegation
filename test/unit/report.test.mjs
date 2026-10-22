@@ -1414,7 +1414,7 @@ test('both report detail modes expose cache token hit rate, writes and the zero-
     assert.match(report, /prompt cache: 80\.0% token hit rate \(8000\/10000 input tokens; 1000 cache-write tokens\)/);
     assert.match(
       compactReport({ usage: { inputTokens: 100, cacheHitTokens: 0 } }, { detail }),
-      /no cache hits reported.*TTL and prefix changes/,
+      /no cache hits reported; check provider cache requirements and prefix changes/,
     );
   }
 });

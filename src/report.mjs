@@ -47,7 +47,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     `in ${scalar(job.usage.inputTokens ?? 0)} (cache hit ${scalar(job.usage.cacheHitTokens ?? 0)}) out ${scalar(job.usage.outputTokens ?? 0)}`;
   const cache = promptCacheSummary(job.usage);
   const cacheLine = cache
-    ? `prompt cache: ${(100 * cache.hitRate).toFixed(1)}% token hit rate (${cache.cacheHitTokens}/${cache.inputTokens} input tokens; ${cache.cacheWriteTokens} cache-write tokens)${cache.cacheHitTokens === 0 ? '; no cache hits reported; check prompt minimum, five-minute TTL and prefix changes' : ''}`
+    ? `prompt cache: ${(100 * cache.hitRate).toFixed(1)}% token hit rate (${cache.cacheHitTokens}/${cache.inputTokens} input tokens; ${cache.cacheWriteTokens} cache-write tokens)${cache.cacheHitTokens === 0 ? '; no cache hits reported; check provider cache requirements and prefix changes' : ''}`
     : '';
   const continuationReason = continuationBlocker(job);
   const continuationLine =
