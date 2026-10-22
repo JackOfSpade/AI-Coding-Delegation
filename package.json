@@ -33,6 +33,8 @@
     "coverage": "node scripts/run-coverage.mjs",
     "artifacts:clean": "node scripts/clean-artifacts.mjs",
     "package:check": "node scripts/package-gate.mjs",
+    "plugin:version": "node scripts/plugin-version.mjs",
+    "plugin:check": "node scripts/plugin-version.mjs --check",
     "release:check": "node scripts/release-check.mjs"
   },
   "devDependencies": {

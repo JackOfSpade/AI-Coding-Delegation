@@ -546,7 +546,7 @@ async function installOwnedFile(path, content, uninstall, backups, manifest, bac
   return false;
 }
 const pluginName = 'offload';
-const pluginFiles = ['plugin.json', '.codex-plugin/plugin.json', 'skills/offload_sonnet/SKILL.md', 'skills/offload_opus/SKILL.md'];
+export const pluginFiles = ['plugin.json', '.codex-plugin/plugin.json', 'skills/offload_sonnet/SKILL.md', 'skills/offload_opus/SKILL.md'];
 const legacyPluginSkill = 'skills/offload/SKILL.md';
 const pluginEntry = () => ({
   name: pluginName,
@@ -650,14 +650,12 @@ function keychainCommandEnv(env, platform) {
   for (const key of keys) if (typeof env[key] === 'string' && env[key]) minimal[key] = env[key];
   return minimal;
 }
-function packagedPluginVersion(artifacts) {
-  let portable, codex;
-  try {
-    portable = JSON.parse(artifacts['plugin.json']);
-    codex = JSON.parse(artifacts['.codex-plugin/plugin.json']);
-  } catch {
-    throw new Error('invalid packaged plugin manifest');
-  }
+/**
+ * The `+codex.<hash>` build suffix both plugin manifests carry. It hashes the
+ * packaged plugin artifacts with each manifest's own version masked, so any
+ * skill or manifest edit changes it; `npm run plugin:version` rewrites it.
+ */
+export function pluginContentVersionSuffix(artifacts) {
   const normalized = pluginFiles
     .slice()
     .sort()
@@ -677,7 +675,17 @@ function packagedPluginVersion(artifacts) {
       return `${path}\0${canonicalContent}\0`;
     })
     .join('');
-  const expected = `+codex.${digest(normalized).slice(0, 16)}`;
+  return `+codex.${digest(normalized).slice(0, 16)}`;
+}
+function packagedPluginVersion(artifacts) {
+  let portable, codex;
+  try {
+    portable = JSON.parse(artifacts['plugin.json']);
+    codex = JSON.parse(artifacts['.codex-plugin/plugin.json']);
+  } catch {
+    throw new Error('invalid packaged plugin manifest');
+  }
+  const expected = pluginContentVersionSuffix(artifacts);
   if (
     !record(portable) ||
     !record(codex) ||
