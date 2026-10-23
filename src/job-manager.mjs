@@ -30,7 +30,7 @@ import {
 import { isolatedDependencyReadPaths } from './worktree.mjs';
 import { classifyVerifierEnvironment, isVerifierEnvironmentKind } from './verify-env.mjs';
 import { continuationBlocker, promptCacheSummary } from './continuation.mjs';
-import { preflightVerifier } from './verifier-preflight.mjs';
+import { narrowTestCommand, preflightVerifier, verifierBlockingMessage } from './verifier-preflight.mjs';
 import {
   expectedVerifierMs,
   sessionVerifierFailures,
@@ -654,6 +654,7 @@ const JOB_INPUT_KEYS = [
   'testCommandSource',
   'requireSandbox',
   'unsafePolicyOnlyVerifier',
+  'acceptVerifierBlockers',
   'profile',
   'effort',
   'maxRepairRounds',
@@ -754,6 +755,7 @@ export function validateJobRequest(input) {
     mode === 'report' &&
     (Object.hasOwn(input, 'requireSandbox') ||
       Object.hasOwn(input, 'unsafePolicyOnlyVerifier') ||
+      input.acceptVerifierBlockers !== undefined ||
       input.verifierMode !== undefined ||
       input.verifierTimeoutSec !== undefined ||
       input.verifierInterpreter !== undefined)
@@ -790,6 +792,8 @@ export function validateJobRequest(input) {
   if (input.requireSandbox != null && typeof input.requireSandbox !== 'boolean') throw new Error('requireSandbox must be boolean');
   if (input.unsafePolicyOnlyVerifier != null && typeof input.unsafePolicyOnlyVerifier !== 'boolean')
     throw new Error('unsafePolicyOnlyVerifier must be boolean');
+  if (input.acceptVerifierBlockers != null && typeof input.acceptVerifierBlockers !== 'boolean')
+    throw new Error('acceptVerifierBlockers must be boolean');
   if (input.unsafePolicyOnlyVerifier === true && input.testCommandSource === 'repo')
     throw new Error('repository testCommand cannot use unsafe policy-only verification');
   if (input.verifierMode != null && !VERIFIER_MODES.has(input.verifierMode))
@@ -959,7 +963,11 @@ export class JobManager {
     // The baseline-diff verifier's private copy is removed with the job's own
     // workspace, so a crash between its creation and its removal is retried by
     // the same recovery path.
-    for (const workspacePath of [job?.verifyBaselineWorkspacePath, ...(job?.workspaceRetained === true ? [] : [job?.workspacePath])]) {
+    for (const workspacePath of [
+      job?.verifyBaselineWorkspacePath,
+      job?.applyVerifyScratchPath,
+      ...(job?.workspaceRetained === true ? [] : [job?.workspacePath]),
+    ]) {
       if (!workspacePath) continue;
       try {
         if (job.mode === 'report' && workspacePath === job.workspacePath) await prepareReportInputsForCleanup(workspacePath);
@@ -1248,9 +1256,14 @@ export class JobManager {
       await update(
         id,
         cleaned && job.workspaceRetained !== true
-          ? { workspaceCleanedAt: this.now().toISOString(), workspaceCleanupError: undefined, verifyBaselineWorkspacePath: undefined }
+          ? {
+              workspaceCleanedAt: this.now().toISOString(),
+              workspaceCleanupError: undefined,
+              verifyBaselineWorkspacePath: undefined,
+              applyVerifyScratchPath: undefined,
+            }
           : cleaned
-            ? { verifyBaselineWorkspacePath: undefined }
+            ? { verifyBaselineWorkspacePath: undefined, applyVerifyScratchPath: undefined }
             : { workspaceCleanupError: 'isolated workspace cleanup could not be completed' },
       );
     } catch {}
@@ -1412,6 +1425,8 @@ export class JobManager {
       (typeof job.verifyBaselineWorkspacePath !== 'string' || !job.verifyBaselineWorkspacePath)
     )
       throw new Error('stored job has invalid baseline workspace metadata');
+    if (job.applyVerifyScratchPath !== undefined && (typeof job.applyVerifyScratchPath !== 'string' || !job.applyVerifyScratchPath))
+      throw new Error('stored job has invalid applyThenVerify scratch metadata');
     if (job.runtimePreflight !== undefined && !validRuntimePreflight(job.runtimePreflight))
       throw new Error('stored job has invalid runtime preflight metadata');
     if (job.workspaceRetained !== undefined && typeof job.workspaceRetained !== 'boolean')
@@ -1536,13 +1551,47 @@ export class JobManager {
       if (!this.isolated) throw new Error('baseline-diff verification requires an isolated private worktree');
     }
     if (input.profile && this.config.profiles && !this.config.profiles[input.profile]) throw new Error(`unknown profile: ${input.profile}`);
-    let verifierPreflight = preflightVerifier({ repoPath, testCommand: input.testCommand, denyRead: input.denyRead });
+    let verifierPreflight = preflightVerifier({
+      repoPath,
+      testCommand: input.testCommand,
+      denyRead: input.denyRead,
+      writeScope: [...input.ownedPaths, ...(input.extraWritable || [])],
+    });
     if (input.mode !== 'report') {
       const previousFailures = await this.verifierEnvironmentFailures();
       if (previousFailures.length) {
         verifierPreflight ||= { scannedFiles: 0, resolvedFiles: [], limited: true, warnings: [] };
-        verifierPreflight.previousFailures = previousFailures;
-        verifierPreflight.status = 'warning';
+        // Only files this testCommand still runs are worth dropping; a narrowed
+        // command that no longer reaches them gets a note instead.
+        const resolved = new Set(verifierPreflight.resolvedFiles);
+        verifierPreflight.previousFailures = previousFailures.map((failure) =>
+          failure.files.length && resolved.size && !verifierPreflight.limited
+            ? { ...failure, inCommand: failure.files.filter((file) => resolved.has(file)) }
+            : failure,
+        );
+        if (verifierPreflight.status !== 'blocking') verifierPreflight.status = 'warning';
+      }
+      const drop = [
+        ...new Set([
+          ...(verifierPreflight?.blocking ?? []).flatMap((finding) => (finding.path === 'testCommand' ? [] : [finding.path])),
+          ...(verifierPreflight?.previousFailures ?? []).flatMap((failure) => failure.inCommand ?? failure.files),
+        ]),
+      ];
+      const narrowed = drop.length
+        ? narrowTestCommand({ repoPath, testCommand: input.testCommand, denyRead: input.denyRead, files: drop })
+        : undefined;
+      if (narrowed) {
+        verifierPreflight.drop = narrowed.drop.length ? narrowed.drop : drop.slice(0, 24);
+        if (narrowed.command) verifierPreflight.suggestedTestCommand = narrowed.command;
+        else verifierPreflight.narrowing = narrowed.reason;
+      }
+      // A write the sandbox is certain to deny ends the job VERIFY_ENV_FAILED
+      // only after the worker has spent its budget, so refuse before any job
+      // exists. baseline-diff tolerates failures the start snapshot shares, and a
+      // policy-only verifier has no sandbox to deny the write.
+      if (verifierPreflight?.blocking?.length && input.requireSandbox === true && input.verifierMode !== 'baseline-diff') {
+        if (input.acceptVerifierBlockers !== true) throw new Error(verifierBlockingMessage(verifierPreflight));
+        verifierPreflight.blockersAccepted = true;
       }
     }
     const branch = this.config.git ? await this.config.git.branch(repoPath) : git(repoPath, ['branch', '--show-current']);
@@ -3802,9 +3851,12 @@ export class JobManager {
    * the live tree, and `offload_revert` afterwards. `apply: false` is a
    * dry run that leaves the primary unchanged; it may recapture a retained workspace.
    */
-  async apply(id, { apply = false, verifiedBy, applyThenVerify, applyThenVerifyTimeoutSec, unsafePolicyOnlyVerifier, signal } = {}) {
+  async apply(
+    id,
+    { apply = false, verifiedBy, applyThenVerify, applyThenVerifyTimeoutSec, applyThenVerifyIn, unsafePolicyOnlyVerifier, signal } = {},
+  ) {
     if (typeof apply !== 'boolean') throw new Error('apply must be boolean');
-    const plan = normalizeApplyVerify({ applyThenVerify, applyThenVerifyTimeoutSec, unsafePolicyOnlyVerifier });
+    const plan = normalizeApplyVerify({ applyThenVerify, applyThenVerifyTimeoutSec, applyThenVerifyIn, unsafePolicyOnlyVerifier });
     const evidence = typeof verifiedBy === 'string' ? verifiedBy.trim() : '';
     // A command is an alternative to the primary's own evidence, so `verifiedBy`
     // is optional beside it; a malformed one is still refused rather than ignored.
@@ -3844,6 +3896,8 @@ export class JobManager {
    */
   #assertApplyVerifySandbox(plan) {
     if (typeof this.runner?.verify !== 'function') throw new Error('applyThenVerify is unavailable: this manager has no command runner');
+    if (plan.location === 'scratch' && !this.isolated)
+      throw new Error('applyThenVerifyIn "scratch" needs isolated private worktrees, which this manager does not have');
     if (plan.policyOnly) return;
     const status = typeof this.runner.sandboxStatus === 'function' ? this.runner.sandboxStatus() : undefined;
     const available = status ? status.available === true : this.runner.sandboxAvailable?.();
@@ -4035,6 +4089,7 @@ export class JobManager {
             command: this.#recordedCommand(plan.command),
             timeoutSec: plan.timeoutSec,
             sandbox: plan.policyOnly ? 'policy-only-authorized' : 'required',
+            ...(plan.location === 'scratch' ? { location: 'scratch' } : {}),
             startedAt: this.now().toISOString(),
             previousStatus: job.status,
             attempts: (Number.isInteger(job.applyVerify?.attempts) ? job.applyVerify.attempts : 0) + 1,
@@ -4188,24 +4243,28 @@ export class JobManager {
       let thrown;
       if (!controller.signal.aborted) {
         try {
-          const gitDir = this.config.gitDir
-            ? await this.config.gitDir(job.repoPath)
-            : resolve(job.repoPath, git(job.repoPath, ['rev-parse', '--git-dir']));
-          run = await this.runner.verify(plan.command, {
-            cwd: job.repoPath,
-            gitDir,
-            signal: controller.signal,
-            // Never the job's own network grant: this runs worker-authored code
-            // against the whole primary checkout, including gitignored local
-            // data the isolated-worktree verifier never saw.
-            allowNetwork: false,
-            denyRead: job.denyRead || [],
-            // Read-only primary: only the per-run temp directory is writable.
-            writablePaths: [],
-            ...interpreterPathsOption(job),
-            requireSandbox,
-            timeoutMs: plan.timeoutSec * 1000,
-          });
+          if (plan.location === 'scratch')
+            run = await this.#scratchApplyVerify(job, { plan, reconciliation, signal: controller.signal, requireSandbox });
+          else {
+            const gitDir = this.config.gitDir
+              ? await this.config.gitDir(job.repoPath)
+              : resolve(job.repoPath, git(job.repoPath, ['rev-parse', '--git-dir']));
+            run = await this.runner.verify(plan.command, {
+              cwd: job.repoPath,
+              gitDir,
+              signal: controller.signal,
+              // Never the job's own network grant: this runs worker-authored code
+              // against the whole primary checkout, including gitignored local
+              // data the isolated-worktree verifier never saw.
+              allowNetwork: false,
+              denyRead: job.denyRead || [],
+              // Read-only primary: only the per-run temp directory is writable.
+              writablePaths: [],
+              ...interpreterPathsOption(job),
+              requireSandbox,
+              timeoutMs: plan.timeoutSec * 1000,
+            });
+          }
         } catch (error) {
           thrown = error;
         }
@@ -4351,6 +4410,46 @@ export class JobManager {
     } catch (error) {
       if (error?.applyVerifyReported) throw error;
       throw await this.#abandonApplyVerify(id, error);
+    }
+  }
+  /**
+   * applyThenVerifyIn "scratch": the command runs in a disposable private
+   * worktree of the just-applied primary tree (tracked and untracked
+   * non-ignored files, the primary node_modules linked read-only), writable
+   * everywhere but .git and node_modules, and never in the primary itself. The
+   * primary stays exactly as applied, so the pass/revert decision is unchanged.
+   */
+  async #scratchApplyVerify(job, { plan, reconciliation, signal, requireSandbox }) {
+    if (!validGitObjectId(reconciliation?.primaryAfter))
+      throw new Error('the applied primary tree is unknown; no scratch copy can be made');
+    const workspace = await this.config.isolation.create({ repoPath: job.repoPath, baselineTree: reconciliation.primaryAfter });
+    if (!workspace?.path || typeof workspace.path !== 'string') throw new Error('could not create a scratch copy of the primary');
+    try {
+      // Recorded before anything runs in it, so a crash leaves a path the job's cleanup can find.
+      await this.store.update(job.id, { applyVerifyScratchPath: workspace.path });
+      const cwd = workspace.path;
+      return await this.runner.verify(plan.command, {
+        cwd,
+        gitDir: this.config.gitDir ? await this.config.gitDir(cwd) : resolve(cwd, git(cwd, ['rev-parse', '--git-dir'])),
+        signal,
+        allowNetwork: false,
+        denyRead: job.denyRead || [],
+        // The copy is disposable and never integrated: the whole tree is writable.
+        writablePaths: [join(cwd, '**')],
+        readablePaths: [dirname(cwd), ...isolatedDependencyReadPaths(cwd, job.repoPath)],
+        ...interpreterPathsOption(job),
+        requireSandbox,
+        timeoutMs: plan.timeoutSec * 1000,
+      });
+    } finally {
+      let removed = false;
+      try {
+        await workspace.cleanup?.();
+        removed = true;
+      } catch {
+        // The persisted path stays so the job's own cleanup retries it.
+      }
+      if (removed) await this.store.update(job.id, { applyVerifyScratchPath: undefined }).catch(() => {});
     }
   }
   /**

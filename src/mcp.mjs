@@ -61,6 +61,11 @@ const startProps = {
     description:
       'High-friction consent for this caller-supplied testCommand to run policy-only when no macOS sandbox can be applied. A policy-only result can never trigger repair.',
   },
+  acceptVerifierBlockers: {
+    type: 'boolean',
+    description:
+      'Start even though the static verifier preflight found blocking findings: writes the verifier sandbox is certain to deny (a hard-coded system temp path, or a worktree path outside ownedPaths/extraWritable such as mkdtemp(join(process.cwd(), ".x-"))). Without it such a start is refused before any job exists, naming each file:line and target, the extraWritable glob that would cover a worktree target, and a narrowed testCommand when one can be derived. Pass it only after deciding the finding is a false positive or the failure is acceptable.',
+  },
   verifierMode: {
     enum: ['standard', 'baseline-diff'],
     description:
@@ -260,7 +265,12 @@ const TOOLS = [
         minLength: 1,
         maxLength: 8_192,
         description:
-          "Alternative to verifiedBy (one of the two is required with apply=true). The command runs in the PRIMARY checkout inside the macOS sandbox with the checkout read-only (writes only to a per-run temp dir; never any network, whatever the job's allowNetwork; .git and secret files unreadable), so a suite that writes into the repo tree or shells out to git fails there. Exit 0 leaves the job DONE_UNVERIFIED with the command, exit status and output tail recorded as your check. Any other result auto-reverts the diff. The call blocks until the command ends, so the host's own tool timeout (60 s on the managed Codex config) bounds it: a client-side cancel aborts the command and reverts the diff, so a check longer than the host allows can never pass; keep it short, or verify by hand with verifiedBy. A call that was abandoned can be followed with offload_wait (progress.applyThenVerify while it runs) or offload_job (a top-level applyThenVerify.phase and a RUNNING report line while it runs, the final report after). Another process's offload_cancel also stops the run and reverts the diff. Refused on a policy-only host unless unsafePolicyOnlyVerifier is true. Do not edit the job's paths while it runs.",
+          "Alternative to verifiedBy (one of the two is required with apply=true). The command runs in the PRIMARY checkout inside the macOS sandbox with the checkout read-only (writes only to a per-run temp dir; never any network, whatever the job's allowNetwork; .git and secret files unreadable), so a suite that writes into the repo tree or shells out to git fails there; for a suite that writes into the tree, pass applyThenVerifyIn 'scratch' to run it in a writable disposable copy instead. Exit 0 leaves the job DONE_UNVERIFIED with the command, exit status and output tail recorded as your check. Any other result auto-reverts the diff. The call blocks until the command ends, so the host's own tool timeout (60 s on the managed Codex config) bounds it: a client-side cancel aborts the command and reverts the diff, so a check longer than the host allows can never pass; keep it short, or verify by hand with verifiedBy. A call that was abandoned can be followed with offload_wait (progress.applyThenVerify while it runs) or offload_job (a top-level applyThenVerify.phase and a RUNNING report line while it runs, the final report after). Another process's offload_cancel also stops the run and reverts the diff. Refused on a policy-only host unless unsafePolicyOnlyVerifier is true. Do not edit the job's paths while it runs.",
+      },
+      applyThenVerifyIn: {
+        enum: ['primary', 'scratch'],
+        description:
+          'Where applyThenVerify runs. primary (default): the primary checkout, read-only. scratch: a disposable private worktree of the just-applied primary (tracked and untracked non-ignored files; gitignored files such as .env are absent; the primary node_modules is linked read-only), writable everywhere except .git and node_modules, still under the macOS sandbox with no network. Use it for a suite that writes into the repo tree (fixtures, mkdtemp under the project) or needs its own git metadata; a hard-coded /tmp is still denied. Exit 0 records the run server-side exactly like primary; anything else reverts the diff in the primary. Use only when health reports applyThenVerifyScratch.',
       },
       applyThenVerifyTimeoutSec: {
         type: 'integer',
@@ -668,6 +678,8 @@ export function createMcpServer(
         (args.applyThenVerifyTimeoutSec !== undefined || args.unsafePolicyOnlyVerifier !== undefined)
       )
         throw new Error('applyThenVerifyTimeoutSec and unsafePolicyOnlyVerifier require applyThenVerify');
+      if (args.applyThenVerify === undefined && args.applyThenVerifyIn !== undefined)
+        throw new Error('applyThenVerifyIn requires applyThenVerify');
     }
     return args;
   };
@@ -684,6 +696,7 @@ export function createMcpServer(
           relevantPaths: args.relevantPaths,
           testCommand: args.testCommand,
           ...(args.unsafePolicyOnlyVerifier !== undefined ? { unsafePolicyOnlyVerifier: args.unsafePolicyOnlyVerifier } : {}),
+          ...(args.acceptVerifierBlockers !== undefined ? { acceptVerifierBlockers: args.acceptVerifierBlockers } : {}),
           ...(args.verifierMode !== undefined ? { verifierMode: args.verifierMode } : {}),
           ...(args.verifierTimeoutSec !== undefined ? { verifierTimeoutSec: args.verifierTimeoutSec } : {}),
           ...(args.verifierInterpreter !== undefined ? { verifierInterpreter: args.verifierInterpreter } : {}),
@@ -744,6 +757,7 @@ export function createMcpServer(
             ? {
                 applyThenVerify: args.applyThenVerify,
                 ...(args.applyThenVerifyTimeoutSec !== undefined ? { applyThenVerifyTimeoutSec: args.applyThenVerifyTimeoutSec } : {}),
+                ...(args.applyThenVerifyIn !== undefined ? { applyThenVerifyIn: args.applyThenVerifyIn } : {}),
                 ...(args.unsafePolicyOnlyVerifier !== undefined ? { unsafePolicyOnlyVerifier: args.unsafePolicyOnlyVerifier } : {}),
                 signal,
               }

@@ -5,7 +5,7 @@ import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JobStore } from '../../src/store.mjs';
-import { JobManager } from '../../src/job-manager.mjs';
+import { JobManager, validateJobRequest } from '../../src/job-manager.mjs';
 import { FAILURE_ERRORS } from '../../src/failure.mjs';
 import { gitPatchApplier, gitSnapshots } from '../../src/core.mjs';
 import {
@@ -1117,10 +1117,121 @@ test('environment failure files survive apply and detached managers and warn hea
     assert.equal(health.verifierEnvironmentFailures[0].jobId, id);
     assert.match(health.verifierEnvironmentFailures[0].advice, /Exclude.*next testCommand/);
     const next = await reader.start({ repoPath: h.repo, task: 'next', ownedPaths: ['src/**'], testCommand }, { launch: false });
-    assert.deepEqual(next.verifierPreflight.previousFailures, health.verifierEnvironmentFailures);
+    assert.deepEqual(
+      next.verifierPreflight.previousFailures,
+      health.verifierEnvironmentFailures.map((failure) => ({ ...failure, inCommand: files })),
+    );
+    // Inline-loaded files cannot be cut from the command text: say so instead of guessing.
+    assert.deepEqual(next.verifierPreflight.drop, files);
+    assert.match(next.verifierPreflight.narrowing, /inline code/);
     assert.match((await reader.job(next.jobId)).report, /verifier session warning:.*resume-download-bundle.js.*platform-utils.js/);
     assert.equal(h.counters.runs, 1, 'warnings are returned before another worker call');
     await reader.cancel(next.jobId);
+  } finally {
+    cleanup(h.repo);
+  }
+});
+
+test('a session failure on one listed test file suggests the narrowed testCommand at the next start', async () => {
+  const h = await harness({
+    worker: async (job) => {
+      writeSrc(job, 'a.js', A_BYTES);
+      return { status: 'DONE', turns: 3, costUsd: 0.5 };
+    },
+    check: () => ({
+      command: 'check',
+      verdict: 'FAIL',
+      result: {
+        code: 1,
+        sandbox: 'macos',
+        stderr: "FAIL test/b.test.mjs :: recovery\nError: EPERM: operation not permitted, mkdtemp '/tmp/ic-job-recovery-report-abc123'",
+      },
+    }),
+  });
+  h.manager.config.sessionStartedAt = new Date(Date.now() - 60_000).toISOString();
+  try {
+    write(join(h.repo, 'test/a.test.mjs'), 'export {};');
+    write(join(h.repo, 'test/b.test.mjs'), "const dir = process.env.SCRATCH ?? '/tmp/ic';");
+    const testCommand = 'node --test test/a.test.mjs test/b.test.mjs';
+    const { done } = await h.begin({ testCommand });
+    assert.equal(done.status, 'VERIFY_ENV_FAILED');
+    assert.deepEqual(done.verifyEnvironment.files, ['test/b.test.mjs']);
+    const next = await h.manager.start({ repoPath: h.repo, task: 'next', ownedPaths: ['src/**'], testCommand }, { launch: false });
+    assert.deepEqual(next.verifierPreflight.drop, ['test/b.test.mjs']);
+    assert.equal(next.verifierPreflight.suggestedTestCommand, 'node --test test/a.test.mjs');
+    const report = (await h.manager.job(next.jobId)).report;
+    assert.match(report, /verifier session warning:.*test\/b\.test\.mjs; exclude/);
+    assert.match(report, /verifier suggestion: drop test\/b\.test\.mjs from testCommand: `node --test test\/a\.test\.mjs`/);
+    await h.manager.cancel(next.jobId);
+    // Once the caller takes the suggestion, the old failure is only a note and nothing is dropped.
+    const narrowed = await h.manager.start(
+      { repoPath: h.repo, task: 'again', ownedPaths: ['src/**'], testCommand: next.verifierPreflight.suggestedTestCommand },
+      { launch: false },
+    );
+    assert.deepEqual(narrowed.verifierPreflight.previousFailures[0].inCommand, []);
+    assert.equal(narrowed.verifierPreflight.drop, undefined);
+    assert.match((await h.manager.job(narrowed.jobId)).report, /verifier session note:.*no longer run by this testCommand/);
+    await h.manager.cancel(narrowed.jobId);
+  } finally {
+    cleanup(h.repo);
+  }
+});
+
+test('a blocking verifier finding refuses the start before any job or spend, unless declared or accepted', async () => {
+  const h = await harness({
+    worker: async (job) => {
+      writeSrc(job, 'a.js', A_BYTES);
+      return { status: 'DONE', turns: 1 };
+    },
+  });
+  try {
+    write(
+      join(h.repo, 'test/career.test.mjs'),
+      "import { mkdtemp } from 'node:fs/promises';\nimport { join } from 'node:path';\nawait mkdtemp(join(process.cwd(), '.career-recovery-verbatim-'));\n",
+    );
+    write(join(h.repo, 'test/other.test.mjs'), 'export {};');
+    const testCommand = 'node --test test/career.test.mjs test/other.test.mjs';
+    const before = (await h.store.list({ limit: 100 })).length;
+    await assert.rejects(
+      () => h.manager.start({ repoPath: h.repo, task: 'w', ownedPaths: ['src/**'], testCommand }, { launch: false }),
+      (error) => {
+        assert.match(error.message, /verifier preflight refused the start/);
+        assert.match(error.message, /test\/career\.test\.mjs:3: mkdtemp \.career-recovery-verbatim-XXXXXX/);
+        assert.match(error.message, /extraWritable: "\.career-recovery-verbatim-\*\*"/);
+        assert.match(error.message, /drop test\/career\.test\.mjs from testCommand: `node --test test\/other\.test\.mjs`/);
+        return true;
+      },
+    );
+    assert.equal((await h.store.list({ limit: 100 })).length, before, 'no job record exists');
+    assert.equal(h.counters.runs, 0);
+    // Declaring the directory removes the blocker; accepting it records the consent.
+    const declared = await h.manager.start(
+      { repoPath: h.repo, task: 'w', ownedPaths: ['src/**'], extraWritable: ['.career-recovery-verbatim-**'], testCommand },
+      { launch: false },
+    );
+    assert.equal(declared.verifierPreflight.blocking, undefined);
+    await h.manager.cancel(declared.jobId);
+    const accepted = await h.manager.start(
+      { repoPath: h.repo, task: 'w', ownedPaths: ['src/**'], testCommand, acceptVerifierBlockers: true },
+      { launch: false },
+    );
+    assert.equal(accepted.verifierPreflight.blockersAccepted, true);
+    assert.equal(accepted.verifierPreflight.status, 'blocking');
+    assert.match(
+      (await h.manager.job(accepted.jobId)).report,
+      /blocking findings accepted by the caller[\s\S]*verifier blocker: test\/career\.test\.mjs:3/,
+    );
+    await h.manager.cancel(accepted.jobId);
+    // baseline-diff tolerates failures the snapshot shares: advisory there.
+    const baseline = await h.manager.start(
+      { repoPath: h.repo, task: 'w', ownedPaths: ['src/**'], testCommand, verifierMode: 'baseline-diff' },
+      { launch: false },
+    );
+    assert.equal(baseline.verifierPreflight.blockersAccepted, undefined);
+    assert.equal(baseline.verifierPreflight.blocking.length, 1);
+    await h.manager.cancel(baseline.jobId);
+    assert.throws(() => validateJobRequest({ task: 't', ownedPaths: ['a'], acceptVerifierBlockers: 'yes' }), /must be boolean/);
+    assert.throws(() => validateJobRequest({ task: 't', mode: 'report', acceptVerifierBlockers: true }), /verifier sandbox options/);
   } finally {
     cleanup(h.repo);
   }

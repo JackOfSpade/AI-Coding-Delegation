@@ -442,7 +442,10 @@ function applyVerifyLines(record, lean) {
   if (!record || typeof record !== 'object' || Array.isArray(record)) return '';
   const command = `\`${scalar(record.command || '').slice(0, 300)}\``;
   const seconds = Number.isFinite(record.durationMs) ? `${Math.round(record.durationMs / 100) / 10}s` : undefined;
-  const ran = record.ranUnder ? `sandbox: ${scalar(record.ranUnder)}` : undefined;
+  const ran =
+    [record.ranUnder ? `sandbox: ${scalar(record.ranUnder)}` : '', record.location === 'scratch' ? 'in a scratch copy of the primary' : '']
+      .filter(Boolean)
+      .join(', ') || undefined;
   // The label states what actually ran: consent only permits an unsandboxed
   // run, and a host that can sandbox still sandboxes it.
   const unsandboxed =
@@ -477,7 +480,16 @@ function applyVerifyLines(record, lean) {
     /\brepoPath must be inside a git working tree\b/.test(record.outputTail)
       ? ' This check needs Git metadata that applyThenVerify intentionally keeps unreadable. Run it yourself in the primary checkout, then call offload_apply with verifiedBy; do not widen the sandbox.'
       : '';
-  return `applyThenVerify ${outcome}${exit || seconds ? ` (${[exit, seconds, ran].filter(Boolean).join(', ')})` : ''}: ${command} — the diff was REVERTED; the primary's job-owned paths are verified identical to before${record.primaryRestoredExactly === false ? ' (other primary files changed during verification and were left alone)' : ''}. Fix the cause and call offload_apply again${gitFixtureHint}${tail(lean ? 20 : 40)}`;
+  // The read-only primary denies writes into the repo tree; a scratch copy grants them.
+  const scratchHint =
+    !gitFixtureHint &&
+    record.location !== 'scratch' &&
+    record.outcome === 'FAILED' &&
+    typeof record.outputTail === 'string' &&
+    /\b(?:EPERM|EACCES)\b|operation not permitted|permission denied/i.test(record.outputTail)
+      ? ' The command was denied a write; if the suite writes into the repo tree (fixtures, mkdtemp under the project), retry with applyThenVerifyIn: "scratch".'
+      : '';
+  return `applyThenVerify ${outcome}${exit || seconds ? ` (${[exit, seconds, ran].filter(Boolean).join(', ')})` : ''}: ${command} — the diff was REVERTED; the primary's job-owned paths are verified identical to before${record.primaryRestoredExactly === false ? ' (other primary files changed during verification and were left alone)' : ''}. Fix the cause and call offload_apply again${gitFixtureHint}${scratchHint}${tail(lean ? 20 : 40)}`;
 }
 const BASELINE_HINTS = {
   'unparseable-output': 'Use a runner with node:test/TAP/jest/pytest/go/cargo output so failing tests can be named.',

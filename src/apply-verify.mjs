@@ -23,16 +23,20 @@ const OSC_BODY_MAX = 2048;
 const OSC_SEQUENCE = new RegExp(`\\x1B\\][^\\x07\\x1B]{0,${OSC_BODY_MAX}}(?:\\x07|\\x1B\\\\)?`, 'g');
 export const APPLY_VERIFY_PHASES = new Set(['applying', 'verifying', 'reverting']);
 export const APPLY_VERIFY_OUTCOMES = new Set(['PASSED', 'FAILED', 'TIMED_OUT', 'CANCELLED', 'NOT_RUN', 'PRIMARY_CHANGED', 'INTERRUPTED']);
+// Where the command runs: the read-only primary checkout, or a disposable,
+// writable private worktree of the just-applied primary.
+export const APPLY_VERIFY_LOCATIONS = new Set(['primary', 'scratch']);
 
 /**
- * Validate the three apply-time options together. Returns `null` when no
- * command was requested (after proving the dependent options are absent too),
- * otherwise `{ command, timeoutSec, policyOnly }`.
+ * Validate the apply-time options together. Returns `null` when no command was
+ * requested (after proving the dependent options are absent too), otherwise
+ * `{ command, timeoutSec, policyOnly, location }`.
  */
-export function normalizeApplyVerify({ applyThenVerify, applyThenVerifyTimeoutSec, unsafePolicyOnlyVerifier } = {}) {
+export function normalizeApplyVerify({ applyThenVerify, applyThenVerifyTimeoutSec, applyThenVerifyIn, unsafePolicyOnlyVerifier } = {}) {
   if (applyThenVerify === undefined) {
     if (applyThenVerifyTimeoutSec !== undefined || unsafePolicyOnlyVerifier !== undefined)
       throw new Error('applyThenVerifyTimeoutSec and unsafePolicyOnlyVerifier require applyThenVerify');
+    if (applyThenVerifyIn !== undefined) throw new Error('applyThenVerifyIn requires applyThenVerify');
     return null;
   }
   if (
@@ -53,10 +57,16 @@ export function normalizeApplyVerify({ applyThenVerify, applyThenVerifyTimeoutSe
     throw new Error(`applyThenVerifyTimeoutSec must be an integer from ${APPLY_VERIFY_MIN_TIMEOUT_SEC} to ${APPLY_VERIFY_MAX_TIMEOUT_SEC}`);
   if (unsafePolicyOnlyVerifier !== undefined && typeof unsafePolicyOnlyVerifier !== 'boolean')
     throw new Error('unsafePolicyOnlyVerifier must be boolean');
+  if (applyThenVerifyIn !== undefined && !APPLY_VERIFY_LOCATIONS.has(applyThenVerifyIn))
+    throw new Error('applyThenVerifyIn must be primary or scratch');
+  // Policy-only means no OS sandbox at all: a writable scratch copy would add nothing to that consent.
+  if (applyThenVerifyIn === 'scratch' && unsafePolicyOnlyVerifier === true)
+    throw new Error('applyThenVerifyIn "scratch" runs only under the macOS sandbox; it cannot be combined with unsafePolicyOnlyVerifier');
   return {
     command: applyThenVerify.trim(),
     timeoutSec: applyThenVerifyTimeoutSec ?? APPLY_VERIFY_DEFAULT_TIMEOUT_SEC,
     policyOnly: unsafePolicyOnlyVerifier === true,
+    location: applyThenVerifyIn ?? 'primary',
   };
 }
 
@@ -133,6 +143,7 @@ export function publicApplyVerify(record) {
   if (typeof record.command === 'string') out.command = text(record.command, 500);
   for (const key of ['outcome', 'commandOutcome']) if (APPLY_VERIFY_OUTCOMES.has(record[key])) out[key] = record[key];
   if (APPLY_VERIFY_PHASES.has(record.phase)) out.phase = record.phase;
+  if (record.location === 'scratch') out.location = 'scratch';
   if (Number.isInteger(record.timeoutSec)) out.timeoutSec = record.timeoutSec;
   for (const key of ['sandbox', 'ranUnder']) if (typeof record[key] === 'string') out[key] = text(record[key], 32);
   if (Number.isInteger(record.exitCode)) out.exitCode = record.exitCode;

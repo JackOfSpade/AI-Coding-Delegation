@@ -20,15 +20,31 @@ test('normalizeApplyVerify trims the command, defaults the timeout to 300s, and 
     command: 'node t.js',
     timeoutSec: 300,
     policyOnly: false,
+    location: 'primary',
   });
   assert.deepEqual(normalizeApplyVerify({ applyThenVerify: 'x', applyThenVerifyTimeoutSec: 5, unsafePolicyOnlyVerifier: true }), {
     command: 'x',
     timeoutSec: 5,
     policyOnly: true,
+    location: 'primary',
   });
   assert.equal(normalizeApplyVerify({ applyThenVerify: 'x', applyThenVerifyTimeoutSec: 900 }).timeoutSec, 900);
   assert.equal(normalizeApplyVerify({ applyThenVerify: 'x'.repeat(8192) }).command.length, 8192);
   assert.equal(normalizeApplyVerify({ applyThenVerify: 'x', unsafePolicyOnlyVerifier: false }).policyOnly, false);
+});
+
+test('applyThenVerifyIn selects a scratch copy, needs a command, and never combines with policy-only consent', () => {
+  assert.equal(normalizeApplyVerify({ applyThenVerify: 'x', applyThenVerifyIn: 'scratch' }).location, 'scratch');
+  assert.equal(normalizeApplyVerify({ applyThenVerify: 'x', applyThenVerifyIn: 'primary' }).location, 'primary');
+  assert.throws(() => normalizeApplyVerify({ applyThenVerifyIn: 'scratch' }), /applyThenVerifyIn requires applyThenVerify/);
+  for (const bad of ['copy', '', null, true])
+    assert.throws(() => normalizeApplyVerify({ applyThenVerify: 'x', applyThenVerifyIn: bad }), /must be primary or scratch/);
+  assert.throws(
+    () => normalizeApplyVerify({ applyThenVerify: 'x', applyThenVerifyIn: 'scratch', unsafePolicyOnlyVerifier: true }),
+    /only under the macOS sandbox/,
+  );
+  assert.equal(publicApplyVerify({ command: 'x', location: 'scratch' }).location, 'scratch');
+  assert.equal(publicApplyVerify({ command: 'x', location: 'elsewhere' }).location, undefined);
 });
 
 test('normalizeApplyVerify rejects malformed commands, timeouts and consent with exact messages', () => {

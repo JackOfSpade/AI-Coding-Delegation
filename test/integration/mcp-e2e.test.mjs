@@ -773,12 +773,27 @@ test(
     ];
     await withServer(t, { repo, scripts }, async ({ open }) => {
       const mcp = await open();
-      const standard = await mcp.call('offload_start', {
+      // The static preflight sees the hard-coded mkdtemp and refuses before any job or spend.
+      const refused = await mcp.call('offload_start', {
         task: 'standard',
         ownedPaths: ['src/one.js'],
         testCommand: command,
         repoPath: repo,
       });
+      assert.equal(refused.isError, true);
+      assert.match(refused.text, /verifier preflight refused the start/);
+      assert.match(refused.text, /test\/hardcoded\.test\.mjs:3: mkdtempSync \/tmp\/offload-hardcoded-XXXXXX/);
+      assert.match(refused.text, /drop test\/hardcoded\.test\.mjs from testCommand: `node --test test\/portable\.test\.mjs`/);
+      assert.equal((await mcp.call('offload_job', { repoPath: repo })).jobs.length, 0);
+      // Accepted, the run shows what the refusal predicted.
+      const standard = await mcp.call('offload_start', {
+        task: 'standard',
+        ownedPaths: ['src/one.js'],
+        testCommand: command,
+        acceptVerifierBlockers: true,
+        repoPath: repo,
+      });
+      assert.equal(standard.verifierPreflight.blockersAccepted, true);
       const failed = await settled(mcp, standard.jobId, repo, { detail: 'full' });
       assert.equal(failed.status, 'VERIFY_ENV_FAILED', failed.report);
       assert.equal(failed.verifyEnvironment.kind, 'temp-dir-denied');

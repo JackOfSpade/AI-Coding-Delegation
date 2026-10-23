@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile } from 'node:fs/promises';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { JobStore } from '../../src/store.mjs';
 import { JobManager } from '../../src/job-manager.mjs';
 import { gitPatchApplier, gitSnapshots } from '../../src/core.mjs';
@@ -1216,6 +1216,164 @@ test(
       assert.equal(passed.applyThenVerify.outputTail, 'temp ok');
       assert.equal((await manager.store.get(id)).status, 'DONE_UNVERIFIED');
       assert.equal(await readFile(join(repo, 'src', 'a.js'), 'utf8'), 'export const marker = "applied-marker";\n');
+    } finally {
+      cleanup(repo);
+      cleanup(gitDir);
+    }
+  },
+);
+
+test('applyThenVerifyIn scratch runs the command in a writable private copy of the applied primary, then removes it', async () => {
+  const seen = {};
+  await run({
+    options: {
+      check: (command, options) => {
+        seen.options = options;
+        seen.contents = readFileSync(join(options.cwd, 'src', 'a.js'), 'utf8');
+        seen.untracked = readFileSync(join(options.cwd, 'unrelated.txt'), 'utf8');
+        seen.real = realpathSync.native(options.cwd);
+        return green();
+      },
+    },
+    run: async (h) => {
+      const result = await h.manager.apply(h.id, via(CHECK, { applyThenVerifyIn: 'scratch' }));
+      const cwd = seen.options.cwd;
+      assert.ok(!seen.real.startsWith(realpathSync.native(h.repo)), 'never the primary checkout');
+      assert.equal(seen.contents, JOB_BYTES, 'the copy holds the applied diff');
+      assert.equal(seen.untracked, 'primary work in progress\n', 'and the primary untracked files');
+      assert.deepEqual(seen.options.writablePaths, [join(cwd, '**')]);
+      assert.equal(seen.options.readablePaths[0], dirname(cwd));
+      assert.equal(seen.options.allowNetwork, false);
+      assert.equal(seen.options.requireSandbox, true);
+      assert.equal(existsSync(cwd), false, 'the copy is removed afterwards');
+      assert.equal(result.applied, true);
+      assert.equal(result.applyThenVerify.outcome, 'PASSED');
+      assert.equal(result.applyThenVerify.location, 'scratch');
+      const job = await h.store.get(h.id);
+      assert.equal(job.applyVerifyScratchPath, undefined);
+      assert.equal(job.appliedUnverified.applyThenVerify.outcome, 'PASSED');
+      assert.match(await readReport(h), /^applyThenVerify PASSED \(exit 0, 1\.5s, sandbox: macos, in a scratch copy of the primary\)/m);
+      assert.equal(readFileSync(join(h.repo, 'src', 'a.js'), 'utf8'), JOB_BYTES, 'the primary keeps the applied diff');
+    },
+  });
+});
+
+test('a failing scratch check reverts the primary like a primary check, and a primary write denial suggests scratch', async () => {
+  const seen = [];
+  await run({
+    options: {
+      check: (command, options, n) => {
+        seen.push(options.cwd);
+        return n === 1
+          ? red({ stderr: "Error: EPERM: operation not permitted, mkdtemp '/repo/.career-recovery-verbatim-AbC123'\n" })
+          : red();
+      },
+    },
+    run: async (h) => {
+      const primary = await h.manager.apply(h.id, via());
+      assert.equal(primary.reverted, true);
+      assert.match(await readReport(h), /denied a write; .*retry with applyThenVerifyIn: "scratch"/);
+      const scratch = await h.manager.apply(h.id, via(CHECK, { applyThenVerifyIn: 'scratch' }));
+      assert.equal(scratch.applied, false);
+      assert.equal(scratch.reverted, true);
+      assert.equal(scratch.applyThenVerify.location, 'scratch');
+      assert.equal(existsSync(join(h.repo, 'src', 'a.js')), false, 'the diff was reverted in the primary');
+      assert.equal(existsSync(seen[1]), false, 'the copy is removed after a failure too');
+      assert.doesNotMatch(await readReport(h), /retry with applyThenVerifyIn/, 'no scratch hint once scratch ran');
+      await assert.rejects(
+        () => h.manager.apply(h.id, via(CHECK, { applyThenVerifyIn: 'scratch', unsafePolicyOnlyVerifier: true })),
+        /only under the macOS sandbox/,
+      );
+    },
+  });
+});
+
+function realManager({ worker }) {
+  const real = new Runner({ defaults: { sandbox: true } });
+  const repo = makeRepo();
+  const gitDir = mkdtempSync(`${tmpdir()}/offload-applyverify-real-`);
+  const manager = new JobManager({
+    store: new JobStore({ gitDir }),
+    snapshots: gitSnapshots(),
+    worker: { run: worker },
+    runner: { sandboxStatus: (...args) => real.sandboxStatus(...args), verify: (command, options) => real.verify(command, options) },
+    config: {
+      repoPath: repo,
+      git: { branch: async (path) => git(path, ['branch', '--show-current']), head: async (path) => git(path, ['rev-parse', 'HEAD']) },
+      applyPatch: gitPatchApplier,
+      isolation: {
+        create: createIsolatedWorktree,
+        open: openIsolatedWorktree,
+        cleanup: cleanupIsolatedWorktree,
+        integrateRecorded: integrateRecordedTree,
+      },
+    },
+  });
+  return { repo, gitDir, manager };
+}
+// The infinite-canvas suite: a temp dir made under the project root, not under TMPDIR.
+const PROJECT_MKDTEMP = `node -e "require('fs').mkdtempSync(require('path').join(process.cwd(), '.career-recovery-verbatim-')); console.log('mkdtemp ok')"`;
+
+test(
+  'real sandbox: a project-root mkdtemp is denied in the primary check but passes in a scratch copy',
+  { skip: !sandboxAvailable() && SKIP_REASON },
+  async () => {
+    const { repo, gitDir, manager } = realManager({
+      worker: async (job) => {
+        write(join(job.workspacePath, 'src', 'a.js'), JOB_BYTES);
+        return { status: 'DONE', turns: 1 };
+      },
+    });
+    try {
+      // `exit 1` lands the job in VERIFY_FAILED with an intact diff to apply.
+      const started = await manager.start({ task: 't', ownedPaths: ['src/**'], repoPath: repo, testCommand: 'exit 1', maxRepairRounds: 0 });
+      await manager.wait(started.jobId, { timeoutSec: WAIT_SEC });
+      const denied = await manager.apply(started.jobId, { apply: true, applyThenVerify: PROJECT_MKDTEMP });
+      assert.equal(denied.applied, false, JSON.stringify(denied.applyThenVerify));
+      assert.match(denied.applyThenVerify.outputTail, /EPERM|operation not permitted/i);
+      const passed = await manager.apply(started.jobId, { apply: true, applyThenVerify: PROJECT_MKDTEMP, applyThenVerifyIn: 'scratch' });
+      assert.equal(passed.applied, true, JSON.stringify(passed.applyThenVerify));
+      assert.equal(passed.applyThenVerify.outcome, 'PASSED');
+      assert.equal(passed.applyThenVerify.ranUnder, 'macos');
+      assert.equal(passed.applyThenVerify.outputTail, 'mkdtemp ok');
+      assert.deepEqual(
+        readdirSync(repo).filter((name) => name.startsWith('.career-recovery-verbatim-')),
+        [],
+        'nothing was written into the primary',
+      );
+      assert.equal(readFileSync(join(repo, 'src', 'a.js'), 'utf8'), JOB_BYTES);
+    } finally {
+      cleanup(repo);
+      cleanup(gitDir);
+    }
+  },
+);
+
+test(
+  'real sandbox: the extraWritable glob the preflight suggests lets the job verifier make that temp dir',
+  { skip: !sandboxAvailable() && SKIP_REASON },
+  async () => {
+    const { repo, gitDir, manager } = realManager({
+      worker: async (job) => {
+        write(join(job.workspacePath, 'src', 'a.js'), JOB_BYTES);
+        return { status: 'DONE', turns: 1 };
+      },
+    });
+    try {
+      const request = { task: 't', ownedPaths: ['src/**'], repoPath: repo, testCommand: PROJECT_MKDTEMP, maxRepairRounds: 0 };
+      const undeclared = await manager.start(request);
+      const denied = await manager.wait(undeclared.jobId, { timeoutSec: WAIT_SEC });
+      assert.equal(denied.status, 'VERIFY_ENV_FAILED');
+      assert.equal(denied.verifyEnvironment.kind, 'permission-denied');
+      await manager.revert(undeclared.jobId).catch(() => {});
+      const declared = await manager.start({ ...request, extraWritable: ['.career-recovery-verbatim-**'] });
+      const done = await manager.wait(declared.jobId, { timeoutSec: WAIT_SEC });
+      assert.equal(done.status, 'DONE_VERIFIED', JSON.stringify(done.verify ?? done));
+      assert.deepEqual(
+        readdirSync(repo).filter((name) => name.startsWith('.career-recovery-verbatim-')),
+        [],
+        'extraWritable output is never integrated',
+      );
     } finally {
       cleanup(repo);
       cleanup(gitDir);

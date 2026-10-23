@@ -38,7 +38,7 @@ const CLI_COMMANDS = Object.freeze({
       'extraWritable',
       'repoPath',
     ],
-    booleanFlags: ['allowNetwork', 'foreground', 'unsafe-policy-only-verifier'],
+    booleanFlags: ['allowNetwork', 'foreground', 'unsafe-policy-only-verifier', 'accept-verifier-blockers'],
     positionals: 'task',
   },
   wait: { valueFlags: ['timeoutSec', 'repoPath', 'detail'], booleanFlags: [], positionals: 'one' },
@@ -203,6 +203,7 @@ function validateDecodedInvocation(command, flags, positionals) {
     ),
     ...(flags.allowNetwork !== undefined ? { allowNetwork: bool(flags.allowNetwork) } : {}),
     ...(flags['unsafe-policy-only-verifier'] !== undefined ? { unsafePolicyOnlyVerifier: bool(flags['unsafe-policy-only-verifier']) } : {}),
+    ...(flags['accept-verifier-blockers'] !== undefined ? { acceptVerifierBlockers: bool(flags['accept-verifier-blockers']) } : {}),
     ...(flags.extraWritable !== undefined ? { extraWritable: decodedFlag(flags, 'extraWritable', []) } : {}),
     repoPath: flags.repoPath,
   });
@@ -441,6 +442,7 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
         ...(flags['unsafe-policy-only-verifier'] !== undefined
           ? { unsafePolicyOnlyVerifier: bool(flags['unsafe-policy-only-verifier']) }
           : {}),
+        ...(flags['accept-verifier-blockers'] !== undefined ? { acceptVerifierBlockers: bool(flags['accept-verifier-blockers']) } : {}),
         ...(flags.extraWritable !== undefined ? { extraWritable: decode(flags.extraWritable, []) } : {}),
         repoPath: flags.repoPath,
       };

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { preflightVerifier, verifierPreflightLines } from '../../src/verifier-preflight.mjs';
+import { narrowTestCommand, preflightVerifier, verifierBlockingMessage, verifierPreflightLines } from '../../src/verifier-preflight.mjs';
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'offload-preflight-'));
@@ -157,4 +157,170 @@ test('native import warnings follow local Python imports and inline commands wit
   assert.ok(inline.warnings.some((warning) => warning.code === 'native-import'));
   const denied = preflightVerifier({ repoPath: root, testCommand: 'python tests/test_native.py', denyRead: ['tests/helper.py'] });
   assert.deepEqual(denied.warnings, []);
+});
+
+test('a worktree-relative mkdtemp outside the write scope is a blocking finding naming the file, line and target', (t) => {
+  const { root, write } = fixture(t);
+  // The infinite-canvas case: the suite made its temp dir under the worktree root.
+  write(
+    'test/career-recovery.test.mjs',
+    "import { mkdtemp } from 'node:fs/promises';\nimport { join } from 'node:path';\nconst ROOT = process.cwd();\nconst dir = await mkdtemp(join(ROOT, '.career-recovery-verbatim-'));\n",
+  );
+  write('test/fine.test.mjs', "import { tmpdir } from 'node:os';\nawait mkdtemp(join(tmpdir(), 'ok-'));\n");
+  const testCommand = 'node --test test/career-recovery.test.mjs test/fine.test.mjs';
+  const result = preflightVerifier({ repoPath: root, testCommand, writeScope: ['src/**'] });
+  assert.equal(result.status, 'blocking');
+  assert.deepEqual(result.blocking, [
+    {
+      code: 'temp-outside-scope',
+      path: 'test/career-recovery.test.mjs',
+      line: 4,
+      call: 'mkdtemp',
+      target: '.career-recovery-verbatim-XXXXXX',
+      extraWritable: '.career-recovery-verbatim-**',
+    },
+  ]);
+  assert.match(
+    verifierPreflightLines(result).join('\n'),
+    /verifier blocker: test\/career-recovery\.test\.mjs:4: mkdtemp \.career-recovery-verbatim-XXXXXX .*extraWritable: "\.career-recovery-verbatim-\*\*"/,
+  );
+  // The glob it suggests really covers the target; without a scope there is no claim at all.
+  assert.equal(
+    preflightVerifier({ repoPath: root, testCommand, writeScope: ['src/**', '.career-recovery-verbatim-**'] }).blocking,
+    undefined,
+  );
+  assert.equal(preflightVerifier({ repoPath: root, testCommand }).blocking, undefined);
+  // `..` climbs from the test directory; an interpolated suffix keeps the directory.
+  write('test/deep/up.test.mjs', "await mkdtemp(path.resolve(__dirname, '..', '..', `.up-${process.pid}-`));");
+  assert.deepEqual(
+    preflightVerifier({ repoPath: root, testCommand: 'node --test test/deep/up.test.mjs', writeScope: ['src/**'] }).blocking.map(
+      (finding) => finding.target,
+    ),
+    ['.up-x-XXXXXX'],
+  );
+  // Fixture text and comments are not calls, and a name resolves from its nearest declaration.
+  write(
+    'test/fixture.test.mjs',
+    [
+      "write('x.mjs', \"await mkdtemp(join(process.cwd(), '.in-string-'))\");",
+      '// mkdirSync(join(process.cwd(), "commented"));',
+      "const re = /mkdtemp('/;",
+      "test('a', () => { const root = process.cwd(); });",
+      "test('b', async () => { const root = await mkdtemp(join(tmpdir(), 'r-')); await writeFile(join(root, 'f'), ''); });",
+    ].join('\n'),
+  );
+  assert.equal(
+    preflightVerifier({ repoPath: root, testCommand: 'node --test test/fixture.test.mjs', writeScope: ['src/**'] }).blocking,
+    undefined,
+  );
+  // A target inside ownedPaths is writable to the verifier.
+  write('test/own.test.mjs', 'await mkdtemp(join(__dirname, "tmp-"));');
+  assert.equal(
+    preflightVerifier({ repoPath: root, testCommand: 'node --test test/own.test.mjs', writeScope: ['test/**'] }).blocking,
+    undefined,
+  );
+});
+
+test('a hard-coded system temp write blocks and names the test file that imports the helper', (t) => {
+  const { root, write } = fixture(t);
+  write('test/report.test.mjs', "import { scratch } from './helpers/scratch.mjs';\nscratch();\n");
+  write(
+    'test/helpers/scratch.mjs',
+    "import path from 'node:path';\nimport fs from 'node:fs';\nexport const scratch = () =>\n  fs.mkdtempSync(path.join('/tmp', 'ic-job-recovery-report-'));\n",
+  );
+  write('test/url.test.mjs', "writeFileSync(fileURLToPath(new URL('../fixtures/out.json', import.meta.url)), '{}');\n");
+  write('test/mention.test.mjs', "assert.equal(clean('/tmp/x'), 'x');\n");
+  const result = preflightVerifier({
+    repoPath: root,
+    testCommand: 'node --test test/report.test.mjs test/url.test.mjs test/mention.test.mjs',
+    writeScope: ['src/**'],
+  });
+  assert.deepEqual(result.blocking, [
+    {
+      code: 'temp-outside-scope',
+      path: 'test/url.test.mjs',
+      line: 1,
+      call: 'writeFileSync',
+      target: 'fixtures/out.json',
+      extraWritable: 'fixtures/out.json',
+    },
+    {
+      code: 'system-temp-write',
+      path: 'test/helpers/scratch.mjs',
+      line: 4,
+      call: 'mkdtempSync',
+      target: '/tmp/ic-job-recovery-report-XXXXXX',
+      testFiles: ['test/report.test.mjs'],
+    },
+  ]);
+  // A bare mention stays an advisory warning, never a blocker.
+  assert.ok(result.warnings.some((w) => w.code === 'system-temp' && w.path === 'test/mention.test.mjs'));
+  const message = verifierBlockingMessage(result);
+  assert.match(message, /refused the start/);
+  assert.match(message, /test\/helpers\/scratch\.mjs:4: mkdtempSync \/tmp\/ic-job-recovery-report-XXXXXX .*run by test\/report\.test\.mjs/);
+  assert.match(message, /acceptVerifierBlockers: true/);
+  assert.doesNotMatch(message, /\n/, 'MCP error text drops control characters');
+});
+
+test('Python tempfile dir= and shell mkdir targets are resolved too', (t) => {
+  const { root, write } = fixture(t);
+  write(
+    'tests/test_io.py',
+    "import tempfile\nfrom pathlib import Path\nHERE = Path(__file__).parent\nd = tempfile.mkdtemp(dir='/tmp')\nwith tempfile.TemporaryDirectory(dir=HERE, prefix='run-') as x:\n    pass\nok = tempfile.mkdtemp()\n",
+  );
+  const result = preflightVerifier({ repoPath: root, testCommand: 'pytest tests/test_io.py && mkdir -p out', writeScope: ['src/**'] });
+  assert.deepEqual(
+    result.blocking.map(({ code, path, line, target }) => ({ code, path, line, target })),
+    [
+      { code: 'temp-outside-scope', path: 'testCommand', line: 1, target: 'out' },
+      { code: 'system-temp-write', path: 'tests/test_io.py', line: 4, target: '/tmp/tmpXXXXXX' },
+      { code: 'temp-outside-scope', path: 'tests/test_io.py', line: 5, target: 'tests/run-XXXXXX' },
+    ],
+  );
+  // A relative mktemp operand is a template under TMPDIR, not a worktree path.
+  assert.equal(preflightVerifier({ repoPath: root, testCommand: 'd=$(mktemp -d -t x.XXXX)', writeScope: [] }).blocking, undefined);
+});
+
+test('narrowTestCommand drops literal files, rewrites node --test globs and inlines a plain node package script', (t) => {
+  const { root, write } = fixture(t);
+  write('test/a.test.mjs', "import './helpers/h.mjs';");
+  write('test/b.test.mjs', "import './helpers/h.mjs';");
+  write('test/c.test.mjs', '');
+  write('test/helpers/h.mjs', '');
+  const narrow = (testCommand, files) => narrowTestCommand({ repoPath: root, testCommand, files });
+  assert.deepEqual(narrow('node --test test/a.test.mjs ./test/c.test.mjs', ['test/c.test.mjs']), {
+    command: 'node --test test/a.test.mjs',
+    drop: ['test/c.test.mjs'],
+  });
+  assert.deepEqual(narrow('node --test "test/*.test.mjs" && echo done', ['test/b.test.mjs']), {
+    command: 'node --test test/a.test.mjs test/c.test.mjs && echo done',
+    drop: ['test/b.test.mjs'],
+  });
+  // A helper maps to every test file that imports it.
+  assert.deepEqual(narrow('node --test "test/*.test.mjs"', ['test/helpers/h.mjs']), {
+    command: 'node --test test/c.test.mjs',
+    drop: ['test/a.test.mjs', 'test/b.test.mjs'],
+  });
+  assert.match(narrow('node --test test/c.test.mjs', ['test/c.test.mjs']).reason, /every test file/);
+  assert.match(narrow('node --test test/c.test.mjs', ['test/elsewhere.mjs']).reason, /not reached/);
+  write('package.json', JSON.stringify({ scripts: { test: 'node --test "test/*.test.mjs"', unit: 'vitest run test' } }));
+  assert.deepEqual(narrow('npm test', ['test/a.test.mjs']), {
+    command: 'node --test test/b.test.mjs test/c.test.mjs',
+    drop: ['test/a.test.mjs'],
+  });
+  assert.deepEqual(narrow('npm run unit', ['test/a.test.mjs']), {
+    command: 'npm run unit -- --exclude test/a.test.mjs',
+    drop: ['test/a.test.mjs'],
+  });
+  assert.match(narrow('node --test test', ['test/a.test.mjs']).reason, /cannot be narrowed/);
+});
+
+test('narrowTestCommand uses runner exclusion flags for pytest directories', (t) => {
+  const { root, write } = fixture(t);
+  write('tests/test_a.py', '');
+  write('tests/test_b.py', '');
+  assert.deepEqual(narrowTestCommand({ repoPath: root, testCommand: '.venv/bin/python -m pytest tests -q', files: ['tests/test_b.py'] }), {
+    command: '.venv/bin/python -m pytest tests -q --ignore=tests/test_b.py',
+    drop: ['tests/test_b.py'],
+  });
 });

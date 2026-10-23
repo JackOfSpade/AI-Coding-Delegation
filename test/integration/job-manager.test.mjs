@@ -158,11 +158,11 @@ test('async start and server verification produce a durable final report', async
       return { summary: 'done', turns: 1 };
     },
   });
-  const job = await m.start({ task: 'do it', ownedPaths: ['src/**'], repoPath: process.cwd(), testCommand: 'test' });
+  const job = await m.start({ task: 'do it', ownedPaths: ['src/**'], repoPath: process.cwd(), testCommand: 'check' });
   assert.equal(job.status, 'QUEUED');
   const done = await m.wait(job.jobId, { timeoutSec: terminalWaitSec(1) });
   assert.equal(done.status, 'DONE_VERIFIED');
-  assert.match(done.report, /verify: `test` PASS/);
+  assert.match(done.report, /verify: `check` PASS/);
   assert.match(await m.store.readArtifact(job.jobId, 'patch.diff'), /patch/);
 });
 test('non-isolated verifier receives no private-worktree parent capability', async () => {
@@ -172,7 +172,7 @@ test('non-isolated verifier receives no private-worktree parent capability', asy
     verifierOptions = options;
     return { command: 'test', verdict: 'PASS', result: { code: 0, sandbox: 'macos' } };
   };
-  const started = await m.start({ task: 'verify primary', ownedPaths: ['src/**'], repoPath: process.cwd(), testCommand: 'test' });
+  const started = await m.start({ task: 'verify primary', ownedPaths: ['src/**'], repoPath: process.cwd(), testCommand: 'check' });
   assert.equal((await m.wait(started.jobId, { timeoutSec: terminalWaitSec(1) })).status, 'DONE_VERIFIED');
   assert.equal(Object.hasOwn(verifierOptions, 'readablePaths'), false);
 });
@@ -2147,7 +2147,7 @@ test('manager enforces cumulative worker budgets and honors cancellation during 
     task: 'cap',
     ownedPaths: ['src/**'],
     repoPath: process.cwd(),
-    testCommand: 'test',
+    testCommand: 'check',
     budget: { maxTurns: 1, maxUsd: 1 },
   });
   assert.equal((await overBudget.wait(started.jobId, { timeoutSec: terminalWaitSec(1) })).status, 'BUDGET');
