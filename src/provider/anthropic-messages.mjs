@@ -172,10 +172,22 @@ function finishReason(value) {
 }
 
 function creditExhaustedCode(body, status) {
-  const value = body?.error?.type ?? body?.error?.code ?? body?.type ?? body?.code;
+  // Authentication, rate limits and server errors never authorize a route change,
+  // even if their body happens to mention a balance.
+  if (![400, 402].includes(status)) return false;
+  const error = body?.error;
+  if (!error || typeof error !== 'object') return false;
+  const creditCodes = ['credit_balance_too_low', 'insufficient_credit', 'insufficient_funds'];
+  if (error.type !== undefined && ![...creditCodes, 'invalid_request_error', 'billing_error'].includes(error.type)) return false;
+  const codes = [error.type, error.code];
+  if (codes.some((value) => creditCodes.includes(value))) return true;
+  // Anthropic also uses its generic invalid_request_error for this explicit
+  // refusal. Match the known sentence, not loose billing/credit keywords.
   return (
-    (typeof value === 'string' && ['credit_balance_too_low', 'insufficient_credit', 'insufficient_funds'].includes(value)) ||
-    (status === 402 && value === 'billing_error')
+    status === 400 &&
+    error.type === 'invalid_request_error' &&
+    typeof error.message === 'string' &&
+    /^Your credit balance is too low to access the Anthropic API\.(?:\s|$)/i.test(error.message)
   );
 }
 

@@ -606,3 +606,79 @@ test('Anthropic: an unsigned thinking block cut by max_tokens is dropped and nev
     { role: 'user', content: 'Continue using an allowed tool call.' },
   ]);
 });
+
+for (const [label, status, error, exhausted] of [
+  [
+    'explicit balance message',
+    400,
+    { type: 'invalid_request_error', message: 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing.' },
+    true,
+  ],
+  ['payment failure without exhaustion', 402, { type: 'billing_error', message: 'Payment method declined' }, false],
+  ['explicit credit code on 402', 402, { type: 'billing_error', code: 'insufficient_credit' }, true],
+  ['code behind generic type', 400, { type: 'invalid_request_error', code: 'insufficient_credit' }, true],
+  ['unrelated invalid request', 400, { type: 'invalid_request_error', message: 'Invalid tool schema' }, false],
+  ['credit mention only', 400, { type: 'invalid_request_error', message: 'Please check your credits or billing settings' }, false],
+  [
+    'authentication with balance text',
+    401,
+    { type: 'invalid_request_error', message: 'Your credit balance is too low to access the Anthropic API.' },
+    false,
+  ],
+  ['authentication envelope with credit code', 400, { type: 'authentication_error', code: 'insufficient_credit' }, false],
+  ['authentication code', 403, { type: 'insufficient_credit' }, false],
+  ['server failure', 500, { type: 'credit_balance_too_low' }, false],
+  ['unsupported request', 400, { type: 'invalid_request_error', message: 'Thinking is not supported' }, false],
+])
+  test(`exhaustion classification: ${label}`, async () => {
+    const provider = new AnthropicMessagesProvider({
+      baseUrl: 'https://api.anthropic.com',
+      apiKey: 'test-key',
+      model: 'claude-sonnet-5-5',
+      retries: 0,
+      fetchImpl: async () => new Response(JSON.stringify({ error }), { status }),
+    });
+    await assert.rejects(
+      async () => {
+        for await (const _ of provider.chat({ messages: [], tools: [] })) {
+        }
+      },
+      (failure) => {
+        assert.equal(failure.kind, exhausted ? 'credit_exhausted' : 'http');
+        assert.doesNotMatch(JSON.stringify(providerFailure(failure)), /Plans|Billing|balance|schema/);
+        return true;
+      },
+    );
+  });
+
+test('fallback refuses partial streams, transport and ordinary HTTP errors', async () => {
+  for (const kind of ['http', 'transport', 'partial']) {
+    let transitions = 0,
+      fallbackCalls = 0;
+    const provider = new CreditFallbackProvider({
+      primaryModel: 'claude-sonnet-5-5',
+      fallbackModel: 'deepseek-flash',
+      primary: {
+        async *chat() {
+          if (kind === 'partial') yield { text: 'partial' };
+          throw new ProviderError('fixed failure', { kind: kind === 'partial' ? 'credit_exhausted' : kind, status: 400 });
+        },
+      },
+      fallback: {
+        async *chat() {
+          fallbackCalls++;
+          yield { text: 'unexpected' };
+        },
+      },
+      onTransition: () => {
+        transitions++;
+      },
+    });
+    await assert.rejects(async () => {
+      for await (const _ of provider.chat({ messages: [] })) {
+      }
+    });
+    assert.equal(transitions, 0);
+    assert.equal(fallbackCalls, 0);
+  }
+});

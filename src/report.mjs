@@ -340,6 +340,8 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     workspaceCleanup,
     summary,
     concerns,
+    job.creditFallback === true &&
+      `provider transition: ${scalar(job.executionProfile?.model)} -> ${scalar(job.executionProfile?.fallback?.model)} (explicit credit exhaustion; work and conversation retained)`,
     providerFailure,
     (!lean || failureDiagnostics) && providerFinishReason,
     (!lean || failureDiagnostics) && budgetReservation,

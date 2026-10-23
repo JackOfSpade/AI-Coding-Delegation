@@ -436,6 +436,8 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
             }),
             primaryModel: profile.model,
             fallbackModel: fallbackConfig.model,
+            fallbackUsed: job.creditFallback === true,
+            onTransition: () => api.progress({ action: 'provider_credit_fallback', creditFallback: true }),
           });
         }
         // A queued job is an immutable execution request.  In particular, do not
@@ -483,6 +485,10 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
             throw new Error(`unable to load pricing file ${pricePath}: ${error.message || error}`);
           }
         }
+        // Retained jobs also need an exact fallback price before any request;
+        // an older/static execution snapshot must not bypass the start gate.
+        if (fallbackConfig && (!pricing || !resolveModel(pricing, fallbackConfig.model)))
+          throw new Error(`pricing is unknown for selected fallback model ${fallbackConfig.model}`);
         // Report workers may read caller-supplied external bodies. Their
         // conversational/tool transcript is therefore intentionally
         // ephemeral: only the separately-sanitized report result is durable.
@@ -926,7 +932,8 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
     }
     // A finite job must not discover an unpriced newer model after a paid
     // request. Dynamic discovery is therefore paired with a price snapshot;
-    // an unfamiliar release fails before a job, lease, or provider call.
+    // an unfamiliar release fails before a job, lease, or provider call. Every
+    // fallback requires an exact price, including a concrete configured route.
     for (const model of requiredModels) {
       const spec = table && resolveModel(table, model);
       if (!spec) throw new Error(`pricing is unknown for selected model ${model}`);
@@ -1001,9 +1008,6 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       ].includes(profile.model);
       // A fallback can be selected only after the primary reports the exact
       // credit-exhausted refusal, so verify its key before accepting a job.
-      const fallbackNeedsDiscovery =
-        !!fallbackProfile &&
-        [OFFLOAD_ANTHROPIC_LATEST_SONNET, OFFLOAD_ANTHROPIC_LATEST_OPUS, OFFLOAD_DEEPSEEK_LATEST_FLASH].includes(fallbackProfile.model);
       const primaryKey = state.integrity || primaryNeedsDiscovery ? resolveStartCredential(providerConfig, 'primary') : undefined;
       const fallbackKey = fallbackProfile ? resolveStartCredential(fallbackProviderConfig, 'fallback') : undefined;
       for (const credential of [primaryKey, fallbackKey]) {
@@ -1123,7 +1127,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           executionProfile,
           ...pricingMetadata(fallbackProviderConfig ? [providerConfig, fallbackProviderConfig] : [providerConfig], loaded, [
             ...(primaryNeedsDiscovery ? [model] : []),
-            ...(fallbackNeedsDiscovery ? [fallbackModel] : []),
+            ...(fallbackProviderConfig ? [fallbackModel] : []),
           ]),
         },
         {

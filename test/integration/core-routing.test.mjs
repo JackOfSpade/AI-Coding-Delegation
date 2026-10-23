@@ -2675,3 +2675,131 @@ test('tsx caller and repository verifier commands are refused before any worker,
     await rm(path, { recursive: true, force: true });
   }
 });
+
+for (const scenario of ['immediate', 'mid-job', 'continued', 'fallback-failed'])
+  test(`credit fallback retains conversation and edits: ${scenario}`, async () => {
+    const path = await repo('offload-credit-retained-');
+    const originalFetch = globalThis.fetch;
+    let primaryCalls = 0,
+      flashCalls = 0;
+    const edited = 'retained implementation\n';
+    const write = { path: 'result.txt', content: edited };
+    globalThis.fetch = async (url, options = {}) => {
+      if (url.startsWith('https://api.anthropic.com/v1/models'))
+        return new Response(JSON.stringify({ data: [{ id: 'claude-sonnet-5-5', line: 'sonnet' }] }));
+      if (url === 'https://api.deepseek.com/models') return new Response(JSON.stringify({ data: [{ id: 'deepseek-flash' }] }));
+      const body = JSON.parse(options.body);
+      if (url === 'https://api.anthropic.com/v1/messages') {
+        primaryCalls++;
+        if (['mid-job', 'fallback-failed'].includes(scenario) && primaryCalls === 1) {
+          const events = [
+            { type: 'message_start', message: { model: 'claude-sonnet-5-5', usage: { input_tokens: 10 } } },
+            {
+              type: 'content_block_start',
+              index: 0,
+              content_block: { type: 'tool_use', id: 'write-retained', name: 'write_file', input: {} },
+            },
+            { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(write) } },
+            { type: 'content_block_stop', index: 0 },
+            { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 10 } },
+            { type: 'message_stop' },
+          ];
+          return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''));
+        }
+        return new Response(
+          JSON.stringify({
+            error: {
+              type: 'invalid_request_error',
+              message: 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing.',
+            },
+          }),
+          { status: 400 },
+        );
+      }
+      assert.equal(url, 'https://api.deepseek.com/chat/completions');
+      flashCalls++;
+      assert.deepEqual(body.thinking, { type: 'enabled' });
+      assert.equal(body.reasoning_effort, 'high');
+      const finishing = ['mid-job', 'fallback-failed'].includes(scenario) || flashCalls > 1;
+      if (finishing) {
+        assert.ok(
+          body.messages.some(
+            (message) => message.role === 'assistant' && message.tool_calls?.some((call) => call.function.name === 'write_file'),
+          ),
+        );
+        assert.ok(body.messages.some((message) => message.role === 'tool'));
+        assert.match(JSON.stringify(body.messages), /retained implementation/);
+      }
+      if (scenario === 'fallback-failed') return new Response(JSON.stringify({ error: { type: 'authentication_error' } }), { status: 401 });
+      const call = finishing
+        ? toolChunk('finish-retained', 'finish', { summary: 'done', concerns: [], testsRun: [] })
+        : toolChunk('write-retained', 'write_file', write);
+      return new Response(
+        [call, usageChunk].map((event) => `data: ${JSON.stringify({ ...event, model: 'deepseek-flash' })}\n\n`).join('') +
+          'data: [DONE]\n\n',
+      );
+    };
+    const core = createCore({
+      config: { loaded: { disabled: false, repoConfig: {}, config: structuredClone(DEFAULT_CONFIG) }, resolveKey: () => 'test-key' },
+    });
+    try {
+      const started = await core.start({
+        profile: 'sonnet',
+        task: 'Write result.txt with the implementation.',
+        repoPath: path,
+        ownedPaths: ['result.txt'],
+        budget: { maxTurns: scenario === 'continued' ? 1 : 3, maxUsd: 1 },
+      });
+      let done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      if (scenario === 'continued') {
+        assert.equal(done.status, 'BUDGET', JSON.stringify(done));
+        await core.continue(started.jobId, { repoPath: path, extraTurns: 2 });
+        done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      }
+      assert.equal(done.status, scenario === 'fallback-failed' ? 'FAILED' : 'DONE_UNVERIFIED', JSON.stringify(done));
+      assert.equal(done.creditFallback, true);
+      assert.equal(primaryCalls, ['mid-job', 'fallback-failed'].includes(scenario) ? 2 : 1);
+      const store = core.manager.store;
+      assert.match(await store.readArtifact(started.jobId, 'patch.diff'), /retained implementation/);
+      assert.match(await store.readArtifact(started.jobId, 'report.md'), /provider transition: claude-sonnet-5-5 -> deepseek-flash/);
+      const events = (await store.readArtifact(started.jobId, 'events.jsonl'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line));
+      assert.equal(events.filter((event) => event.type === 'progress' && event.creditFallback === true).length, 1);
+      if (scenario === 'fallback-failed') {
+        assert.equal(done.providerFailure.status, 401);
+        assert.equal(existsSync(join(path, 'result.txt')), false);
+      } else assert.equal(await readFile(join(path, 'result.txt'), 'utf8'), edited);
+    } finally {
+      globalThis.fetch = originalFetch;
+      await core.shutdown();
+      await rm(path, { recursive: true, force: true });
+    }
+  });
+
+test('a concrete Flash fallback without trusted pricing fails before provider spend', async () => {
+  const path = await repo('offload-unpriced-credit-fallback-');
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    throw new Error('must not spend');
+  };
+  const configured = structuredClone(DEFAULT_CONFIG);
+  configured.profiles.sonnet.model = 'claude-sonnet-5-5';
+  configured.profiles.flash.model = 'deepseek-flash';
+  delete configured.providers.deepseek.pricing;
+  const core = createCore({ config: { loaded: { disabled: false, repoConfig: {}, config: configured }, resolveKey: () => 'test-key' } });
+  try {
+    await assert.rejects(
+      () => core.start({ mode: 'report', profile: 'sonnet', task: 'review', repoPath: path, budget: { maxTurns: 2, maxUsd: 1 } }),
+      /pricing is unknown for selected model deepseek-flash/,
+    );
+    assert.equal(calls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await core.shutdown();
+    await rm(path, { recursive: true, force: true });
+  }
+});

@@ -1959,6 +1959,8 @@ export class JobManager {
             defects,
             progress: async (event) => {
               const progress = {};
+              if (event?.action === 'provider_credit_fallback' && event.creditFallback === true && job.executionProfile?.fallback)
+                progress.creditFallback = true;
               if (Object.hasOwn(event || {}, 'cappedFinishRecovery')) {
                 const requested = event.cappedFinishRecovery;
                 const permitted =
@@ -3134,6 +3136,7 @@ export class JobManager {
         : {}),
       ...(job.workspaceCleanupRequired === true ? { workspaceCleanupRequired: true } : {}),
       ...(job.workspaceRetained === true ? { workspaceRetained: true } : {}),
+      ...(job.creditFallback === true ? { creditFallback: true } : {}),
       ...(safeProviderFailure(job.providerFailure) ? { providerFailure: safeProviderFailure(job.providerFailure) } : {}),
       ...(safeProviderFinishReason(job.providerFinishReason)
         ? { providerFinishReason: safeProviderFinishReason(job.providerFinishReason) }
