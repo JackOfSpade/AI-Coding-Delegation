@@ -1951,7 +1951,9 @@ export class JobManager {
               ? transcript.some(
                   (message) =>
                     message?.role === 'assistant' &&
-                    (Object.hasOwn(message, 'reasoning_content') || Object.hasOwn(message, 'anthropic_content')),
+                    (Object.hasOwn(message, 'reasoning_content') ||
+                      Object.hasOwn(message, 'anthropic_content') ||
+                      Object.hasOwn(message, 'openai_reasoning')),
                 )
               : false;
             if (job.transcriptReplayable === false || (job.transcriptReplayable !== true && hasProviderProtocolState))
@@ -3666,7 +3668,10 @@ export class JobManager {
       if (
         messages?.some(
           (message) =>
-            message.role === 'assistant' && (Object.hasOwn(message, 'reasoning_content') || Object.hasOwn(message, 'anthropic_content')),
+            message.role === 'assistant' &&
+            (Object.hasOwn(message, 'reasoning_content') ||
+              Object.hasOwn(message, 'anthropic_content') ||
+              Object.hasOwn(message, 'openai_reasoning')),
         )
       )
         throw new Error('durable transcript reasoning is unavailable for safe provider replay; start a fresh job');

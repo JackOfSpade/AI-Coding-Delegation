@@ -336,6 +336,45 @@ test('Anthropic thinking replay state survives storage and redaction makes it no
   }
 });
 
+test('OpenAI encrypted reasoning with token-shaped base64url runs survives storage byte-for-byte', async () => {
+  const gitDir = tempDir();
+  // Fernet-style ciphertext uses `-` and `_`, so a random run can look like a
+  // `-sk_...` token. It is opaque provider state, not a credential.
+  const encrypted = 'gAAAAABpQx-sk_ABCDEFGHIJKLmno_rk-0123456789abcdef-key_ZYXWVUTSRQPONM==';
+  const messages = [
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'read-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"README.md"}' } }],
+      openai_reasoning: [
+        { type: 'reasoning', encrypted_content: encrypted, summary: [{ type: 'summary_text', text: 'credential sk-abcdefghijklmnop' }] },
+      ],
+    },
+    { role: 'tool', tool_call_id: 'read-1', content: 'READ: README.md' },
+  ];
+  try {
+    const store = new JobStore({ gitDir }).configureIntegrity({ requiredFor: () => true, keyForId: () => 'key' });
+    const job = await store.create({ task: 'openai', ownedPaths: ['src/**'] });
+    await store.messagesBatch(job.id, [
+      { ...messages[0], openai_reasoning: [{ ...messages[0].openai_reasoning[0], summary: [] }] },
+      messages[1],
+    ]);
+    const transcript = await store.readMessages(job.id);
+    assert.equal(transcript[0].openai_reasoning[0].encrypted_content, encrypted);
+    assert.equal((await store.get(job.id)).transcriptReplayable, true);
+
+    // Summary text is still redacted like any other reasoning text.
+    const redactedJob = await store.create({ task: 'openai-redacted', ownedPaths: ['src/**'] });
+    await store.messagesBatch(redactedJob.id, messages);
+    const redacted = await store.readMessages(redactedJob.id);
+    assert.equal(redacted[0].openai_reasoning[0].encrypted_content, encrypted);
+    assert.match(redacted[0].openai_reasoning[0].summary[0].text, /\[REDACTED\]/);
+    assert.equal((await store.get(redactedJob.id)).transcriptReplayable, false);
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
 test('publication locks grace a partial owner and serialize concurrent event records', async () => {
   const gitDir = tempDir();
   try {

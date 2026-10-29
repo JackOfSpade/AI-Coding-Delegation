@@ -32,6 +32,45 @@ const OPENAI_BASE = 'https://api.openai.com/v1';
 const openaiModels = (ids) => new Response(JSON.stringify({ data: ids.map((id, index) => ({ id, created: 1_000 - index })) }));
 const openaiCredit = (status = 429, code = 'credit_balance_exhausted') =>
   new Response(JSON.stringify({ error: { code, type: 'billing_error', message: 'x' } }), { status });
+// Official OpenAI is reached through the Responses API: Chat Completions
+// there rejects function tools combined with reasoning.
+const OPENAI_RESPONSES = `${OPENAI_BASE}/responses`;
+const openaiUsage = { input_tokens: 1, input_tokens_details: { cached_tokens: 0 }, output_tokens: 1, total_tokens: 2 };
+const openaiReasoningItem = (encrypted = 'enc-reasoning-1') => ({ type: 'reasoning', encrypted_content: encrypted, summary: [] });
+const openaiFunctionCall = (callId, name, args) => ({
+  id: `fc_${callId}`,
+  type: 'function_call',
+  status: 'completed',
+  call_id: callId,
+  name,
+  arguments: JSON.stringify(args),
+});
+const openaiResponse = (model, output) =>
+  new Response(JSON.stringify({ id: 'resp_test', model, status: 'completed', output, usage: openaiUsage }), {
+    headers: { 'content-type': 'application/json' },
+  });
+// The wire every official OpenAI job request carries: high reasoning, stateless
+// encrypted-reasoning replay, an output cap, and non-strict function tools.
+function assertOpenAIResponsesWire(body) {
+  assert.deepEqual(body.reasoning, { effort: 'high' });
+  assert.equal(body.reasoning_effort, undefined);
+  assert.equal(body.thinking, undefined);
+  assert.equal(body.store, false);
+  assert.deepEqual(body.include, ['reasoning.encrypted_content']);
+  assert.equal(body.stream, undefined);
+  assert.equal(body.messages, undefined);
+  assert.equal(body.max_tokens, undefined);
+  assert.equal(body.max_completion_tokens, undefined);
+  assert.ok(Number.isSafeInteger(body.max_output_tokens));
+  assert.ok(Array.isArray(body.input) && body.input.length > 0);
+  assert.ok(body.tools.length > 0);
+  for (const tool of body.tools) {
+    assert.equal(tool.type, 'function');
+    assert.equal(typeof tool.name, 'string');
+    assert.equal(tool.function, undefined);
+    assert.equal(tool.strict, false);
+  }
+}
 const OPENAI_MODEL_LIST = ['gpt-6-terra', 'gpt-5.6-terra', 'gpt-6.1-terra', 'gpt-6.1-sol', 'gpt-5.9-sol', 'gpt-6.1-terra-mini'];
 
 async function repo(prefix) {
@@ -2529,7 +2568,7 @@ for (const line of ['sonnet', 'opus'])
       if (url === `${OPENAI_BASE}/models`) return openaiModels(OPENAI_MODEL_LIST);
       if (url === 'https://api.anthropic.com/v1/messages')
         return new Response(JSON.stringify({ error: { type: 'credit_balance_too_low' } }), { status: 400 });
-      if (url === `${OPENAI_BASE}/chat/completions`) return openaiCredit();
+      if (url === OPENAI_RESPONSES) return openaiCredit();
       assert.equal(url, 'https://api.deepseek.com/chat/completions');
       const call = toolChunk('finish-report', 'finish', { summary: 'done', report: 'Reviewed.', concerns: [], testsRun: [] });
       const events = [call, usageChunk].map((chunk) => ({ ...chunk, model: 'deepseek-flash' }));
@@ -2556,12 +2595,9 @@ for (const line of ['sonnet', 'opus'])
       assert.equal(done.status, 'DONE_UNVERIFIED', JSON.stringify(done));
       assert.equal(done.reportResult.text, 'Reviewed.');
       assert.equal(requests.length, 3);
-      assert.equal(requests[0].url, `${OPENAI_BASE}/chat/completions`);
+      assert.equal(requests[0].url, OPENAI_RESPONSES);
       assert.equal(requests[0].body.model, line === 'sonnet' ? 'gpt-6.1-terra' : 'gpt-6.1-sol');
-      assert.equal(requests[0].body.reasoning_effort, 'high');
-      assert.equal(requests[0].body.thinking, undefined);
-      assert.equal(requests[0].body.max_tokens, undefined);
-      assert.ok(Number.isSafeInteger(requests[0].body.max_completion_tokens));
+      assertOpenAIResponsesWire(requests[0].body);
       assert.equal(requests[1].url, 'https://api.anthropic.com/v1/messages');
       assert.equal(requests[1].body.model, `claude-${line}-5-5`);
       assert.deepEqual(requests[1].body.thinking, { type: 'adaptive' });
@@ -2709,16 +2745,25 @@ for (const scenario of ['immediate', 'mid-job', 'claude-mid-job', 'continued', '
       if (url === 'https://api.deepseek.com/models') return new Response(JSON.stringify({ data: [{ id: 'deepseek-flash' }] }));
       if (url === `${OPENAI_BASE}/models`) return openaiModels(OPENAI_MODEL_LIST);
       const body = JSON.parse(options.body);
-      if (url === `${OPENAI_BASE}/chat/completions`) {
+      if (url === OPENAI_RESPONSES) {
         // OpenAI is the primary route: it may write before its credit runs out.
         primaryCalls++;
         assert.equal(body.model, 'gpt-6.1-terra');
+        assertOpenAIResponsesWire(body);
         if (['mid-job', 'fallback-failed'].includes(scenario) && primaryCalls === 1)
-          return new Response(
-            [toolChunk('write-retained', 'write_file', write), usageChunk]
-              .map((event) => `data: ${JSON.stringify({ ...event, model: 'gpt-6.1-terra' })}\n\n`)
-              .join('') + 'data: [DONE]\n\n',
-          );
+          return openaiResponse('gpt-6.1-terra', [
+            { id: 'rs_retained', ...openaiReasoningItem('enc-retained'), content: [] },
+            openaiFunctionCall('write-retained', 'write_file', write),
+          ]);
+        if (primaryCalls === 2) {
+          // The next OpenAI turn replays the encrypted reasoning, without its
+          // id, immediately before the function call it produced.
+          const callIndex = body.input.findIndex((item) => item.type === 'function_call');
+          assert.deepEqual(body.input[callIndex - 1], openaiReasoningItem('enc-retained'));
+          assert.equal(body.input[callIndex].call_id, 'write-retained');
+          assert.equal(body.input[callIndex + 1].type, 'function_call_output');
+          assert.equal(body.input[callIndex + 1].call_id, 'write-retained');
+        }
         return openaiCredit();
       }
       if (url === 'https://api.anthropic.com/v1/messages') {
@@ -2729,6 +2774,9 @@ for (const scenario of ['immediate', 'mid-job', 'claude-mid-job', 'continued', '
           assert.match(JSON.stringify(body.messages), /retained implementation/);
           assert.match(JSON.stringify(body.messages), /write_file/);
         }
+        // OpenAI encrypted reasoning is provider protocol state; it never
+        // crosses to another provider.
+        assert.doesNotMatch(JSON.stringify(body), /openai_reasoning|enc-retained|"type":"reasoning"/);
         // Claude may also write before its own credit runs out.
         if (scenario === 'claude-mid-job' && anthropicCalls === 1)
           return anthropicToolResponse('claude-sonnet-5-5', 'write-retained', 'write_file', write);
@@ -2744,6 +2792,7 @@ for (const scenario of ['immediate', 'mid-job', 'claude-mid-job', 'continued', '
       }
       assert.equal(url, 'https://api.deepseek.com/chat/completions');
       flashCalls++;
+      assert.doesNotMatch(JSON.stringify(body), /openai_reasoning|enc-retained/);
       assert.deepEqual(body.thinking, { type: 'enabled' });
       assert.equal(body.reasoning_effort, 'high');
       const finishing = ['mid-job', 'claude-mid-job', 'fallback-failed'].includes(scenario) || flashCalls > 1;
@@ -2880,6 +2929,10 @@ async function routedCore(path, { line = 'sonnet', behave, models = OPENAI_MODEL
     if (url === `${OPENAI_BASE}/models`) return openaiModels(models);
     const host = url.startsWith('https://api.anthropic.com') ? 'anthropic' : url.startsWith(OPENAI_BASE) ? 'openai' : 'deepseek';
     const body = JSON.parse(options.body);
+    if (host === 'openai') {
+      assert.equal(url, OPENAI_RESPONSES);
+      assertOpenAIResponsesWire(body);
+    }
     // The durable stage is read back from the sealed record at spend time.
     while (!holder.id) await new Promise((resolve) => setTimeout(resolve, 5));
     const stored = await holder.core.manager.store.get(holder.id);
@@ -2990,6 +3043,69 @@ test('an immediate double hop persists each stage before spending on that route'
     const report = await harness.core.manager.store.readArtifact(started.jobId, 'report.md');
     assert.match(report, /provider transition: gpt-6\.1-terra -> claude-sonnet-5-5 \(explicit credit exhaustion/);
     assert.match(report, /provider transition: claude-sonnet-5-5 -> deepseek-flash \(explicit credit exhaustion/);
+  } finally {
+    await harness.close();
+    await rm(path, { recursive: true, force: true });
+  }
+});
+
+test('an OpenAI worker replays encrypted reasoning before its function call on the next turn', async () => {
+  const path = await repo('offload-openai-reasoning-replay-');
+  const write = { path: 'result.txt', content: 'written by terra\n' };
+  const harness = await routedCore(path, {
+    behave: (host, count, body) => {
+      assert.equal(host, 'openai', `an OpenAI job with credit must not reach ${host}`);
+      if (count === 1)
+        return openaiResponse('gpt-6.1-terra', [
+          { id: 'rs_1', ...openaiReasoningItem('enc-turn-1'), content: [] },
+          openaiFunctionCall('call_write', 'write_file', write),
+        ]);
+      assert.equal(count, 2);
+      const callIndex = body.input.findIndex((item) => item.type === 'function_call');
+      assert.ok(callIndex > 0);
+      // Exactly the stored reasoning item, without its id, immediately before
+      // the function call it produced, and then that call's output.
+      assert.deepEqual(body.input[callIndex - 1], openaiReasoningItem('enc-turn-1'));
+      assert.deepEqual(body.input[callIndex], {
+        type: 'function_call',
+        call_id: 'call_write',
+        name: 'write_file',
+        arguments: JSON.stringify(write),
+      });
+      assert.equal(body.input[callIndex + 1].type, 'function_call_output');
+      assert.equal(body.input[callIndex + 1].call_id, 'call_write');
+      assert.equal(typeof body.input[callIndex + 1].output, 'string');
+      assert.equal(body.input.filter((item) => item.type === 'reasoning').length, 1);
+      assert.doesNotMatch(JSON.stringify(body.input), /rs_1|openai_reasoning/);
+      return openaiResponse('gpt-6.1-terra', [
+        openaiFunctionCall('call_finish', 'finish', { summary: 'done', concerns: [], testsRun: [] }),
+      ]);
+    },
+  });
+  try {
+    const started = await harness.core.start({
+      profile: 'sonnet',
+      task: 'Write result.txt.',
+      repoPath: path,
+      ownedPaths: ['result.txt'],
+      budget: { maxTurns: 3, maxUsd: 1 },
+    });
+    harness.holder.id = started.jobId;
+    const done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    assert.equal(done.status, 'DONE_UNVERIFIED', JSON.stringify(done));
+    assert.deepEqual(
+      harness.calls.map((call) => [call.host, call.stage ?? 0]),
+      [
+        ['openai', 0],
+        ['openai', 0],
+      ],
+    );
+    assert.equal(done.creditFallback ?? false, false);
+    assert.equal(await readFile(join(path, 'result.txt'), 'utf8'), write.content);
+    // The durable transcript keeps the reasoning on the assistant tool-call message.
+    const messages = await harness.core.manager.store.readMessages(started.jobId);
+    const assistant = messages.find((message) => message.role === 'assistant' && message.tool_calls?.[0]?.id === 'call_write');
+    assert.deepEqual(assistant?.openai_reasoning, [openaiReasoningItem('enc-turn-1')]);
   } finally {
     await harness.close();
     await rm(path, { recursive: true, force: true });

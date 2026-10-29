@@ -7,6 +7,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { redact as foundationRedact, redactText, redactTokenShapes, safeTokenAccountingValue } from './redact.mjs';
 import { validJobId } from './job-manager.mjs';
 import { anthropicContentMatchesAssistant, validAnthropicContent } from './anthropic-content.mjs';
+import { validOpenAIReasoning } from './openai-reasoning.mjs';
 
 // Keep the accounting exception shared with the foundation redactor. A
 // token-shaped key only bypasses redaction when its value is a safe count.
@@ -169,6 +170,8 @@ function redactToolInput(source, secrets) {
   }
 }
 
+const literalSecretsRedacted = (value, secrets) =>
+  secrets.reduce((text, secret) => (typeof secret === 'string' && secret.length > 0 ? text.split(secret).join('[REDACTED]') : text), value);
 function redactMessage(message, secrets) {
   const stored = foundationRedact(redact(message), secrets);
   if (message.role !== 'assistant') return stored;
@@ -177,6 +180,13 @@ function redactMessage(message, secrets) {
   });
   message.anthropic_content?.forEach((block, index) => {
     if (block.type === 'tool_use') stored.anthropic_content[index].input = redactToolInput(block.input, secrets);
+  });
+  // OpenAI encrypted reasoning is opaque base64url ciphertext, so `-` and `_`
+  // runs inside it can look like `-sk_...` token shapes. It holds no
+  // plaintext credential: keep it byte-for-byte apart from known literal
+  // secrets, or a random ciphertext run would make the transcript unreplayable.
+  message.openai_reasoning?.forEach((item, index) => {
+    stored.openai_reasoning[index].encrypted_content = literalSecretsRedacted(item.encrypted_content, secrets);
   });
   return stored;
 }
@@ -613,7 +623,8 @@ export class JobStore {
         message?.role === 'assistant' &&
         ((typeof message.reasoning_content === 'string' && stored?.reasoning_content !== message.reasoning_content) ||
           (message.anthropic_content !== undefined &&
-            JSON.stringify(stored?.anthropic_content) !== JSON.stringify(message.anthropic_content)))
+            JSON.stringify(stored?.anthropic_content) !== JSON.stringify(message.anthropic_content)) ||
+          (message.openai_reasoning !== undefined && JSON.stringify(stored?.openai_reasoning) !== JSON.stringify(message.openai_reasoning)))
       );
     });
     const lines = storedMessages.map((message) => JSON.stringify(message) + '\n');
@@ -1383,13 +1394,16 @@ function validMessage(value) {
       (value.reasoning_content === undefined || value.reasoning_content === null || messageText(value.reasoning_content)) &&
       (value.anthropic_content === undefined ||
         (validAnthropicContent(value.anthropic_content) && anthropicContentMatchesAssistant(value.anthropic_content, value))) &&
+      (value.openai_reasoning === undefined || validOpenAIReasoning(value.openai_reasoning)) &&
       (value.tool_calls === undefined ||
         (Array.isArray(value.tool_calls) &&
           value.tool_calls.length > 0 &&
           value.tool_calls.length <= 64 &&
           value.tool_calls.every(validCall) &&
           new Set(value.tool_calls.map((call) => call.id)).size === value.tool_calls.length)) &&
-      Object.keys(value).every((key) => ['role', 'content', 'reasoning_content', 'anthropic_content', 'tool_calls'].includes(key))
+      Object.keys(value).every((key) =>
+        ['role', 'content', 'reasoning_content', 'anthropic_content', 'openai_reasoning', 'tool_calls'].includes(key),
+      )
     );
   return (
     messageId(value.tool_call_id, 512) &&

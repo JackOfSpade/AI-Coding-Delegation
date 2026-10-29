@@ -6,6 +6,7 @@ import { OpenAIChatProvider, PROVIDER_FINISH_REASONS, ProviderError, providerFai
 import { FAILURE_ERRORS, isWallTimeout, summarizeToolFailure, toolErrorHint } from '../failure.mjs';
 import { MAX_BATCH_COMMAND_SEC } from '../timing.mjs';
 import { anthropicContentMatchesAssistant, cloneAnthropicContent, validAnthropicContent } from '../anthropic-content.mjs';
+import { cloneOpenAIReasoning, validOpenAIReasoning } from '../openai-reasoning.mjs';
 
 // Progress is advisory and goes to the job store, whose write can wait on a busy
 // publication lock. It must never hold a round past its deadline or a cancel:
@@ -234,12 +235,25 @@ function reserveForModel(table, model, messages, tools, remainingUsd, requestOpt
   return { inputTokens, inputUsd, minOutputUsd, maxTokens: Math.min(MAX_REQUEST_OUTPUT_TOKENS, affordable) };
 }
 
+// Encrypted OpenAI reasoning is sent only by the Responses route; every other
+// adapter drops it, so it must not inflate their prompt reservation.
+const withoutOpenAIReasoning = (messages) =>
+  messages.some((message) => message?.openai_reasoning !== undefined)
+    ? messages.map((message) => {
+        if (message?.openai_reasoning === undefined) return message;
+        const { openai_reasoning: _replay, ...rest } = message;
+        return rest;
+      })
+    : messages;
+
 // A credit fallback can switch routes mid-request and a later route may cost
 // more than the primary, so every model the provider may use must fit.
-function reserveRequestBudget(table, models, ...request) {
+function reserveRequestBudget(table, models, messages, ...request) {
   let combined;
-  for (const model of models) {
-    const reservation = reserveForModel(table, model, ...request);
+  let portableMessages;
+  for (const { model, replaysOpenAIReasoning } of models) {
+    const routeMessages = replaysOpenAIReasoning ? messages : (portableMessages ??= withoutOpenAIReasoning(messages));
+    const reservation = reserveForModel(table, model, routeMessages, ...request);
     if (!reservation) return null;
     combined = combined
       ? {
@@ -360,7 +374,10 @@ export class AgentLoop {
         throw new TypeError(`context.${method} must be a function when supplied`);
     this.meter = meter ?? new Meter({ table: pricing, model });
     this.model = model;
-    this.reservationModels = Array.isArray(provider?.routes) ? provider.routes.map((route) => route.model) : [model];
+    this.reservationModels = (Array.isArray(provider?.routes) ? provider.routes : [{ provider, model }]).map((route) => ({
+      model: route.model,
+      replaysOpenAIReasoning: route.provider?.replaysOpenAIReasoning === true,
+    }));
     this.toolDefinitions = toolDefinitions;
     this.allowedToolNames = new Set(names);
     this.maxTurns = maxTurns;
@@ -592,12 +609,14 @@ export class AgentLoop {
           reasoning = '',
           calls = [],
           anthropicContent,
+          openaiReasoning,
           reasoningWasExplicitNull = false,
           reasoningWasExplicitString = false,
           responseModel,
           usageRecords = 0,
           toolCallRecords = 0,
           anthropicContentRecords = 0,
+          openaiReasoningRecords = 0,
           unauthorizedResponseModel,
           modelConflict = false;
         const usageCharges = [];
@@ -897,6 +916,7 @@ export class AgentLoop {
               (event.text !== undefined && typeof event.text !== 'string') ||
               (event.reasoning !== undefined && event.reasoning !== null && typeof event.reasoning !== 'string') ||
               (event.anthropicContent !== undefined && !validAnthropicContent(event.anthropicContent)) ||
+              (event.openaiReasoning !== undefined && !validOpenAIReasoning(event.openaiReasoning)) ||
               (event.model !== undefined && !validMetadata(event.model)) ||
               (event.modelConflict !== undefined && typeof event.modelConflict !== 'boolean') ||
               (event.providerFinishReason !== undefined && !PROVIDER_FINISH_REASONS.has(event.providerFinishReason)) ||
@@ -932,6 +952,11 @@ export class AgentLoop {
               anthropicContentRecords++;
               if (anthropicContentRecords > 1) throw new Error('Provider yielded multiple Anthropic replay records');
               anthropicContent = cloneAnthropicContent(event.anthropicContent);
+            }
+            if (event.openaiReasoning !== undefined) {
+              openaiReasoningRecords++;
+              if (openaiReasoningRecords > 1) throw new Error('Provider yielded multiple OpenAI reasoning records');
+              openaiReasoning = cloneOpenAIReasoning(event.openaiReasoning);
             }
             if (text.length + reasoning.length > MAX_ASSISTANT_CHARS) throw new Error('Provider response exceeds assistant size limit');
             // Some compatible providers send model metadata only in an earlier
@@ -1138,6 +1163,9 @@ export class AgentLoop {
             throw new Error('Provider Anthropic replay does not match its assistant response');
           assistant.anthropic_content = anthropicContent;
         }
+        // Encrypted OpenAI reasoning items carry no tool ids; the Responses
+        // adapter replays them ahead of this message's function calls.
+        if (openaiReasoning !== undefined) assistant.openai_reasoning = openaiReasoning;
         // Never invent an empty reasoning_content to make a disabled-thinking
         // tool response look like a thinking response.  Once this exact
         // replay shape is durable, subsequent official DeepSeek requests must

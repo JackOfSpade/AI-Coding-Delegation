@@ -7,6 +7,7 @@ import { macosProfile, sandboxStatus } from './sandbox.mjs';
 import { healthIdentity } from './identity.mjs';
 import { resolveClientPaths } from './client-paths.mjs';
 import { DEFAULT_ATTEMPT_TIMEOUT_MS, OpenAIChatProvider } from './provider/openai-chat.mjs';
+import { OpenAIResponsesProvider } from './provider/openai-responses.mjs';
 import { AnthropicMessagesProvider, resolveLatestAnthropicOpus, resolveLatestAnthropicSonnet } from './provider/anthropic-messages.mjs';
 import {
   OFFLOAD_ANTHROPIC_LATEST_OPUS,
@@ -370,6 +371,10 @@ export function doctor({
 
 const MAX_LIVE_USD = 0.02;
 const LIVE_MAX_TOKENS = 32;
+// Jobs send OpenAI Responses requests at high reasoning effort; the probe must
+// test that same wire, and a reasoning model needs room to think before its
+// forced call. At gpt-6.1-sol prices two reserved turns still fit the cap.
+const LIVE_RESPONSES_MAX_TOKENS = 1_024;
 const LIVE_FRAMING_TOKENS = 1024;
 const LIVE_TOOL = [
   {
@@ -400,6 +405,7 @@ function pricingForLive(provider, configPath) {
   return table;
 }
 function worstReservation(table, model, messages, options = {}) {
+  const outputTokens = options.max_tokens ?? LIVE_MAX_TOKENS;
   const spec = resolveModel(table, model);
   if (!spec) throw new Error('live probe refuses unknown priced model');
   // The serialized request is a deliberately pessimistic token estimate: every
@@ -413,7 +419,7 @@ function worstReservation(table, model, messages, options = {}) {
       tools: LIVE_TOOL,
       stream: true,
       stream_options: { include_usage: true },
-      max_tokens: LIVE_MAX_TOKENS,
+      max_tokens: outputTokens,
       thinking: { type: 'disabled' },
     }),
     'utf8',
@@ -421,10 +427,17 @@ function worstReservation(table, model, messages, options = {}) {
   const inputTokens = wireBytes + LIVE_FRAMING_TOKENS;
   const inputRate = Math.max(...Object.values(spec.usd_per_1m.input_cache_miss), ...Object.values(spec.usd_per_1m.input_cache_write ?? {}));
   const outputRate = Math.max(spec.usd_per_1m.output.off_peak, spec.usd_per_1m.output.peak);
-  return { inputTokens, outputTokens: LIVE_MAX_TOKENS, usd: (inputTokens * inputRate + LIVE_MAX_TOKENS * outputRate) / 1_000_000 };
+  return { inputTokens, outputTokens, usd: (inputTokens * inputRate + outputTokens * outputRate) / 1_000_000 };
 }
 async function chatProbe(provider, messages, options = {}) {
-  const response = { model: undefined, usage: undefined, toolCalls: undefined, reasoning: undefined, acknowledged: false };
+  const response = {
+    model: undefined,
+    usage: undefined,
+    toolCalls: undefined,
+    reasoning: undefined,
+    openaiReasoning: undefined,
+    acknowledged: false,
+  };
   let usageRecords = 0;
   for await (const event of provider.chat({ messages, tools: LIVE_TOOL, max_tokens: LIVE_MAX_TOKENS, ...options })) {
     if (event.modelConflict) throw new Error('live probe returned conflicting model metadata');
@@ -446,6 +459,7 @@ async function chatProbe(provider, messages, options = {}) {
     }
     if (event.text) response.acknowledged = true;
     if (event.toolCalls) response.toolCalls = event.toolCalls;
+    if (event.openaiReasoning) response.openaiReasoning = event.openaiReasoning;
     if (event.usage) {
       usageRecords++;
       response.usage = event.usage;
@@ -528,14 +542,17 @@ export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = pr
   const provider =
     providerConfig.type === 'anthropic-messages'
       ? new AnthropicMessagesProvider(providerOptions)
-      : new OpenAIChatProvider({
-          ...providerOptions,
-          ...(isOpenAIEndpoint(providerConfig.baseUrl) ? {} : { thinking: { type: 'disabled' } }),
-        });
+      : isOpenAIEndpoint(providerConfig.baseUrl)
+        ? // Official OpenAI rejects function tools with reasoning on Chat
+          // Completions; probe the Responses route jobs actually use.
+          new OpenAIResponsesProvider({ ...providerOptions, reasoningEffort: 'high' })
+        : new OpenAIChatProvider({ ...providerOptions, thinking: { type: 'disabled' } });
   const firstMessages = [{ role: 'user', content: 'Use offload_doctor_echo once with {"ok":true}.' }];
   let measuredUsd = 0,
     reservedUsd = 0;
-  const request = async (messages, options) => {
+  const responsesProbe = provider instanceof OpenAIResponsesProvider;
+  const request = async (messages, requestOptions) => {
+    const options = responsesProbe ? { ...requestOptions, max_tokens: LIVE_RESPONSES_MAX_TOKENS } : requestOptions;
     const reservation = worstReservation(table, model, messages, options);
     if (measuredUsd + reservation.usd > maxUsd) throw new Error('live probe cap is insufficient for the next reserved request');
     reservedUsd += reservation.usd;
@@ -576,6 +593,7 @@ export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = pr
     tool_calls: [{ id: call.id, type: 'function', function: { name: call.name, arguments: call.arguments } }],
   };
   if (first.response.reasoning !== undefined) assistant.reasoning_content = first.response.reasoning;
+  if (first.response.openaiReasoning !== undefined) assistant.openai_reasoning = first.response.openaiReasoning;
   const secondMessages = [
     ...firstMessages,
     assistant,
@@ -591,7 +609,7 @@ export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = pr
     returnedModel: response.model || model,
     estimatedUsd: priced.usd,
     toolCall: !!response.toolCalls?.length,
-    reasoningReturned: response.reasoning !== undefined,
+    reasoningReturned: response.reasoning !== undefined || response.openaiReasoning !== undefined,
   });
   return {
     live: true,
@@ -599,7 +617,7 @@ export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = pr
     requestedModel: model,
     first: summarize(first),
     followup: summarize(second),
-    reasoningReplayed: first.response.reasoning !== undefined,
+    reasoningReplayed: first.response.reasoning !== undefined || first.response.openaiReasoning !== undefined,
     measuredUsd,
     reservedUsd,
   };

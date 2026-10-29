@@ -534,19 +534,82 @@ test('doctor --live resolves the latest Opus, Terra and Sol selectors', async ()
       }),
     );
     const urls = [];
+    const bodies = [];
+    const usage = { input_tokens: 40, input_tokens_details: { cached_tokens: 0 }, output_tokens: 20, total_tokens: 60 };
+    const reasoning = { type: 'reasoning', encrypted_content: 'enc-probe', summary: [] };
     const fetchImpl = async (url, init) => {
       urls.push(String(url));
       if (String(url).endsWith('/models')) {
         assert.equal(init.headers.authorization, 'Bearer oa-live');
         return Response.json({ data: ids.map((id) => ({ id })) });
       }
+      // Official OpenAI rejects function tools with reasoning on Chat
+      // Completions; the probe exercises the Responses route jobs use.
+      assert.equal(String(url), 'https://api.openai.com/v1/responses');
       const body = JSON.parse(init.body);
+      bodies.push(body);
       assert.equal(body.model, expected);
       assert.equal(body.thinking, undefined);
-      throw new Error('stop after model resolution');
+      assert.equal(body.reasoning_effort, undefined);
+      assert.equal(body.messages, undefined);
+      assert.equal(body.stream, undefined);
+      assert.equal(body.store, false);
+      assert.deepEqual(body.include, ['reasoning.encrypted_content']);
+      // Jobs send high reasoning with function tools; the probe tests that
+      // exact wire, with room for reasoning before the forced call.
+      assert.deepEqual(body.reasoning, { effort: 'high' });
+      assert.equal(body.max_output_tokens, 1024);
+      assert.equal(body.tools.length, 1);
+      assert.equal(body.tools[0].type, 'function');
+      assert.equal(body.tools[0].name, 'offload_doctor_echo');
+      assert.equal(body.tools[0].strict, false);
+      if (bodies.length === 1)
+        return Response.json({
+          id: 'resp_1',
+          model: expected,
+          status: 'completed',
+          output: [
+            { id: 'rs_1', ...reasoning, content: [] },
+            {
+              id: 'fc_1',
+              type: 'function_call',
+              status: 'completed',
+              call_id: 'call_probe',
+              name: 'offload_doctor_echo',
+              arguments: '{"ok":true}',
+            },
+          ],
+          usage,
+        });
+      return Response.json({
+        id: 'resp_2',
+        model: expected,
+        status: 'completed',
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Acknowledged.' }] }],
+        usage,
+      });
     };
-    await assert.rejects(doctorLive({ maxUsd: 0.02, configPath, env: { OA_KEY: 'oa-live' }, fetchImpl }));
+    const result = await doctorLive({ maxUsd: 0.02, configPath, env: { OA_KEY: 'oa-live' }, fetchImpl });
     assert.equal(urls[0], 'https://api.openai.com/v1/models');
-    assert.equal(urls.length, 2);
+    assert.equal(urls.length, 3);
+    assert.equal(result.requestedModel, expected);
+    assert.equal(result.first.toolCall, true);
+    assert.equal(result.first.reasoningReturned, true);
+    assert.equal(result.followup.toolCall, false);
+    assert.equal(result.reasoningReplayed, true);
+    // The forced call uses the Responses named-function shape.
+    assert.deepEqual(bodies[0].tool_choice, { type: 'function', name: 'offload_doctor_echo' });
+    assert.equal(bodies[1].tool_choice, undefined);
+    // The follow-up replays the encrypted reasoning, without its id, directly
+    // before the function call it produced, then the tool output.
+    const callIndex = bodies[1].input.findIndex((item) => item.type === 'function_call');
+    assert.deepEqual(bodies[1].input[callIndex - 1], reasoning);
+    assert.deepEqual(bodies[1].input[callIndex], {
+      type: 'function_call',
+      call_id: 'call_probe',
+      name: 'offload_doctor_echo',
+      arguments: '{"ok":true}',
+    });
+    assert.deepEqual(bodies[1].input[callIndex + 1], { type: 'function_call_output', call_id: 'call_probe', output: '{"ok":true}' });
   }
 });

@@ -55,6 +55,7 @@ import {
   validCredentialFingerprints,
 } from './integrity.mjs';
 import { DEFAULT_ATTEMPT_TIMEOUT_MS, OpenAIChatProvider, ProviderError } from './provider/openai-chat.mjs';
+import { OpenAIResponsesProvider } from './provider/openai-responses.mjs';
 import { AnthropicMessagesProvider, resolveLatestAnthropicSonnet, resolveLatestAnthropicOpus } from './provider/anthropic-messages.mjs';
 import { CreditFallbackProvider } from './provider/fallback.mjs';
 import { PathPolicy } from './policy.mjs';
@@ -304,11 +305,15 @@ function providerInstance(providerConfig, key, model, { fetchImpl, reasoningEffo
     ...(fetchImpl ? { fetchImpl } : {}),
   };
   if (providerConfig.type === 'anthropic-messages') return new AnthropicMessagesProvider(options);
+  // Official OpenAI rejects function tools with reasoning on Chat
+  // Completions, so its 'openai-chat' route uses the Responses adapter.
+  // DeepSeek and other compatible endpoints keep Chat Completions.
+  if (providerConfig.type === 'openai-chat' && isOpenAIEndpoint(providerConfig.baseUrl))
+    return new OpenAIResponsesProvider({ ...options, reasoningEffort: 'high' });
   if (providerConfig.type === 'openai-chat')
     return new OpenAIChatProvider({
       ...options,
       ...(isDeepSeekEndpoint(providerConfig.baseUrl) ? { thinking: { type: 'enabled' }, reasoningEffort: reasoningEffort ?? 'high' } : {}),
-      ...(isOpenAIEndpoint(providerConfig.baseUrl) ? { reasoningEffort: 'high' } : {}),
     });
   throw new Error(`unsupported provider type: ${providerConfig?.type || 'missing'}`);
 }

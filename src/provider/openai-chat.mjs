@@ -71,7 +71,7 @@ export function providerFailure(error) {
 }
 // Remove the listener on both paths. Retries can be numerous and long-lived;
 // retaining one once-listener per completed retry is an avoidable leak.
-const delay = (ms, signal) =>
+export const retryDelay = (ms, signal) =>
   new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(signal.reason ?? new Error('Aborted'));
@@ -95,13 +95,13 @@ const positive = (value, name, fallback) => {
   if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${name} must be a non-negative integer`);
   return value;
 };
-const isLoopbackHost = (hostname) => {
+export const isLoopbackHost = (hostname) => {
   const host = String(hostname)
     .toLowerCase()
     .replace(/^\[|\]$/g, '');
   return host === 'localhost' || host === '::1' || /^127(?:\.\d{1,3}){3}$/.test(host);
 };
-const validModel = (value) => typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\x00-\x1F\x7F]/.test(value);
+export const validModel = (value) => typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\x00-\x1F\x7F]/.test(value);
 // This is intentionally narrower than an OpenAI-compatible URL or a model
 // name prefix.  The focused-write override depends on DeepSeek's documented
 // thinking/tool-choice interaction, so a proxy or a future, unknown model
@@ -113,7 +113,7 @@ const supportsForcedImplementationFocus = (parsed, model) =>
   parsed.port === '' &&
   parsed.pathname === '/' &&
   OFFICIAL_DEEPSEEK_FOCUS_MODELS.has(model);
-const validToolIdentifier = (value, max) =>
+export const validToolIdentifier = (value, max) =>
   typeof value === 'string' && value.length > 0 && value.length <= max && !/[\x00-\x1F\x7F]/.test(value);
 const MAX_TOOL_CALLS = 64;
 const MAX_TOOL_ARGUMENT_CHARS = 512_000;
@@ -259,7 +259,7 @@ export function normalizeUsage(usage) {
 const OPENAI_CREDIT_CODES = new Set(['credit_balance_exhausted', 'insufficient_quota']);
 // Only the explicit error envelope qualifies; the body is read within a small
 // bound and is never retained or echoed.
-async function openAICreditExhausted(response, signal) {
+export async function openAICreditExhausted(response, signal) {
   try {
     const chunks = [];
     let bytes = 0;
@@ -413,7 +413,7 @@ export class OpenAIChatProvider {
         clearTimeout(timer);
         externalSignal?.removeEventListener('abort', abort);
       }
-      await delay(Math.min(4_000, 250 * 2 ** attempt) + Math.floor(Math.random() * 125), externalSignal);
+      await retryDelay(Math.min(4_000, 250 * 2 ** attempt) + Math.floor(Math.random() * 125), externalSignal);
     }
     throw last;
   }

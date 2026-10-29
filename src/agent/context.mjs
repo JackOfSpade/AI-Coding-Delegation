@@ -4,6 +4,7 @@ import {
   cloneAnthropicContent,
   validAnthropicContent,
 } from '../anthropic-content.mjs';
+import { cloneOpenAIReasoning, openAIReasoningChars, validOpenAIReasoning } from '../openai-reasoning.mjs';
 
 /** Append-only conversation store.  Only old bulky tool output is replaced,
  * preserving message order (and therefore provider prefix-cache locality). */
@@ -244,12 +245,13 @@ function messageChars(message) {
     ? message.content.length +
         (typeof message.reasoning_content === 'string' ? message.reasoning_content.length : 0) +
         anthropicContentChars(message.anthropic_content) +
+        openAIReasoningChars(message.openai_reasoning) +
         (Array.isArray(message.tool_calls)
           ? message.tool_calls.reduce((n, call) => n + String(call?.function?.arguments ?? '').length, 0)
           : 0)
     : typeof message?.reasoning_content === 'string'
-      ? message.reasoning_content.length + anthropicContentChars(message.anthropic_content)
-      : anthropicContentChars(message?.anthropic_content);
+      ? message.reasoning_content.length + anthropicContentChars(message.anthropic_content) + openAIReasoningChars(message.openai_reasoning)
+      : anthropicContentChars(message?.anthropic_content) + openAIReasoningChars(message?.openai_reasoning);
 }
 function elideMessages(messages, maxToolChars, keepRecentToolResults) {
   const tools = messages.map((message, index) => [message, index]).filter(([message]) => message.role === 'tool' && !message.elided);
@@ -288,6 +290,7 @@ function cloneMessage(message, { includeElided = false } = {}) {
       content: message.content,
       ...(message.reasoning_content !== undefined ? { reasoning_content: message.reasoning_content } : {}),
       ...(message.anthropic_content !== undefined ? { anthropic_content: cloneAnthropicContent(message.anthropic_content) } : {}),
+      ...(message.openai_reasoning !== undefined ? { openai_reasoning: cloneOpenAIReasoning(message.openai_reasoning) } : {}),
       ...(message.tool_calls !== undefined
         ? {
             tool_calls: message.tool_calls.map((call) => ({
@@ -318,6 +321,8 @@ function validCall(call) {
 function validateMessageShape(message) {
   if (!message || typeof message !== 'object' || Array.isArray(message) || typeof message.role !== 'string')
     throw new Error('Conversation transcript contains an invalid message');
+  if (message.role !== 'assistant' && message.openai_reasoning !== undefined)
+    throw new Error('Conversation transcript has OpenAI reasoning outside an assistant message');
   if (message.role === 'system' || message.role === 'user') {
     if (!boundedText(message.content)) throw new Error('Conversation transcript has invalid content');
     return;
@@ -326,7 +331,8 @@ function validateMessageShape(message) {
     if (
       !boundedText(message.content) ||
       (message.reasoning_content !== undefined && message.reasoning_content !== null && !boundedText(message.reasoning_content)) ||
-      (message.anthropic_content !== undefined && !validAnthropicContent(message.anthropic_content))
+      (message.anthropic_content !== undefined && !validAnthropicContent(message.anthropic_content)) ||
+      (message.openai_reasoning !== undefined && !validOpenAIReasoning(message.openai_reasoning))
     )
       throw new Error('Conversation transcript has an invalid role or assistant content');
     if (
