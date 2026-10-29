@@ -8,7 +8,9 @@ import {
   ConfigError,
   deepMerge,
   defaultConfigPath,
+  legacyCommandProfiles,
   loadConfig,
+  migrateLegacyCommandProfiles,
   parseJsonFile,
   validateConfig,
   validateRepoConfig,
@@ -337,4 +339,60 @@ test('profile fallback chains reject cycles and more than three routes', () => {
   const four = structuredClone(base);
   four.profiles['claude-opus'].fallback = 'claude-sonnet';
   assert.throws(() => validateConfig(four), /exceeds 3 routes/);
+});
+
+// Command profiles as the a548949 (Claude -> Flash) and d5c7358 (Claude -> GPT
+// -> Flash) example configs shipped them.
+const CLAUDE_FLASH_EXAMPLE = {
+  sonnet: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' },
+  opus: { provider: 'anthropic', model: 'latest-opus', fallback: 'flash' },
+  flash: { provider: 'deepseek', model: 'latest-flash' },
+};
+const CLAUDE_GPT_FLASH_EXAMPLE = {
+  sonnet: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'terra' },
+  opus: { provider: 'anthropic', model: 'latest-opus', fallback: 'sol' },
+  terra: { provider: 'openai', model: 'latest-terra', fallback: 'flash' },
+  sol: { provider: 'openai', model: 'latest-sol', fallback: 'flash' },
+  flash: { provider: 'deepseek', model: 'latest-flash' },
+};
+test('legacy Claude-first example profiles migrate to the OpenAI -> Claude -> Flash chain', () => {
+  for (const profiles of [CLAUDE_FLASH_EXAMPLE, CLAUDE_GPT_FLASH_EXAMPLE]) {
+    const user = { providers: {}, profiles: structuredClone(profiles), default: 'sonnet' };
+    assert.deepEqual(legacyCommandProfiles(user.profiles), ['sonnet', 'opus']);
+    const before = structuredClone(user);
+    const { config, migrated, blocked } = migrateLegacyCommandProfiles(user);
+    assert.deepEqual(user, before, 'the input is not mutated');
+    assert.deepEqual(migrated, ['sonnet', 'opus']);
+    assert.deepEqual(blocked, []);
+    for (const name of ['sonnet', 'opus', 'claude-sonnet', 'claude-opus'])
+      assert.deepEqual(config.profiles[name], DEFAULT_CONFIG.profiles[name]);
+    assert.equal(config.default, 'sonnet');
+    const merged = validateConfig(deepMerge(DEFAULT_CONFIG, config));
+    assert.deepEqual(legacyCommandProfiles(merged.profiles), []);
+    assert.deepEqual(migrateLegacyCommandProfiles(config).migrated, [], 'migration is idempotent');
+  }
+  // Merged over the defaults, a copied example still reads as legacy.
+  assert.deepEqual(legacyCommandProfiles(deepMerge(DEFAULT_CONFIG, { profiles: CLAUDE_GPT_FLASH_EXAMPLE }).profiles), ['sonnet', 'opus']);
+  assert.deepEqual(legacyCommandProfiles(DEFAULT_CONFIG.profiles), []);
+});
+test('only exact shipped shapes migrate; customized chains and Claude-name conflicts are left alone', () => {
+  const custom = (mutate) => {
+    const profiles = structuredClone(CLAUDE_GPT_FLASH_EXAMPLE);
+    mutate(profiles);
+    return { profiles };
+  };
+  for (const mutate of [
+    (p) => (p.sonnet.effort = 'high'),
+    (p) => (p.terra.fallback = undefined),
+    (p) => (p.terra.model = 'gpt-6.1-terra'),
+    (p) => (p.sonnet.model = 'claude-sonnet-5-5'),
+  ])
+    assert.deepEqual(migrateLegacyCommandProfiles(custom(mutate)).migrated.includes('sonnet'), false);
+  const conflict = custom((p) => (p['claude-sonnet'] = { provider: 'anthropic', model: 'latest-opus' }));
+  const result = migrateLegacyCommandProfiles(conflict);
+  assert.deepEqual(result.migrated, ['opus']);
+  assert.deepEqual(result.blocked, ['sonnet']);
+  assert.deepEqual(result.config.profiles.sonnet, CLAUDE_GPT_FLASH_EXAMPLE.sonnet);
+  assert.deepEqual(result.config.profiles['claude-sonnet'], conflict.profiles['claude-sonnet']);
+  assert.deepEqual(migrateLegacyCommandProfiles({}).migrated, []);
 });

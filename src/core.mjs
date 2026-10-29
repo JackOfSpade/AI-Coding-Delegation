@@ -42,7 +42,7 @@ import {
 import { resolveLogWindow } from './diagnostics.mjs';
 import { MAX_RETROSPECTIVE_JOBS, buildRetrospective } from './retrospective.mjs';
 import { createRetrospectiveLog } from './retrospective-log.mjs';
-import { defaultConfigPath, loadConfig, resolveConfigRelativePath } from './config.mjs';
+import { defaultConfigPath, legacyRoutingStatus, loadConfig, resolveConfigRelativePath } from './config.mjs';
 import { WINDOWS_INTEGRITY_ROOT_CREDENTIAL, readWindowsCredential, resolveKeyRef, storeWindowsCredential } from './secrets.mjs';
 import {
   PosixIntegrityRoot,
@@ -695,6 +695,17 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       return false;
     }
   };
+  // A config copied from an earlier example still routes a command Claude
+  // first; health names it so every client, not only the Claude banner, sees it.
+  const legacyRouting = (root) => {
+    try {
+      const loaded = config.loaded || loadConfig({ configPath: config.configPath, repoPath: root });
+      const status = legacyRoutingStatus({ profiles: loaded.config.profiles, configPath: loaded.configPath });
+      return status ? { legacyClaudeFirst: status } : {};
+    } catch {
+      return {};
+    }
+  };
   // The verifier sandbox can read no interpreter or virtualenv unless the
   // caller declares one (verifierInterpreter), so a Python project's readiness
   // is its own report, and `verifierDeps` (a JavaScript notion) mirrors it
@@ -864,6 +875,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
                   return {
                     ...(await sandboxHealth()),
                     worker: workerHealth(root),
+                    ...legacyRouting(root),
                     repo: root,
                     ...deps,
                     ...pythonDeps(deps, python),

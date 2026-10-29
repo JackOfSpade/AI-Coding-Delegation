@@ -1,7 +1,7 @@
 import { join, resolve, win32 } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { loadConfig, resolveConfigRelativePath } from './config.mjs';
+import { legacyRoutingStatus, loadConfig, resolveConfigRelativePath } from './config.mjs';
 import { resolveKeyRef } from './secrets.mjs';
 import { macosProfile, sandboxStatus } from './sandbox.mjs';
 import { healthIdentity } from './identity.mjs';
@@ -319,6 +319,9 @@ export function doctor({
   try {
     const loaded = loadConfig({ configPath, repoPath, env });
     config = { ok: true, path: loaded.configPath, profile: loaded.config.default, disabled: loaded.disabled };
+    // A config copied from an earlier example still routes these commands Claude first.
+    const legacy = legacyRoutingStatus({ profiles: loaded.config.profiles, configPath: loaded.configPath });
+    if (legacy) config.legacyClaudeFirst = legacy;
     keys = routeKeyTargets(loaded.config).map(({ provider, keyRef }) => {
       try {
         resolveKeyRef(keyRef, { env, platform });

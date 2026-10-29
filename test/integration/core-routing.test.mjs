@@ -3166,3 +3166,22 @@ for (const [provider, label] of [
       await rm(path, { recursive: true, force: true });
     }
   });
+
+test('repository health names commands a legacy config still routes Claude first', async () => {
+  const path = await repo('offload-core-legacy-health-');
+  const configured = structuredClone(DEFAULT_CONFIG);
+  configured.profiles.opus = { provider: 'anthropic', model: 'latest-opus', fallback: 'flash' };
+  const core = createCore({ config: { loaded: { disabled: false, repoConfig: {}, config: configured }, skillHealth: noInstalledSkill } });
+  const current = createCore({
+    config: { loaded: { disabled: false, repoConfig: {}, config: structuredClone(DEFAULT_CONFIG) }, skillHealth: noInstalledSkill },
+  });
+  try {
+    const result = await core.job(undefined, { repoPath: path });
+    assert.deepEqual(result.health.legacyClaudeFirst, { profiles: ['opus'], fix: 'install' });
+    assert.equal((await current.job(undefined, { repoPath: path })).health.legacyClaudeFirst, undefined);
+  } finally {
+    await core.shutdown();
+    await current.shutdown();
+    await rm(path, { recursive: true, force: true });
+  }
+});

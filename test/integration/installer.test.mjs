@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { access, constants, cp, mkdtemp, mkdir, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises';
+import { access, constants, cp, link, mkdtemp, mkdir, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import {
   install as rawInstall,
   isMainModule,
@@ -2320,4 +2320,165 @@ test('storeKeychainKey on macOS never takes the secret from the prompt and label
   });
   assert.equal(result.stored, false);
   assert.equal(promptCalls, 0);
+});
+// config.example.json profiles as d5c7358 and a548949 shipped them.
+const CLAUDE_GPT_FLASH_PROFILES = {
+  sonnet: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'terra' },
+  opus: { provider: 'anthropic', model: 'latest-opus', fallback: 'sol' },
+  terra: { provider: 'openai', model: 'latest-terra', fallback: 'flash' },
+  sol: { provider: 'openai', model: 'latest-sol', fallback: 'flash' },
+  flash: { provider: 'deepseek', model: 'latest-flash' },
+};
+const CLAUDE_FLASH_PROFILES = {
+  sonnet: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' },
+  opus: { provider: 'anthropic', model: 'latest-opus', fallback: 'flash' },
+  flash: { provider: 'deepseek', model: 'latest-flash' },
+};
+async function legacyConfigHome(content, { mode } = {}) {
+  const home = await mkdtemp(`${tmpdir()}/offload-home-`);
+  const configHome = join(home, 'config');
+  const configPath = join(configHome, 'offload', 'config.json');
+  await mkdir(dirname(configPath), { recursive: true });
+  await writeFile(configPath, content, mode === undefined ? undefined : { mode });
+  const options = { root: process.cwd(), home, configHome, clients: ['codex'], env: { PATH: '/usr/bin' } };
+  const legacyStatus = () => doctor({ root: process.cwd(), home, configPath, repoPath: process.cwd() }).config.legacyClaudeFirst;
+  return { home, configPath, options, legacyStatus };
+}
+test('installer migrates a config copied from the Claude-first example, backing up the exact bytes and keeping the mode', async () => {
+  // A BOM and CRLF line endings must survive in the backup byte for byte.
+  const original =
+    '﻿' +
+    JSON.stringify({ profiles: CLAUDE_GPT_FLASH_PROFILES, limits: { maxTurns: 40, timeoutMinutes: 30, maxUsd: 2 } }, null, 4).replace(
+      /\n/g,
+      '\r\n',
+    );
+  const { home, configPath, options, legacyStatus } = await legacyConfigHome(original, { mode: 0o640 });
+  try {
+    assert.deepEqual(legacyStatus(), { profiles: ['sonnet', 'opus'], fix: 'install' });
+    const result = await install(options);
+    assert.deepEqual(result.configMigration, { migrated: ['sonnet', 'opus'], pending: [] });
+    assert.ok(result.changed.includes(configPath));
+    const backup = `${configPath}.claude-first.offload.bak`;
+    assert.ok(result.backups.includes(backup));
+    assert.deepEqual(await readFile(backup), Buffer.from(original, 'utf8'));
+    if (process.platform !== 'win32') assert.equal(statSync(configPath).mode & 0o777, 0o640);
+    const migrated = JSON.parse(await readFile(configPath, 'utf8'));
+    assert.deepEqual(migrated.profiles.sonnet, { provider: 'openai', model: 'latest-terra', fallback: 'claude-sonnet' });
+    assert.deepEqual(migrated.profiles.opus, { provider: 'openai', model: 'latest-sol', fallback: 'claude-opus' });
+    assert.deepEqual(migrated.profiles['claude-sonnet'], { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' });
+    assert.deepEqual(migrated.profiles['claude-opus'], { provider: 'anthropic', model: 'latest-opus', fallback: 'flash' });
+    assert.equal(migrated.limits.maxTurns, 40, 'unrelated settings survive');
+    assert.equal(legacyStatus(), undefined);
+    const again = await install(options);
+    assert.equal(again.configMigration, undefined);
+    assert.ok(!again.changed.includes(configPath));
+    // Restoring the old example and installing again keeps both originals.
+    await writeFile(configPath, JSON.stringify({ profiles: CLAUDE_FLASH_PROFILES }));
+    const restored = await install(options);
+    assert.deepEqual(restored.configMigration.migrated, ['sonnet', 'opus']);
+    assert.deepEqual(await readFile(backup), Buffer.from(original, 'utf8'));
+    assert.ok(restored.backups.includes(`${backup}.legacy-1`));
+    assert.equal(await readFile(`${backup}.legacy-1`, 'utf8'), JSON.stringify({ profiles: CLAUDE_FLASH_PROFILES }));
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+test('installer leaves a config it cannot safely migrate untouched and still completes', async () => {
+  const cases = [
+    // Invalid elsewhere: migration must not turn a loadable install into an aborted one.
+    ['invalid', JSON.stringify({ profiles: CLAUDE_FLASH_PROFILES, limits: { maxTurns: 1, timeoutMinutes: 1, maxUsd: -1 } })],
+    [
+      'conflict',
+      JSON.stringify({ profiles: { ...CLAUDE_FLASH_PROFILES, 'claude-sonnet': { provider: 'anthropic', model: 'latest-opus' } } }),
+    ],
+    ['readonly', JSON.stringify({ profiles: CLAUDE_FLASH_PROFILES })],
+    ['hardlink', JSON.stringify({ profiles: CLAUDE_FLASH_PROFILES })],
+    ['customized', JSON.stringify({ profiles: { sonnet: { ...CLAUDE_FLASH_PROFILES.sonnet, effort: 'high' } } })],
+  ];
+  for (const [kind, content] of cases) {
+    if (kind === 'readonly' && (process.platform === 'win32' || process.getuid?.() === 0)) continue;
+    const { home, configPath, options, legacyStatus } = await legacyConfigHome(content, kind === 'readonly' ? { mode: 0o444 } : {});
+    try {
+      if (kind === 'hardlink') await link(configPath, join(home, 'dotfiles-copy.json'));
+      const result = await install(options);
+      assert.ok(existsSync(join(home, '.agents')) || existsSync(join(home, '.codex')), `${kind}: the install completes`);
+      if (kind !== 'conflict') {
+        assert.equal(await readFile(configPath, 'utf8'), content, `${kind}: config untouched`);
+        assert.ok(!result.backups.some((backup) => backup.includes('claude-first')), kind);
+      }
+      if (kind === 'customized') {
+        assert.equal(result.configMigration, undefined);
+        assert.equal(legacyStatus(), undefined);
+      } else if (kind === 'conflict') {
+        // opus is free to migrate; sonnet's Claude name is taken by the user.
+        assert.deepEqual(result.configMigration, { migrated: ['opus'], pending: ['sonnet'], reason: 'conflict' });
+        assert.deepEqual(legacyStatus(), { profiles: ['sonnet'], fix: 'manual', reason: 'conflict' });
+        const partly = JSON.parse(await readFile(configPath, 'utf8')).profiles;
+        assert.deepEqual(partly.sonnet, CLAUDE_FLASH_PROFILES.sonnet);
+        assert.deepEqual(partly['claude-sonnet'], { provider: 'anthropic', model: 'latest-opus' });
+        assert.equal(partly.opus.provider, 'openai');
+        assert.equal(await readFile(`${configPath}.claude-first.offload.bak`, 'utf8'), content);
+      } else {
+        assert.deepEqual(result.configMigration, { migrated: [], pending: ['sonnet', 'opus'], reason: kind });
+        if (kind !== 'invalid') assert.deepEqual(legacyStatus(), { profiles: ['sonnet', 'opus'], fix: 'manual', reason: kind });
+      }
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+});
+test('installer never rewrites a symlinked config, and doctor says it needs a manual edit', async () => {
+  const { home, configPath, options, legacyStatus } = await legacyConfigHome('{}');
+  const target = join(home, 'dotfiles', 'offload.json');
+  const legacy = JSON.stringify({ profiles: CLAUDE_FLASH_PROFILES, default: 'sonnet' });
+  try {
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, legacy);
+    await rm(configPath);
+    await symlink(target, configPath);
+    const linked = await install(options);
+    assert.deepEqual(linked.configMigration, { migrated: [], pending: ['sonnet', 'opus'], reason: 'symlink' });
+    assert.equal(await readlink(configPath), target);
+    assert.equal(await readFile(target, 'utf8'), legacy);
+    assert.deepEqual(legacyStatus(), { profiles: ['sonnet', 'opus'], fix: 'manual', reason: 'symlink' });
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+test('the session banner warns while a config still routes the commands Claude first', async () => {
+  const configHome = await mkdtemp(`${tmpdir()}/offload-xdg-`);
+  try {
+    await mkdir(join(configHome, 'offload'));
+    await writeFile(
+      join(configHome, 'offload', 'config.json'),
+      JSON.stringify({ profiles: { opus: { provider: 'anthropic', model: 'latest-opus', fallback: 'flash' } } }),
+    );
+    const run = spawnSync(process.execPath, ['install.mjs', '--doctor-hook'], {
+      encoding: 'utf8',
+      env: { ...process.env, XDG_CONFIG_HOME: configHome },
+    });
+    assert.match(run.stdout, /config still routes opus Claude first \(old example\): run node install\.mjs from /);
+    await writeFile(join(configHome, 'offload', 'config.json'), '{}');
+    const clean = spawnSync(process.execPath, ['install.mjs', '--doctor-hook'], {
+      encoding: 'utf8',
+      env: { ...process.env, XDG_CONFIG_HOME: configHome },
+    });
+    assert.doesNotMatch(clean.stdout, /Claude first/);
+    await writeFile(
+      join(configHome, 'offload', 'config.json'),
+      JSON.stringify({
+        profiles: {
+          opus: { provider: 'anthropic', model: 'latest-opus', fallback: 'flash' },
+          'claude-opus': { provider: 'anthropic', model: 'latest-sonnet' },
+        },
+      }),
+    );
+    const manual = spawnSync(process.execPath, ['install.mjs', '--doctor-hook'], {
+      encoding: 'utf8',
+      env: { ...process.env, XDG_CONFIG_HOME: configHome },
+    });
+    assert.match(manual.stdout, /config still routes opus Claude first \(old example\): edit .*config\.json by hand \(conflict\)/);
+  } finally {
+    await rm(configHome, { recursive: true, force: true });
+  }
 });

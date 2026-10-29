@@ -7,7 +7,15 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { stdin, stderr } from 'node:process';
-import { loadConfig } from './src/config.mjs';
+import {
+  DEFAULT_CONFIG,
+  deepMerge,
+  legacyRoutingStatus,
+  loadConfig,
+  migrateLegacyCommandProfiles,
+  parseJsonFile,
+  validateConfig,
+} from './src/config.mjs';
 import { parseKeyRef, resolveKeyRef, storeKeychainSecret } from './src/secrets.mjs';
 import { doctor, doctorLive, keysSummary, routeKeyTargets } from './src/doctor.mjs';
 import { resolveClientPaths } from './src/client-paths.mjs';
@@ -186,11 +194,11 @@ function safeArtifactSize(size) {
 function sameArtifactMetadata(left, right) {
   return ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].every((key) => typeof left?.[key] === 'bigint' && left[key] === right?.[key]);
 }
-async function atomic(path, content) {
+async function atomic(path, content, { mode = 0o600 } = {}) {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const tmp = `${path}.offload-${process.pid}-${randomBytes(8).toString('hex')}.tmp`;
   try {
-    await writeFile(tmp, content, { mode: 0o600, flag: 'wx' });
+    await writeFile(tmp, content, { mode, flag: 'wx' });
     await rename(tmp, path);
   } catch (error) {
     await rm(tmp, { force: true }).catch(() => {});
@@ -415,6 +423,58 @@ async function updateManaged(path, block, uninstall, backups) {
   }
   await atomic(path, next);
   return true;
+}
+/**
+ * Upgrade command profiles copied from an earlier shipped example (Claude
+ * first) to the current OpenAI -> Claude -> Flash chain. Only exact shipped
+ * shapes change, the original bytes are backed up and the file mode is kept.
+ * Anything the installer cannot safely rewrite is reported as `pending` with
+ * a reason, and doctor keeps naming it; a failure here never stops the install.
+ */
+async function migrateConfigFile(configPath, backups, changed) {
+  const none = { migrated: [], pending: [] };
+  let status;
+  try {
+    status = legacyRoutingStatus({ profiles: parseJsonFile(configPath, 'config')?.profiles, configPath });
+  } catch {
+    return none; // An unreadable config is reported by doctor, not here.
+  }
+  if (!status) return none;
+  if (status.fix === 'manual' && status.reason !== 'conflict') return { migrated: [], pending: status.profiles, reason: status.reason };
+  let bytes, stat, user;
+  try {
+    stat = await lstat(configPath, BIGINT_STAT_OPTIONS);
+    if (!stat.isFile()) throw new Error('unsafe');
+    const handle = await open(configPath, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+    try {
+      if (!sameArtifactMetadata(stat, await handle.stat(BIGINT_STAT_OPTIONS))) throw new Error('unsafe');
+      bytes = await handle.readFile();
+    } finally {
+      await handle.close().catch(() => {});
+    }
+    user = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  } catch {
+    return none;
+  }
+  const result = migrateLegacyCommandProfiles(user);
+  const pending = (reason, profiles = [...result.migrated, ...result.blocked]) => ({ migrated: [], pending: profiles, reason });
+  if (!result.migrated.length) return pending('conflict', result.blocked);
+  try {
+    // Never write a config that the runtime would then refuse to load.
+    validateConfig(deepMerge(DEFAULT_CONFIG, result.config));
+  } catch {
+    return pending('invalid');
+  }
+  try {
+    const backup = await reserveBackupPath(`${configPath}.claude-first.offload.bak`);
+    if (!(await atomicIfMissing(backup, bytes))) throw new Error('backup collision');
+    backups.push(backup);
+    await atomic(configPath, JSON.stringify(result.config, null, 2) + '\n', { mode: Number(stat.mode) & 0o777 });
+  } catch {
+    return pending('unwritable');
+  }
+  changed.push(configPath);
+  return { migrated: result.migrated, pending: result.blocked, ...(result.blocked.length ? { reason: 'conflict' } : {}) };
 }
 const legacySkillBackupPath = (skillPath) => `${skillPath}.offload.bak`;
 const skillBackupPath = (backupDirectory, skillPath) => join(backupDirectory, basename(legacySkillBackupPath(skillPath)));
@@ -2047,10 +2107,11 @@ export async function install({
     }
   }
   const configPath = join(configHome, 'offload', 'config.json');
+  let configMigration = { migrated: [], pending: [] };
   if (!uninstall && !(await exists(configPath))) {
     await atomic(configPath, artifactContents.get(join(root, 'config.example.json')));
     changed.push(configPath);
-  }
+  } else if (!uninstall) configMigration = await migrateConfigFile(configPath, backups, changed);
   let key = { stored: false },
     keys = [];
   if (!uninstall && keyPrompt) {
@@ -2141,6 +2202,7 @@ export async function install({
     backups,
     skippedCursorConfig: !!currentCursor && currentCursor !== cursorJson(root),
     configPath,
+    ...(configMigration.migrated.length || configMigration.pending.length ? { configMigration } : {}),
     key,
     keys,
     plugin,
@@ -2159,6 +2221,15 @@ function doctorHookWarnings(result) {
     .map(([client]) => client);
   if (stale.length) warnings.push(`installed ${stale.join('/')} skill is STALE: run node install.mjs from ${result.root}, then restart`);
   if (result.otherDoctorHooks?.length) warnings.push(`another offload hook root is registered: ${result.otherDoctorHooks.join(', ')}`);
+  const legacy = result.config?.legacyClaudeFirst;
+  if (legacy)
+    warnings.push(
+      `config still routes ${legacy.profiles.join('/')} Claude first (old example): ${
+        legacy.fix === 'install'
+          ? `run node install.mjs from ${result.root} to migrate`
+          : `edit ${result.config.path} by hand (${legacy.reason}); see config.example.json`
+      }`,
+    );
   return warnings.map((warning) => ` · ${warning}`).join('');
 }
 export { doctor, doctorLive };

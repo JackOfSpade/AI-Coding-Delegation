@@ -1,6 +1,7 @@
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, posix, resolve, win32 } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { modelPolicyViolation } from './model-policy.mjs';
 
 export const DEFAULT_CONFIG = Object.freeze({
@@ -38,7 +39,90 @@ export const DEFAULT_CONFIG = Object.freeze({
   default: 'sonnet',
   limits: { maxTurns: 80, timeoutMinutes: 30, maxUsd: 2 },
 });
+/**
+ * Whether the effective config still routes a command Claude first, and
+ * whether `node install.mjs` can fix it. The installer rewrites only a plain,
+ * singly linked, writable config whose Claude profile names are free.
+ */
+export function legacyRoutingStatus({ profiles, configPath, fs = defaultFs }) {
+  const { migrated, blocked } = migrateLegacyCommandProfiles({ profiles });
+  const legacy = [...migrated, ...blocked];
+  if (!legacy.length) return undefined;
+  let reason = blocked.length ? 'conflict' : undefined;
+  try {
+    const stat = configPath ? fs.lstatSync(configPath) : undefined;
+    if (stat?.isSymbolicLink()) reason = 'symlink';
+    else if (stat?.nlink > 1) reason = 'hardlink';
+    else if (stat && !(stat.mode & 0o200)) reason = 'readonly';
+  } catch {
+    // A missing file means the defaults apply, which are never legacy.
+  }
+  return { profiles: legacy, fix: reason ? 'manual' : 'install', ...(reason ? { reason } : {}) };
+}
 const MAX_CONFIG_BYTES = 1024 * 1024;
+// Command profiles exactly as earlier releases shipped them in
+// config.example.json. A config copied from those still routes Claude first,
+// so the installer rewrites these (and only these) to the current chain.
+const LEGACY_COMMAND_PROFILES = {
+  sonnet: {
+    claude: 'claude-sonnet',
+    shapes: [
+      { profile: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' } },
+      {
+        profile: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'terra' },
+        via: { terra: { provider: 'openai', model: 'latest-terra', fallback: 'flash' } },
+      },
+    ],
+  },
+  opus: {
+    claude: 'claude-opus',
+    shapes: [
+      { profile: { provider: 'anthropic', model: 'latest-opus', fallback: 'flash' } },
+      {
+        profile: { provider: 'anthropic', model: 'latest-opus', fallback: 'sol' },
+        via: { sol: { provider: 'openai', model: 'latest-sol', fallback: 'flash' } },
+      },
+    ],
+  },
+};
+
+/** Command profile names whose chain is still a shipped Claude-first example. */
+export function legacyCommandProfiles(profiles) {
+  if (!isPlainObject(profiles)) return [];
+  return Object.entries(LEGACY_COMMAND_PROFILES)
+    .filter(([name, { shapes }]) =>
+      shapes.some(
+        ({ profile, via = {} }) =>
+          isDeepStrictEqual(profiles[name], profile) &&
+          Object.entries(via).every(([other, shape]) => isDeepStrictEqual(profiles[other], shape)),
+      ),
+    )
+    .map(([name]) => name);
+}
+
+/**
+ * Rewrite legacy command profiles in a user config to the current OpenAI ->
+ * Claude -> Flash chain. A profile is left alone (and reported as blocked) when
+ * the user already defines its Claude profile name differently.
+ */
+export function migrateLegacyCommandProfiles(user) {
+  const legacy = legacyCommandProfiles(user?.profiles);
+  const migrated = [],
+    blocked = [];
+  if (!legacy.length) return { config: user, migrated, blocked };
+  const profiles = { ...user.profiles };
+  for (const name of legacy) {
+    const claude = LEGACY_COMMAND_PROFILES[name].claude;
+    if (profiles[claude] !== undefined && !isDeepStrictEqual(profiles[claude], DEFAULT_CONFIG.profiles[claude])) {
+      blocked.push(name);
+      continue;
+    }
+    profiles[name] = { ...DEFAULT_CONFIG.profiles[name] };
+    profiles[claude] = { ...DEFAULT_CONFIG.profiles[claude] };
+    migrated.push(name);
+  }
+  return { config: migrated.length ? { ...user, profiles } : user, migrated, blocked };
+}
 const MAX_PROVIDERS = 64;
 const MAX_PROFILES = 128;
 const MAX_NAME = 128;
