@@ -7,6 +7,7 @@ import { DEFAULT_CONFIG, ConfigError, loadConfig, validateConfig } from '../../s
 import { OpenAIChatProvider } from '../../src/provider/openai-chat.mjs';
 import { loadPricing } from '../../src/pricing-registry.mjs';
 import {
+  OFFLOAD_ANTHROPIC_LATEST_OPUS,
   OFFLOAD_ANTHROPIC_LATEST_SONNET,
   OFFLOAD_DEEPSEEK_LATEST_FLASH,
   OFFLOAD_DEEPSEEK_MODEL,
@@ -84,14 +85,18 @@ test('dynamic selectors are accepted only while validating configuration, never 
   assert.ok(modelPolicyViolation({ type: 'openai-chat', baseUrl: 'https://api.deepseek.com', model: OFFLOAD_DEEPSEEK_LATEST_FLASH }));
 });
 
-test('shipped defaults and the example config route Sonnet -> Terra -> Flash and Opus -> Sol -> Flash', () => {
-  assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles), ['sonnet', 'opus', 'terra', 'sol', 'flash']);
+test('shipped defaults and the example config route Terra -> Sonnet -> Flash and Sol -> Opus -> Flash', () => {
+  assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles), ['sonnet', 'opus', 'claude-sonnet', 'claude-opus', 'flash']);
   assert.equal(DEFAULT_CONFIG.default, 'sonnet');
-  assert.equal(DEFAULT_CONFIG.profiles.sonnet.model, OFFLOAD_ANTHROPIC_LATEST_SONNET);
-  assert.equal(DEFAULT_CONFIG.profiles.sonnet.fallback, 'terra');
+  assert.equal(DEFAULT_CONFIG.profiles.sonnet.model, OFFLOAD_OPENAI_LATEST_TERRA);
+  assert.equal(DEFAULT_CONFIG.profiles.sonnet.fallback, 'claude-sonnet');
+  assert.equal(DEFAULT_CONFIG.profiles['claude-sonnet'].model, OFFLOAD_ANTHROPIC_LATEST_SONNET);
+  assert.equal(DEFAULT_CONFIG.profiles.opus.model, OFFLOAD_OPENAI_LATEST_SOL);
+  assert.equal(DEFAULT_CONFIG.profiles.opus.fallback, 'claude-opus');
+  assert.equal(DEFAULT_CONFIG.profiles['claude-opus'].model, OFFLOAD_ANTHROPIC_LATEST_OPUS);
   assert.equal(DEFAULT_CONFIG.profiles.flash.model, OFFLOAD_DEEPSEEK_LATEST_FLASH);
   const example = JSON.parse(readFileSync(join(root, 'config.example.json'), 'utf8'));
-  assert.deepEqual(Object.keys(example.profiles), ['sonnet', 'opus', 'terra', 'sol', 'flash']);
+  assert.deepEqual(example.profiles, DEFAULT_CONFIG.profiles);
   assert.equal(example.default, 'sonnet');
   assert.doesNotThrow(() => validateConfig(structuredClone(example)));
 });

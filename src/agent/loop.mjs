@@ -208,7 +208,7 @@ const normalizedUsage = (usage) => {
 // deliberately a pessimistic prompt-token estimate. The fixed allowance covers
 // chat framing that is not represented by JSON. This is a reservation, not an
 // attempt to predict provider billing; exact streamed usage remains decisive.
-function reserveRequestBudget(table, model, messages, tools, remainingUsd, requestOptions) {
+function reserveForModel(table, model, messages, tools, remainingUsd, requestOptions) {
   const spec = resolveModel(table, model);
   if (!spec) return null;
   const rates = spec.usd_per_1m;
@@ -232,6 +232,25 @@ function reserveRequestBudget(table, model, messages, tools, remainingUsd, reque
   if (!(available > 0)) return { inputTokens, inputUsd, minOutputUsd, maxTokens: 0 };
   const affordable = outputRate === 0 ? MAX_REQUEST_OUTPUT_TOKENS : Math.floor((available * 1_000_000) / outputRate);
   return { inputTokens, inputUsd, minOutputUsd, maxTokens: Math.min(MAX_REQUEST_OUTPUT_TOKENS, affordable) };
+}
+
+// A credit fallback can switch routes mid-request and a later route may cost
+// more than the primary, so every model the provider may use must fit.
+function reserveRequestBudget(table, models, ...request) {
+  let combined;
+  for (const model of models) {
+    const reservation = reserveForModel(table, model, ...request);
+    if (!reservation) return null;
+    combined = combined
+      ? {
+          inputTokens: Math.max(combined.inputTokens, reservation.inputTokens),
+          inputUsd: Math.max(combined.inputUsd, reservation.inputUsd),
+          minOutputUsd: Math.max(combined.minOutputUsd, reservation.minOutputUsd),
+          maxTokens: Math.min(combined.maxTokens, reservation.maxTokens),
+        }
+      : reservation;
+  }
+  return combined ?? null;
 }
 
 const MAX_BUDGET_DIAGNOSTIC_NUMBER = 10_000_000_000;
@@ -341,6 +360,7 @@ export class AgentLoop {
         throw new TypeError(`context.${method} must be a function when supplied`);
     this.meter = meter ?? new Meter({ table: pricing, model });
     this.model = model;
+    this.reservationModels = Array.isArray(provider?.routes) ? provider.routes.map((route) => route.model) : [model];
     this.toolDefinitions = toolDefinitions;
     this.allowedToolNames = new Set(names);
     this.maxTurns = maxTurns;
@@ -598,7 +618,7 @@ export class AgentLoop {
           this.reportMode && this.maxUsd !== Infinity
             ? reserveRequestBudget(
                 this.meter.table,
-                this.model,
+                this.reservationModels,
                 this.context.snapshot(),
                 this.toolDefinitions,
                 (this.maxUsd - this.meter.usd) / 2,
@@ -664,7 +684,7 @@ export class AgentLoop {
           // afford the minimum response, never as a cheaper normal path.
           let reservation = reserveRequestBudget(
             this.meter.table,
-            this.model,
+            this.reservationModels,
             messagesForTurn,
             activeToolDefinitions,
             this.maxUsd - this.meter.usd,
@@ -682,7 +702,7 @@ export class AgentLoop {
             for (const candidate of candidates) {
               const compactReservation = reserveRequestBudget(
                 this.meter.table,
-                this.model,
+                this.reservationModels,
                 candidate.messages,
                 activeToolDefinitions,
                 this.maxUsd - this.meter.usd,
@@ -711,7 +731,7 @@ export class AgentLoop {
             for (const candidate of candidates) {
               const compactReservation = reserveRequestBudget(
                 this.meter.table,
-                this.model,
+                this.reservationModels,
                 candidate.messages,
                 activeToolDefinitions,
                 this.maxUsd - this.meter.usd,
@@ -757,7 +777,7 @@ export class AgentLoop {
                 : undefined;
               budgetFinishReservation = reserveRequestBudget(
                 this.meter.table,
-                this.model,
+                this.reservationModels,
                 [{ role: 'user', content: BUDGET_FINISH_RECOVERY_MESSAGE }],
                 finishOnlyTools,
                 remainingUsd,

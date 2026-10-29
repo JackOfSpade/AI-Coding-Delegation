@@ -4520,3 +4520,32 @@ test("the manager's wall-clock watchdog abort ends the loop as TIMEOUT, not CANC
   }).run({ task: 'x' });
   assert.equal(before.status, 'TIMEOUT', 'between turns too');
 });
+
+test('a credit-fallback chain reserves output at its costliest route, not the cheaper primary', async () => {
+  const pricing = priceTable(['cheap', 'costly']);
+  pricing.models.costly.usd_per_1m.output = { off_peak: 100, peak: 100 };
+  const tools = { execute: async () => ({ finish: { summary: 'ok', concerns: [], testsRun: [] } }) };
+  const requested = async (provider, model) => {
+    let maxTokens;
+    const chat = async function* (options) {
+      maxTokens = options.max_tokens;
+      yield { usage: { inputTokens: 0, outputTokens: 0 }, toolCalls: [call('finish', '{"summary":"ok"}')] };
+    };
+    const result = await new AgentLoop({
+      provider: { ...provider, chat },
+      tools,
+      model,
+      pricing,
+      maxUsd: 1,
+      toolDefinitions: availableToolDefinitions({ allowCommand: false }),
+    }).run({ task: 'x' });
+    assert.equal(result.status, 'DONE');
+    return maxTokens;
+  };
+  const cheapOnly = await requested({}, 'cheap');
+  const costlyOnly = await requested({}, 'costly');
+  assert.equal(cheapOnly, 16_384);
+  assert.ok(costlyOnly < cheapOnly);
+  // An OpenAI primary can hop to a pricier Claude route inside one request.
+  assert.equal(await requested({ routes: [{ model: 'cheap' }, { model: 'costly' }] }, 'cheap'), costlyOnly);
+});

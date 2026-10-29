@@ -28,6 +28,7 @@ export const RUNTIME_CAPABILITIES = Object.freeze({
   verifierImports: true,
   retrospective: true,
   openaiCreditTier: true,
+  openaiFirst: true,
 });
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));

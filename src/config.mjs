@@ -28,10 +28,11 @@ export const DEFAULT_CONFIG = Object.freeze({
     },
   },
   profiles: {
-    sonnet: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'terra' },
-    opus: { provider: 'anthropic', model: 'latest-opus', fallback: 'sol' },
-    terra: { provider: 'openai', model: 'latest-terra', fallback: 'flash' },
-    sol: { provider: 'openai', model: 'latest-sol', fallback: 'flash' },
+    // Command profiles try OpenAI first, then Claude, then DeepSeek Flash.
+    sonnet: { provider: 'openai', model: 'latest-terra', fallback: 'claude-sonnet' },
+    opus: { provider: 'openai', model: 'latest-sol', fallback: 'claude-opus' },
+    'claude-sonnet': { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' },
+    'claude-opus': { provider: 'anthropic', model: 'latest-opus', fallback: 'flash' },
     flash: { provider: 'deepseek', model: 'latest-flash' },
   },
   default: 'sonnet',

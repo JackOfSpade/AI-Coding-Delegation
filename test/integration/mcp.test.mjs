@@ -71,6 +71,7 @@ test('MCP lists exact tools, initializes, pings and dispatches', async () => {
     verifierImports: true,
     retrospective: true,
     openaiCreditTier: true,
+    openaiFirst: true,
   });
   assert.ok(
     values.some((value) => value.id === null && value.result?.tools),

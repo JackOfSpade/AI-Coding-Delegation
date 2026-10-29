@@ -17,15 +17,20 @@ import { cleanup, tempDir } from './helpers.mjs';
 
 test('config merges nested defaults and validates profile references', () => {
   assert.equal(DEFAULT_CONFIG.default, 'sonnet');
-  assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles), ['sonnet', 'opus', 'terra', 'sol', 'flash']);
+  assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles), ['sonnet', 'opus', 'claude-sonnet', 'claude-opus', 'flash']);
   assert.equal(DEFAULT_CONFIG.providers.anthropic.keyRef, 'keychain:offload-anthropic');
   assert.equal(DEFAULT_CONFIG.providers.anthropic.type, 'anthropic-messages');
   assert.equal(DEFAULT_CONFIG.providers.deepseek.keyRef, 'keychain:offload-deepseek');
   assert.equal(DEFAULT_CONFIG.providers.deepseek.attemptTimeoutMs, 300_000);
-  assert.equal(DEFAULT_CONFIG.profiles.sonnet.model, 'latest-sonnet');
-  assert.equal(DEFAULT_CONFIG.profiles.sonnet.fallback, 'terra');
-  assert.equal(DEFAULT_CONFIG.profiles.opus.fallback, 'sol');
-  assert.equal(DEFAULT_CONFIG.profiles.terra.fallback, 'flash');
+  assert.equal(DEFAULT_CONFIG.profiles.sonnet.provider, 'openai');
+  assert.equal(DEFAULT_CONFIG.profiles.sonnet.model, 'latest-terra');
+  assert.equal(DEFAULT_CONFIG.profiles.sonnet.fallback, 'claude-sonnet');
+  assert.equal(DEFAULT_CONFIG.profiles.opus.model, 'latest-sol');
+  assert.equal(DEFAULT_CONFIG.profiles.opus.fallback, 'claude-opus');
+  assert.equal(DEFAULT_CONFIG.profiles['claude-sonnet'].model, 'latest-sonnet');
+  assert.equal(DEFAULT_CONFIG.profiles['claude-sonnet'].fallback, 'flash');
+  assert.equal(DEFAULT_CONFIG.profiles['claude-opus'].model, 'latest-opus');
+  assert.equal(DEFAULT_CONFIG.profiles['claude-opus'].fallback, 'flash');
   assert.equal(DEFAULT_CONFIG.providers.openai.keyRef, 'keychain:offload-openai');
   assert.equal(DEFAULT_CONFIG.providers.openai.pricing, 'openai-2026-10-26');
   assert.equal(DEFAULT_CONFIG.profiles.flash.model, 'latest-flash');
@@ -111,8 +116,8 @@ test('missing config receives the documented promo and fallback profiles', () =>
   try {
     const result = loadConfig({ configPath: join(dir, 'absent.json') });
     assert.equal(result.config.default, 'sonnet');
-    assert.equal(result.config.profiles.sonnet.model, 'latest-sonnet');
-    assert.equal(result.config.profiles.sonnet.fallback, 'terra');
+    assert.equal(result.config.profiles.sonnet.model, 'latest-terra');
+    assert.equal(result.config.profiles.sonnet.fallback, 'claude-sonnet');
     assert.equal(result.config.profiles.flash.model, 'latest-flash');
   } finally {
     cleanup(dir);
@@ -324,13 +329,12 @@ test('profile fallback chains reject cycles and more than three routes', () => {
     /cycle/,
   );
   const long = structuredClone(base);
-  long.profiles.flash.fallback = 'sol';
-  long.profiles.sol.fallback = 'terra';
-  long.profiles.terra.fallback = 'opus';
+  long.profiles.flash.fallback = 'claude-opus';
+  long.profiles['claude-opus'].fallback = 'claude-sonnet';
+  long.profiles['claude-sonnet'].fallback = 'opus';
   delete long.profiles.opus.fallback;
   assert.throws(() => validateConfig(long), /exceeds 3 routes|cycle/);
   const four = structuredClone(base);
-  four.profiles.flash.provider = 'deepseek';
-  four.profiles.sol.fallback = 'terra';
+  four.profiles['claude-opus'].fallback = 'claude-sonnet';
   assert.throws(() => validateConfig(four), /exceeds 3 routes/);
 });
