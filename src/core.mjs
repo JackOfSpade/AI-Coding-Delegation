@@ -7,7 +7,15 @@ import { randomUUID } from 'node:crypto';
 import { LeaseManager, getGitDir } from './lease.mjs';
 import { JobStore } from './store.mjs';
 import { Runner } from './runner.mjs';
-import { JobManager, mergeListings, validateExplicitRepoPath, validateJobId, validateJobRequest } from './job-manager.mjs';
+import {
+  JobManager,
+  executionFallbacks,
+  recordedProviderStage,
+  mergeListings,
+  validateExplicitRepoPath,
+  validateJobId,
+  validateJobRequest,
+} from './job-manager.mjs';
 import { probeVerifierTemp, sandboxAvailable, sandboxStatus } from './sandbox.mjs';
 import { healthIdentity, runtimeIdentity } from './identity.mjs';
 import { assertStartRuntimeCurrent, installedSkillHealth, withSkillHealth } from './skill-health.mjs';
@@ -44,6 +52,7 @@ import {
   deriveJobMacKey,
   sameCredentialFingerprint,
   validCredentialFingerprint,
+  validCredentialFingerprints,
 } from './integrity.mjs';
 import { DEFAULT_ATTEMPT_TIMEOUT_MS, OpenAIChatProvider, ProviderError } from './provider/openai-chat.mjs';
 import { AnthropicMessagesProvider, resolveLatestAnthropicSonnet, resolveLatestAnthropicOpus } from './provider/anthropic-messages.mjs';
@@ -59,6 +68,11 @@ import {
   OFFLOAD_ANTHROPIC_LATEST_SONNET,
   OFFLOAD_ANTHROPIC_LATEST_OPUS,
   isDeepSeekEndpoint,
+  isOpenAIEndpoint,
+  isOpenAITerraModel,
+  isOpenAISolModel,
+  OFFLOAD_OPENAI_LATEST_TERRA,
+  OFFLOAD_OPENAI_LATEST_SOL,
   OFFLOAD_DEEPSEEK_LATEST_FLASH,
   OFFLOAD_DEEPSEEK_MODEL,
 } from './model-policy.mjs';
@@ -212,12 +226,59 @@ export async function resolveLatestDeepSeekFlash({ baseUrl, apiKey, fetchImpl = 
   return model.id;
 }
 
+const OPENAI_LINES = {
+  terra: { label: 'Terra', matches: isOpenAITerraModel },
+  sol: { label: 'Sol', matches: isOpenAISolModel },
+};
+/** Highest `gpt-<major>[.<minor>]-<line>` by numeric version, never by `created` or list order. */
+export async function resolveLatestOpenAI(line, { baseUrl, key, apiKey = key, fetch, fetchImpl = fetch ?? globalThis.fetch, signal } = {}) {
+  const spec = OPENAI_LINES[line];
+  if (!spec) throw new TypeError('unsupported OpenAI model line');
+  let response;
+  try {
+    response = await fetchImpl(new URL('models', `${baseUrl.replace(/\/+$/, '')}/`).href, {
+      headers: { authorization: `Bearer ${apiKey}` },
+      signal,
+      redirect: 'error',
+    });
+  } catch {
+    throw new ProviderError('OpenAI model discovery failed');
+  }
+  if (!response.ok) throw new ProviderError('OpenAI model discovery failed', { status: response.status, kind: 'http' });
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    throw new ProviderError('OpenAI model discovery returned invalid JSON');
+  }
+  const version = (id) => {
+    const [, major, minor] = /^gpt-(\d+)(?:\.(\d+))?-/.exec(id);
+    return [Number(major), Number(minor ?? 0)];
+  };
+  let best;
+  for (const entry of Array.isArray(body?.data) ? body.data : []) {
+    const id = entry?.id;
+    if (!spec.matches(id)) continue;
+    const [major, minor] = version(id);
+    if (!best || major > best.major || (major === best.major && minor > best.minor)) best = { id, major, minor };
+  }
+  if (!best) throw new ProviderError(`No supported OpenAI ${spec.label} model is available`);
+  return best.id;
+}
+
 // Only a ProviderError's bare HTTP status is safe to surface from discovery;
 // its message, body and every other field may carry provider detail.
 function safeDiscoveryStatusSuffix(error) {
   if (!(error instanceof ProviderError)) return '';
   const status = error.status;
   return Number.isSafeInteger(status) && status >= 100 && status <= 599 ? ` (HTTP ${status})` : '';
+}
+
+/** How to supply a missing worker key; the save command is only printed where it is real. */
+function keySaveHint(keyRef, provider) {
+  return /^keychain:[\w.-]+$/.test(String(keyRef)) && /^[\w-]+$/.test(String(provider))
+    ? `save it with: node install.mjs --key=${provider} (from the Offload checkout)`
+    : 'run offload doctor or configure keyRef';
 }
 
 async function resolveProfileModel(profile, provider, key, { fetchImpl, signal } = {}) {
@@ -227,6 +288,9 @@ async function resolveProfileModel(profile, provider, key, { fetchImpl, signal }
     return resolveLatestAnthropicSonnet({ baseUrl: provider.baseUrl, apiKey: key, fetchImpl, signal });
   if (profile.model === OFFLOAD_DEEPSEEK_LATEST_FLASH)
     return resolveLatestDeepSeekFlash({ baseUrl: provider.baseUrl, apiKey: key, fetchImpl, signal });
+  if (profile.model === OFFLOAD_OPENAI_LATEST_TERRA)
+    return resolveLatestOpenAI('terra', { baseUrl: provider.baseUrl, key, fetchImpl, signal });
+  if (profile.model === OFFLOAD_OPENAI_LATEST_SOL) return resolveLatestOpenAI('sol', { baseUrl: provider.baseUrl, key, fetchImpl, signal });
   return profile.model;
 }
 
@@ -244,6 +308,7 @@ function providerInstance(providerConfig, key, model, { fetchImpl, reasoningEffo
     return new OpenAIChatProvider({
       ...options,
       ...(isDeepSeekEndpoint(providerConfig.baseUrl) ? { thinking: { type: 'enabled' }, reasoningEffort: reasoningEffort ?? 'high' } : {}),
+      ...(isOpenAIEndpoint(providerConfig.baseUrl) ? { reasoningEffort: 'high' } : {}),
     });
   throw new Error(`unsupported provider type: ${providerConfig?.type || 'missing'}`);
 }
@@ -350,25 +415,36 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         const credential = resolveCredential(execution.keyRef);
         if (!sameCredentialFingerprint(job.credentialFingerprint, credentialFingerprint(root.value, credential)))
           throw new Error('stored job credential check failed');
-        if (!execution.fallback) return { primary: credential };
-        if (typeof execution.fallback.keyRef !== 'string' || !validCredentialFingerprint(job.fallbackCredentialFingerprint))
+        const routes = executionFallbacks(execution);
+        if (!routes.length) return { primary: credential };
+        // Legacy records carry only the singular fingerprint of their one fallback.
+        const stored =
+          job.fallbackCredentialFingerprints ?? (job.fallbackCredentialFingerprint ? [job.fallbackCredentialFingerprint] : undefined);
+        if (
+          !validCredentialFingerprints(stored) ||
+          stored.length !== routes.length ||
+          routes.some((route) => typeof route.keyRef !== 'string')
+        )
           throw new Error('stored job credential check failed');
-        const fallback = resolveCredential(execution.fallback.keyRef);
-        if (!sameCredentialFingerprint(job.fallbackCredentialFingerprint, credentialFingerprint(root.value, fallback)))
-          throw new Error('stored job credential check failed');
-        return { primary: credential, fallback };
+        const fallbacks = routes.map((route, index) => {
+          const value = resolveCredential(route.keyRef);
+          if (!sameCredentialFingerprint(stored[index], credentialFingerprint(root.value, value)))
+            throw new Error('stored job credential check failed');
+          return value;
+        });
+        return { primary: credential, fallback: fallbacks[0], fallbacks };
       },
       async prepare(job) {
         const execution = job?.executionProfile;
         if (!execution || typeof execution.keyRef !== 'string') throw new Error('job credential is unavailable');
         const credential = resolveCredential(execution.keyRef);
-        const fallback = execution.fallback;
-        if (fallback && typeof fallback.keyRef !== 'string') throw new Error('job credential is unavailable');
-        const fallbackCredential = fallback ? resolveCredential(fallback.keyRef) : undefined;
+        const routes = executionFallbacks(execution);
+        if (routes.some((route) => typeof route.keyRef !== 'string')) throw new Error('job credential is unavailable');
+        const fingerprints = routes.map((route) => credentialFingerprint(root.value, resolveCredential(route.keyRef)));
         return {
           ...job,
           credentialFingerprint: credentialFingerprint(root.value, credential),
-          ...(fallbackCredential ? { fallbackCredentialFingerprint: credentialFingerprint(root.value, fallbackCredential) } : {}),
+          ...(fingerprints.length ? { fallbackCredentialFingerprint: fingerprints[0], fallbackCredentialFingerprints: fingerprints } : {}),
         };
       },
       preflight: (keyRef) => resolveCredential(keyRef),
@@ -419,25 +495,32 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         let provider = providerInstance(providerConfig, key, profile.model, {
           reasoningEffort: (job.effort || profile.effort) === 'high' ? 'high' : undefined,
         });
-        const fallbackConfig = execution?.fallback;
-        if (fallbackConfig) {
-          assertModelAllowed({ type: fallbackConfig.type, baseUrl: fallbackConfig.baseUrl, model: fallbackConfig.model });
-          let fallbackKey;
-          try {
-            fallbackKey = authenticated?.fallback || (config.resolveKey || resolveKeyRef)(fallbackConfig.keyRef);
-          } catch {
-            throw new Error('fallback worker key is unavailable; run offload doctor or configure keyRef');
-          }
-          if (!state.store.secrets.includes(fallbackKey)) state.store.secrets.push(fallbackKey);
+        const fallbackConfigs = executionFallbacks(execution);
+        if (fallbackConfigs.length) {
+          const routes = [{ provider, model: profile.model }];
+          fallbackConfigs.forEach((fallbackConfig, index) => {
+            assertModelAllowed({ type: fallbackConfig.type, baseUrl: fallbackConfig.baseUrl, model: fallbackConfig.model });
+            let fallbackKey;
+            try {
+              fallbackKey = authenticated?.fallbacks?.[index] || (config.resolveKey || resolveKeyRef)(fallbackConfig.keyRef);
+            } catch {
+              throw new Error('fallback worker key is unavailable; run offload doctor or configure keyRef');
+            }
+            if (!state.store.secrets.includes(fallbackKey)) state.store.secrets.push(fallbackKey);
+            routes.push({
+              provider: providerInstance(fallbackConfig, fallbackKey, fallbackConfig.model, {
+                reasoningEffort: (job.effort || fallbackConfig.effort) === 'high' ? 'high' : undefined,
+              }),
+              model: fallbackConfig.model,
+            });
+          });
+          // A continuation or repair resumes on the persisted stage, never the primary.
+          const stage = recordedProviderStage(job);
+          if (stage >= routes.length) throw new Error('stored job has an invalid provider stage');
           provider = new CreditFallbackProvider({
-            primary: provider,
-            fallback: providerInstance(fallbackConfig, fallbackKey, fallbackConfig.model, {
-              reasoningEffort: (job.effort || fallbackConfig.effort) === 'high' ? 'high' : undefined,
-            }),
-            primaryModel: profile.model,
-            fallbackModel: fallbackConfig.model,
-            fallbackUsed: job.creditFallback === true,
-            onTransition: () => api.progress({ action: 'provider_credit_fallback', creditFallback: true }),
+            routes,
+            stage,
+            onTransition: (toStage) => api.progress({ action: 'provider_credit_fallback', providerStage: toStage, creditFallback: true }),
           });
         }
         // A queued job is an immutable execution request.  In particular, do not
@@ -487,8 +570,9 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         }
         // Retained jobs also need an exact fallback price before any request;
         // an older/static execution snapshot must not bypass the start gate.
-        if (fallbackConfig && (!pricing || !resolveModel(pricing, fallbackConfig.model)))
-          throw new Error(`pricing is unknown for selected fallback model ${fallbackConfig.model}`);
+        for (const fallbackConfig of fallbackConfigs)
+          if (!pricing || !resolveModel(pricing, fallbackConfig.model))
+            throw new Error(`pricing is unknown for selected fallback model ${fallbackConfig.model}`);
         // Report workers may read caller-supplied external bodies. Their
         // conversational/tool transcript is therefore intentionally
         // ephemeral: only the separately-sanitized report result is durable.
@@ -988,29 +1072,49 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       const providerConfig = loaded.config.providers[profile.provider];
       if (!['openai-chat', 'anthropic-messages'].includes(providerConfig?.type))
         throw new Error(`unsupported provider type: ${providerConfig?.type || 'missing'}`);
-      const fallbackProfile = profile.fallback ? loaded.config.profiles[profile.fallback] : undefined;
-      const fallbackProviderConfig = fallbackProfile && loaded.config.providers[fallbackProfile.provider];
-      if (fallbackProviderConfig && !['openai-chat', 'anthropic-messages'].includes(fallbackProviderConfig.type))
-        throw new Error(`unsupported fallback provider type: ${fallbackProviderConfig.type || 'missing'}`);
+      // The whole chain is snapshotted: primary plus up to two fallbacks, each
+      // taken only after the previous route's explicit credit exhaustion.
+      const chain = [{ name: profile.provider, profile, providerConfig }];
+      for (
+        let next = profile.fallback, seen = new Set([profileName]);
+        next && chain.length < 3 && !seen.has(next);
+        next = chain.at(-1).profile.fallback
+      ) {
+        seen.add(next);
+        const fallbackProfile = loaded.config.profiles[next];
+        const fallbackProviderConfig = fallbackProfile && loaded.config.providers[fallbackProfile.provider];
+        if (!['openai-chat', 'anthropic-messages'].includes(fallbackProviderConfig?.type))
+          throw new Error(`unsupported fallback provider type: ${fallbackProviderConfig?.type || 'missing'}`);
+        chain.push({ name: fallbackProfile.provider, profile: fallbackProfile, providerConfig: fallbackProviderConfig });
+      }
       // Resolve before snapshotting or acquiring a lease so a missing key can
       // never leave an executable but unsigned durable job behind.
-      const resolveStartCredential = (provider, label) => {
+      const resolveStartCredential = (route, label) => {
         try {
-          return state.integrity ? state.integrity.preflight(provider.keyRef) : (config.resolveKey || resolveKeyRef)(provider.keyRef);
+          return state.integrity
+            ? state.integrity.preflight(route.providerConfig.keyRef)
+            : (config.resolveKey || resolveKeyRef)(route.providerConfig.keyRef);
         } catch {
-          throw new Error(`${label} worker key is unavailable; run offload doctor or configure keyRef`);
+          throw new Error(
+            `${label} worker key is unavailable${label === 'primary' ? '' : ` for provider ${route.name}`}; ${keySaveHint(route.providerConfig.keyRef, route.name)}`,
+          );
         }
       };
       const primaryNeedsDiscovery = [
         OFFLOAD_ANTHROPIC_LATEST_SONNET,
         OFFLOAD_ANTHROPIC_LATEST_OPUS,
         OFFLOAD_DEEPSEEK_LATEST_FLASH,
+        OFFLOAD_OPENAI_LATEST_TERRA,
+        OFFLOAD_OPENAI_LATEST_SOL,
       ].includes(profile.model);
-      // A fallback can be selected only after the primary reports the exact
-      // credit-exhausted refusal, so verify its key before accepting a job.
-      const primaryKey = state.integrity || primaryNeedsDiscovery ? resolveStartCredential(providerConfig, 'primary') : undefined;
-      const fallbackKey = fallbackProfile ? resolveStartCredential(fallbackProviderConfig, 'fallback') : undefined;
-      for (const credential of [primaryKey, fallbackKey]) {
+      // A fallback can be selected only after the previous route reports the exact
+      // credit-exhausted refusal, so verify every key before accepting a job.
+      const keys = chain.map((route, index) =>
+        index === 0 && !state.integrity && !primaryNeedsDiscovery
+          ? undefined
+          : resolveStartCredential(route, index === 0 ? 'primary' : 'fallback'),
+      );
+      for (const credential of keys) {
         if (!credential) continue;
         // Preserve the resolved value only in the in-memory redaction set.
         // A caller can otherwise put a non-heuristic literal credential in
@@ -1018,48 +1122,33 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         state.store.secrets ||= [];
         if (!state.store.secrets.includes(credential)) state.store.secrets.push(credential);
       }
-      let model;
-      try {
-        model = await resolveProfileModel(profile, providerConfig, primaryKey, { fetchImpl: config.fetchImpl });
-      } catch (error) {
-        throw new Error(`primary provider model discovery failed${safeDiscoveryStatusSuffix(error)}`);
-      }
-      let fallbackModel;
-      if (fallbackProfile) {
+      const models = [];
+      for (const [index, route] of chain.entries()) {
         try {
-          fallbackModel = await resolveProfileModel(fallbackProfile, fallbackProviderConfig, fallbackKey, { fetchImpl: config.fetchImpl });
+          models.push(await resolveProfileModel(route.profile, route.providerConfig, keys[index], { fetchImpl: config.fetchImpl }));
         } catch (error) {
-          throw new Error(`fallback provider model discovery failed${safeDiscoveryStatusSuffix(error)}`);
+          throw new Error(`${index === 0 ? 'primary' : 'fallback'} provider model discovery failed${safeDiscoveryStatusSuffix(error)}`);
         }
+        assertModelAllowed({ type: route.providerConfig.type, baseUrl: route.providerConfig.baseUrl, model: models[index] });
       }
-      assertModelAllowed({ type: providerConfig.type, baseUrl: providerConfig.baseUrl, model });
-      if (fallbackProviderConfig)
-        assertModelAllowed({ type: fallbackProviderConfig.type, baseUrl: fallbackProviderConfig.baseUrl, model: fallbackModel });
-      const executionProfile = {
-        type: providerConfig.type,
-        baseUrl: providerConfig.baseUrl,
-        keyRef: providerConfig.keyRef,
-        model,
-        effort: profile.effort,
-        pricing: providerConfig.pricing,
-        attemptTimeoutMs: providerConfig.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS,
-        ...(providerConfig.pricingFile ? { pricingFile: resolveConfigRelativePath(providerConfig.pricingFile, loaded.configPath) } : {}),
-        ...(fallbackProviderConfig
-          ? {
-              fallback: {
-                type: fallbackProviderConfig.type,
-                baseUrl: fallbackProviderConfig.baseUrl,
-                keyRef: fallbackProviderConfig.keyRef,
-                model: fallbackModel,
-                effort: fallbackProfile.effort,
-                pricing: fallbackProviderConfig.pricing,
-                attemptTimeoutMs: fallbackProviderConfig.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS,
-                ...(fallbackProviderConfig.pricingFile
-                  ? { pricingFile: resolveConfigRelativePath(fallbackProviderConfig.pricingFile, loaded.configPath) }
-                  : {}),
-              },
-            }
+      const [model] = models;
+      const snapshotRoute = (route, concrete) => ({
+        type: route.providerConfig.type,
+        baseUrl: route.providerConfig.baseUrl,
+        keyRef: route.providerConfig.keyRef,
+        model: concrete,
+        effort: route.profile.effort,
+        pricing: route.providerConfig.pricing,
+        attemptTimeoutMs: route.providerConfig.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS,
+        ...(route.providerConfig.pricingFile
+          ? { pricingFile: resolveConfigRelativePath(route.providerConfig.pricingFile, loaded.configPath) }
           : {}),
+      });
+      const fallbackRoutes = chain.slice(1).map((route, index) => snapshotRoute(route, models[index + 1]));
+      // `fallback` stays the first fallback for readers of older records.
+      const executionProfile = {
+        ...snapshotRoute(chain[0], model),
+        ...(fallbackRoutes.length ? { fallback: fallbackRoutes[0], fallbacks: fallbackRoutes } : {}),
       };
       // Repository policy may tighten reads, but never expands write scope.
       // A repository-provided verifier is always sandbox-required; only a
@@ -1125,10 +1214,11 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           sandboxMode: sandboxAvailable() ? 'macos' : 'policy-only',
           configuredModel: model,
           executionProfile,
-          ...pricingMetadata(fallbackProviderConfig ? [providerConfig, fallbackProviderConfig] : [providerConfig], loaded, [
-            ...(primaryNeedsDiscovery ? [model] : []),
-            ...(fallbackProviderConfig ? [fallbackModel] : []),
-          ]),
+          ...pricingMetadata(
+            chain.map((route) => route.providerConfig),
+            loaded,
+            [...(primaryNeedsDiscovery ? [model] : []), ...models.slice(1)],
+          ),
         },
         {
           launch,

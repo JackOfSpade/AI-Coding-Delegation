@@ -1,7 +1,9 @@
 /**
  * Hard routing policy for delegated workers.
  *
- * Offload runs the provider-maintained Flash, Sonnet and Opus routes. A DeepSeek Pro
+ * Offload runs the provider-maintained Flash, Sonnet, Opus, OpenAI GPT Terra
+ * and OpenAI GPT Sol routes. An OpenAI endpoint may be asked only for a Terra or
+ * Sol model, and a DeepSeek Pro
  * model must not be reachable through configuration, a persisted execution
  * snapshot, a per-request model override, or a model-name spelling variant.
  * Every layer that can choose a model calls `modelPolicyViolation`, so a
@@ -11,10 +13,16 @@
 /** The one model a DeepSeek endpoint may be asked for. */
 export const OFFLOAD_DEEPSEEK_MODEL = 'deepseek-flash';
 export const OFFLOAD_DEEPSEEK_LATEST_FLASH = 'latest-flash';
+export const OFFLOAD_OPENAI_LATEST_TERRA = 'latest-terra';
+export const OFFLOAD_OPENAI_LATEST_SOL = 'latest-sol';
 export const OFFLOAD_ANTHROPIC_LATEST_SONNET = 'latest-sonnet';
 export const OFFLOAD_ANTHROPIC_LATEST_OPUS = 'latest-opus';
 
 export const isAnthropicModel = (model) => typeof model === 'string' && /^claude-(?:sonnet|opus)-[0-9]+-[0-9]+(?:-[0-9]+)?$/.test(model);
+
+export const isOpenAITerraModel = (model) => typeof model === 'string' && /^gpt-\d+(?:\.\d+)?-terra$/.test(model);
+export const isOpenAISolModel = (model) => typeof model === 'string' && /^gpt-\d+(?:\.\d+)?-sol$/.test(model);
+export const isOpenAIModel = (model) => isOpenAITerraModel(model) || isOpenAISolModel(model);
 
 const modelTokens = (model) =>
   String(model)
@@ -43,6 +51,15 @@ export function isDeepSeekEndpoint(baseUrl) {
   return hostname === 'deepseek.com' || hostname.endsWith('.deepseek.com');
 }
 
+/** Only the official OpenAI API host; a parse failure is simply not OpenAI. */
+export function isOpenAIEndpoint(baseUrl) {
+  try {
+    return new URL(String(baseUrl)).hostname.toLowerCase() === 'api.openai.com';
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Returns a human-readable reason when `model` may not be requested from
  * `baseUrl`, or undefined when it is allowed. Callers throw their own error type.
@@ -52,6 +69,15 @@ export function modelPolicyViolation({ baseUrl, model, type, allowSelector = fal
   if (type === 'anthropic-messages') {
     if (allowSelector && [OFFLOAD_ANTHROPIC_LATEST_SONNET, OFFLOAD_ANTHROPIC_LATEST_OPUS].includes(model)) return undefined;
     return isAnthropicModel(model) ? undefined : 'only a Claude Sonnet or Opus model is permitted on an Anthropic Messages endpoint';
+  }
+  if (type === undefined || type === 'openai-chat') {
+    if (isOpenAIEndpoint(baseUrl)) {
+      if (allowSelector && [OFFLOAD_OPENAI_LATEST_TERRA, OFFLOAD_OPENAI_LATEST_SOL].includes(model)) return undefined;
+      if (isProModel(model)) return `model "${model}" is disabled: Offload does not route to Pro models; use a GPT Terra or GPT Sol model`;
+      return isOpenAIModel(model)
+        ? undefined
+        : `model "${model}" is not allowed on an OpenAI endpoint: only GPT Terra and GPT Sol models are permitted`;
+    }
   }
   if (type === 'openai-chat' && isDeepSeekEndpoint(baseUrl) && allowSelector && model === OFFLOAD_DEEPSEEK_LATEST_FLASH) return undefined;
   if (isProModel(model))

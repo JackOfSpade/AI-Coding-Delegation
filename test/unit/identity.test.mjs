@@ -95,3 +95,9 @@ test('runtime identity advertises the retrospective digest as an additive capabi
   assert.equal(identity.capabilities.retrospective, true);
   assert.equal(identity.schemaRevision, 2, 'include "retrospective" and jobIds are additive: no schema revision bump');
 });
+
+test('runtime identity advertises the OpenAI credit tier as an additive capability', () => {
+  const identity = runtimeIdentity();
+  assert.equal(identity.capabilities.openaiCreditTier, true);
+  assert.equal(identity.schemaRevision, 2, 'an additive capability does not bump the schema revision');
+});

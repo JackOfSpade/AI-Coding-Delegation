@@ -478,9 +478,30 @@ function canonicalRelevantPaths(paths) {
   }
   return new Set(entries).size === entries.length ? entries : null;
 }
+/** Fallback routes in order; a legacy record's single `fallback` is `fallbacks: [fallback]`. */
+export function executionFallbacks(execution) {
+  if (Array.isArray(execution?.fallbacks)) return execution.fallbacks;
+  return execution?.fallback ? [execution.fallback] : [];
+}
+/** Persisted route stage; a legacy `creditFallback: true` record without `providerStage` is stage 1. */
+export function recordedProviderStage(job) {
+  if (Number.isSafeInteger(job?.providerStage) && job.providerStage >= 0) return job.providerStage;
+  return job?.creditFallback === true ? 1 : 0;
+}
 function validExecutionProfile(value) {
   if (value == null) return true;
-  const permitted = new Set(['type', 'baseUrl', 'keyRef', 'model', 'effort', 'pricing', 'pricingFile', 'attemptTimeoutMs', 'fallback']);
+  const permitted = new Set([
+    'type',
+    'baseUrl',
+    'keyRef',
+    'model',
+    'effort',
+    'pricing',
+    'pricingFile',
+    'attemptTimeoutMs',
+    'fallback',
+    'fallbacks',
+  ]);
   const cleanProviderText = (text, maximum) =>
     typeof text === 'string' && text.length > 0 && text.length <= maximum && !/[\x00-\x1f\x7f]/.test(text);
   const one = (profile, nested = false) => {
@@ -488,7 +509,7 @@ function validExecutionProfile(value) {
       !profile ||
       typeof profile !== 'object' ||
       Array.isArray(profile) ||
-      Object.keys(profile).some((key) => !permitted.has(key) || (nested && key === 'fallback')) ||
+      Object.keys(profile).some((key) => !permitted.has(key) || (nested && (key === 'fallback' || key === 'fallbacks'))) ||
       !['openai-chat', 'anthropic-messages'].includes(profile.type) ||
       !cleanProviderText(profile.baseUrl, 2048) ||
       !cleanText(profile.model, 128) ||
@@ -515,7 +536,15 @@ function validExecutionProfile(value) {
       return false;
     }
   };
-  return one(value) && (value.fallback === undefined || one(value.fallback, true));
+  if (!one(value)) return false;
+  if (value.fallbacks !== undefined) {
+    // Primary plus at most two fallbacks; the singular field mirrors the first.
+    if (!Array.isArray(value.fallbacks) || value.fallbacks.length < 1 || value.fallbacks.length > 2) return false;
+    if (!value.fallbacks.every((route) => one(route, true))) return false;
+    if (value.fallback === undefined || JSON.stringify(value.fallback) !== JSON.stringify(value.fallbacks[0])) return false;
+    return true;
+  }
+  return value.fallback === undefined || one(value.fallback, true);
 }
 // `writePaths` is a convenience snapshot written alongside a job, never an
 // authority. Derive the operative scope from fields validated at every
@@ -1934,6 +1963,7 @@ export class JobManager {
           // allowed to cross the provider POST boundary.
           let cappedFinishRecoveryState = job.cappedFinishRecovery;
           let budgetFinishRecoveryState = job.budgetFinishRecovery;
+          let providerStageState = recordedProviderStage(job);
           const workerJob =
             job.assertionRepair?.round === (job.rounds || 0) ? { ...job, ownedPaths: job.assertionRepair.paths, extraWritable: [] } : job;
           // limits.timeoutMinutes bounds the worker round from its claim, as the
@@ -1959,8 +1989,17 @@ export class JobManager {
             defects,
             progress: async (event) => {
               const progress = {};
-              if (event?.action === 'provider_credit_fallback' && event.creditFallback === true && job.executionProfile?.fallback)
-                progress.creditFallback = true;
+              if (event?.action === 'provider_credit_fallback') {
+                // Monotonic and bounded by the sealed route chain: a worker can
+                // only ever advance to a route this job snapshotted at start.
+                const routeCount = 1 + executionFallbacks(job.executionProfile).length;
+                const requested = event.providerStage ?? (event.creditFallback === true ? 1 : undefined);
+                if (Number.isSafeInteger(requested) && requested >= 1 && requested < routeCount && requested > providerStageState) {
+                  providerStageState = requested;
+                  progress.providerStage = requested;
+                  progress.creditFallback = true;
+                }
+              }
               if (Object.hasOwn(event || {}, 'cappedFinishRecovery')) {
                 const requested = event.cappedFinishRecovery;
                 const permitted =
@@ -3136,7 +3175,8 @@ export class JobManager {
         : {}),
       ...(job.workspaceCleanupRequired === true ? { workspaceCleanupRequired: true } : {}),
       ...(job.workspaceRetained === true ? { workspaceRetained: true } : {}),
-      ...(job.creditFallback === true ? { creditFallback: true } : {}),
+      ...(job.creditFallback === true || recordedProviderStage(job) > 0 ? { creditFallback: true } : {}),
+      ...(recordedProviderStage(job) > 0 ? { providerStage: recordedProviderStage(job) } : {}),
       ...(safeProviderFailure(job.providerFailure) ? { providerFailure: safeProviderFailure(job.providerFailure) } : {}),
       ...(safeProviderFinishReason(job.providerFinishReason)
         ? { providerFinishReason: safeProviderFinishReason(job.providerFinishReason) }

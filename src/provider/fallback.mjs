@@ -1,21 +1,44 @@
 import { ProviderError } from './openai-chat.mjs';
 
-/** Switch only after an uncharged, explicit promotional-credit refusal. */
+/**
+ * Walk an ordered route chain, advancing only after an uncharged, explicit
+ * credit-exhaustion refusal from the active route. `onTransition(toStage)` must
+ * make the new stage durable before the next route is spent on.
+ * The legacy {primary, fallback, primaryModel, fallbackModel, fallbackUsed}
+ * signature maps to two routes.
+ */
 export class CreditFallbackProvider {
-  constructor({ primary, fallback, primaryModel, fallbackModel, onTransition, fallbackUsed = false } = {}) {
-    if (!primary?.chat || !fallback?.chat || typeof primaryModel !== 'string' || typeof fallbackModel !== 'string')
-      throw new TypeError('primary, fallback, and concrete models are required');
-    this.primary = primary;
-    this.fallback = fallback;
-    this.primaryModel = primaryModel;
-    this.fallbackModel = fallbackModel;
-    this.active = fallbackUsed ? fallback : primary;
-    this.activeModel = fallbackUsed ? fallbackModel : primaryModel;
-    this.fallbackUsed = fallbackUsed;
+  constructor({ routes, stage = 0, onTransition, primary, fallback, primaryModel, fallbackModel, fallbackUsed = false } = {}) {
+    if (!routes) {
+      routes = [
+        { provider: primary, model: primaryModel },
+        { provider: fallback, model: fallbackModel },
+      ];
+      stage = fallbackUsed ? 1 : 0;
+    }
+    if (
+      !Array.isArray(routes) ||
+      routes.length < 2 ||
+      routes.length > 3 ||
+      routes.some((route) => !route?.provider?.chat || typeof route.model !== 'string' || !route.model)
+    )
+      throw new TypeError('2 to 3 routes with providers and concrete models are required');
+    if (!Number.isSafeInteger(stage) || stage < 0 || stage >= routes.length) throw new TypeError('stage must index a route');
+    this.routes = routes.map(({ provider, model }) => ({ provider, model }));
+    this.stage = stage;
     this.onTransition = onTransition;
   }
+  get active() {
+    return this.routes[this.stage].provider;
+  }
+  get activeModel() {
+    return this.routes[this.stage].model;
+  }
+  get fallbackUsed() {
+    return this.stage > 0;
+  }
   allowsResponseModel(_requested, response) {
-    return response === this.primaryModel || response === this.fallbackModel;
+    return this.routes.some((route) => route.model === response);
   }
   async *chat(request) {
     let emitted = false;
@@ -25,13 +48,13 @@ export class CreditFallbackProvider {
         yield event;
       }
     } catch (error) {
-      if (emitted || this.active !== this.primary || !(error instanceof ProviderError) || error.kind !== 'credit_exhausted') throw error;
+      if (emitted || this.stage >= this.routes.length - 1 || !(error instanceof ProviderError) || error.kind !== 'credit_exhausted')
+        throw error;
+      const next = this.stage + 1;
       // Persist before spending on the new route, including if it then fails.
-      await this.onTransition?.();
-      this.active = this.fallback;
-      this.activeModel = this.fallbackModel;
-      this.fallbackUsed = true;
-      yield* this.fallback.chat({ ...request, model: this.fallbackModel });
+      await this.onTransition?.(next);
+      this.stage = next;
+      yield* this.chat(request);
     }
   }
 }

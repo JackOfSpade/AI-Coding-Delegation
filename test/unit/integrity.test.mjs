@@ -10,6 +10,7 @@ import {
   credentialFingerprint,
   deriveJobMacKey,
   validCredentialFingerprint,
+  validCredentialFingerprints,
 } from '../../src/integrity.mjs';
 
 test(
@@ -108,4 +109,16 @@ test('Windows root uses one fixed vault item and a create race re-reads the winn
   const key = deriveJobMacKey(root.value, { repoPath: '/repo', gitDir: '/repo/.git', id: 'oj-one' });
   assert.equal(typeof key, 'string');
   assert.equal(validCredentialFingerprint(credentialFingerprint(root.value, 'credential')), true);
+});
+
+test('fallback credential fingerprint lists hold one or two valid fingerprints only', () => {
+  const root = 'a'.repeat(43);
+  const one = credentialFingerprint(root, 'first');
+  const two = credentialFingerprint(root, 'second');
+  assert.equal(validCredentialFingerprints([one]), true);
+  assert.equal(validCredentialFingerprints([one, two]), true);
+  assert.equal(validCredentialFingerprints([]), false);
+  assert.equal(validCredentialFingerprints([one, two, one]), false);
+  assert.equal(validCredentialFingerprints([one, { ...two, extra: 1 }]), false);
+  assert.equal(validCredentialFingerprints(one), false);
 });

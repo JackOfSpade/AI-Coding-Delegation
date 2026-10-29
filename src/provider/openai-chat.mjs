@@ -1,6 +1,6 @@
 import { sseJson } from './sse.mjs';
-import { bestEffort, fetchAbortable } from './abort.mjs';
-import { assertModelAllowed, modelPolicyViolation } from '../model-policy.mjs';
+import { abortableBody, bestEffort, fetchAbortable } from './abort.mjs';
+import { assertModelAllowed, isOpenAIEndpoint, modelPolicyViolation } from '../model-policy.mjs';
 
 export const DEFAULT_ATTEMPT_TIMEOUT_MS = 300_000;
 
@@ -136,7 +136,7 @@ const streamFailureKind = (error) => {
 // Context may retain local metadata (for display or durability), but the
 // provider receives only fields in the Chat Completions wire schema. In
 // particular DeepSeek's tool messages document no `name` field.
-export function wireMessages(messages) {
+export function wireMessages(messages, { reasoning = true } = {}) {
   return messages.map((message) => {
     if (!message || typeof message !== 'object' || typeof message.role !== 'string') throw new ProviderError('Invalid transcript message');
     if (message.role === 'system' || message.role === 'user') {
@@ -154,7 +154,7 @@ export function wireMessages(messages) {
           (typeof message.reasoning_content !== 'string' || message.reasoning_content.length > MAX_MESSAGE_CHARS)
         )
           throw new ProviderError('Invalid assistant reasoning');
-        output.reasoning_content = message.reasoning_content;
+        if (reasoning) output.reasoning_content = message.reasoning_content;
       }
       if (message.tool_calls !== undefined) {
         if (!Array.isArray(message.tool_calls) || message.tool_calls.length === 0 || message.tool_calls.length > MAX_TOOL_CALLS)
@@ -256,6 +256,30 @@ export function normalizeUsage(usage) {
   return { inputTokens, outputTokens, cacheHitTokens: normalizedCacheHitTokens, cacheMissTokens, totalTokens };
 }
 
+const OPENAI_CREDIT_CODES = new Set(['credit_balance_exhausted', 'insufficient_quota']);
+// Only the explicit error envelope qualifies; the body is read within a small
+// bound and is never retained or echoed.
+async function openAICreditExhausted(response, signal) {
+  try {
+    const chunks = [];
+    let bytes = 0;
+    for await (const chunk of abortableBody(response.body, signal)) {
+      bytes += chunk.byteLength;
+      if (bytes > 65_536) return false;
+      chunks.push(chunk);
+    }
+    const error = JSON.parse(Buffer.concat(chunks).toString('utf8'))?.error;
+    return (
+      Boolean(error) &&
+      typeof error === 'object' &&
+      !Array.isArray(error) &&
+      (OPENAI_CREDIT_CODES.has(error.code) || error.type === 'insufficient_quota')
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** OpenAI chat-completions adapter. A whole successful attempt is buffered
  * before yielding: retrying a broken stream can therefore never duplicate a
  * previously emitted delta. The request timeout stays live through body EOF. */
@@ -340,6 +364,14 @@ export class OpenAIChatProvider {
         // Provider response bodies may contain an echoed prompt, credentials,
         // or other untrusted data.  Never put them in an error/log path.
         if (!response.ok) {
+          if (isOpenAIEndpoint(this.baseUrl) && [400, 402, 429].includes(response.status)) {
+            if (await openAICreditExhausted(response, controller.signal))
+              throw new ProviderError('OpenAI API credit is exhausted', {
+                status: response.status,
+                kind: 'credit_exhausted',
+                retryable: false,
+              });
+          }
           bestEffort(() => response.body?.cancel?.());
           throw new ProviderError(`Chat request failed (HTTP ${response.status})`, {
             status: response.status,
@@ -389,14 +421,17 @@ export class OpenAIChatProvider {
     if (!Array.isArray(messages) || !Array.isArray(tools)) throw new TypeError('messages and tools must be arrays');
     if (retryLimit !== undefined && (!Number.isSafeInteger(retryLimit) || retryLimit < 0 || retryLimit > this.retries))
       throw new TypeError('retryLimit must be an integer from 0 to configured retries');
-    const { thinking: requestedThinking, stream: requestedStream, stream_options: requestedStreamOptions, ...requestOptions } = options;
+    const { thinking: requestedThinking, stream: requestedStream, stream_options: requestedStreamOptions, ...rawOptions } = options;
+    const openai = isOpenAIEndpoint(this.baseUrl);
+    const { max_tokens: maxTokens, ...withoutMaxTokens } = rawOptions;
+    const requestOptions = openai && maxTokens !== undefined ? { ...withoutMaxTokens, max_completion_tokens: maxTokens } : rawOptions;
     if (requestedStream !== undefined || requestedStreamOptions !== undefined)
       throw new ProviderError('stream options are controlled by the provider adapter');
     const requestModel = requestOptions.model ?? this.model;
     if (!validModel(requestModel)) throw new ProviderError('Invalid request model');
     const modelViolation = modelPolicyViolation({ baseUrl: this.baseUrl, model: requestModel });
     if (modelViolation) throw new ProviderError(`Offload model policy: ${modelViolation}`, { kind: 'model-policy' });
-    const thinking = requestedThinking ?? this.thinking;
+    const thinking = openai ? undefined : (requestedThinking ?? this.thinking);
     const reasoningEffort = requestOptions.reasoning_effort ?? this.reasoningEffort;
     if (thinking?.type === 'enabled' && (options.tool_choice === 'required' || typeof options.tool_choice === 'object'))
       throw new ProviderError('Thinking mode does not support required or named tool_choice');
@@ -404,7 +439,7 @@ export class OpenAIChatProvider {
       {
         ...requestOptions,
         model: requestModel,
-        messages: wireMessages(messages),
+        messages: wireMessages(messages, { reasoning: !openai }),
         tools,
         stream: true,
         stream_options: { include_usage: true },
@@ -423,6 +458,14 @@ export class OpenAIChatProvider {
     for (const chunk of chunks) {
       if (!chunk || typeof chunk !== 'object' || Array.isArray(chunk)) throw new ProviderError('Invalid SSE response chunk');
       if (chunk?.model !== undefined && !validModel(chunk.model)) throw new ProviderError('Invalid response model');
+      // OpenAI may echo the dated snapshot of the requested alias; it is the same priced model.
+      if (
+        openai &&
+        typeof chunk.model === 'string' &&
+        /^-\d{4}-\d{2}-\d{2}$/.test(chunk.model.slice(requestModel.length)) &&
+        chunk.model.startsWith(requestModel)
+      )
+        chunk.model = requestModel;
       if (chunk.choices !== undefined) {
         if (!Array.isArray(chunk.choices)) throw new ProviderError('Invalid SSE response choices');
         const choice = chunk.choices[0];

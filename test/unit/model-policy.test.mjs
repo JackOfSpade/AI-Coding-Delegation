@@ -11,6 +11,10 @@ import {
   OFFLOAD_DEEPSEEK_LATEST_FLASH,
   OFFLOAD_DEEPSEEK_MODEL,
   assertModelAllowed,
+  OFFLOAD_OPENAI_LATEST_SOL,
+  OFFLOAD_OPENAI_LATEST_TERRA,
+  isOpenAIEndpoint,
+  isOpenAIModel,
   isProModel,
   modelPolicyViolation,
 } from '../../src/model-policy.mjs';
@@ -80,14 +84,14 @@ test('dynamic selectors are accepted only while validating configuration, never 
   assert.ok(modelPolicyViolation({ type: 'openai-chat', baseUrl: 'https://api.deepseek.com', model: OFFLOAD_DEEPSEEK_LATEST_FLASH }));
 });
 
-test('shipped defaults and the example config route promo Sonnet to Flash fallback', () => {
-  assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles), ['sonnet', 'opus', 'flash']);
+test('shipped defaults and the example config route Sonnet -> Terra -> Flash and Opus -> Sol -> Flash', () => {
+  assert.deepEqual(Object.keys(DEFAULT_CONFIG.profiles), ['sonnet', 'opus', 'terra', 'sol', 'flash']);
   assert.equal(DEFAULT_CONFIG.default, 'sonnet');
   assert.equal(DEFAULT_CONFIG.profiles.sonnet.model, OFFLOAD_ANTHROPIC_LATEST_SONNET);
-  assert.equal(DEFAULT_CONFIG.profiles.sonnet.fallback, 'flash');
+  assert.equal(DEFAULT_CONFIG.profiles.sonnet.fallback, 'terra');
   assert.equal(DEFAULT_CONFIG.profiles.flash.model, OFFLOAD_DEEPSEEK_LATEST_FLASH);
   const example = JSON.parse(readFileSync(join(root, 'config.example.json'), 'utf8'));
-  assert.deepEqual(Object.keys(example.profiles), ['sonnet', 'opus', 'flash']);
+  assert.deepEqual(Object.keys(example.profiles), ['sonnet', 'opus', 'terra', 'sol', 'flash']);
   assert.equal(example.default, 'sonnet');
   assert.doesNotThrow(() => validateConfig(structuredClone(example)));
 });
@@ -170,4 +174,28 @@ test('no shipped source, skill, template, or config names a Pro model id', () =>
     .filter((file) => /deepseek[-_.]?v?\d*[-_.]?pro\b/i.test(readFileSync(file, 'utf8')))
     .map((file) => relative(root, file));
   assert.deepEqual(offenders, []);
+});
+
+test('OpenAI endpoints allow only Terra and Sol models; selectors only in config', () => {
+  const base = 'https://api.openai.com/v1';
+  for (const model of ['gpt-6.1-terra', 'gpt-6-sol', 'gpt-10.12-terra'])
+    assert.equal(modelPolicyViolation({ baseUrl: base, model, type: 'openai-chat' }), undefined, model);
+  for (const model of ['gpt-6.1', 'gpt-5-mini', 'gpt-6.1-terra-pro', 'o3', 'deepseek-flash', 'gpt-6.1-pro'])
+    assert.match(modelPolicyViolation({ baseUrl: base, model }), /disabled|not allowed/, model);
+  assert.ok(modelPolicyViolation({ baseUrl: base, model: OFFLOAD_OPENAI_LATEST_TERRA }));
+  assert.equal(
+    modelPolicyViolation({ baseUrl: base, model: OFFLOAD_OPENAI_LATEST_TERRA, type: 'openai-chat', allowSelector: true }),
+    undefined,
+  );
+  assert.equal(
+    modelPolicyViolation({ baseUrl: base, model: OFFLOAD_OPENAI_LATEST_SOL, type: 'openai-chat', allowSelector: true }),
+    undefined,
+  );
+  assert.ok(modelPolicyViolation({ baseUrl: base, model: 'latest-flash', type: 'openai-chat', allowSelector: true }));
+  assert.ok(modelPolicyViolation({ baseUrl: 'https://api.deepseek.com', model: 'gpt-6.1-terra', type: 'openai-chat' }));
+  assert.equal(isOpenAIEndpoint('https://api.openai.com/v1'), true);
+  assert.equal(isOpenAIEndpoint('https://evil.example/api.openai.com'), false);
+  assert.equal(isOpenAIEndpoint('not a url'), false);
+  assert.equal(isOpenAIModel('gpt-6.1-terra') && isOpenAIModel('gpt-6-sol'), true);
+  assert.equal(isOpenAIModel('gpt-6.1-pro'), false);
 });

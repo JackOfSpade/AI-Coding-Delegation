@@ -1558,3 +1558,27 @@ test('late apply primary pass preserves the earlier native crash without repeati
     assert.match(before, /then use offload_apply/);
   }
 });
+test('report names every provider hop actually taken, and a legacy creditFallback is one hop', () => {
+  const route = (model) => ({ type: 'openai-chat', baseUrl: 'https://x.test/v1', keyRef: 'env:K', model });
+  const executionProfile = {
+    ...route('claude-sonnet-5-5'),
+    fallback: route('gpt-6.1-terra'),
+    fallbacks: [route('gpt-6.1-terra'), route('deepseek-flash')],
+  };
+  const lines = (job) =>
+    compactReport({ id: 'oj-1', status: 'DONE_UNVERIFIED', executionProfile, ...job })
+      .split('\n')
+      .filter((line) => line.startsWith('provider transition:'));
+  assert.deepEqual(lines({}), []);
+  assert.deepEqual(lines({ creditFallback: true, providerStage: 1 }), [
+    'provider transition: claude-sonnet-5-5 -> gpt-6.1-terra (explicit credit exhaustion; work and conversation retained)',
+  ]);
+  assert.deepEqual(lines({ creditFallback: true, providerStage: 2 }), [
+    'provider transition: claude-sonnet-5-5 -> gpt-6.1-terra (explicit credit exhaustion; work and conversation retained)',
+    'provider transition: gpt-6.1-terra -> deepseek-flash (explicit credit exhaustion; work and conversation retained)',
+  ]);
+  const legacy = { ...route('claude-sonnet-5-5'), fallback: route('deepseek-flash') };
+  assert.deepEqual(lines({ executionProfile: legacy, creditFallback: true }), [
+    'provider transition: claude-sonnet-5-5 -> deepseek-flash (explicit credit exhaustion; work and conversation retained)',
+  ]);
+});

@@ -255,19 +255,25 @@ test('Anthropic discovery chooses the newest listed concrete Sonnet model and re
 test('credit fallback switches once and keeps the concrete fallback model for the job', async () => {
   const seen = [];
   const provider = new CreditFallbackProvider({
-    primary: {
-      async *chat() {
-        throw new ProviderError('credit exhausted', { kind: 'credit_exhausted' });
+    routes: [
+      {
+        provider: {
+          async *chat() {
+            throw new ProviderError('credit exhausted', { kind: 'credit_exhausted' });
+          },
+        },
+        model: 'claude-sonnet-5-5',
       },
-    },
-    fallback: {
-      async *chat(request) {
-        seen.push(request.model);
-        yield { text: 'fallback', model: 'deepseek-flash' };
+      {
+        provider: {
+          async *chat(request) {
+            seen.push(request.model);
+            yield { text: 'fallback', model: 'deepseek-flash' };
+          },
+        },
+        model: 'deepseek-flash',
       },
-    },
-    primaryModel: 'claude-sonnet-5-5',
-    fallbackModel: 'deepseek-flash',
+    ],
   });
   const first = [];
   for await (const event of provider.chat({ messages: [], tools: [] })) first.push(event);
@@ -656,20 +662,26 @@ test('fallback refuses partial streams, transport and ordinary HTTP errors', asy
     let transitions = 0,
       fallbackCalls = 0;
     const provider = new CreditFallbackProvider({
-      primaryModel: 'claude-sonnet-5-5',
-      fallbackModel: 'deepseek-flash',
-      primary: {
-        async *chat() {
-          if (kind === 'partial') yield { text: 'partial' };
-          throw new ProviderError('fixed failure', { kind: kind === 'partial' ? 'credit_exhausted' : kind, status: 400 });
+      routes: [
+        {
+          provider: {
+            async *chat() {
+              if (kind === 'partial') yield { text: 'partial' };
+              throw new ProviderError('fixed failure', { kind: kind === 'partial' ? 'credit_exhausted' : kind, status: 400 });
+            },
+          },
+          model: 'claude-sonnet-5-5',
         },
-      },
-      fallback: {
-        async *chat() {
-          fallbackCalls++;
-          yield { text: 'unexpected' };
+        {
+          provider: {
+            async *chat() {
+              fallbackCalls++;
+              yield { text: 'unexpected' };
+            },
+          },
+          model: 'deepseek-flash',
         },
-      },
+      ],
       onTransition: () => {
         transitions++;
       },

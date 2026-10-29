@@ -70,6 +70,7 @@ test('MCP lists exact tools, initializes, pings and dispatches', async () => {
     verifierInterpreter: true,
     verifierImports: true,
     retrospective: true,
+    openaiCreditTier: true,
   });
   assert.ok(
     values.some((value) => value.id === null && value.result?.tools),
@@ -615,7 +616,7 @@ test('MCP keeps current requests stateless and legacy initialize envelopes separ
   assert.match(list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.allowNetwork.description, /only/);
   assert.match(
     list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.profile.description,
-    /falls back to the provider-maintained DeepSeek Flash route/,
+    /then provider-maintained DeepSeek Flash\)/,
   );
   assert.match(
     list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.profile.description,
@@ -742,7 +743,7 @@ test('MCP exposes the canonical static skill with exact resources and safe reque
   assert.match(expectedText, /including Sonnet ultracode\/native-agent workflows/);
   assert.match(
     expectedText,
-    /A mention, quotation, negation, or discussion of `\/offload_sonnet`, offload, delegation, \*\*DeepSeek\*\* \/ \*\*DeepSeek-V4\.1-Flash\*\*, a provider, or a model does not select Offload/,
+    /A mention, quotation, negation, or discussion of `\/offload_sonnet`, offload, delegation, \*\*DeepSeek\*\* \/ \*\*DeepSeek-V4\.1-Flash\*\*, \*\*OpenAI\*\* \/ \*\*GPT Terra\*\* \/ \*\*GPT Sol\*\*, a provider, or a model does not select Offload/,
   );
   assert.match(expectedText, /A standalone instruction not to use native subagents does not trigger Offload/);
   assert.match(expectedText, /For an `\/offload_sonnet` or `\/offload_opus` command invocation, end every final answer/);

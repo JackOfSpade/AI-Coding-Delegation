@@ -67,6 +67,30 @@ test('numeric budget reservation output tokens survive storage redaction while a
   }
 });
 
+test('opaque credential fingerprint lists survive redaction while other credential-named fields stay redacted', async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir });
+    const fingerprint = (value) => ({ version: 1, algorithm: 'hmac-sha256', value: value.repeat(64) });
+    const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
+    await store.update(job.id, {
+      credentialFingerprint: fingerprint('a'),
+      fallbackCredentialFingerprint: fingerprint('b'),
+      fallbackCredentialFingerprints: [fingerprint('b'), fingerprint('c')],
+      workerCredential: 'must-not-persist',
+    });
+    const stored = await store.get(job.id);
+    assert.deepEqual(stored.fallbackCredentialFingerprints, [fingerprint('b'), fingerprint('c')]);
+    assert.deepEqual(stored.fallbackCredentialFingerprint, fingerprint('b'));
+    assert.equal(stored.workerCredential, '[REDACTED]');
+    // A cleared list is dropped rather than persisted as a redaction marker.
+    await store.update(job.id, { fallbackCredentialFingerprints: undefined });
+    assert.equal((await store.get(job.id)).fallbackCredentialFingerprints, undefined);
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
 test('failed preparation or initial record publication leaves no owned job directory', async () => {
   const gitDir = tempDir();
   try {
