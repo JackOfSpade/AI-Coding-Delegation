@@ -236,11 +236,11 @@ test('keychain commands are injected and platform-specific', () => {
   );
   assert.deepEqual(seen[0], ['security', ['find-generic-password', '-a', 'offload', '-s', 'offload-test', '-w']]);
 });
-test('macOS keychain writes never send a secret through argv or an undocumented stdin pipe', () => {
+test('macOS interactive keychain writes use security’s own prompt and never take a secret', () => {
   const secret = 'macOS-Only-Secret';
   let call;
   assert.throws(
-    () => storeKeychainSecret('offload-test', secret, { platform: 'darwin', execFile: () => ({ status: 0 }) }),
+    () => storeKeychainSecret('offload-test', undefined, { platform: 'darwin', execFile: () => ({ status: 0 }) }),
     (error) => error.code === 'E_SECRET_STORE_INTERACTIVE',
   );
   assert.deepEqual(
@@ -258,6 +258,31 @@ test('macOS keychain writes never send a secret through argv or an undocumented 
   assert.equal(call.args.includes(secret), false);
   assert.deepEqual(call.options.stdio, 'inherit');
   assert.equal(Object.hasOwn(call.options, 'input'), false);
+});
+test('macOS keychain writes pipe a long secret to security -i, never argv, and verify it exactly', () => {
+  const secret = `sk-proj-${'b'.repeat(160)}`;
+  let call;
+  const store = (stored) =>
+    storeKeychainSecret('offload-openai', secret, {
+      platform: 'darwin',
+      execFile: (cmd, args, options) => {
+        call = { cmd, args, options };
+        return { status: 0 };
+      },
+      readExecFile: () => `${stored}\n`,
+    });
+  assert.deepEqual(store(secret), { stored: true, service: 'offload-openai' });
+  assert.deepEqual([call.cmd, call.args], ['security', ['-i']]);
+  assert.equal(call.options.input, `add-generic-password -U -a offload -s offload-openai -w ${secret}\n`);
+  assert.throws(
+    () => store(secret.slice(0, 128)),
+    (error) => error.code === 'E_SECRET_STORE' && !error.message.includes(secret),
+  );
+  for (const bad of ['has space', 'quote"d', 'new\nline'])
+    assert.throws(
+      () => storeKeychainSecret('offload-openai', bad, { platform: 'darwin', execFile: () => assert.fail('must not run') }),
+      (error) => error.code === 'E_SECRET_INVALID',
+    );
 });
 test('Windows Credential Locker transport keeps secret out of argv and uses stdin', () => {
   const calls = [];

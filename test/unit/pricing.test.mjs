@@ -124,3 +124,12 @@ test('Claude five-minute cache writes are priced separately and accumulate throu
   broken.models['claude-opus-5-5'].usd_per_1m.input_cache_write.peak = -1;
   assert.throws(() => validatePricingTable(broken), /non-negative/);
 });
+
+test('openai pricing table prices Terra and Sol and lacks unknown releases', () => {
+  const openai = loadPricing('openai-2026-10-26');
+  const usage = { inputTokens: 1_000_000, cacheHitTokens: 0, cacheMissTokens: 1_000_000, outputTokens: 1_000_000 };
+  const now = new Date('2026-10-28T02:00:00Z');
+  assert.equal(priceUsage(openai, 'gpt-6.1-terra', usage, now).usd, 6);
+  assert.equal(priceUsage(openai, 'gpt-6.1-sol', usage, new Date('2026-10-31T12:00:00Z')).usd, 12);
+  assert.equal(resolveModel(openai, 'gpt-6.2-terra'), undefined);
+});

@@ -621,3 +621,13 @@ test('CLI forwards explicit assertion paths and named defects for the fixed repa
   assert.equal(status, 0);
   assert.deepEqual(seen, ['job', ['src/a.js: expected 42'], { repoPath: undefined, assertionPaths: ['src/a.js'] }]);
 });
+test('doctor --hook prints the per-route keys line', async () => {
+  const out = sink();
+  await runCli(['doctor', '--hook'], {
+    core: { job: async () => ({ health: {} }), shutdown: async () => {} },
+    stdout: out.stream,
+    stderr: sink().stream,
+  });
+  assert.match(out.get(), /· keys (ok|missing(: [a-z, ]+)?) · sandbox /);
+  assert.doesNotMatch(out.get(), /· key (ok|missing) ·/);
+});

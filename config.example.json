@@ -13,11 +13,20 @@
       "keyRef": "keychain:offload-deepseek",
       "pricing": "deepseek-2026-10-01",
       "attemptTimeoutMs": 300000
+    },
+    "openai": {
+      "type": "openai-chat",
+      "baseUrl": "https://api.openai.com/v1",
+      "keyRef": "keychain:offload-openai",
+      "pricing": "openai-2026-10-26",
+      "attemptTimeoutMs": 300000
     }
   },
   "profiles": {
-    "sonnet": { "provider": "anthropic", "model": "latest-sonnet", "fallback": "flash" },
-    "opus": { "provider": "anthropic", "model": "latest-opus", "fallback": "flash" },
+    "sonnet": { "provider": "anthropic", "model": "latest-sonnet", "fallback": "terra" },
+    "opus": { "provider": "anthropic", "model": "latest-opus", "fallback": "sol" },
+    "terra": { "provider": "openai", "model": "latest-terra", "fallback": "flash" },
+    "sol": { "provider": "openai", "model": "latest-sol", "fallback": "flash" },
     "flash": { "provider": "deepseek", "model": "latest-flash" }
   },
   "default": "sonnet",

@@ -245,6 +245,9 @@ export function validCredentialFingerprint(value) {
     Object.keys(value).every((key) => ['version', 'algorithm', 'value'].includes(key))
   );
 }
+export function validCredentialFingerprints(value) {
+  return Array.isArray(value) && value.length >= 1 && value.length <= 2 && value.every(validCredentialFingerprint);
+}
 export function sameCredentialFingerprint(left, right) {
   if (!validCredentialFingerprint(left) || !validCredentialFingerprint(right)) return false;
   return timingSafeEqual(Buffer.from(left.value, 'hex'), Buffer.from(right.value, 'hex'));

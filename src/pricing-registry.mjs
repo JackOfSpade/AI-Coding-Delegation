@@ -68,7 +68,31 @@ const ANTHROPIC_2026_10_19 = deepFreeze({
   },
 });
 
+const OPENAI_2026_10_26 = deepFreeze({
+  fetched_at: '2026-10-26T00:00Z',
+  sources: ['https://developers.openai.com/api/docs/pricing'],
+  models: {
+    'gpt-6.1-sol': {
+      usd_per_1m: {
+        input_cache_hit: { off_peak: 0.1, peak: 0.1 },
+        input_cache_miss: { off_peak: 2, peak: 2 },
+        input_cache_write: { off_peak: 2.5, peak: 2.5 },
+        output: { off_peak: 10, peak: 10 },
+      },
+    },
+    'gpt-6.1-terra': {
+      usd_per_1m: {
+        input_cache_hit: { off_peak: 0.05, peak: 0.05 },
+        input_cache_miss: { off_peak: 1, peak: 1 },
+        input_cache_write: { off_peak: 1.25, peak: 1.25 },
+        output: { off_peak: 5, peak: 5 },
+      },
+    },
+  },
+});
+
 const TABLES = Object.freeze({
+  'openai-2026-10-26': OPENAI_2026_10_26,
   'anthropic-2026-10-19': ANTHROPIC_2026_10_19,
   'deepseek-2026-10-01': DEEPSEEK_2026_10_01,
   'anthropic-sonnet-2026-10-12': ANTHROPIC_SONNET_2026_10_12,

@@ -55,6 +55,18 @@ The adapter now recognizes the known sentence “Your credit balance is too low 
 
 `provider_credit_fallback` is logged as a progress action with `creditFallback: true` before Flash spend. The durable marker appears in public results and the report names the snapshotted primary and fallback models. The original context and worktree are reused; a later continuation/repair reconstructs the provider on Flash. No job schema or transcript is rewritten. Flash remains limited by existing discovery, model-policy, trusted-price, thinking/high-effort and cumulative-budget gates. Unit tests pin classification and partial-stream/transport refusal. Core integration tests cover immediate refusal, refusal after an Anthropic edit, budget continuation on Flash, a Flash authentication failure with the original edit still captured in the retained diff, and refusal of a concrete Flash fallback with no trusted price before any provider request. Retained/static worker snapshots receive the same price check before a request.
 
+OpenAI tier. `/offload_sonnet` falls back Sonnet -> latest GPT Terra -> Flash and `/offload_opus` Opus -> latest GPT Sol -> Flash (profiles `terra` and `sol`, provider `openai`, key `keychain:offload-openai`, trusted table `openai-2026-10-26`). Each hop needs that provider's explicit refusal before any output: for OpenAI, HTTP 429/402/400 whose JSON `error.code` is `credit_balance_exhausted` or `insufficient_quota` (or `error.type` `insufficient_quota`). `rate_limit_error`, spend-limit codes (`*_spend_limit_exceeded`, `organization_usage_limit_exceeded`), `slow_down`, 401/403, 5xx, network and partial streams never qualify, and bodies are never echoed into errors or logs. The adapter sends `max_completion_tokens` and `reasoning_effort: "high"` on OpenAI and no `reasoning_content` or `thinking`; the DeepSeek wire is unchanged. Discovery picks the highest `gpt-<major>[.<minor>]-terra|sol` by numeric version, not `created`; a release missing from the price table fails before spend. Every hop writes `provider_credit_fallback` with `providerStage` (durable `job.providerStage`, monotonic; `creditFallback: true` kept once stage >= 1) before spend on the next route, a double hop (OpenAI also exhausted) is allowed in one request, and a continuation or repair resumes at the persisted stage. Legacy records with only `creditFallback: true` resume at stage 1. Reports print one `provider transition: <from> -> <to>` line per hop. Unit and mock tests cover all of this with stubbed fetch only; never run these against the real keychain or API.
+
+Save the OpenAI key. The installer reads it at a hidden prompt, then on macOS pipes `add-generic-password … -w <key>` to `security -i` on stdin (never argv) and reads the item back, reporting success only when it matches exactly:
+
+```
+node install.mjs --key=openai
+```
+
+Do not use the bare `security add-generic-password -U -a offload -s offload-openai -w` prompt for OpenAI keys: it goes through getpass, which silently truncates input at 128 characters, and current OpenAI project keys are longer. The stored key then fails with HTTP 401 `invalid_api_key`.
+
+`offload doctor` and the session hook check every provider key in the default, `sonnet` and `opus` chains and print `keys ok` or `keys missing: openai`.
+
 For existing jobs:
 
 1. Update the installed package using the procedure below, restart clients, and check fresh health. A healthy old runtime does not include this fix merely because its health passes.

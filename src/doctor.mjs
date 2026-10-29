@@ -7,8 +7,16 @@ import { macosProfile, sandboxStatus } from './sandbox.mjs';
 import { healthIdentity } from './identity.mjs';
 import { resolveClientPaths } from './client-paths.mjs';
 import { DEFAULT_ATTEMPT_TIMEOUT_MS, OpenAIChatProvider } from './provider/openai-chat.mjs';
-import { AnthropicMessagesProvider, resolveLatestAnthropicSonnet } from './provider/anthropic-messages.mjs';
-import { OFFLOAD_ANTHROPIC_LATEST_SONNET, OFFLOAD_DEEPSEEK_LATEST_FLASH, OFFLOAD_DEEPSEEK_MODEL } from './model-policy.mjs';
+import { AnthropicMessagesProvider, resolveLatestAnthropicOpus, resolveLatestAnthropicSonnet } from './provider/anthropic-messages.mjs';
+import {
+  OFFLOAD_ANTHROPIC_LATEST_OPUS,
+  OFFLOAD_ANTHROPIC_LATEST_SONNET,
+  OFFLOAD_DEEPSEEK_LATEST_FLASH,
+  OFFLOAD_DEEPSEEK_MODEL,
+  OFFLOAD_OPENAI_LATEST_SOL,
+  OFFLOAD_OPENAI_LATEST_TERRA,
+  isOpenAIEndpoint,
+} from './model-policy.mjs';
 import { loadPricing } from './pricing-registry.mjs';
 import { priceUsage, resolveModel, samePricedModel, validatePricingTable } from './pricing.mjs';
 import { snapshotGitEnv } from './git-snapshot.mjs';
@@ -256,6 +264,33 @@ function otherDoctorHooks(paths, root, path) {
   return [...found];
 }
 
+/**
+ * Every provider whose key a job on the default, sonnet or opus route can
+ * need, following fallback chains and de-duplicated by keyRef.
+ */
+export function routeKeyTargets(config) {
+  const targets = [],
+    seen = new Set();
+  for (const name of new Set([config.default, 'sonnet', 'opus'])) {
+    const visited = new Set();
+    for (let current = config.profiles[name]; current; current = config.profiles[current.fallback]) {
+      if (visited.has(current)) break;
+      visited.add(current);
+      const provider = config.providers[current.provider];
+      if (!provider || seen.has(provider.keyRef)) continue;
+      seen.add(provider.keyRef);
+      targets.push({ provider: current.provider, keyRef: provider.keyRef });
+    }
+  }
+  return targets;
+}
+/** Hook/compact wording for the per-route key state. */
+export function keysSummary(result) {
+  const missing = Array.isArray(result?.keys) ? result.keys.filter((entry) => !entry.ok).map((entry) => entry.provider) : [];
+  if (missing.length) return `keys missing: ${missing.join(', ')}`;
+  return result?.key?.ok ? 'keys ok' : 'keys missing';
+}
+
 /** Local-only diagnostic. It never makes an HTTP request or prints a key. */
 export function doctor({
   root,
@@ -279,17 +314,21 @@ export function doctor({
   const repoProbe =
     git.status === 0 ? gitProbe(['-C', repoCandidate, 'rev-parse', '--show-toplevel'], { env, platform, spawnProcess }) : { status: 1 };
   let config = { ok: false },
-    key = { ok: false };
+    key = { ok: false },
+    keys = [];
   try {
     const loaded = loadConfig({ configPath, repoPath, env });
-    const profile = loaded.config.profiles[loaded.config.default];
     config = { ok: true, path: loaded.configPath, profile: loaded.config.default, disabled: loaded.disabled };
-    try {
-      resolveKeyRef(loaded.config.providers[profile.provider].keyRef, { env, platform });
-      key = { ok: true };
-    } catch (error) {
-      key = { ok: false, error: error.code || 'unavailable' };
-    }
+    keys = routeKeyTargets(loaded.config).map(({ provider, keyRef }) => {
+      try {
+        resolveKeyRef(keyRef, { env, platform });
+        return { provider, keyRef, ok: true };
+      } catch (error) {
+        return { provider, keyRef, ok: false, error: error.code || 'unavailable' };
+      }
+    });
+    const failed = keys.find((entry) => !entry.ok);
+    key = failed ? { ok: false, error: failed.error } : { ok: true };
   } catch (error) {
     config = { ok: false, error: error.code || String(error.message || error) };
   }
@@ -319,6 +358,7 @@ export function doctor({
     ...(sandboxStatusResult.signal ? { sandboxProbeSignal: sandboxStatusResult.signal } : {}),
     config,
     key,
+    keys,
     registration: registrations(home, rootPath, platform, env),
     skill: skillStatus(clientPaths, rootPath, path),
     otherDoctorHooks: otherDoctorHooks(clientPaths, rootPath, path),
@@ -417,6 +457,32 @@ async function chatProbe(provider, messages, options = {}) {
  * exactly two no-retry requests, and reserves worst-tier cost before each one.
  * `probe` remains an injection seam for callers that only need budget plumbing.
  */
+const OPENAI_LINE = { [OFFLOAD_OPENAI_LATEST_TERRA]: 'terra', [OFFLOAD_OPENAI_LATEST_SOL]: 'sol' };
+async function resolveLatestOpenAILive(line, { baseUrl, apiKey, fetchImpl = globalThis.fetch }) {
+  const pattern = new RegExp(`^gpt-(\\d+)(?:\\.(\\d+))?-${line}$`);
+  let body;
+  try {
+    const response = await fetchImpl(new URL('models', `${baseUrl.replace(/\/+$/, '')}/`).href, {
+      headers: { authorization: `Bearer ${apiKey}` },
+      redirect: 'error',
+    });
+    if (!response.ok) throw new Error('discovery failed');
+    body = await response.json();
+  } catch {
+    throw new Error('OpenAI model discovery failed');
+  }
+  let best;
+  for (const entry of Array.isArray(body?.data) ? body.data : []) {
+    const match = typeof entry?.id === 'string' ? pattern.exec(entry.id) : null;
+    if (!match) continue;
+    const version = [Number(match[1]), Number(match[2] ?? 0)];
+    if (!best || version[0] > best.version[0] || (version[0] === best.version[0] && version[1] > best.version[1]))
+      best = { id: entry.id, version };
+  }
+  if (!best) throw new Error('No supported OpenAI model is available');
+  return best.id;
+}
+
 export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = process.env, fetchImpl, now = () => new Date() } = {}) {
   if (!Number.isFinite(maxUsd) || maxUsd <= 0 || maxUsd > MAX_LIVE_USD)
     throw new Error('live probe requires maxUsd greater than 0 and at most 0.02');
@@ -435,6 +501,10 @@ export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = pr
   try {
     if (model === OFFLOAD_ANTHROPIC_LATEST_SONNET)
       model = await resolveLatestAnthropicSonnet({ baseUrl: providerConfig.baseUrl, apiKey, fetchImpl });
+    else if (model === OFFLOAD_ANTHROPIC_LATEST_OPUS)
+      model = await resolveLatestAnthropicOpus({ baseUrl: providerConfig.baseUrl, apiKey, fetchImpl });
+    else if (OPENAI_LINE[model])
+      model = await resolveLatestOpenAILive(OPENAI_LINE[model], { baseUrl: providerConfig.baseUrl, apiKey, fetchImpl });
     else if (model === OFFLOAD_DEEPSEEK_LATEST_FLASH) model = OFFLOAD_DEEPSEEK_MODEL;
   } catch {
     throw new Error('live probe model discovery failed');
@@ -455,7 +525,10 @@ export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = pr
   const provider =
     providerConfig.type === 'anthropic-messages'
       ? new AnthropicMessagesProvider(providerOptions)
-      : new OpenAIChatProvider({ ...providerOptions, thinking: { type: 'disabled' } });
+      : new OpenAIChatProvider({
+          ...providerOptions,
+          ...(isOpenAIEndpoint(providerConfig.baseUrl) ? {} : { thinking: { type: 'disabled' } }),
+        });
   const firstMessages = [{ role: 'user', content: 'Use offload_doctor_echo once with {"ok":true}.' }];
   let measuredUsd = 0,
     reservedUsd = 0;

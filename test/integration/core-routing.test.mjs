@@ -28,6 +28,12 @@ import { sandboxAvailable } from '../../src/sandbox.mjs';
 import { installedSkillHealth } from '../../src/skill-health.mjs';
 import { createMockOpenAIServer } from '../mock-openai-server.mjs';
 
+const OPENAI_BASE = 'https://api.openai.com/v1';
+const openaiModels = (ids) => new Response(JSON.stringify({ data: ids.map((id, index) => ({ id, created: 1_000 - index })) }));
+const openaiCredit = (status = 429, code = 'credit_balance_exhausted') =>
+  new Response(JSON.stringify({ error: { code, type: 'billing_error', message: 'x' } }), { status });
+const OPENAI_MODEL_LIST = ['gpt-6-terra', 'gpt-5.6-terra', 'gpt-6.1-terra', 'gpt-6.1-sol', 'gpt-5.9-sol', 'gpt-6.1-terra-mini'];
+
 async function repo(prefix) {
   const path = await mkdtemp(join(tmpdir(), prefix));
   execFileSync('git', ['init', '-q', path]);
@@ -1107,6 +1113,7 @@ test('a no-id server listing does not bind its incidental cwd as a repository', 
     verifierInterpreter: true,
     verifierImports: true,
     retrospective: true,
+    openaiCreditTier: true,
   });
   assert.match(result.health.server.buildHash, /^sha256:[0-9a-f]{64}$/);
   assert.match(result.health.server.skillHash, /^sha256:[0-9a-f]{64}$/);
@@ -2508,7 +2515,7 @@ test('assertion repair sends a fresh focused conversation through Core while pre
 });
 
 for (const line of ['sonnet', 'opus'])
-  test(`${line} worker uses adaptive thinking and credit fallback uses Flash thinking`, async () => {
+  test(`${line} worker uses adaptive thinking, then OpenAI high reasoning, then Flash thinking`, async () => {
     const path = await repo('offload-thinking-fallback-');
     const originalFetch = globalThis.fetch;
     const requests = [];
@@ -2518,8 +2525,10 @@ for (const line of ['sonnet', 'opus'])
       if (url.startsWith('https://api.anthropic.com/v1/models'))
         return new Response(JSON.stringify({ data: [{ id: `claude-${line}-5-5`, line }] }));
       if (url === 'https://api.deepseek.com/models') return new Response(JSON.stringify({ data: [{ id: 'deepseek-flash' }] }));
+      if (url === `${OPENAI_BASE}/models`) return openaiModels(OPENAI_MODEL_LIST);
       if (url === 'https://api.anthropic.com/v1/messages')
         return new Response(JSON.stringify({ error: { type: 'credit_balance_too_low' } }), { status: 400 });
+      if (url === `${OPENAI_BASE}/chat/completions`) return openaiCredit();
       assert.equal(url, 'https://api.deepseek.com/chat/completions');
       const call = toolChunk('finish-report', 'finish', { summary: 'done', report: 'Reviewed.', concerns: [], testsRun: [] });
       const events = [call, usageChunk].map((chunk) => ({ ...chunk, model: 'deepseek-flash' }));
@@ -2545,12 +2554,18 @@ for (const line of ['sonnet', 'opus'])
       const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
       assert.equal(done.status, 'DONE_UNVERIFIED', JSON.stringify(done));
       assert.equal(done.reportResult.text, 'Reviewed.');
-      assert.equal(requests.length, 2);
+      assert.equal(requests.length, 3);
       assert.equal(requests[0].body.model, `claude-${line}-5-5`);
       assert.deepEqual(requests[0].body.thinking, { type: 'adaptive' });
-      assert.equal(requests[1].body.model, 'deepseek-flash');
-      assert.deepEqual(requests[1].body.thinking, { type: 'enabled' });
+      assert.equal(requests[1].body.model, line === 'sonnet' ? 'gpt-6.1-terra' : 'gpt-6.1-sol');
       assert.equal(requests[1].body.reasoning_effort, 'high');
+      assert.equal(requests[1].body.thinking, undefined);
+      assert.equal(requests[1].body.max_tokens, undefined);
+      assert.ok(Number.isSafeInteger(requests[1].body.max_completion_tokens));
+      assert.equal(requests[2].body.model, 'deepseek-flash');
+      assert.deepEqual(requests[2].body.thinking, { type: 'enabled' });
+      assert.equal(requests[2].body.reasoning_effort, 'high');
+      assert.equal(done.providerStage, 2);
     } finally {
       globalThis.fetch = originalFetch;
       await core.shutdown();
@@ -2681,13 +2696,19 @@ for (const scenario of ['immediate', 'mid-job', 'continued', 'fallback-failed'])
     const path = await repo('offload-credit-retained-');
     const originalFetch = globalThis.fetch;
     let primaryCalls = 0,
-      flashCalls = 0;
+      flashCalls = 0,
+      openaiCalls = 0;
     const edited = 'retained implementation\n';
     const write = { path: 'result.txt', content: edited };
     globalThis.fetch = async (url, options = {}) => {
       if (url.startsWith('https://api.anthropic.com/v1/models'))
         return new Response(JSON.stringify({ data: [{ id: 'claude-sonnet-5-5', line: 'sonnet' }] }));
       if (url === 'https://api.deepseek.com/models') return new Response(JSON.stringify({ data: [{ id: 'deepseek-flash' }] }));
+      if (url === `${OPENAI_BASE}/models`) return openaiModels(OPENAI_MODEL_LIST);
+      if (url === `${OPENAI_BASE}/chat/completions`) {
+        openaiCalls++;
+        return openaiCredit();
+      }
       const body = JSON.parse(options.body);
       if (url === 'https://api.anthropic.com/v1/messages') {
         primaryCalls++;
@@ -2758,15 +2779,21 @@ for (const scenario of ['immediate', 'mid-job', 'continued', 'fallback-failed'])
       }
       assert.equal(done.status, scenario === 'fallback-failed' ? 'FAILED' : 'DONE_UNVERIFIED', JSON.stringify(done));
       assert.equal(done.creditFallback, true);
+      assert.equal(done.providerStage, 2);
       assert.equal(primaryCalls, ['mid-job', 'fallback-failed'].includes(scenario) ? 2 : 1);
+      // The exhausted OpenAI route is asked once; later rounds stay on Flash.
+      assert.equal(openaiCalls, 1);
       const store = core.manager.store;
       assert.match(await store.readArtifact(started.jobId, 'patch.diff'), /retained implementation/);
-      assert.match(await store.readArtifact(started.jobId, 'report.md'), /provider transition: claude-sonnet-5-5 -> deepseek-flash/);
+      const reportText = await store.readArtifact(started.jobId, 'report.md');
+      assert.match(reportText, /provider transition: claude-sonnet-5-5 -> gpt-6\.1-terra \(explicit credit exhaustion/);
+      assert.match(reportText, /provider transition: gpt-6\.1-terra -> deepseek-flash \(explicit credit exhaustion/);
       const events = (await store.readArtifact(started.jobId, 'events.jsonl'))
         .trim()
         .split('\n')
         .map((line) => JSON.parse(line));
-      assert.equal(events.filter((event) => event.type === 'progress' && event.creditFallback === true).length, 1);
+      const hops = events.filter((event) => event.type === 'progress' && event.creditFallback === true);
+      assert.equal(hops.length, 2);
       if (scenario === 'fallback-failed') {
         assert.equal(done.providerFailure.status, 401);
         assert.equal(existsSync(join(path, 'result.txt')), false);
@@ -2788,6 +2815,7 @@ test('a concrete Flash fallback without trusted pricing fails before provider sp
   };
   const configured = structuredClone(DEFAULT_CONFIG);
   configured.profiles.sonnet.model = 'claude-sonnet-5-5';
+  configured.profiles.terra.model = 'gpt-6.1-terra';
   configured.profiles.flash.model = 'deepseek-flash';
   delete configured.providers.deepseek.pricing;
   const core = createCore({ config: { loaded: { disabled: false, repoConfig: {}, config: configured }, resolveKey: () => 'test-key' } });
@@ -2800,6 +2828,301 @@ test('a concrete Flash fallback without trusted pricing fails before provider sp
   } finally {
     globalThis.fetch = originalFetch;
     await core.shutdown();
+    await rm(path, { recursive: true, force: true });
+  }
+});
+
+// Claude -> OpenAI -> DeepSeek Flash: every hop needs the previous provider's
+// explicit credit refusal and is persisted before the next route is spent on.
+const sseResponse = (model, chunks) =>
+  new Response(chunks.map((chunk) => `data: ${JSON.stringify({ ...chunk, model })}\n\n`).join('') + 'data: [DONE]\n\n', {
+    headers: { 'content-type': 'text/event-stream' },
+  });
+const anthropicCredit = () =>
+  new Response(
+    JSON.stringify({
+      error: {
+        type: 'invalid_request_error',
+        message: 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing.',
+      },
+    }),
+    { status: 400 },
+  );
+async function routedCore(path, { line = 'sonnet', behave, models = OPENAI_MODEL_LIST, resolveKey, mutate } = {}) {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const holder = {};
+  const configured = structuredClone(DEFAULT_CONFIG);
+  mutate?.(configured);
+  globalThis.fetch = async (url, options = {}) => {
+    if (url.startsWith('https://api.anthropic.com/v1/models'))
+      return new Response(JSON.stringify({ data: [{ id: `claude-${line}-5-5`, line }] }));
+    if (url === 'https://api.deepseek.com/models') return new Response(JSON.stringify({ data: [{ id: 'deepseek-flash' }] }));
+    if (url === `${OPENAI_BASE}/models`) return openaiModels(models);
+    const host = url.startsWith('https://api.anthropic.com') ? 'anthropic' : url.startsWith(OPENAI_BASE) ? 'openai' : 'deepseek';
+    const body = JSON.parse(options.body);
+    // The durable stage is read back from the sealed record at spend time.
+    while (!holder.id) await new Promise((resolve) => setTimeout(resolve, 5));
+    const stored = await holder.core.manager.store.get(holder.id);
+    calls.push({ host, body, stage: stored.providerStage, creditFallback: stored.creditFallback });
+    return behave(host, calls.filter((call) => call.host === host).length, body);
+  };
+  const core = createCore({
+    config: { loaded: { disabled: false, repoConfig: {}, config: configured }, resolveKey: resolveKey || (() => 'test-key') },
+  });
+  holder.core = core;
+  return {
+    core,
+    calls,
+    holder,
+    async close() {
+      globalThis.fetch = originalFetch;
+      await core.shutdown();
+    },
+  };
+}
+const reportFinish = (id = 'finish-report') =>
+  toolChunk(id, 'finish', { summary: 'done', report: 'Reviewed.', concerns: [], testsRun: [] });
+const reviewInput = (path, profile = 'sonnet') => ({
+  mode: 'report',
+  profile,
+  task: 'review',
+  repoPath: path,
+  budget: { maxTurns: 2, maxUsd: 1 },
+});
+
+for (const [line, openai] of [
+  ['sonnet', 'gpt-6.1-terra'],
+  ['opus', 'gpt-6.1-sol'],
+])
+  test(`${line} hops to ${openai} after Claude credit exhaustion and never reaches Flash`, async () => {
+    const path = await repo('offload-openai-hop-');
+    const harness = await routedCore(path, {
+      line,
+      behave: (host) => (host === 'anthropic' ? anthropicCredit() : sseResponse(openai, [reportFinish(), usageChunk])),
+    });
+    try {
+      const started = await harness.core.start(reviewInput(path, line));
+      harness.holder.id = started.jobId;
+      const done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      assert.equal(done.status, 'DONE_UNVERIFIED', JSON.stringify(done));
+      assert.deepEqual(
+        harness.calls.map((call) => [call.host, call.stage ?? 0]),
+        [
+          ['anthropic', 0],
+          ['openai', 1],
+        ],
+      );
+      assert.equal(harness.calls[1].body.model, openai);
+      assert.equal(done.providerStage, 1);
+      assert.equal(done.creditFallback, true);
+      const report = await harness.core.manager.store.readArtifact(started.jobId, 'report.md');
+      assert.match(
+        report,
+        new RegExp(`provider transition: claude-${line}-5-5 -> ${openai.replace('.', '\\.')} \\(explicit credit exhaustion`),
+      );
+      assert.equal((report.match(/provider transition:/g) || []).length, 1);
+      const job = await harness.core.manager.store.get(started.jobId);
+      assert.deepEqual(
+        job.executionProfile.fallbacks.map((route) => route.model),
+        [openai, 'deepseek-flash'],
+      );
+      assert.deepEqual(job.executionProfile.fallback, job.executionProfile.fallbacks[0]);
+      assert.equal(job.fallbackCredentialFingerprints.length, 2);
+    } finally {
+      await harness.close();
+      await rm(path, { recursive: true, force: true });
+    }
+  });
+
+test('an immediate double hop persists each stage before spending on that route', async () => {
+  const path = await repo('offload-openai-double-hop-');
+  const harness = await routedCore(path, {
+    behave: (host) => {
+      if (host === 'anthropic') return anthropicCredit();
+      if (host === 'openai') return openaiCredit(402, 'insufficient_quota');
+      return sseResponse('deepseek-flash', [reportFinish(), usageChunk]);
+    },
+  });
+  try {
+    const started = await harness.core.start(reviewInput(path));
+    harness.holder.id = started.jobId;
+    const done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    assert.equal(done.status, 'DONE_UNVERIFIED', JSON.stringify(done));
+    assert.deepEqual(
+      harness.calls.map((call) => [call.host, call.stage ?? 0]),
+      [
+        ['anthropic', 0],
+        ['openai', 1],
+        ['deepseek', 2],
+      ],
+    );
+    assert.equal(done.providerStage, 2);
+    const report = await harness.core.manager.store.readArtifact(started.jobId, 'report.md');
+    assert.match(report, /provider transition: claude-sonnet-5-5 -> gpt-6\.1-terra \(explicit credit exhaustion/);
+    assert.match(report, /provider transition: gpt-6\.1-terra -> deepseek-flash \(explicit credit exhaustion/);
+  } finally {
+    await harness.close();
+    await rm(path, { recursive: true, force: true });
+  }
+});
+
+test('sonnet to Terra to Flash retains edits and a continuation resumes at the persisted stage 2', async () => {
+  const path = await repo('offload-openai-continue-');
+  const write = { path: 'result.txt', content: 'retained through two hops\n' };
+  const harness = await routedCore(path, {
+    behave: (host, count, body) => {
+      if (host === 'anthropic') return anthropicCredit();
+      if (host === 'openai') return openaiCredit();
+      if (count === 1) return sseResponse('deepseek-flash', [toolChunk('write-1', 'write_file', write), usageChunk]);
+      assert.match(JSON.stringify(body.messages), /retained through two hops/);
+      return sseResponse('deepseek-flash', [toolChunk('finish-1', 'finish', { summary: 'done', concerns: [], testsRun: [] }), usageChunk]);
+    },
+  });
+  try {
+    const started = await harness.core.start({
+      profile: 'sonnet',
+      task: 'Write result.txt.',
+      repoPath: path,
+      ownedPaths: ['result.txt'],
+      budget: { maxTurns: 1, maxUsd: 1 },
+    });
+    harness.holder.id = started.jobId;
+    let done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    assert.equal(done.status, 'BUDGET', JSON.stringify(done));
+    assert.equal(done.providerStage, 2);
+    const before = harness.calls.length;
+    await harness.core.continue(started.jobId, { repoPath: path, extraTurns: 2 });
+    done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    assert.equal(done.status, 'DONE_UNVERIFIED', JSON.stringify(done));
+    // Only Flash is asked after the continuation: no re-try of Claude or OpenAI.
+    assert.deepEqual(
+      harness.calls.slice(before).map((call) => [call.host, call.stage]),
+      [['deepseek', 2]],
+    );
+    assert.equal(harness.calls.filter((call) => call.host === 'anthropic').length, 1);
+    assert.equal(harness.calls.filter((call) => call.host === 'openai').length, 1);
+    assert.equal(await readFile(join(path, 'result.txt'), 'utf8'), write.content);
+    assert.match(await harness.core.manager.store.readArtifact(started.jobId, 'patch.diff'), /retained through two hops/);
+  } finally {
+    await harness.close();
+    await rm(path, { recursive: true, force: true });
+  }
+});
+
+test('a legacy job (creditFallback true, single fallback) resumes at stage 1 on its own fallback', async () => {
+  const path = await repo('offload-openai-legacy-');
+  const harness = await routedCore(path, {
+    behave: (host) => {
+      assert.equal(host, 'deepseek', `a legacy stage-1 job must not touch ${host}`);
+      return sseResponse('deepseek-flash', [reportFinish(), usageChunk]);
+    },
+    mutate: (configured) => {
+      configured.profiles.sonnet.fallback = 'flash';
+    },
+  });
+  try {
+    const started = await harness.core.start(reviewInput(path), { launch: false });
+    harness.holder.id = started.jobId;
+    // Rewrite the sealed record into the pre-fallbacks shape.
+    const store = harness.core.manager.store;
+    const job = await store.get(started.jobId);
+    const { fallbacks, ...execution } = job.executionProfile;
+    assert.equal(fallbacks.length, 1);
+    await store.update(started.jobId, {
+      executionProfile: execution,
+      fallbackCredentialFingerprint: job.fallbackCredentialFingerprints[0],
+      fallbackCredentialFingerprints: undefined,
+      creditFallback: true,
+      providerStage: undefined,
+    });
+    const legacy = await store.get(started.jobId);
+    assert.equal(legacy.fallbackCredentialFingerprints, undefined);
+    assert.equal(legacy.providerStage, undefined);
+    await harness.core.assignWorkerPid(started.jobId, process.pid, path);
+    await harness.core.resume(started.jobId, path);
+    const done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    assert.equal(done.status, 'DONE_UNVERIFIED', JSON.stringify(done));
+    assert.deepEqual(
+      harness.calls.map((call) => call.host),
+      ['deepseek'],
+    );
+    assert.equal(done.creditFallback, true);
+    assert.match(await store.readArtifact(started.jobId, 'report.md'), /provider transition: claude-sonnet-5-5 -> deepseek-flash/);
+  } finally {
+    await harness.close();
+    await rm(path, { recursive: true, force: true });
+  }
+});
+
+for (const [line, family, ignored] of [
+  ['sonnet', 'terra', 'gpt-6.1-sol'],
+  ['opus', 'sol', 'gpt-6.1-terra'],
+]) {
+  test(`OpenAI discovery snapshots the highest ${family} version and ignores ${ignored}`, async () => {
+    const path = await repo('offload-openai-discovery-');
+    const harness = await routedCore(path, {
+      line,
+      models: [`gpt-6-${family}`, `gpt-5.6-${family}`, `gpt-6.1-${family}`, `gpt-6.2-${family}-mini`, ignored, `gpt-6.1-${family}-preview`],
+      behave: () => {
+        throw new Error('no provider chat request expected');
+      },
+    });
+    try {
+      const started = await harness.core.start(reviewInput(path, line), { launch: false });
+      const job = await harness.core.manager.store.get(started.jobId);
+      assert.equal(job.executionProfile.fallbacks[0].model, `gpt-6.1-${family}`);
+      assert.equal(job.executionProfile.fallbacks[0].baseUrl, OPENAI_BASE);
+      assert.ok(job.pricingSnapshot.models[`gpt-6.1-${family}`]);
+      assert.equal(job.pricingId.includes('openai-2026-10-26'), true);
+    } finally {
+      await harness.close();
+      await rm(path, { recursive: true, force: true });
+    }
+  });
+}
+
+test('a newer OpenAI release without a trusted price fails before any provider chat request or job', async () => {
+  const path = await repo('offload-openai-unpriced-');
+  const harness = await routedCore(path, {
+    models: ['gpt-6.1-terra', 'gpt-7-terra'],
+    behave: () => {
+      throw new Error('must not spend');
+    },
+  });
+  try {
+    await assert.rejects(() => harness.core.start(reviewInput(path)), /pricing is unknown for selected model gpt-7-terra/);
+    assert.equal(harness.calls.length, 0);
+    assert.equal(existsSync(join(getGitDir(path), 'offload', 'jobs')) ? (await harness.core.manager.store.list()).length : 0, 0);
+  } finally {
+    await harness.close();
+    await rm(path, { recursive: true, force: true });
+  }
+});
+
+test('a missing OpenAI key fails at start, before any job, naming the provider and the save command', async () => {
+  const path = await repo('offload-openai-missing-key-');
+  const resolveKey = (ref) => {
+    if (ref === 'keychain:offload-openai') throw new Error('not found');
+    return 'test-key';
+  };
+  const harness = await routedCore(path, {
+    resolveKey,
+    behave: () => {
+      throw new Error('must not spend');
+    },
+  });
+  try {
+    await assert.rejects(
+      () => harness.core.start(reviewInput(path)),
+      process.platform === 'darwin'
+        ? /fallback worker key is unavailable for provider openai; save it with: node install\.mjs --key=openai/
+        : /fallback worker key is unavailable for provider openai; run offload doctor or configure keyRef/,
+    );
+    assert.equal(harness.calls.length, 0);
+    assert.equal(existsSync(join(getGitDir(path), 'offload', 'jobs')) ? (await harness.core.manager.store.list()).length : 0, 0);
+  } finally {
+    await harness.close();
     await rm(path, { recursive: true, force: true });
   }
 });

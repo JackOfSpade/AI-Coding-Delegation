@@ -302,13 +302,38 @@ export function storeWindowsCredential(credential, secret, { execFile = defaultS
 export function storeKeychainSecret(
   service,
   secret,
-  { platform = process.platform, execFile = defaultSpawn, interactive = false, ifAbsent = false } = {},
+  { platform = process.platform, execFile = defaultSpawn, readExecFile = defaultExecFile, interactive = false, ifAbsent = false } = {},
 ) {
   validateKeychainService(service);
-  // `security add-generic-password -w` documents a terminal prompt when -w
-  // has no argument. It does not document stdin password data; never risk
-  // falling back to argv or claiming a pipe-fed secret was stored. The caller
-  // must opt into the native terminal prompt explicitly.
+  // `security add-generic-password -w` with no argument prompts through
+  // getpass, which silently truncates at 128 characters (longer OpenAI keys).
+  // Instead feed the command to `security -i` on stdin, so the secret never
+  // reaches argv, then read it back: a store is only reported when exact.
+  if (platform === 'darwin' && typeof secret === 'string') {
+    if (!/^[A-Za-z0-9._~+/=-]+$/.test(secret) || Buffer.byteLength(secret) > MAX_SECRET_BYTES)
+      throw new SecretError('Secret has invalid size or characters', 'E_SECRET_INVALID');
+    let result;
+    try {
+      result = execFile('security', ['-i'], {
+        input: `add-generic-password -U -a offload -s ${service} -w ${secret}\n`,
+        encoding: 'utf8',
+        timeout: 10_000,
+        stdio: ['pipe', 'ignore', 'ignore'],
+        windowsHide: true,
+      });
+    } catch {
+      throw new SecretError('macOS keychain storage failed', 'E_SECRET_STORE');
+    }
+    if (result?.status !== undefined && result.status !== 0) throw new SecretError('macOS keychain storage failed', 'E_SECRET_STORE');
+    let stored;
+    try {
+      stored = String(readKeychainSecret(service, { platform, execFile: readExecFile })).replace(/\r?\n$/, '');
+    } catch {
+      throw new SecretError('macOS keychain storage could not be verified', 'E_SECRET_STORE');
+    }
+    if (stored !== secret) throw new SecretError('macOS keychain stored a different value than entered', 'E_SECRET_STORE');
+    return { stored: true, service };
+  }
   if (platform === 'darwin') {
     if (!interactive) throw new SecretError('macOS keychain storage requires an interactive security prompt', 'E_SECRET_STORE_INTERACTIVE');
     let result;

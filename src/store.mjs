@@ -13,6 +13,7 @@ import { anthropicContentMatchesAssistant, validAnthropicContent } from './anthr
 const secretKey = (key, value) =>
   key !== 'credentialFingerprint' &&
   key !== 'fallbackCredentialFingerprint' &&
+  key !== 'fallbackCredentialFingerprints' &&
   !safeTokenAccountingValue(key, value) &&
   /(?:api[_-]?key|authorization|secret|password|credential|bearer|(?:access|refresh|auth|session|id)?[_-]?token)/i.test(key);
 const MAX_TRANSCRIPT_BYTES = 4 * 1024 * 1024;
@@ -410,10 +411,13 @@ export class JobStore {
     // credential. Preserve its already validated adapter-generated shape.
     const credentialFingerprint = job.credentialFingerprint;
     const fallbackCredentialFingerprint = job.fallbackCredentialFingerprint;
+    const fallbackCredentialFingerprints = job.fallbackCredentialFingerprints;
     const copy = foundationRedact(redact({ ...job, updatedAt: this.now().toISOString() }), this.secrets);
     if (ownerNonce) copy.leaseOwnerNonce = ownerNonce;
     if (credentialFingerprint) copy.credentialFingerprint = credentialFingerprint;
     if (fallbackCredentialFingerprint) copy.fallbackCredentialFingerprint = fallbackCredentialFingerprint;
+    if (Array.isArray(fallbackCredentialFingerprints)) copy.fallbackCredentialFingerprints = fallbackCredentialFingerprints;
+    else delete copy.fallbackCredentialFingerprints;
     // Normalize through the exact JSON representation before signing. This
     // handles Date/toJSON values and rejects values JSON cannot persist rather
     // than emitting a record whose subsequent read has different MAC bytes.

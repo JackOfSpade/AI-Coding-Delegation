@@ -19,10 +19,19 @@ export const DEFAULT_CONFIG = Object.freeze({
       pricing: 'deepseek-2026-10-01',
       attemptTimeoutMs: 300_000,
     },
+    openai: {
+      type: 'openai-chat',
+      baseUrl: 'https://api.openai.com/v1',
+      keyRef: 'keychain:offload-openai',
+      pricing: 'openai-2026-10-26',
+      attemptTimeoutMs: 300_000,
+    },
   },
   profiles: {
-    sonnet: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'flash' },
-    opus: { provider: 'anthropic', model: 'latest-opus', fallback: 'flash' },
+    sonnet: { provider: 'anthropic', model: 'latest-sonnet', fallback: 'terra' },
+    opus: { provider: 'anthropic', model: 'latest-opus', fallback: 'sol' },
+    terra: { provider: 'openai', model: 'latest-terra', fallback: 'flash' },
+    sol: { provider: 'openai', model: 'latest-sol', fallback: 'flash' },
     flash: { provider: 'deepseek', model: 'latest-flash' },
   },
   default: 'sonnet',
@@ -221,6 +230,12 @@ export function validateConfig(config) {
       if (!boundedText(profile.fallback, MAX_NAME) || !config.profiles[profile.fallback] || profile.fallback === name)
         throw new ConfigError(`Profile ${name}.fallback must name another profile`, 'E_CONFIG_PROFILE');
     }
+    const chain = [name];
+    for (let next = profile.fallback; next !== undefined; next = config.profiles[next]?.fallback) {
+      if (chain.includes(next)) throw new ConfigError(`Profile ${name} has a fallback cycle`, 'E_CONFIG_PROFILE');
+      chain.push(next);
+    }
+    if (chain.length > 3) throw new ConfigError(`Profile ${name} fallback chain exceeds 3 routes`, 'E_CONFIG_PROFILE');
     const violation = modelPolicyViolation({
       type: config.providers[profile.provider].type,
       baseUrl: config.providers[profile.provider].baseUrl,

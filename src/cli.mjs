@@ -5,7 +5,7 @@ import { validateExplicitRepoPath, validateJobRequest, validJobId } from './job-
 import { normalizeInterpreterDeclaration, normalizeVerifierImports } from './verify-interpreter.mjs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { doctor, doctorLive } from './doctor.mjs';
+import { doctor, doctorLive, keysSummary } from './doctor.mjs';
 import { redactText } from './redact.mjs';
 import { MAX_RETROSPECTIVE_JOBS } from './retrospective.mjs';
 
@@ -379,7 +379,7 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
       const result = { ...diagnostic, worker: health?.worker, coreSandbox: health?.sandbox, verifierTmp: health?.verifierTmp };
       if (bool(flags.hook)) {
         stdout.write(
-          `offload: node ${result.nodeOk ? 'ok' : 'bad'} · git ${result.git ? 'ok' : 'missing'} · key ${result.key.ok ? 'ok' : 'missing'} · sandbox ${result.sandbox}\n`,
+          `offload: node ${result.nodeOk ? 'ok' : 'bad'} · git ${result.git ? 'ok' : 'missing'} · ${keysSummary(result)} · sandbox ${result.sandbox}\n`,
         );
         return result.nodeOk && result.git ? 0 : 2;
       }

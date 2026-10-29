@@ -4,7 +4,7 @@ import { Writable } from 'node:stream';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, win32 } from 'node:path';
-import { doctor, doctorLive } from '../../src/doctor.mjs';
+import { doctor, doctorLive, keysSummary } from '../../src/doctor.mjs';
 import { runCli } from '../../src/cli.mjs';
 
 function sink() {
@@ -469,4 +469,84 @@ test('doctor reports a stale installed skill and another Offload hook root witho
     }),
   );
   assert.deepEqual(run().otherDoctorHooks, ['/old/global/offload/install.mjs']);
+});
+async function routeConfig(keys) {
+  const dir = await mkdtemp(`${tmpdir()}/offload-doctor-keys-`);
+  const configPath = join(dir, 'config.json');
+  const provider = (keyRef) => ({ type: 'openai-chat', baseUrl: 'https://api.example.test', keyRef, pricing: 'deepseek-2026-10-01' });
+  await writeFile(
+    configPath,
+    JSON.stringify({
+      providers: { a: provider('env:KEY_A'), o: provider('env:KEY_O'), d: provider('env:KEY_D') },
+      profiles: {
+        sonnet: { provider: 'a', model: 'm', fallback: 'terra' },
+        opus: { provider: 'a', model: 'm', fallback: 'sol' },
+        terra: { provider: 'o', model: 'm', fallback: 'flash' },
+        sol: { provider: 'o', model: 'm', fallback: 'flash' },
+        flash: { provider: 'd', model: 'm' },
+      },
+      default: 'sonnet',
+      limits: { maxTurns: 1, timeoutMinutes: 1, maxUsd: 1 },
+    }),
+  );
+  return { configPath, env: { ...keys } };
+}
+test('doctor checks every provider key in the default, sonnet and opus chains and dedupes by keyRef', async () => {
+  const { configPath, env } = await routeConfig({ KEY_A: 'x', KEY_D: 'y' });
+  const result = doctor({ root: process.cwd(), repoPath: process.cwd(), home: process.cwd(), configPath, env });
+  assert.deepEqual(
+    result.keys.map(({ provider, ok }) => [provider, ok]),
+    [
+      ['a', true],
+      ['o', false],
+      ['d', true],
+    ],
+  );
+  assert.equal(result.key.ok, false);
+  assert.equal(keysSummary(result), 'keys missing: o');
+  assert.doesNotMatch(JSON.stringify(result), /"x"|"y"/);
+  const all = doctor({
+    root: process.cwd(),
+    repoPath: process.cwd(),
+    home: process.cwd(),
+    configPath,
+    env: { KEY_A: 'x', KEY_O: 'z', KEY_D: 'y' },
+  });
+  assert.equal(all.key.ok, true);
+  assert.equal(keysSummary(all), 'keys ok');
+});
+test('doctor --live resolves the latest Opus, Terra and Sol selectors', async () => {
+  for (const [model, ids, expected] of [
+    ['latest-terra', ['gpt-6-terra', 'gpt-6.1-terra', 'gpt-5.6-terra', 'gpt-6.1-sol'], 'gpt-6.1-terra'],
+    ['latest-sol', ['gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.1-terra'], 'gpt-6.1-sol'],
+  ]) {
+    const dir = await mkdtemp(`${tmpdir()}/offload-doctor-live-`);
+    const configPath = join(dir, 'config.json');
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        providers: {
+          openai: { type: 'openai-chat', baseUrl: 'https://api.openai.com/v1', keyRef: 'env:OA_KEY', pricing: 'openai-2026-10-26' },
+        },
+        profiles: { p: { provider: 'openai', model } },
+        default: 'p',
+        limits: { maxTurns: 1, timeoutMinutes: 1, maxUsd: 1 },
+      }),
+    );
+    const urls = [];
+    const fetchImpl = async (url, init) => {
+      urls.push(String(url));
+      if (String(url).endsWith('/models')) {
+        assert.equal(init.headers.authorization, 'Bearer oa-live');
+        return Response.json({ data: ids.map((id) => ({ id })) });
+      }
+      const body = JSON.parse(init.body);
+      assert.equal(body.model, expected);
+      assert.equal(body.thinking, undefined);
+      throw new Error('stop after model resolution');
+    };
+    await assert.rejects(doctorLive({ maxUsd: 0.02, configPath, env: { OA_KEY: 'oa-live' }, fetchImpl }));
+    assert.equal(urls[0], 'https://api.openai.com/v1/models');
+    assert.equal(urls.length, 2);
+  }
 });

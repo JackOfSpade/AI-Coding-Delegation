@@ -9,7 +9,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { stdin, stderr } from 'node:process';
 import { loadConfig } from './src/config.mjs';
 import { parseKeyRef, resolveKeyRef, storeKeychainSecret } from './src/secrets.mjs';
-import { doctor, doctorLive } from './src/doctor.mjs';
+import { doctor, doctorLive, keysSummary, routeKeyTargets } from './src/doctor.mjs';
 import { resolveClientPaths } from './src/client-paths.mjs';
 import { runtimeIdentityFor } from './src/identity.mjs';
 
@@ -45,7 +45,14 @@ export function isMainModule({
 /** Parse the intentionally small installer CLI before any filesystem or keychain work. */
 export function parseInstallerArgs(argv) {
   if (!Array.isArray(argv) || argv.some((value) => typeof value !== 'string')) throw new TypeError('installer arguments must be strings');
-  const parsed = { uninstall: false, skipKey: false, replaceKey: false, clients: 'detected', doctorHook: false, approvalMode: undefined };
+  const parsed = {
+    uninstall: false,
+    skipKey: false,
+    replaceKey: false,
+    clients: 'detected',
+    doctorHook: false,
+    approvalMode: undefined,
+  };
   const seen = new Set();
   const once = (flag) => {
     if (seen.has(flag)) throw new Error(`duplicate installer option: ${flag}`);
@@ -66,6 +73,15 @@ export function parseInstallerArgs(argv) {
     if (value === '--replace-key') {
       once(value);
       parsed.replaceKey = true;
+      continue;
+    }
+    if (value === '--key' || value.startsWith('--key=')) {
+      once('--key');
+      const provider = value === '--key' ? argv[++index] : value.slice('--key='.length);
+      // Never echo the value: a pasted API key here must not reach output or logs.
+      if (!provider || provider.startsWith('-') || /^sk-/i.test(provider) || !/^[A-Za-z0-9_-]{1,32}$/.test(provider))
+        throw new Error('--key requires a configured provider name such as openai (never the key itself; it is prompted for)');
+      parsed.keyProvider = provider;
       continue;
     }
     if (value === '--doctor-hook') {
@@ -95,6 +111,10 @@ export function parseInstallerArgs(argv) {
     return parsed;
   }
   if (parsed.uninstall && parsed.replaceKey) throw new Error('--replace-key cannot be used with --uninstall');
+  if (parsed.keyProvider !== undefined) {
+    if (parsed.uninstall) throw new Error('--key cannot be used with --uninstall');
+    if (parsed.skipKey) throw new Error('--key cannot be combined with --skip-key');
+  }
   if (parsed.uninstall && parsed.skipKey) throw new Error('--skip-key cannot be used with --uninstall');
   if (parsed.uninstall && parsed.approvalMode !== undefined) throw new Error('--approval-mode cannot be used with --uninstall');
   return parsed;
@@ -1593,22 +1613,25 @@ export async function storeKeychainKey({
   platform = process.platform,
   env = process.env,
   macosInteractive = false,
+  label,
+  readExecFile,
 } = {}) {
   const guardedExecFile = (command, args, options = {}) => execFile(command, args, { ...options, env: keychainCommandEnv(env, platform) });
-  if (platform === 'darwin') {
-    if (!macosInteractive)
-      return { stored: false, reason: 'macOS keychain setup requires an interactive terminal; rerun install in a terminal' };
-    return storeKeychainSecret(service, undefined, { platform, execFile: guardedExecFile, interactive: true });
-  }
+  if (platform === 'darwin' && !macosInteractive)
+    return { stored: false, reason: 'macOS keychain setup requires an interactive terminal; rerun install in a terminal' };
   if (typeof prompt !== 'function') return { stored: false, reason: 'no prompt' };
-  const key = await prompt({ echo: false, label: `API key for ${service}` });
+  const key = await prompt({ echo: false, label: label || `API key for ${service}` });
   if (typeof key !== 'string' || !key.trim()) return { stored: false, reason: 'empty key' };
   if (!['darwin', 'linux', 'win32'].includes(platform)) return { stored: false, reason: 'system keychain unsupported' };
-  return storeKeychainSecret(service, key, { platform, execFile: guardedExecFile });
+  return storeKeychainSecret(service, key, {
+    platform,
+    execFile: guardedExecFile,
+    ...(readExecFile ? { readExecFile } : {}),
+  });
 }
-export async function promptNoEcho({ input = stdin, output = stderr } = {}) {
+export async function promptNoEcho({ input = stdin, output = stderr, label } = {}) {
   if (!input.isTTY) return '';
-  output.write('Offload worker API key (stored in system keychain; input hidden): ');
+  output.write(`Offload ${label || 'worker API key'} (stored in system keychain; input hidden): `);
   return new Promise((resolve, reject) => {
     let value = '',
       finished = false,
@@ -1683,6 +1706,7 @@ export async function install({
   runCommand = (command, args, options) => spawnSync(command, args, options),
   clients = 'detected',
   replaceKey = false,
+  keyProvider,
   approvalMode,
 } = {}) {
   if (Number(process.versions.node.split('.')[0]) < 20) throw new Error('Node.js 20 or newer is required');
@@ -2027,34 +2051,56 @@ export async function install({
     await atomic(configPath, artifactContents.get(join(root, 'config.example.json')));
     changed.push(configPath);
   }
-  let key = { stored: false };
+  let key = { stored: false },
+    keys = [];
   if (!uninstall && keyPrompt) {
-    let keyRef;
+    let targets = [];
     try {
       const loaded = loadConfig({ configPath, repoPath: undefined });
-      const profile = loaded.config.profiles[loaded.config.default];
-      keyRef = loaded.config.providers[profile.provider].keyRef;
-    } catch {}
-    let parsedRef;
-    try {
-      parsedRef = parseKeyRef(keyRef);
-    } catch {}
-    let present = false;
-    try {
-      present = !!parsedRef && !!resolveKeyRef(keyRef, { env });
-    } catch {}
-    if (!parsedRef) key = { stored: false, reason: 'configured key reference is unavailable' };
-    else if (parsedRef.kind !== 'keychain') key = { stored: false, reason: `configure ${parsedRef.kind}: key reference manually` };
-    else
-      key =
-        present && !replaceKey
-          ? { stored: false, reason: 'already configured' }
-          : await keychain({
-              service: parsedRef.value,
-              prompt: keyPrompt,
-              platform,
-              macosInteractive: platform === 'darwin' && keyPrompt === promptNoEcho && stdin.isTTY,
-            });
+      if (keyProvider !== undefined) {
+        const provider = loaded.config.providers[keyProvider];
+        if (!Object.hasOwn(loaded.config.providers, keyProvider) || !provider) throw new Error('unknown provider');
+        targets = [{ provider: keyProvider, keyRef: provider.keyRef }];
+      } else targets = routeKeyTargets(loaded.config);
+    } catch {
+      keys = [
+        {
+          ...(keyProvider ? {} : { provider: keyProvider }),
+          stored: false,
+          reason: keyProvider
+            ? 'unknown provider; pass a provider name from the config such as openai'
+            : 'configured key reference is unavailable',
+        },
+      ];
+    }
+    const replace = replaceKey || keyProvider !== undefined;
+    for (const { provider, keyRef } of targets) {
+      let parsedRef;
+      try {
+        parsedRef = parseKeyRef(keyRef);
+      } catch {}
+      let present = false;
+      try {
+        present = !!parsedRef && !!resolveKeyRef(keyRef, { env });
+      } catch {}
+      let result;
+      if (!parsedRef) result = { stored: false, reason: 'configured key reference is unavailable' };
+      else if (parsedRef.kind !== 'keychain') result = { stored: false, reason: `configure ${parsedRef.kind}: key reference manually` };
+      else if (present && !replace) result = { stored: false, reason: 'already configured' };
+      else {
+        const macosInteractive = platform === 'darwin' && keyPrompt === promptNoEcho && stdin.isTTY;
+        if (macosInteractive) stderr.write(`offload: saving the ${provider} API key (keychain service ${parsedRef.value})\n`);
+        result = await keychain({
+          service: parsedRef.value,
+          prompt: keyPrompt,
+          platform,
+          macosInteractive,
+          label: `${provider} API key`,
+        });
+      }
+      keys.push({ provider, ...result });
+    }
+    key = keys[0] ?? key;
   }
   if (!uninstall) manifest.approvalMode = effectiveApprovalMode;
   else delete manifest.approvalMode;
@@ -2096,6 +2142,7 @@ export async function install({
     skippedCursorConfig: !!currentCursor && currentCursor !== cursorJson(root),
     configPath,
     key,
+    keys,
     plugin,
     claudeMcp,
     ...(installedRuntime ? { runtime: installedRuntime } : {}),
@@ -2120,7 +2167,7 @@ if (isMainModule()) {
   if (args.doctorHook) {
     const result = doctor({ root: here });
     console.log(
-      `offload: node ${result.nodeOk ? 'ok' : 'bad'} · git ${result.git ? 'ok' : 'missing'} · key ${result.key.ok ? 'ok' : 'missing'} · sandbox ${result.sandboxReason} · runtime ${result.server.version} ${result.server.buildHash.slice(0, 19)} schema ${result.server.schemaRevision} · report/inputFiles ${result.server.capabilities.reportMode && result.server.capabilities.inputFiles ? 'yes' : 'no'}${doctorHookWarnings(result)} · restart the MCP client after updates`,
+      `offload: node ${result.nodeOk ? 'ok' : 'bad'} · git ${result.git ? 'ok' : 'missing'} · ${keysSummary(result)} · sandbox ${result.sandboxReason} · runtime ${result.server.version} ${result.server.buildHash.slice(0, 19)} schema ${result.server.schemaRevision} · report/inputFiles ${result.server.capabilities.reportMode && result.server.capabilities.inputFiles ? 'yes' : 'no'}${doctorHookWarnings(result)} · restart the MCP client after updates`,
     );
     process.exitCode = result.nodeOk && result.git ? 0 : 2;
   } else {
@@ -2129,11 +2176,13 @@ if (isMainModule()) {
       keyPrompt: args.skipKey ? undefined : promptNoEcho,
       clients: args.clients,
       replaceKey: args.replaceKey,
+      keyProvider: args.keyProvider,
       approvalMode: args.approvalMode,
     });
     const checked = doctor({ root: here });
     console.log(JSON.stringify({ ...result, doctor: checked }, null, 2));
     if (result.restart.required) console.error(`offload: ${result.restart.action}`);
     if (!checked.nodeOk || !checked.git) process.exitCode = 2;
+    else if (args.keyProvider !== undefined && !result.keys?.some((entry) => entry.stored)) process.exitCode = 1;
   }
 }

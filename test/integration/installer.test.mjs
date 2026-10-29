@@ -192,7 +192,7 @@ test('installer is idempotent and removes only managed routing blocks', async ()
   assert.equal((doc.match(/BEGIN offload/g) || []).length, 1);
   assert.match(afterFirstInstall, /Use Offload only when the user invokes `\/offload_sonnet` or `\/offload_opus` as a slash command/);
   assert.match(afterFirstInstall, /profile `sonnet`/);
-  assert.match(afterFirstInstall, /fall back to the latest provider-maintained DeepSeek Flash/);
+  assert.match(afterFirstInstall, /then to the latest provider-maintained DeepSeek Flash/);
   assert.match(afterFirstInstall, /latest Sonnet with adaptive thinking/);
   assert.match(afterFirstInstall, /on policy-only hosts they also have no worker shell/);
   assert.match(afterFirstInstall, /edit permitted private-worktree files with file tools/);
@@ -205,7 +205,7 @@ test('installer is idempotent and removes only managed routing blocks', async ()
   assert.match(afterFirstInstall, /For either command invocation, end every final answer/);
   assert.match(
     afterFirstInstall,
-    /A mention, quotation, negation, or discussion of `\/offload_sonnet`, offload, delegation, DeepSeek, a provider, or a model does not select Offload/,
+    /A mention, quotation, negation, or discussion of `\/offload_sonnet`, offload, delegation, DeepSeek, OpenAI, Terra, Sol, a provider, or a model does not select Offload/,
   );
   assert.doesNotMatch(afterFirstInstall, /as well as for clearly bounded multi-file implementation/);
   assert.match(afterFirstInstall, /old `\/offload` command is removed/);
@@ -390,7 +390,7 @@ test(
     await assert.rejects(access(`${cursor}.offload.bak`), /ENOENT/);
   },
 );
-test('installer preserves unrelated MCP configs and macOS key storage uses security’s own prompt', async () => {
+test('installer preserves unrelated MCP configs and macOS key storage pipes to security -i and verifies the stored key', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-home-`);
   const root = process.cwd();
   await (await import('node:fs/promises')).mkdir(join(home, '.cursor'), { recursive: true });
@@ -399,31 +399,38 @@ test('installer preserves unrelated MCP configs and macOS key storage uses secur
   const cursor = JSON.parse(await readFile(join(home, '.cursor', 'mcp.json'), 'utf8'));
   assert.ok(cursor.mcpServers.other);
   assert.ok(cursor.mcpServers.offload);
-  let args;
-  let options;
-  let prompted = false;
+  const secret = `sk-proj-${'A'.repeat(156)}`;
+  const calls = [];
   const saved = await storeKeychainKey({
     platform: 'darwin',
     env: { PATH: '/usr/bin', HOME: '/private/home', OPENAI_API_KEY: 'must-not-reach-security' },
     macosInteractive: true,
-    prompt: async () => {
-      prompted = true;
-      return 'TOP_SECRET';
-    },
+    prompt: async () => secret,
     execFile: (cmd, values, opts) => {
-      args = [cmd, values];
-      options = opts;
+      calls.push({ cmd, values, opts });
       return { status: 0 };
     },
+    readExecFile: () => `${secret}\n`,
   });
   assert.equal(saved.stored, true);
-  assert.equal(prompted, false);
-  assert.deepEqual(args[0], 'security');
-  assert.equal(args[1].includes('TOP_SECRET'), false);
-  assert.deepEqual(options.stdio, 'inherit');
-  assert.equal(Object.hasOwn(options, 'input'), false);
+  const [{ cmd, values, opts: options }] = calls;
+  assert.equal(cmd, 'security');
+  assert.deepEqual(values, ['-i']);
+  assert.equal(
+    values.some((value) => value.includes(secret)),
+    false,
+  );
+  assert.equal(options.input, `add-generic-password -U -a offload -s offload-deepseek -w ${secret}\n`);
   assert.equal(options.env.OPENAI_API_KEY, undefined);
   assert.equal(options.env.PATH, '/usr/bin');
+  const truncated = storeKeychainKey({
+    platform: 'darwin',
+    macosInteractive: true,
+    prompt: async () => secret,
+    execFile: () => ({ status: 0 }),
+    readExecFile: () => secret.slice(0, 128),
+  });
+  await assert.rejects(truncated, (error) => error.code === 'E_SECRET_STORE' && !error.message.includes(secret));
 });
 test('installer sends a Windows key to Credential Locker only on stdin', async () => {
   let command, args, options;
@@ -456,12 +463,17 @@ test('installer stores only the configured keychain service and never prompts fo
     limits: { maxTurns: 1, timeoutMinutes: 1, maxUsd: 1 },
   };
   await writeFile(configPath, JSON.stringify(config));
+  // Default sonnet/opus route providers are checked too; point them at env refs.
+  for (const name of ['anthropic', 'openai', 'deepseek'])
+    config.providers[name] = { ...config.providers.custom, keyRef: `env:ROUTE_${name}` };
+  await writeFile(configPath, JSON.stringify(config));
   let stored;
   await install({
     root: process.cwd(),
     home,
     configHome,
     clients: ['codex'],
+    env: { PATH: '/usr/bin', ROUTE_anthropic: 'x', ROUTE_openai: 'x', ROUTE_deepseek: 'x' },
     keyPrompt: async () => 'x',
     keychain: async (value) => {
       stored = value;
@@ -477,6 +489,7 @@ test('installer stores only the configured keychain service and never prompts fo
     home,
     configHome,
     clients: ['codex'],
+    env: { PATH: '/usr/bin', ROUTE_anthropic: 'x', ROUTE_openai: 'x', ROUTE_deepseek: 'x' },
     keyPrompt: async () => {
       prompted = true;
       return 'x';
@@ -2185,4 +2198,126 @@ test('installer migrates the owned legacy command to both commands and preserves
   await install({ ...options, uninstall: true });
   for (const name of ['offload_sonnet', 'offload_opus'])
     await assert.rejects(access(join(home, '.claude', 'skills', name, 'SKILL.md')), /ENOENT/);
+});
+async function keyRoutesFixture(keyRefs) {
+  const home = await mkdtemp(`${tmpdir()}/offload-home-`);
+  const configHome = join(home, 'config');
+  await mkdir(join(configHome, 'offload'), { recursive: true });
+  const provider = (keyRef) => ({ type: 'openai-chat', baseUrl: 'https://api.example.test', keyRef });
+  await writeFile(
+    join(configHome, 'offload', 'config.json'),
+    JSON.stringify({
+      providers: { anthropic: provider(keyRefs.anthropic), openai: provider(keyRefs.openai), deepseek: provider(keyRefs.deepseek) },
+      profiles: {
+        sonnet: { provider: 'anthropic', model: 'm', fallback: 'terra' },
+        opus: { provider: 'anthropic', model: 'm', fallback: 'sol' },
+        terra: { provider: 'openai', model: 'm', fallback: 'flash' },
+        sol: { provider: 'openai', model: 'm', fallback: 'flash' },
+        flash: { provider: 'deepseek', model: 'm' },
+      },
+      default: 'sonnet',
+      limits: { maxTurns: 1, timeoutMinutes: 1, maxUsd: 1 },
+    }),
+  );
+  return { home, configHome };
+}
+test('installer prompts for each missing route key, one provider at a time, and skips present ones', async () => {
+  const { home, configHome } = await keyRoutesFixture({
+    anthropic: 'env:KR_ANTHROPIC',
+    openai: 'keychain:offload-test-openai-zz',
+    deepseek: 'keychain:offload-test-deepseek-zz',
+  });
+  const calls = [];
+  const result = await install({
+    root: process.cwd(),
+    home,
+    configHome,
+    clients: ['codex'],
+    env: { PATH: '/usr/bin', KR_ANTHROPIC: 'present' },
+    platform: 'linux',
+    keyPrompt: async () => 'x',
+    keychain: async (value) => {
+      calls.push(value);
+      return { stored: true, service: value.service };
+    },
+  });
+  assert.deepEqual(
+    calls.map((call) => call.service),
+    ['offload-test-openai-zz', 'offload-test-deepseek-zz'],
+  );
+  assert.deepEqual(
+    result.keys.map((entry) => entry.provider),
+    ['anthropic', 'openai', 'deepseek'],
+  );
+  assert.match(result.keys[0].reason, /configure env/);
+  assert.equal(result.key.provider, 'anthropic');
+});
+test('--key=openai stores only the OpenAI service through the injected keychain command and replaces it', async () => {
+  assert.equal(parseInstallerArgs(['--key=openai']).keyProvider, 'openai');
+  assert.equal(parseInstallerArgs(['--key', 'openai']).keyProvider, 'openai');
+  assert.throws(() => parseInstallerArgs(['--key=openai', '--skip-key']), /--key/);
+  assert.throws(() => parseInstallerArgs(['--key=openai', '--uninstall']), /--key/);
+  assert.throws(() => parseInstallerArgs(['--key=sk-live-secret value']), /--key requires/);
+  assert.throws(() => parseInstallerArgs(['--key']), /--key requires/);
+  const { home, configHome } = await keyRoutesFixture({
+    anthropic: 'env:KR_ANTHROPIC',
+    openai: 'env:KR_OPENAI',
+    deepseek: 'keychain:offload-test-deepseek-zz',
+  });
+  await writeFile(
+    join(configHome, 'offload', 'config.json'),
+    (await readFile(join(configHome, 'offload', 'config.json'), 'utf8')).replace('env:KR_OPENAI', 'keychain:offload-test-openai-zz'),
+  );
+  const calls = [];
+  const result = await install({
+    root: process.cwd(),
+    home,
+    configHome,
+    clients: ['codex'],
+    env: { PATH: '/usr/bin' },
+    platform: 'linux',
+    keyPrompt: async () => 'x',
+    keyProvider: 'openai',
+    keychain: async (value) => {
+      calls.push(value);
+      return { stored: true, service: value.service };
+    },
+  });
+  assert.deepEqual(
+    calls.map((call) => call.service),
+    ['offload-test-openai-zz'],
+  );
+  assert.equal(result.key.provider, 'openai');
+  const unknown = await install({
+    root: process.cwd(),
+    home,
+    configHome,
+    clients: ['codex'],
+    keyPrompt: async () => 'x',
+    keyProvider: 'nope',
+    keychain: async () => assert.fail('must not store'),
+  });
+  assert.equal(unknown.key.stored, false);
+  assert.match(unknown.key.reason, /unknown provider/);
+  assert.doesNotMatch(JSON.stringify(unknown), /nope/);
+  assert.throws(
+    () => parseInstallerArgs(['--key=sk-abc123def456']),
+    (error) => !/abc123/.test(error.message),
+  );
+});
+test('storeKeychainKey on macOS never takes the secret from the prompt and labels the provider', async () => {
+  let promptCalls = 0;
+  const result = await storeKeychainKey({
+    service: 'offload-openai',
+    platform: 'darwin',
+    macosInteractive: false,
+    label: 'openai API key',
+    prompt: async () => {
+      promptCalls++;
+      return 'secret';
+    },
+    execFile: () => assert.fail('must not run'),
+  });
+  assert.equal(result.stored, false);
+  assert.equal(promptCalls, 0);
 });

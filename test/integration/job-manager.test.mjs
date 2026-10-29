@@ -3427,3 +3427,49 @@ test("offload_wait stays bounded when another live process holds an orphan's job
   }
   assert.equal(status, 'FAILED');
 });
+test('executionProfile accepts a legacy single fallback or a mirrored chain of at most two fallbacks', async () => {
+  const m = await manager({ run: async () => ({ status: 'DONE' }) });
+  const route = (model, baseUrl = 'https://provider.example.test/v1') => ({
+    type: 'openai-chat',
+    baseUrl,
+    keyRef: 'env:OFFLOAD_TEST_KEY',
+    model,
+  });
+  const primary = route('test-model');
+  const second = route('second-model');
+  const third = route('third-model');
+  const attempt = (executionProfile) =>
+    m.start({ task: 'x', ownedPaths: ['src/**'], executionProfile, repoPath: process.cwd() }, { launch: false });
+  await attempt({ ...primary, fallback: second });
+  await attempt({ ...primary, fallback: second, fallbacks: [second, third] });
+  for (const bad of [
+    { ...primary, fallbacks: [second] },
+    { ...primary, fallback: third, fallbacks: [second] },
+    { ...primary, fallback: second, fallbacks: [second, third, route('fourth-model')] },
+    { ...primary, fallback: second, fallbacks: [] },
+    { ...primary, fallback: second, fallbacks: [{ ...second, fallback: third }] },
+    { ...primary, fallback: second, fallbacks: [{ ...second, fallbacks: [third] }] },
+  ])
+    await assert.rejects(() => attempt(bad), /executionProfile/);
+});
+test('a provider_credit_fallback progress event persists a monotonic providerStage bounded by the sealed chain', async () => {
+  const route = (model) => ({ type: 'openai-chat', baseUrl: 'https://provider.example.test/v1', keyRef: 'env:OFFLOAD_TEST_KEY', model });
+  const executionProfile = { ...route('a-model'), fallback: route('b-model'), fallbacks: [route('b-model'), route('c-model')] };
+  const m = await manager({
+    run: async (_job, api) => {
+      await api.progress({ action: 'provider_credit_fallback', providerStage: 2, creditFallback: true });
+      // A lower, equal or out-of-range stage never rewinds or extends the chain.
+      await api.progress({ action: 'provider_credit_fallback', providerStage: 1, creditFallback: true });
+      await api.progress({ action: 'provider_credit_fallback', providerStage: 3, creditFallback: true });
+      return { status: 'DONE', summary: 'ok' };
+    },
+  });
+  const started = await m.start({ task: 'x', ownedPaths: ['src/**'], executionProfile, repoPath: process.cwd() });
+  for (let i = 0; i < 200 && !(await m.store.get(started.jobId)).providerStage; i++)
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  const job = await m.store.get(started.jobId);
+  assert.equal(job.providerStage, 2);
+  assert.equal(job.creditFallback, true);
+  assert.equal(m.public(job).providerStage, 2);
+  assert.equal(m.public(job).creditFallback, true);
+});

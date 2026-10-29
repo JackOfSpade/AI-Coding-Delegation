@@ -340,8 +340,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     workspaceCleanup,
     summary,
     concerns,
-    job.creditFallback === true &&
-      `provider transition: ${scalar(job.executionProfile?.model)} -> ${scalar(job.executionProfile?.fallback?.model)} (explicit credit exhaustion; work and conversation retained)`,
+    ...providerTransitionLines(job),
     providerFailure,
     (!lean || failureDiagnostics) && providerFinishReason,
     (!lean || failureDiagnostics) && budgetReservation,
@@ -682,6 +681,16 @@ function stripControls(value) {
   return stripTerminalEscapes(value)
     .replace(/\t/g, '↹')
     .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
+}
+function providerTransitionLines(job) {
+  const stage = Number.isSafeInteger(job.providerStage) && job.providerStage > 0 ? job.providerStage : job.creditFallback === true ? 1 : 0;
+  const execution = job.executionProfile;
+  const routes = [execution, ...(execution?.fallbacks ?? (execution?.fallback ? [execution.fallback] : []))];
+  return Array.from(
+    { length: Math.min(stage, 2) },
+    (_, hop) =>
+      `provider transition: ${scalar(routes[hop]?.model)} -> ${scalar(routes[hop + 1]?.model)} (explicit credit exhaustion; work and conversation retained)`,
+  );
 }
 function scalar(value) {
   // Strip an entire terminal sequence before clipping. Clipping first could
