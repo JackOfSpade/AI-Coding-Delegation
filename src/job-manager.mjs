@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { compactReport, terminalStatuses } from './report.mjs';
 import { matchesAny, normalizePath, pathsOverlap } from './glob.mjs';
 import { parseKeyRef } from './secrets.mjs';
-import { modelPolicyViolation } from './model-policy.mjs';
+import { isDeepSeekEndpoint, isOpenAIEndpoint, modelPolicyViolation } from './model-policy.mjs';
 import { safeProviderFailureReason } from './provider/openai-chat.mjs';
 import { diffTreeFiles, diffTrees, git as snapshotGit } from './git-snapshot.mjs';
 import { copyReportInputs, prepareReportInputsForCleanup, reportInputRoots, validateReportInputFiles } from './report-inputs.mjs';
@@ -482,6 +482,26 @@ function canonicalRelevantPaths(paths) {
 export function executionFallbacks(execution) {
   if (Array.isArray(execution?.fallbacks)) return execution.fallbacks;
   return execution?.fallback ? [execution.fallback] : [];
+}
+// The snapshotted credit-fallback chain as callers may see it: provider
+// family and concrete model per route, never endpoints or key references.
+function publicRoutes(job) {
+  const execution = job?.executionProfile;
+  if (!execution || typeof execution.model !== 'string') return undefined;
+  const stage = recordedProviderStage(job);
+  const provider = ({ type, baseUrl }) =>
+    isOpenAIEndpoint(baseUrl)
+      ? 'openai'
+      : isDeepSeekEndpoint(baseUrl)
+        ? 'deepseek'
+        : type === 'anthropic-messages'
+          ? 'anthropic'
+          : 'openai-compatible';
+  return [execution, ...executionFallbacks(execution)].map((route, index) => ({
+    provider: provider(route),
+    model: route.model,
+    ...(index === stage ? { active: true } : {}),
+  }));
 }
 /** Persisted route stage; a legacy `creditFallback: true` record without `providerStage` is stage 1. */
 export function recordedProviderStage(job) {
@@ -3179,6 +3199,7 @@ export class JobManager {
       ...(job.workspaceRetained === true ? { workspaceRetained: true } : {}),
       ...(job.creditFallback === true || recordedProviderStage(job) > 0 ? { creditFallback: true } : {}),
       ...(recordedProviderStage(job) > 0 ? { providerStage: recordedProviderStage(job) } : {}),
+      ...(publicRoutes(job) ? { routes: publicRoutes(job) } : {}),
       ...(safeProviderFailure(job.providerFailure) ? { providerFailure: safeProviderFailure(job.providerFailure) } : {}),
       ...(safeProviderFinishReason(job.providerFinishReason)
         ? { providerFinishReason: safeProviderFinishReason(job.providerFinishReason) }

@@ -3000,6 +3000,13 @@ for (const [line, openai] of [
       assert.equal(harness.calls[1].body.model, claude);
       assert.equal(done.providerStage, 1);
       assert.equal(done.creditFallback, true);
+      // Callers see the snapshotted chain and the active route, never endpoints or keys.
+      assert.deepEqual(done.routes, [
+        { provider: 'openai', model: openai },
+        { provider: 'anthropic', model: claude, active: true },
+        { provider: 'deepseek', model: 'deepseek-flash' },
+      ]);
+      assert.doesNotMatch(JSON.stringify(done.routes), /keychain|https:/);
       assert.equal(done.reportResult.text, 'Reviewed.');
       const report = await harness.core.manager.store.readArtifact(started.jobId, 'report.md');
       assert.match(report, new RegExp(`provider transition: ${openai.replace('.', '\\.')} -> ${claude} \\(explicit credit exhaustion`));
@@ -3220,6 +3227,16 @@ for (const [line, family, ignored] of [
       assert.equal(job.executionProfile.model, `gpt-6.1-${family}`);
       assert.equal(job.executionProfile.baseUrl, OPENAI_BASE);
       assert.equal(job.executionProfile.fallbacks[0].model, `claude-${line}-5-5`);
+      const view = await harness.core.job(started.jobId, { repoPath: path });
+      assert.deepEqual(
+        view.routes.map(({ provider, active }) => [provider, active === true]),
+        [
+          ['openai', true],
+          ['anthropic', false],
+          ['deepseek', false],
+        ],
+      );
+      assert.equal(view.routes[0].model, job.executionProfile.model);
       assert.ok(job.pricingSnapshot.models[`gpt-6.1-${family}`]);
       assert.equal(job.pricingId.includes('openai-2026-10-26'), true);
     } finally {
