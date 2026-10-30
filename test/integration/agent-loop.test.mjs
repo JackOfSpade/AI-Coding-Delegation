@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { OpenAIChatProvider } from '../../src/provider/openai-chat.mjs';
@@ -50,6 +50,7 @@ test('streaming fragmented calls, reasoning passback, tools, and mandatory finis
   if (!server) return;
   try {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-loop-'));
+    t.after(() => rm(dir, { recursive: true, force: true }));
     const loop = new AgentLoop({
       provider: new OpenAIChatProvider({ baseUrl: server.baseUrl, apiKey: 'x', model: 'mock' }),
       tools: new LocalTools({ repoPath: dir, ownedPaths: ['*.txt'] }),
@@ -81,6 +82,7 @@ test('provider retries 5xx and loop rejects a final answer without finish', asyn
   if (!server) return;
   try {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-loop-'));
+    t.after(() => rm(dir, { recursive: true, force: true }));
     const result = await new AgentLoop({
       provider: new OpenAIChatProvider({ baseUrl: server.baseUrl, model: 'mock', retries: 1 }),
       tools: new LocalTools({ repoPath: dir, ownedPaths: ['**'] }),
@@ -177,5 +179,42 @@ test('a provider body that hangs mid-stream ends at attemptTimeoutMs, and a canc
     assert.equal(server.requests.length, 2);
   } finally {
     await server.close();
+  }
+});
+
+test('mock server releases a header-stall timer without starting another stall after cancellation', async (t) => {
+  const timers = new Set();
+  const schedule = globalThis.setTimeout;
+  const clear = globalThis.clearTimeout;
+  t.mock.method(globalThis, 'setTimeout', (callback, ms, ...args) => {
+    const timer = schedule(callback, ms, ...args);
+    if (ms === 60_000) timers.add(timer);
+    return timer;
+  });
+  t.mock.method(globalThis, 'clearTimeout', (timer) => {
+    timers.delete(timer);
+    return clear(timer);
+  });
+  const server = await mockOrSkip(t, [{ stallMs: 60_000, stallAfterChunks: 1, chunks: [{ choices: [{ delta: { content: 'closed' } }] }] }]);
+  if (!server) return;
+  const controller = new AbortController();
+  const pending = new OpenAIChatProvider({ baseUrl: server.baseUrl, model: 'mock', retries: 0 })
+    .chat({ messages: [], tools: [], signal: controller.signal })
+    .next();
+  // Observe a failure immediately, even if an assertion below fails first.
+  pending.catch(() => {});
+  try {
+    for (let i = 0; server.requests.length === 0 && i < 200; i++) await new Promise((resolve) => schedule(resolve, 5));
+    assert.equal(server.requests.length, 1);
+    assert.equal(timers.size, 1, 'the request is waiting for its headers');
+    controller.abort(new Error('cancel fixture request'));
+    await assert.rejects(pending, /cancel fixture request/);
+    await server.close();
+    for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(timers.size, 0, 'a closed response cannot start the body stall or retain a timer');
+  } finally {
+    controller.abort();
+    await server.close();
+    for (const timer of timers) clear(timer);
   }
 });

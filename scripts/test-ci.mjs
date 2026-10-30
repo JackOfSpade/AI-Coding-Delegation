@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { posix, resolve, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { acquireArtifactLease, publishArtifactFile } from './artifact-lease.mjs';
+import { processExit } from './process-exit.mjs';
 
 export async function runCiTests({
   cwd = process.cwd(),
@@ -37,10 +38,7 @@ export async function runCiTests({
   });
   let exitCode;
   try {
-    exitCode = await new Promise((resolveExit, reject) => {
-      child.once('error', reject);
-      child.once('exit', (value) => resolveExit(value ?? 1));
-    });
+    exitCode = await processExit(child);
     if (explicitSummary) return exitCode;
     await checkAccess(summaryFile);
     const lease = await acquireLease({ cwd, environment, platform });

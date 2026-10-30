@@ -110,6 +110,36 @@ test('secrets and absolute paths are removed from the recorded call and error', 
   assert.doesNotMatch(JSON.stringify(summary), /hunter2|\/Users/);
 });
 
+test('opaque explicit secrets are removed before argument, key and error clipping or path aliases', () => {
+  const opaque = 'opaque-credit-value-with-no-recognized-key-shape';
+  const summary = summarizeToolFailure(
+    failing({
+      parsed: [{ ['n'.repeat(30) + opaque]: 'v', command: 'x'.repeat(110) + opaque }],
+      errors: [new Error('e'.repeat(290) + opaque)],
+      secrets: [opaque],
+    }),
+  );
+  assert.doesNotMatch(JSON.stringify(summary), /opaque|credit/);
+  assert.match(summary.args, /REDACTED/);
+  assert.match(summary.error, /REDACTED/);
+  const pathSecret = '/Users/jack/proj/wt/opaque-value';
+  const aliased = summarizeToolFailure(
+    failing({ parsed: [{ path: pathSecret }], errors: [new Error(pathSecret)], pathAliases: aliases, secrets: [pathSecret] }),
+  );
+  assert.equal(aliased.error, '[REDACTED]');
+  assert.equal(aliased.args, '{"path":"[REDACTED]"}');
+  const multiline = 'opaque-first-half\nopaque-second-half';
+  assert.equal(summarizeToolFailure(failing({ errors: [new Error(multiline)], secrets: [multiline] })).error, '[REDACTED]');
+
+  const raw = safeToolFailure(
+    { tool: 'read_file', turn: 1, repeats: 3, args: 'x'.repeat(290) + opaque, error: 'e'.repeat(290) + opaque },
+    { secrets: [opaque] },
+  );
+  assert.doesNotMatch(JSON.stringify(raw), /opaque|credit/);
+  assert.match(raw.args, /REDACTED/);
+  assert.match(raw.error, /REDACTED/);
+});
+
 test('an alias stops at a path boundary and the longest prefix wins', () => {
   const summary = summarizeToolFailure(
     failing({

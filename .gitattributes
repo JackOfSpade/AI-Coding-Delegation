@@ -2,5 +2,5 @@
 # artifacts byte-stable on Windows checkouts as well as POSIX checkouts.
 plugins/offload/plugin.json text eol=lf
 plugins/offload/.codex-plugin/plugin.json text eol=lf
-plugins/offload/skills/offload_sonnet/SKILL.md text eol=lf
-plugins/offload/skills/offload_opus/SKILL.md text eol=lf
+plugins/offload/skills/offload_economy/SKILL.md text eol=lf
+plugins/offload/skills/offload_premium/SKILL.md text eol=lf

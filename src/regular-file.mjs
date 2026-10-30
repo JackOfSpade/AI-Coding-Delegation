@@ -39,7 +39,10 @@ export function readRegularFileSync(path, cap, { platform = process.platform, fs
     // O_NOFOLLOW protects the final path component on POSIX. On Windows the
     // fstat identity check below detects a redirected target after opening.
     const noFollow = platform === 'win32' ? 0 : fs.constants.O_NOFOLLOW || 0;
-    fd = fs.openSync(path, fs.constants.O_RDONLY | noFollow);
+    // A regular file can be replaced by a FIFO after lstat. Nonblocking open
+    // reaches the authoritative fstat rejection instead of waiting forever.
+    const nonBlock = platform === 'win32' ? 0 : fs.constants.O_NONBLOCK || 0;
+    fd = fs.openSync(path, fs.constants.O_RDONLY | noFollow | nonBlock);
     const opened = fs.fstatSync(fd, BIGINT_STATS);
     if (!validRegular(opened, maximum) || !sameFile(before, opened)) throw new Error('file changed while opening');
     const bytes = Buffer.allocUnsafe(Number(opened.size));
@@ -68,7 +71,8 @@ export async function readRegularFile(path, cap, { platform = process.platform, 
     const before = await fs.lstat(path, BIGINT_STATS);
     if (!validRegular(before, maximum)) throw new Error('file is not a bounded regular file');
     const noFollow = platform === 'win32' ? 0 : fs.constants.O_NOFOLLOW || 0;
-    handle = await fs.open(path, fs.constants.O_RDONLY | noFollow);
+    const nonBlock = platform === 'win32' ? 0 : fs.constants.O_NONBLOCK || 0;
+    handle = await fs.open(path, fs.constants.O_RDONLY | noFollow | nonBlock);
     const opened = await handle.stat(BIGINT_STATS);
     if (!validRegular(opened, maximum) || !sameFile(before, opened)) throw new Error('file changed while opening');
     const bytes = Buffer.allocUnsafe(Number(opened.size));

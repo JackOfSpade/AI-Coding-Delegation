@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process';
 import { createMcpServer, parseSkillFrontmatter, readSkillRegularUtf8 } from '../../src/mcp.mjs';
 import { runCli } from '../../src/cli.mjs';
 import { IDENTITY_SCHEMA_REVISION, RUNTIME_CAPABILITIES, runtimeIdentity } from '../../src/identity.mjs';
-const skillUri = 'skill://offload/offload_sonnet/SKILL.md';
+const skillUri = 'skill://offload/offload_economy/SKILL.md';
 const serverMeta = { _meta: { 'io.modelcontextprotocol/serverInfo': runtimeIdentity() } };
 const currentMeta = {
   _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28', 'io.modelcontextprotocol/clientCapabilities': {} },
@@ -561,12 +561,12 @@ test('MCP keeps current requests stateless and legacy initialize envelopes separ
     assert.match(discovery.instructions, /Offload skill/);
     assert.match(
       discovery.instructions,
-      /conversational client may call offload_start only for an actual `\/offload_sonnet <task>` or `\/offload_opus <task>` slash command/,
+      /conversational client may call offload_start only for an actual `\/offload_economy <task>` or `\/offload_premium <task>` slash command/,
     );
     assert.match(discovery.instructions, /Prose, mentions, quotes, or negations/);
     assert.match(discovery.instructions, /DeepSeek, providers, or models never authorize it/);
     assert.doesNotMatch(discovery.instructions, /Direct CLI\/MCP operators may explicitly call it/);
-    assert.match(discovery.instructions, /skill:\/\/offload\/offload_sonnet\/SKILL\.md/);
+    assert.match(discovery.instructions, /skill:\/\/offload\/offload_economy\/SKILL\.md/);
     assert.match(discovery.instructions, /repoPath/);
     assert.match(discovery.instructions, /native Claude subagents/);
     assert.match(discovery.instructions, /profiles "sonnet" and "opus"/);
@@ -601,7 +601,7 @@ test('MCP keeps current requests stateless and legacy initialize envelopes separ
   const startDescription = list.tools.find((tool) => tool.name === 'offload_start').description;
   assert.match(
     startDescription,
-    /conversational client may use this tool only to fulfill an actual `\/offload_sonnet <task>` or `\/offload_opus <task>` slash command/,
+    /conversational client may use this tool only to fulfill an actual `\/offload_economy <task>` or `\/offload_premium <task>` slash command/,
   );
   assert.doesNotMatch(startDescription, /explicit direct CLI\/MCP operator request/);
   assert.match(startDescription, /do not infer authorization from ordinary prose/);
@@ -621,7 +621,7 @@ test('MCP keeps current requests stateless and legacy initialize envelopes separ
   );
   assert.match(
     list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.profile.description,
-    /Use "sonnet" for \/offload_sonnet and "opus" for \/offload_opus/,
+    /Use "sonnet" for \/offload_economy and "opus" for \/offload_premium/,
   );
   assert.match(
     list.tools.find((tool) => tool.name === 'offload_start').inputSchema.properties.effort.description,
@@ -666,7 +666,7 @@ test('MCP applies current envelopes per request, rejects malformed current metad
     );
   assert.deepEqual(modernValues.find((value) => value.id === 4).result.resources, [
     { uri: skillUri, name: 'SKILL.md', mimeType: 'text/markdown' },
-    { uri: 'skill://offload/offload_opus/SKILL.md', name: 'SKILL.md', mimeType: 'text/markdown' },
+    { uri: 'skill://offload/offload_premium/SKILL.md', name: 'SKILL.md', mimeType: 'text/markdown' },
   ]);
   assert.deepEqual(modernValues.find((value) => value.id === 7).error, {
     code: -32022,
@@ -730,10 +730,10 @@ test('MCP applies current envelopes per request, rejects malformed current metad
   await legacy.close();
 });
 test('MCP exposes the canonical static skill with exact resources and safe request handling', async () => {
-  const expectedText = await readFile(new URL('../../plugins/offload/skills/offload_sonnet/SKILL.md', import.meta.url), 'utf8');
+  const expectedText = await readFile(new URL('../../plugins/offload/skills/offload_economy/SKILL.md', import.meta.url), 'utf8');
   const expectedFrontmatter = jsonFrontmatter(expectedText);
   assert.match(expectedFrontmatter.description, /\/offload/);
-  assert.match(expectedFrontmatter.description, /explicitly enters \/offload_sonnet as a slash command/);
+  assert.match(expectedFrontmatter.description, /explicitly enters \/offload_economy as a slash command/);
   assert.equal(expectedFrontmatter['argument-hint'], '<task or verification request>');
   assert.equal(Object.hasOwn(expectedFrontmatter.metadata || {}, 'argument-hint'), false);
   assert.match(expectedText, /Do \*\*not\*\* satisfy that command invocation with Claude Code's native subagents/);
@@ -744,10 +744,10 @@ test('MCP exposes the canonical static skill with exact resources and safe reque
   assert.match(expectedText, /including Sonnet ultracode\/native-agent workflows/);
   assert.match(
     expectedText,
-    /A mention, quotation, negation, or discussion of `\/offload_sonnet`, offload, delegation, \*\*DeepSeek\*\* \/ \*\*DeepSeek-V4\.1-Flash\*\*, \*\*OpenAI\*\* \/ \*\*GPT Terra\*\* \/ \*\*GPT Sol\*\*, a provider, or a model does not select Offload/,
+    /A mention, quotation, negation, or discussion of `\/offload_economy`, offload, delegation, \*\*DeepSeek\*\* \/ \*\*DeepSeek-V4\.1-Flash\*\*, \*\*OpenAI\*\* \/ \*\*GPT Terra\*\* \/ \*\*GPT Sol\*\*, a provider, or a model does not select Offload/,
   );
   assert.match(expectedText, /A standalone instruction not to use native subagents does not trigger Offload/);
-  assert.match(expectedText, /For an `\/offload_sonnet` or `\/offload_opus` command invocation, end every final answer/);
+  assert.match(expectedText, /For an `\/offload_economy` or `\/offload_premium` command invocation, end every final answer/);
   assert.match(expectedText, /explicitly set `profile: "sonnet"`/);
   assert.match(expectedText, /omit `effort`/);
   assert.match(expectedText, /explicitly set `profile: "opus"`/);
@@ -771,11 +771,13 @@ test('MCP exposes the canonical static skill with exact resources and safe reque
   request(2, 'skills/get', { uri: skillUri, ...meta });
   request(3, 'resources/read', { uri: skillUri, ...meta });
   request(4, 'skills/list', { cursor: 'not-issued' });
-  request(5, 'skills/get', { uri: 'skill://offload/offload_sonnet/../SKILL.md' });
-  request(6, 'resources/read', { uri: 'skill://offload/offload_sonnet/missing.md' });
+  request(5, 'skills/get', { uri: 'skill://offload/offload_economy/../SKILL.md' });
+  request(6, 'resources/read', { uri: 'skill://offload/offload_economy/missing.md' });
   request(7, 'skills/get', { uri: skillUri, extra: true });
   request(8, 'skills/nope', {});
   request(9, 'skills/list');
+  request(10, 'skills/get', { uri: 'skill://offload/offload_sonnet/SKILL.md' });
+  request(11, 'resources/read', { uri: 'skill://offload/offload_opus/SKILL.md' });
   await new Promise((resolve) => setTimeout(resolve, 30));
   const values = responseValues(wire);
   const listed = values.find((value) => value.id === 1).result,
@@ -790,9 +792,9 @@ test('MCP exposes the canonical static skill with exact resources and safe reque
     ...serverMeta,
   });
   assert.equal(listed.skills.length, 2);
-  assert.equal(listed.skills[1].frontmatter.name, 'offload_opus');
+  assert.equal(listed.skills[1].frontmatter.name, 'offload_premium');
   assert.equal(
-    listed.skills.some((entry) => entry.frontmatter.name === 'offload'),
+    listed.skills.some((entry) => ['offload', 'offload_sonnet', 'offload_opus'].includes(entry.frontmatter.name)),
     false,
   );
   assert.equal(Object.hasOwn(listed, 'nextCursor'), false, 'terminal page has no cursor');
@@ -815,11 +817,13 @@ test('MCP exposes the canonical static skill with exact resources and safe reque
   assert.equal(values.find((value) => value.id === 6).error.code, -32602);
   assert.equal(values.find((value) => value.id === 7).error.code, -32602);
   assert.equal(values.find((value) => value.id === 8).error.code, -32601);
+  assert.equal(values.find((value) => value.id === 10).error.code, -32602);
+  assert.equal(values.find((value) => value.id === 11).error.code, -32602);
   await server.close();
 });
 test('MCP preserves JSON frontmatter nested metadata, arrays, and special strings exactly', () => {
   const frontmatter = {
-    name: 'offload_sonnet',
+    name: 'offload_economy',
     description: 'Quoted "text" with \\slashes and\nnewlines.',
     metadata: { nested: { enabled: true, count: 2 }, labels: ['one', 'two'] },
     'x-extra': [null, false, 3],
@@ -1127,6 +1131,51 @@ test('MCP close aborts an active wait and shares one shutdown promise', async ()
   await first;
   assert.equal(aborted, true);
   assert.equal(shutdowns, 1);
+});
+test('MCP start forwards cancellation so setup can stop before accepting paid work', async () => {
+  const input = new PassThrough(),
+    output = new PassThrough();
+  let entered;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  let aborted;
+  const stopped = new Promise((resolve) => {
+    aborted = resolve;
+  });
+  const server = createMcpServer(
+    {
+      start: async (_input, { signal }) =>
+        new Promise((_resolve, reject) => {
+          signal.addEventListener(
+            'abort',
+            () => {
+              aborted();
+              reject(signal.reason);
+            },
+            { once: true },
+          );
+          entered();
+        }),
+    },
+    { input, output },
+  );
+  try {
+    input.write(JSON.stringify({ jsonrpc: '2.0', id: 99, method: 'initialize', params: {} }) + '\n');
+    input.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'offload_start', arguments: { task: 'inspect', mode: 'report' } },
+      }) + '\n',
+    );
+    await started;
+    input.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 1 } }) + '\n');
+    await stopped;
+  } finally {
+    await server.close();
+  }
 });
 test('MCP shutdown waits for an aborting handler, writes nothing afterward, and permits an undefined synchronous result', async () => {
   const input = new PassThrough(),
@@ -1466,7 +1515,7 @@ test('MCP routes include "retrospective" to the digest, forwards only the jobs a
   await server.close();
 });
 test('the skill tells the primary to load deferred tools, what the snapshot includes, and how health and the list behave', async () => {
-  const text = await readFile(new URL('../../plugins/offload/skills/offload_sonnet/SKILL.md', import.meta.url), 'utf8');
+  const text = await readFile(new URL('../../plugins/offload/skills/offload_economy/SKILL.md', import.meta.url), 'utf8');
   const section = (from, to) => {
     const start = text.indexOf(from);
     const end = text.indexOf(to, start + from.length);
@@ -1493,7 +1542,7 @@ test('the skill tells the primary to load deferred tools, what the snapshot incl
   assert.match(section('## 4. Review', '## 5. Fix loop'), /a `spend across N jobs touched this session:` line/);
 });
 test('the skill names exactly the capabilities, tools, parameters and CLI flags the server provides', async () => {
-  const text = await readFile(new URL('../../plugins/offload/skills/offload_sonnet/SKILL.md', import.meta.url), 'utf8');
+  const text = await readFile(new URL('../../plugins/offload/skills/offload_economy/SKILL.md', import.meta.url), 'utf8');
   const input = new PassThrough(),
     output = new PassThrough();
   let wire = '';

@@ -118,6 +118,6 @@ export function assertStartRuntimeCurrent(health, { requireCurrentSkill = true }
       typeof action === 'string' && action.trim()
         ? action.trim()
         : 'Run `node install.mjs` from the Offload checkout, then restart the MCP client before starting a job.'
-    } For /offload_sonnet or /offload_opus, stop the requested task; do not continue implementation locally or through native subagents or bypass this refusal through the CLI.`,
+    } For /offload_economy or /offload_premium, stop the requested task; do not continue implementation locally or through native subagents or bypass this refusal through the CLI.`,
   );
 }

@@ -100,6 +100,7 @@ test('the expected verifier duration is the median of recent sandboxed passing r
     passed('policy-only', 1, { verify: { result: { code: 0, sandbox: 'policy-only', durationMs: 1 } } }),
     passed('failed', 1, { verify: { result: { code: 1, sandbox: 'macos', durationMs: 1 } } }),
     passed('timed-out', 1, { verify: { result: { code: 0, sandbox: 'macos', durationMs: 1, timedOut: true } } }),
+    passed('cancelled', 1, { verify: { result: { code: 0, sandbox: 'macos', durationMs: 1, cancelled: true } } }),
   ];
   assert.equal(expectedVerifierMs(jobs, query), 34_000);
   assert.equal(expectedVerifierMs([], query), undefined);

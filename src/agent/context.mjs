@@ -167,7 +167,7 @@ export class AgentContext {
     const olderToolIndexes = toolIndexes.filter((index) => !protectedIndexes.has(index));
     const eligible = olderToolIndexes
       .slice(0, Math.max(0, olderToolIndexes.length - this.keepRecentToolResults))
-      .filter((index) => source[index].elided !== true);
+      .filter((index) => canElideToolResult(source[index]));
     const compact = source.map((message) => cloneMessage(message, { includeElided: true }));
     let elidedToolResults = 0;
     for (const index of eligible) {
@@ -201,12 +201,12 @@ export class AgentContext {
     const ordinaryEligible = new Set(
       olderToolIndexes
         .slice(0, Math.max(0, olderToolIndexes.length - this.keepRecentToolResults))
-        .filter((index) => source[index].elided !== true),
+        .filter((index) => canElideToolResult(source[index])),
     );
     const compact = source.map((message) => cloneMessage(message, { includeElided: true }));
     for (const index of ordinaryEligible) compact[index].content = toolOutputElisionMarker(compact[index].content.length);
     const eligible = olderToolIndexes.filter(
-      (index) => !ordinaryEligible.has(index) && !protectedIndexes.has(index) && source[index].elided !== true,
+      (index) => !ordinaryEligible.has(index) && !protectedIndexes.has(index) && canElideToolResult(source[index]),
     );
     let elidedToolResults = ordinaryEligible.size;
     for (const index of eligible) {
@@ -221,6 +221,8 @@ export class AgentContext {
   }
 }
 const toolOutputElisionMarker = (chars) => `[tool output elided: ${chars} chars; request a narrower read if needed]`;
+const canElideToolResult = (message) =>
+  message.elided !== true && toolOutputElisionMarker(message.content.length).length < message.content.length;
 function newestCompleteToolTransactionIndexes(messages) {
   let newest;
   for (let index = 0; index < messages.length; index++) {
@@ -264,6 +266,7 @@ function elideMessages(messages, maxToolChars, keepRecentToolResults) {
   // in addition to that transaction, to the newest older results.
   for (const [message] of olderTools.slice(0, Math.max(0, olderTools.length - keepRecentToolResults))) {
     if (chars <= maxToolChars) break;
+    if (!canElideToolResult(message)) continue;
     const original = message.content ?? '';
     message.content = toolOutputElisionMarker(original.length);
     message.elided = true;

@@ -1,4 +1,4 @@
-import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, posix, resolve, win32 } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
@@ -186,7 +186,8 @@ export function parseJsonFile(filePath, label = 'config', { rejectSymlink = fals
     // O_NOFOLLOW closes the final-component swap on POSIX. Windows has no
     // portable equivalent, so its fallback compares lstat/fstat identity.
     const noFollow = rejectSymlink && platform !== 'win32' ? fs.constants.O_NOFOLLOW || 0 : 0;
-    fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+    const nonBlocking = platform === 'win32' ? 0 : fs.constants.O_NONBLOCK || 0;
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow | nonBlocking);
     const opened = fs.fstatSync(fd, BIGINT_STAT_OPTIONS);
     const size = checkedConfigSize(opened.size);
     if (!opened.isFile() || size === undefined || size > MAX_CONFIG_BYTES || (rejectSymlink && !sameConfigMetadata(before, opened))) {
@@ -236,7 +237,7 @@ export function validateConfig(config) {
   if (Object.keys(config.providers).length > MAX_PROVIDERS || Object.keys(config.profiles).length > MAX_PROFILES)
     throw new ConfigError('Config has too many providers or profiles', 'E_CONFIG_LIMIT');
   if (!boundedText(config.default, MAX_NAME)) throw new ConfigError('Config.default must be a non-empty profile name');
-  if (!config.profiles[config.default]) throw new ConfigError(`Default profile does not exist: ${config.default}`);
+  if (!Object.hasOwn(config.profiles, config.default)) throw new ConfigError(`Default profile does not exist: ${config.default}`);
   if (!isPlainObject(config.limits)) throw new ConfigError('Config.limits must be an object');
   assertSafeKeys(config.limits);
   assertAllowedKeys(config.limits, ['maxTurns', 'timeoutMinutes', 'maxUsd'], 'Config.limits');
@@ -308,11 +309,12 @@ export function validateConfig(config) {
       throw new ConfigError(`Profile ${name} requires provider and model`);
     assertSafeKeys(profile);
     assertAllowedKeys(profile, ['provider', 'model', 'effort', 'fallback'], `Profile ${name}`);
-    if (!config.providers[profile.provider]) throw new ConfigError(`Profile ${name} refers to unknown provider: ${profile.provider}`);
+    if (!Object.hasOwn(config.providers, profile.provider))
+      throw new ConfigError(`Profile ${name} refers to unknown provider: ${profile.provider}`);
     if (profile.effort !== undefined && !['normal', 'high'].includes(profile.effort))
       throw new ConfigError(`Profile ${name}.effort must be normal or high`);
     if (profile.fallback !== undefined) {
-      if (!boundedText(profile.fallback, MAX_NAME) || !config.profiles[profile.fallback] || profile.fallback === name)
+      if (!boundedText(profile.fallback, MAX_NAME) || !Object.hasOwn(config.profiles, profile.fallback) || profile.fallback === name)
         throw new ConfigError(`Profile ${name}.fallback must name another profile`, 'E_CONFIG_PROFILE');
     }
     const chain = [name];
@@ -354,13 +356,13 @@ export function validateRepoConfig(config) {
 export function loadConfig({ configPath, repoPath, requireConfig = false, env = process.env } = {}) {
   configPath ||= defaultConfigPath(env);
   let user = {};
-  if (existsSync(configPath)) user = parseJsonFile(configPath, 'config');
+  if (configFilePresent(configPath)) user = parseJsonFile(configPath, 'config');
   else if (requireConfig) throw new ConfigError(`Config file not found: ${configPath}`, 'E_CONFIG_MISSING');
   const config = validateConfig(deepMerge(DEFAULT_CONFIG, user));
   let repoConfig = {};
   if (repoPath) {
     const file = join(resolve(repoPath), '.offload.json');
-    if (existsSync(file)) {
+    if (configFilePresent(file)) {
       // Repo policy affects command execution. Its read opens exactly the
       // lstat-checked file and fails closed on a final-component link swap.
       try {
@@ -377,6 +379,18 @@ export function loadConfig({ configPath, repoPath, requireConfig = false, env = 
 
 export function resolveConfigRelativePath(value, configPath) {
   return isAbsolute(value) ? value : resolve(dirname(configPath), value);
+}
+
+// existsSync follows symlinks and hides access errors. Only an absent entry
+// may select defaults; a dangling link or unreadable policy must fail closed.
+function configFilePresent(path) {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
 }
 
 function numeric(value, name, minimum, maximum, integer = false) {

@@ -47,6 +47,18 @@ test('public job results expose cleanup errors without exposing a workspace path
   assert.match(result.workspaceCleanupError, /manual workspace cleanup/);
   assert.doesNotMatch(JSON.stringify(result), /private\/worktree/);
 });
+test('public report and baseline strings share terminal parsing without swallowing visible neighbours', () => {
+  const manager = new JobManager({ store: {} });
+  const payload = 'a\u001b]0;first\u001b\\b\u001b]0;second\u001b\\c';
+  assert.equal(manager.public({ id: 'report', mode: 'report', reportText: payload }).reportResult.text, 'abc');
+  assert.equal(manager.public({ id: 'report', mode: 'report', reportText: 'visible\u001b]0;private' }).reportResult.text, 'visible');
+  const view = manager.public({
+    id: 'baseline',
+    verify: { baseline: { mode: 'baseline-diff', status: 'compared', newFailures: [payload] } },
+  });
+  assert.deepEqual(view.verifyBaseline.newFailures, ['abc']);
+});
+
 test('public job results expose only bounded provider failure metadata', () => {
   const manager = new JobManager({ store: {} });
   const result = manager.public({
@@ -148,6 +160,97 @@ async function manager(worker, command = 'ok') {
     config: { repoPath: process.cwd(), git: { branch: async () => 'main', head: async () => gitId } },
   });
 }
+test('an aborted start stops after each deferred setup boundary without launching a worker', async () => {
+  for (const phase of ['snapshot', 'workspace', 'stored', 'lease']) {
+    let enter;
+    let release;
+    const entered = new Promise((resolve) => (enter = resolve));
+    const gate = new Promise((resolve) => (release = resolve));
+    const controller = new AbortController();
+    let runs = 0;
+    let cleaned = 0;
+    let leaseReleased = 0;
+    const m = await manager({ run: async () => ((runs += 1), { status: 'DONE' }) });
+    const defer = async () => {
+      enter();
+      await gate;
+    };
+    if (phase === 'snapshot')
+      m.snapshots.create = async () => {
+        await defer();
+        return gitId;
+      };
+    if (phase === 'workspace')
+      m.config.isolation = {
+        open: () => ({}),
+        create: async () => {
+          await defer();
+          return { path: '/tmp/offload-aborted-start-workspace', cleanup: async () => ((cleaned += 1), { removed: true }) };
+        },
+      };
+    if (phase === 'stored') {
+      const create = m.store.create.bind(m.store);
+      m.store.create = async (input) => {
+        const job = await create(input);
+        await defer();
+        return job;
+      };
+    }
+    if (phase === 'lease') m.leases = { acquire: async () => defer(), release: async () => ((leaseReleased += 1), true) };
+    const starting = m.start({ task: 'abort safely', ownedPaths: ['src/**'] }, { signal: controller.signal });
+    await entered;
+    const rejected = assert.rejects(starting, /setup cancelled/);
+    controller.abort(new Error('setup cancelled'));
+    release();
+    await rejected;
+    assert.equal(runs, 0, phase);
+    assert.equal(m.running.size, 0, phase);
+    const jobs = await m.store.list();
+    if (phase === 'stored' || phase === 'lease') {
+      assert.equal(jobs.length, 1, phase);
+      assert.equal(jobs[0].status, 'CANCELLED', phase);
+    } else assert.deepEqual(jobs, [], phase);
+    assert.equal(cleaned, phase === 'workspace' ? 1 : 0);
+    assert.equal(leaseReleased, phase === 'lease' ? 1 : 0);
+  }
+});
+
+test('a start failure reports a retained pre-record workspace instead of claiming cleanup succeeded', async () => {
+  for (const result of [{ retained: true }, { removed: false }, false]) {
+    const m = await manager({ run: async () => assert.fail('setup must not launch') });
+    m.config.isolation = {
+      open: () => ({}),
+      create: async () => ({ path: '/tmp/offload-retained-start-workspace', cleanup: async () => result }),
+    };
+    m.store.create = async () => {
+      throw new Error('durable creation failed');
+    };
+    await assert.rejects(
+      () => m.start({ task: 'do not hide cleanup failure', ownedPaths: ['src/**'] }),
+      /durable creation failed; isolated workspace cleanup failed at .* and must be retried/,
+    );
+  }
+});
+
+test('a failed repair setup reports retention of its replacement workspace', async () => {
+  const m = await manager({ run: async () => assert.fail('setup must not launch') });
+  const started = await m.start({ task: 'repair safely', ownedPaths: ['src/**'] }, { launch: false });
+  await m.store.update(started.jobId, { status: 'DONE_UNVERIFIED' });
+  m.config.isolation = {
+    open: () => ({}),
+    cleanup: async () => ({ removed: true }),
+    create: async () => ({ path: '/tmp/offload-retained-repair-workspace', cleanup: async () => ({ retained: true }) }),
+  };
+  m.leases.acquire = async () => {
+    throw new Error('lease unavailable');
+  };
+  await assert.rejects(
+    () => m.repair(started.jobId, ['fix the result']),
+    /lease unavailable; replacement isolated workspace cleanup failed at .* and must be retried/,
+  );
+  assert.equal((await m.store.get(started.jobId)).status, 'FAILED');
+});
+
 test('direct Git patch application accepts only byte buffers', () => {
   assert.throws(() => gitPatchApplier(process.cwd(), 'diff --git a/a b/a\n', { reverse: false, check: true }), /patch must be a Buffer/);
 });
@@ -3085,6 +3188,27 @@ test('worker cache writes survive durable accounting and appear in public hit-ra
   assert.match(done.report, /prompt cache: 80\.0%/);
 });
 
+test('continuation events preserve the terminal status that requested the next round', async () => {
+  for (const status of ['BUDGET', 'TIMEOUT', 'FAILED']) {
+    const m = await manager({ run: async () => assert.fail('this test queues without launching') });
+    const started = await m.start({ task: 'continue', ownedPaths: ['src/**'], budget: { maxTurns: 10, maxUsd: 1 } }, { launch: false });
+    await m.store.update(started.jobId, {
+      status,
+      files: [{ path: 'src/a.js' }],
+      turns: 1,
+      costUsd: 0.01,
+      ...(status === 'FAILED' ? { failureKind: 'no-finish', error: 'Worker ended without mandatory finish call' } : {}),
+    });
+    const next = await m.continue(started.jobId, { extraTurns: 1, launch: false });
+    assert.equal(next.status, 'QUEUED');
+    const events = (await m.store.readArtifact(started.jobId, 'events.jsonl'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.equal(events.findLast((event) => event.type === 'continuation').fromStatus, status);
+  }
+});
+
 test('continuation note limits accept 3600 characters and reject 3601 before dispatch', async () => {
   const m = new JobManager({ store: {} });
   let dispatched;
@@ -3097,7 +3221,7 @@ test('continuation note limits accept 3600 characters and reject 3601 before dis
   dispatched = undefined;
   await assert.rejects(() => m.continue('job', { note: 'n'.repeat(3601) }), /up to 3600 characters/);
   assert.equal(dispatched, undefined);
-  for (const name of ['offload_sonnet', 'offload_opus']) {
+  for (const name of ['offload_economy', 'offload_premium']) {
     const skill = await readFile(new URL(`../../plugins/offload/skills/${name}/SKILL.md`, import.meta.url), 'utf8');
     assert.match(skill, /offload_continue\.note.*3,600 characters/);
     assert.match(skill, /maxLength: 3600/);

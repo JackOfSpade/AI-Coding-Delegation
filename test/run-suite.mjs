@@ -183,6 +183,10 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
     ],
     ['an explicitly selected user config may remain a symlink', 'Windows symlink creation requires Developer Mode or elevation'],
     [
+      'dangling configuration symlinks fail instead of silently selecting defaults',
+      'Windows symlink creation requires Developer Mode or elevation',
+    ],
+    [
       'lease storage refuses offload and locks symlinks before creating or reclaiming locks',
       'Windows symlink creation requires Developer Mode or elevation',
     ],

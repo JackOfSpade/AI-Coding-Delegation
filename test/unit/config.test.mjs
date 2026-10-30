@@ -125,6 +125,43 @@ test('missing config receives the documented promo and fallback profiles', () =>
     cleanup(dir);
   }
 });
+test('profile references use declared keys while allowing explicit names inherited from Object.prototype', () => {
+  for (const name of ['toString', 'valueOf', 'hasOwnProperty']) {
+    const config = structuredClone(DEFAULT_CONFIG);
+    assert.throws(() => validateConfig({ ...config, default: name }), /Default profile does not exist/);
+    config.profiles = { flash: config.profiles.flash };
+    config.default = 'flash';
+    config.profiles.flash.provider = name;
+    assert.throws(() => validateConfig(config), /unknown provider/);
+    config.profiles.flash.provider = 'deepseek';
+    config.profiles.flash.fallback = name;
+    assert.throws(() => validateConfig(config), /fallback must name another profile/);
+
+    config.providers[name] = { ...config.providers.deepseek };
+    config.profiles = { [name]: { provider: name, model: config.profiles.flash.model } };
+    config.default = name;
+    assert.equal(validateConfig(config).default, name);
+  }
+});
+test('dangling configuration symlinks fail instead of silently selecting defaults', (t) => {
+  const dir = tempDir();
+  try {
+    const global = join(dir, 'config.json');
+    const policy = join(dir, '.offload.json');
+    try {
+      symlinkSync(join(dir, 'missing-global.json'), global);
+      symlinkSync(join(dir, 'missing-policy.json'), policy);
+    } catch (error) {
+      if (process.platform === 'win32' && error.code === 'EPERM')
+        return t.skip('Windows symlink creation requires Developer Mode or elevation');
+      throw error;
+    }
+    assert.throws(() => loadConfig({ configPath: global }), { code: 'ENOENT' });
+    assert.throws(() => loadConfig({ configPath: join(dir, 'absent.json'), repoPath: dir }), /regular in-repository file/);
+  } finally {
+    cleanup(dir);
+  }
+});
 test('config parser rejects an oversized file before JSON parsing', () => {
   const dir = tempDir();
   const file = join(dir, 'large.json');

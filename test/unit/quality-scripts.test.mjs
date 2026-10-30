@@ -741,6 +741,40 @@ test('release gate holds one artifact lease across cleanup and passes it to its 
     args: ['/deps/npm-cli.js', 'run', 'coverage'],
   });
 });
+test('coverage reports a failed rollback instead of hiding an inconsistent artifact pair', async () => {
+  let moves = 0;
+  let released = false;
+  await assert.rejects(
+    runCoverage({
+      cwd: '/repo',
+      platform: 'linux',
+      createTemporaryDirectory: async () => '/tmp/run-failure',
+      spawnProcess: () => fakeCoverageChild(0),
+      checkAccess: async () => {},
+      makeDirectory: async () => {},
+      copy: async () => {},
+      move: async () => {
+        if (++moves >= 2) throw new Error(moves === 2 ? 'publication failed' : 'rollback failed');
+      },
+      remove: async () => {},
+      acquireLease: async () => ({
+        release: () => {
+          released = true;
+        },
+      }),
+    }),
+    (error) => {
+      assert.equal(error instanceof AggregateError, true);
+      assert.match(error.message, /could not be restored/);
+      assert.deepEqual(
+        error.errors.map(({ message }) => message),
+        ['publication failed', 'rollback failed'],
+      );
+      return true;
+    },
+  );
+  assert.equal(released, true);
+});
 
 test('package gate keeps the two plugin manifests semantically aligned and requires JSON skill frontmatter', () => {
   const marketplace = {
@@ -751,7 +785,7 @@ test('package gate keeps the two plugin manifests semantically aligned and requi
     keywords: ['delegation'],
   };
   const codex = { ...marketplace, skills: './skills/' };
-  const skill = '---\n{"name":"offload_sonnet","description":"delegate work"}\n---\n\n# Offload\n';
+  const skill = '---\n{"name":"offload_economy","description":"delegate work"}\n---\n\n# Offload\n';
   assert.deepEqual(validateOffloadPluginArtifacts(marketplace, codex, skill), []);
   assert.deepEqual(validateOffloadPluginArtifacts(marketplace, { ...codex, version: '1.2.4' }, skill), ['plugin manifest version differs']);
   assert.deepEqual(

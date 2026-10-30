@@ -133,3 +133,19 @@ test('openai pricing table prices Terra and Sol and lacks unknown releases', () 
   assert.equal(priceUsage(openai, 'gpt-6.1-sol', usage, new Date('2026-10-31T12:00:00Z')).usd, 12);
   assert.equal(resolveModel(openai, 'gpt-6.2-terra'), undefined);
 });
+
+test('pricing peak windows reject invalid UTC minute and hour values', () => {
+  for (const window of [
+    ['01:60', '04:00'],
+    ['01:00', '04:99'],
+    ['24:00', '25:00'],
+    ['1:00', '04:00'],
+  ]) {
+    const broken = structuredClone(table);
+    broken.peak.utc_windows = [window];
+    assert.throws(() => validatePricingTable(broken), /peak window/);
+  }
+  const valid = structuredClone(table);
+  valid.peak.utc_windows = [['00:00', '23:59']];
+  assert.doesNotThrow(() => validatePricingTable(valid));
+});

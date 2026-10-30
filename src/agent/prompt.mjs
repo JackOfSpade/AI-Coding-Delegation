@@ -39,7 +39,8 @@ export async function repoConventions(repoPath, maxChars = 12_000) {
       const canonical = await realpath(candidate);
       if (!canonical.startsWith(`${root}${path.sep}`)) continue;
       const noFollow = process.platform === 'win32' ? 0 : constants.O_NOFOLLOW || 0;
-      const handle = await open(canonical, constants.O_RDONLY | noFollow);
+      const nonBlock = process.platform === 'win32' ? 0 : constants.O_NONBLOCK || 0;
+      const handle = await open(canonical, constants.O_RDONLY | noFollow | nonBlock);
       let bytes;
       try {
         const opened = await handle.stat(BIGINT_STAT_OPTIONS);

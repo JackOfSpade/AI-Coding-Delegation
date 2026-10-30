@@ -104,6 +104,50 @@ const createCore = (options) =>
     ...options,
     config: { ...options.config, skillHealth: options.config?.skillHealth ?? noInstalledSkill },
   });
+
+for (const stoppedBy of ['request', 'shutdown']) {
+  test(`Core stops ${stoppedBy}-cancelled model discovery before accepting a job`, { timeout: 5000 }, async () => {
+    const path = await repo('offload-cancel-discovery-');
+    const config = structuredClone(loaded);
+    config.config.profiles.test.model = 'latest-terra';
+    config.config.providers.test.baseUrl = OPENAI_BASE;
+    const controller = new AbortController();
+    let entered;
+    const discovering = new Promise((resolve) => {
+      entered = resolve;
+    });
+    const core = createCore({
+      config: {
+        loaded: config,
+        resolveKey: () => 'test-discovery-key',
+        fetchImpl: () => {
+          entered();
+          return new Promise(() => {});
+        },
+      },
+      worker: { run: async () => assert.fail('cancelled setup must not launch a worker') },
+    });
+    try {
+      const stopped = assert.rejects(
+        core.start({ task: 'inspect', mode: 'report', repoPath: path }, { signal: controller.signal }),
+        /cancelled discovery|shutting down/,
+      );
+      await Promise.race([
+        discovering,
+        stopped.then(() => {
+          throw new Error('start settled before discovery');
+        }),
+      ]);
+      if (stoppedBy === 'request') controller.abort(new Error('cancelled discovery'));
+      else await core.shutdown();
+      await stopped;
+      assert.deepEqual(await core.manager.store.list(), []);
+    } finally {
+      await core.shutdown();
+      await rm(path, { recursive: true, force: true });
+    }
+  });
+}
 function testCore() {
   return createCore({
     config: { loaded, skillHealth: noInstalledSkill },

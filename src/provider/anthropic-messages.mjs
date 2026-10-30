@@ -1,6 +1,6 @@
 import { sseEvents } from './sse.mjs';
-import { abortableBody, fetchAbortable } from './abort.mjs';
-import { ProviderError } from './openai-chat.mjs';
+import { bestEffort, fetchAbortable, readJsonAbortable } from './abort.mjs';
+import { DEFAULT_ATTEMPT_TIMEOUT_MS, ProviderError } from './openai-chat.mjs';
 import { assertModelAllowed, isAnthropicModel, modelPolicyViolation } from '../model-policy.mjs';
 import { anthropicContentMatchesAssistant, cloneAnthropicContent, validAnthropicContent } from '../anthropic-content.mjs';
 
@@ -36,7 +36,8 @@ function normalizedUsage(input, output) {
   const write = input.cache_creation_input_tokens ?? 0;
   // Anthropic's input_tokens excludes cache reads AND cache writes.
   const totalInput = input.input_tokens + hit + write;
-  if (!count(hit) || !count(write) || !count(totalInput)) throw new ProviderError('Invalid Anthropic cache usage', { kind: 'response' });
+  if (!count(hit) || !count(write) || !count(totalInput) || !count(totalInput + output.output_tokens))
+    throw new ProviderError('Invalid Anthropic cache usage', { kind: 'response' });
   return {
     inputTokens: totalInput,
     outputTokens: output.output_tokens,
@@ -194,15 +195,9 @@ function creditExhaustedCode(body, status) {
 async function responseError(response, signal) {
   let body;
   try {
-    const chunks = [];
-    let bytes = 0;
-    for await (const chunk of abortableBody(response.body, signal)) {
-      bytes += chunk.byteLength;
-      if (bytes > 65_536) break;
-      chunks.push(chunk);
-    }
-    if (bytes <= 65_536) body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    body = await readJsonAbortable(response.body, { signal, maxBytes: 65_536 });
   } catch {
+    if (signal?.aborted) throw signal.reason ?? new Error('Aborted');
     // Never preserve or expose a provider response body in diagnostics.
   }
   const exhausted = creditExhaustedCode(body, response.status);
@@ -324,110 +319,158 @@ export class AnthropicMessagesProvider {
       signal,
       retryLimit,
     );
-    let modelName,
-      inputUsage,
-      outputUsage,
-      stop,
-      sawStop = false;
-    const blocks = new Map();
-    for (const event of events) {
-      if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.type !== 'string')
-        throw new ProviderError('Invalid Anthropic SSE event', { kind: 'response' });
-      if (event.type === 'message_start') {
-        if (!isAnthropicModel(event.message?.model)) throw new ProviderError('Invalid Anthropic response model', { kind: 'response' });
-        modelName = event.message.model;
-        inputUsage = event.message.usage;
-      } else if (event.type === 'content_block_start') {
-        const index = event.index;
-        if (!Number.isSafeInteger(index) || index < 0 || blocks.has(index))
-          throw new ProviderError('Invalid Anthropic content block', { kind: 'response' });
-        const block = event.content_block;
-        if (block?.type === 'text' && validText(block.text ?? '')) blocks.set(index, { type: 'text', text: block.text ?? '' });
-        else if (block?.type === 'tool_use' && validId(block.id, 512) && validId(block.name, 128))
-          blocks.set(index, { type: 'tool_use', id: block.id, name: block.name, input: '' });
-        else if (block?.type === 'thinking' && validText(block.thinking ?? '') && validText(block.signature ?? ''))
-          blocks.set(index, { type: 'thinking', thinking: block.thinking ?? '', signature: block.signature ?? '' });
-        else if (block?.type === 'redacted_thinking' && validText(block.data ?? '') && block.data.length > 0)
-          blocks.set(index, { type: 'redacted_thinking', data: block.data });
-        else throw new ProviderError('Unsupported Anthropic content block', { kind: 'response' });
-      } else if (event.type === 'content_block_delta') {
-        const block = blocks.get(event.index);
-        if (!block || !event.delta || typeof event.delta !== 'object')
-          throw new ProviderError('Invalid Anthropic content delta', { kind: 'response' });
-        if (block.type === 'text' && event.delta.type === 'text_delta' && validText(event.delta.text ?? '')) {
-          block.text += event.delta.text ?? '';
-          if (!validText(block.text)) throw new ProviderError('Anthropic text exceeds size limit', { kind: 'response' });
-        } else if (
-          block.type === 'tool_use' &&
-          event.delta.type === 'input_json_delta' &&
-          validText(event.delta.partial_json ?? '', MAX_TOOL_ARGUMENT_CHARS)
-        ) {
-          block.input += event.delta.partial_json ?? '';
-          if (block.input.length > MAX_TOOL_ARGUMENT_CHARS)
-            throw new ProviderError('Tool arguments exceed size limit', { kind: 'response' });
-        } else if (block.type === 'thinking' && event.delta.type === 'thinking_delta' && validText(event.delta.thinking ?? '')) {
-          block.thinking += event.delta.thinking ?? '';
-          if (!validText(block.thinking)) throw new ProviderError('Anthropic thinking exceeds size limit', { kind: 'response' });
-        } else if (block.type === 'thinking' && event.delta.type === 'signature_delta' && validText(event.delta.signature ?? '')) {
-          block.signature += event.delta.signature ?? '';
-          if (!validText(block.signature)) throw new ProviderError('Anthropic thinking signature exceeds size limit', { kind: 'response' });
-        } else throw new ProviderError('Unsupported Anthropic content delta', { kind: 'response' });
-      } else if (event.type === 'message_delta') {
-        stop = finishReason(event.delta?.stop_reason);
-        outputUsage = event.usage;
-      } else if (event.type === 'message_stop') sawStop = true;
-    }
-    if (!sawStop || !modelName || !inputUsage || !outputUsage)
-      throw new ProviderError('Incomplete Anthropic SSE response', { kind: 'sse_protocol' });
-    let text = '';
-    const toolCalls = [];
-    const anthropicContent = [];
-    let hasThinking = false;
-    for (const [, block] of [...blocks.entries()].sort(([a], [b]) => a - b)) {
-      if (block.type === 'text') {
-        text += block.text;
-        anthropicContent.push({ type: 'text', text: block.text });
-      } else if (block.type === 'tool_use') {
-        try {
-          const parsed = JSON.parse(block.input || '{}');
-          if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('invalid');
-        } catch {
-          // max_tokens can cut a tool call mid-input. That is a completed,
-          // billed `length` response, not a malformed one: drop the
-          // unexecutable fragment and let output-cap recovery see the reason.
-          if (stop === 'length') continue;
-          throw new ProviderError('Incomplete Anthropic tool JSON', { kind: 'response' });
-        }
-        toolCalls.push({ id: block.id, name: block.name, arguments: block.input || '{}' });
-        anthropicContent.push({ type: 'tool_use', id: block.id, name: block.name, input: block.input || '{}' });
-      } else if (block.type === 'thinking') {
-        if (!block.signature) {
-          // An unsigned (capped) thinking block cannot be replayed; drop it.
-          if (stop === 'length') continue;
-          throw new ProviderError('Incomplete Anthropic thinking signature', { kind: 'response' });
-        }
-        hasThinking = true;
-        anthropicContent.push({ type: 'thinking', thinking: block.thinking, signature: block.signature });
-      } else {
-        hasThinking = true;
-        anthropicContent.push({ type: 'redacted_thinking', data: block.data });
+    // The complete stream may be billed even when its tool JSON or replay
+    // blocks are unusable. Recover an unambiguous terminal usage envelope
+    // before validating output so the loop can account for that failure.
+    const starts = events.filter((event) => event?.type === 'message_start');
+    const deltas = events.filter((event) => event?.type === 'message_delta');
+    let billed;
+    if (starts.length === 1 && isAnthropicModel(starts[0].message?.model) && events.some((event) => event?.type === 'message_stop')) {
+      try {
+        billed = { usage: normalizedUsage(starts[0].message.usage, deltas.at(-1)?.usage), model: starts[0].message.model };
+      } catch {
+        // Invalid or missing usage cannot establish a billable record.
       }
     }
-    if (text) yield { text, model: modelName };
-    if (toolCalls.length) yield { toolCalls, model: modelName };
-    // Sonnet's adaptive thinking is on by default. Its native thinking blocks
-    // must be sent back unchanged with the next tool_result user turn; retain
-    // the complete ordered assistant response only when that protocol applies.
-    if (hasThinking) yield { anthropicContent: cloneAnthropicContent(anthropicContent), model: modelName };
-    yield { usage: normalizedUsage(inputUsage, outputUsage), model: modelName };
-    if (stop !== undefined) yield { providerFinishReason: stop };
+    let usageYielded = false;
+    try {
+      let modelName,
+        inputUsage,
+        outputUsage,
+        stop,
+        sawStop = false;
+      const blocks = new Map();
+      for (const event of events) {
+        if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.type !== 'string')
+          throw new ProviderError('Invalid Anthropic SSE event', { kind: 'response' });
+        if (event.type === 'error') throw new ProviderError('Anthropic stream reported an error', { kind: 'response' });
+        if (event.type === 'message_start') {
+          if (modelName) throw new ProviderError('Duplicate Anthropic message start', { kind: 'sse_protocol' });
+          if (!isAnthropicModel(event.message?.model)) throw new ProviderError('Invalid Anthropic response model', { kind: 'response' });
+          modelName = event.message.model;
+          inputUsage = event.message.usage;
+        } else if (event.type === 'content_block_start') {
+          const index = event.index;
+          if (!Number.isSafeInteger(index) || index < 0 || blocks.has(index))
+            throw new ProviderError('Invalid Anthropic content block', { kind: 'response' });
+          const block = event.content_block;
+          if (block?.type === 'text' && validText(block.text ?? '')) blocks.set(index, { type: 'text', text: block.text ?? '' });
+          else if (block?.type === 'tool_use' && validId(block.id, 512) && validId(block.name, 128))
+            blocks.set(index, { type: 'tool_use', id: block.id, name: block.name, input: '' });
+          else if (block?.type === 'thinking' && validText(block.thinking ?? '') && validText(block.signature ?? ''))
+            blocks.set(index, { type: 'thinking', thinking: block.thinking ?? '', signature: block.signature ?? '' });
+          else if (block?.type === 'redacted_thinking' && validText(block.data ?? '') && block.data.length > 0)
+            blocks.set(index, { type: 'redacted_thinking', data: block.data });
+          else throw new ProviderError('Unsupported Anthropic content block', { kind: 'response' });
+        } else if (event.type === 'content_block_delta') {
+          const block = blocks.get(event.index);
+          if (!block || !event.delta || typeof event.delta !== 'object')
+            throw new ProviderError('Invalid Anthropic content delta', { kind: 'response' });
+          if (block.type === 'text' && event.delta.type === 'text_delta' && validText(event.delta.text ?? '')) {
+            block.text += event.delta.text ?? '';
+            if (!validText(block.text)) throw new ProviderError('Anthropic text exceeds size limit', { kind: 'response' });
+          } else if (
+            block.type === 'tool_use' &&
+            event.delta.type === 'input_json_delta' &&
+            validText(event.delta.partial_json ?? '', MAX_TOOL_ARGUMENT_CHARS)
+          ) {
+            block.input += event.delta.partial_json ?? '';
+            if (block.input.length > MAX_TOOL_ARGUMENT_CHARS)
+              throw new ProviderError('Tool arguments exceed size limit', { kind: 'response' });
+          } else if (block.type === 'thinking' && event.delta.type === 'thinking_delta' && validText(event.delta.thinking ?? '')) {
+            block.thinking += event.delta.thinking ?? '';
+            if (!validText(block.thinking)) throw new ProviderError('Anthropic thinking exceeds size limit', { kind: 'response' });
+          } else if (block.type === 'thinking' && event.delta.type === 'signature_delta' && validText(event.delta.signature ?? '')) {
+            block.signature += event.delta.signature ?? '';
+            if (!validText(block.signature))
+              throw new ProviderError('Anthropic thinking signature exceeds size limit', { kind: 'response' });
+          } else throw new ProviderError('Unsupported Anthropic content delta', { kind: 'response' });
+        } else if (event.type === 'message_delta') {
+          stop = finishReason(event.delta?.stop_reason);
+          outputUsage = event.usage;
+        } else if (event.type === 'message_stop') sawStop = true;
+      }
+      if (!sawStop || !modelName || !inputUsage || !outputUsage)
+        throw new ProviderError('Incomplete Anthropic SSE response', { kind: 'sse_protocol' });
+      let text = '';
+      const toolCalls = [];
+      const anthropicContent = [];
+      let hasThinking = false;
+      for (const [, block] of [...blocks.entries()].sort(([a], [b]) => a - b)) {
+        if (block.type === 'text') {
+          text += block.text;
+          anthropicContent.push({ type: 'text', text: block.text });
+        } else if (block.type === 'tool_use') {
+          try {
+            const parsed = JSON.parse(block.input || '{}');
+            if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('invalid');
+          } catch {
+            // max_tokens can cut a tool call mid-input. That is a completed,
+            // billed `length` response, not a malformed one: drop the
+            // unexecutable fragment and let output-cap recovery see the reason.
+            if (stop === 'length') continue;
+            throw new ProviderError('Incomplete Anthropic tool JSON', { kind: 'response' });
+          }
+          toolCalls.push({ id: block.id, name: block.name, arguments: block.input || '{}' });
+          anthropicContent.push({ type: 'tool_use', id: block.id, name: block.name, input: block.input || '{}' });
+        } else if (block.type === 'thinking') {
+          if (!block.signature) {
+            // An unsigned (capped) thinking block cannot be replayed; drop it.
+            if (stop === 'length') continue;
+            throw new ProviderError('Incomplete Anthropic thinking signature', { kind: 'response' });
+          }
+          hasThinking = true;
+          anthropicContent.push({ type: 'thinking', thinking: block.thinking, signature: block.signature });
+        } else {
+          hasThinking = true;
+          anthropicContent.push({ type: 'redacted_thinking', data: block.data });
+        }
+      }
+      if (text.length > 1_000_000) throw new ProviderError('Anthropic text exceeds size limit', { kind: 'response' });
+      if (toolCalls.length > MAX_TOOL_CALLS || new Set(toolCalls.map((call) => call.id)).size !== toolCalls.length)
+        throw new ProviderError('Invalid Anthropic tool calls', { kind: 'response' });
+      if (toolCalls.reduce((total, call) => total + call.arguments.length, 0) > MAX_TOOL_ARGUMENT_CHARS)
+        throw new ProviderError('Tool arguments exceed size limit', { kind: 'response' });
+      const replay = hasThinking ? cloneAnthropicContent(anthropicContent) : undefined;
+      if (text) yield { text, model: modelName };
+      if (toolCalls.length) yield { toolCalls, model: modelName };
+      // Sonnet's adaptive thinking is on by default. Its native thinking blocks
+      // must be sent back unchanged with the next tool_result user turn; retain
+      // the complete ordered assistant response only when that protocol applies.
+      if (replay) yield { anthropicContent: replay, model: modelName };
+      const usage = normalizedUsage(inputUsage, outputUsage);
+      usageYielded = true;
+      yield { usage, model: modelName };
+      if (stop !== undefined) yield { providerFinishReason: stop };
+    } catch (error) {
+      if (billed && !usageYielded) yield billed;
+      throw error;
+    }
   }
 }
 
 export const resolveLatestAnthropicSonnet = (options) => resolveLatestAnthropicModel({ ...options, line: 'sonnet' });
 export const resolveLatestAnthropicOpus = (options) => resolveLatestAnthropicModel({ ...options, line: 'opus' });
 
-async function resolveLatestAnthropicModel({ baseUrl, apiKey, fetchImpl = globalThis.fetch, signal, line } = {}) {
+async function resolveLatestAnthropicModel({ signal: externalSignal, timeoutMs = DEFAULT_ATTEMPT_TIMEOUT_MS, ...options } = {}) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 600_000) throw new TypeError('timeoutMs is invalid');
+  const controller = new AbortController();
+  const abort = () => controller.abort(externalSignal.reason ?? new Error('Aborted'));
+  externalSignal?.addEventListener('abort', abort, { once: true });
+  if (externalSignal?.aborted) abort();
+  const timer = setTimeout(
+    () => controller.abort(new ProviderError('Anthropic Models request timed out', { kind: 'attempt_timeout', timeoutMs })),
+    timeoutMs,
+  );
+  try {
+    return await discoverAnthropicModel({ ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+    externalSignal?.removeEventListener('abort', abort);
+  }
+}
+
+async function discoverAnthropicModel({ baseUrl, apiKey, fetchImpl = globalThis.fetch, signal, line } = {}) {
   const checked = checkedBaseUrl(baseUrl);
   // Anthropic documents newest-first ordering. Keep that provider-defined
   // release order rather than guessing from model-id spelling. Prefer the
@@ -440,7 +483,7 @@ async function resolveLatestAnthropicModel({ baseUrl, apiKey, fetchImpl = global
     const endpoint = new URL('v1/models', `${checked}/`);
     if (activeOnly) endpoint.searchParams.set('lifecycle', 'active');
     if (afterId) endpoint.searchParams.set('after_id', afterId);
-    const response = await fetchImpl(endpoint.href, {
+    const response = await fetchAbortable(fetchImpl, endpoint.href, {
       headers: { 'x-api-key': apiKey, 'anthropic-version': DEFAULT_ANTHROPIC_VERSION },
       signal,
       redirect: 'error',
@@ -450,14 +493,16 @@ async function resolveLatestAnthropicModel({ baseUrl, apiKey, fetchImpl = global
     // the ordinary newest-first catalogue and locally reject non-active rows.
     // Do not mask auth, network, pagination, or later-page errors.
     if (!response.ok && activeOnly && page === 0 && response.status === 400) {
+      bestEffort(() => response.body?.cancel?.());
       activeOnly = false;
       continue;
     }
-    if (!response.ok) throw await responseError(response);
+    if (!response.ok) throw await responseError(response, signal);
     let body;
     try {
-      body = await response.json();
+      body = await readJsonAbortable(response.body, { signal });
     } catch {
+      if (signal?.aborted) throw signal.reason ?? new Error('Aborted');
       throw new ProviderError('Invalid Anthropic Models response');
     }
     if (!Array.isArray(body?.data)) throw new ProviderError('Invalid Anthropic Models response');
@@ -467,7 +512,7 @@ async function resolveLatestAnthropicModel({ baseUrl, apiKey, fetchImpl = global
         isAnthropicModel(entry.id) &&
         entry.id.startsWith(`claude-${line}-`) &&
         entry.capabilities?.thinking?.types?.adaptive?.supported !== false &&
-        (activeOnly || entry.lifecycle === undefined || entry.lifecycle === 'active'),
+        (entry.lifecycle === undefined || entry.lifecycle === 'active'),
     );
     if (model) return model.id;
     if (body.has_more !== true) break;

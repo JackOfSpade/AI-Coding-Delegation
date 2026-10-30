@@ -1,7 +1,8 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, renameSync } from 'node:fs';
+import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { readRegularFileSync } from './regular-file.mjs';
 import { redactText, stripTerminalControls } from './redact.mjs';
 
@@ -222,9 +223,24 @@ export function parseNulNameStatus(raw) {
   return files;
 }
 function atomicWrite(file, contents) {
-  const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(temp, contents, { mode: 0o600 });
-  renameSync(temp, file);
+  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  let fd,
+    created = false;
+  try {
+    fd = openSync(temp, 'wx', 0o600);
+    created = true;
+    writeFileSync(fd, contents);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(temp, file);
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {}
+    }
+    if (created) rmSync(temp, { force: true });
+  }
 }
 function pathspecs(paths, { literal = false } = {}) {
   if (!Array.isArray(paths) || paths.length === 0)

@@ -225,6 +225,21 @@ test('repeated phase events do not double count, a request that never reported u
   assert.equal(sum(record), record.activeMs);
 });
 
+test('a backwards phase transition does not double count the interval when the clock catches up', () => {
+  const clock = new RoundClock({ claimedAtMs: 0 });
+  clock.enter('provider', 1000);
+  clock.enter('overhead', 5000);
+  const transition = clock.enter('tool', 4000, { tool: 'read_file' });
+  assert.equal(transition.prevMs, 0);
+  assert.equal(clock.activity.since, new Date(5000).toISOString());
+  const record = clock.finish(6000);
+  assert.equal(record.startupMs, 1000);
+  assert.equal(record.providerMs, 4000);
+  assert.equal(record.otherMs, 0);
+  assert.equal(record.toolMs, 1000);
+  assert.equal(record.activeMs, 6000);
+});
+
 test('observe ignores or sanitises hostile event fields instead of trusting them', () => {
   const clock = new RoundClock({ claimedAtMs: 0 });
   assert.equal(clock.observe(null, 10), undefined);

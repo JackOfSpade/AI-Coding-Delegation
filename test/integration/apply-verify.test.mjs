@@ -1258,6 +1258,30 @@ test('applyThenVerifyIn scratch runs the command in a writable private copy of t
   });
 });
 
+test('a retained scratch cleanup keeps its durable path until a later cleanup succeeds', async () => {
+  let creates = 0;
+  await run({
+    options: {
+      isolation: {
+        create: async (options) => {
+          const workspace = await createIsolatedWorktree(options);
+          creates += 1;
+          return creates === 2 ? { ...workspace, cleanup: async () => ({ retained: true, removed: false }) } : workspace;
+        },
+      },
+    },
+    run: async (h) => {
+      const result = await h.manager.apply(h.id, via(CHECK, { applyThenVerifyIn: 'scratch' }));
+      assert.equal(result.applyThenVerify.outcome, 'PASSED');
+      const retained = (await h.store.get(h.id)).applyVerifyScratchPath;
+      assert.ok(retained && existsSync(retained), 'the retry path remains recorded while the scratch worktree exists');
+      assert.equal(await h.manager.cleanupWorkspace(h.id), true);
+      assert.equal(existsSync(retained), false);
+      assert.equal((await h.store.get(h.id)).applyVerifyScratchPath, undefined);
+    },
+  });
+});
+
 test('a failing scratch check reverts the primary like a primary check, and a primary write denial suggests scratch', async () => {
   const seen = [];
   await run({

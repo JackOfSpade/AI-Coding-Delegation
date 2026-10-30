@@ -40,9 +40,33 @@ const CONTROL = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/;
 // one module.  The streaming projector below uses the same semantics, but
 // retains raw source offsets while it does so.
 export function stripTerminalControls(value) {
-  return String(value)
-    .replace(/\x1B(?:\[[0-?]*[ -\/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g, '')
-    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+  let state = 'normal',
+    output = '';
+  // A regex that searches every OSC opener for a later terminator is
+  // quadratic on untrusted output containing many unterminated openers.
+  // Keep the same finite states as the streaming projector instead, and
+  // stop at the first terminator so a later OSC cannot swallow visible text.
+  for (const char of String(value)) {
+    if (state === 'escape') {
+      if (char === '[') state = 'csi';
+      else if (char === ']') state = 'osc';
+      else state = 'normal';
+      if (state !== 'normal') continue;
+    } else if (state === 'csi') {
+      if (/[\x40-\x7e]/.test(char)) state = 'normal';
+      continue;
+    } else if (state === 'osc') {
+      if (char === '\x07') state = 'normal';
+      else if (char === '\x1b') state = 'osc-escape';
+      continue;
+    } else if (state === 'osc-escape') {
+      state = char === '\\' ? 'normal' : 'osc';
+      continue;
+    }
+    if (char === '\x1b') state = 'escape';
+    else if (!CONTROL.test(char)) output += char;
+  }
+  return output;
 }
 
 const sensitiveAssignment = (identifier) => {
@@ -339,6 +363,11 @@ export function redactText(value, secrets = []) {
     .replace(BEARER, '$1 [REDACTED]')
     .replace(ASSIGNMENT, '$1=[REDACTED]')
     .replace(SENSITIVE_HEADER, (value) => value.replace(/:\s*[\s\S]*/, ': [REDACTED]'));
+}
+
+/** One-line client error text: remove terminal formatting before recognizing credentials. */
+export function safeErrorText(value) {
+  return redactText(redactTokenShapes(stripTerminalControls(String(value)))).replace(/[\x00-\x1f\x7f]/g, '');
 }
 
 // A home directory is somebody's account name; `/Users/<name>`, `/home/<name>` and `C:\Users\<name>` read `~`.

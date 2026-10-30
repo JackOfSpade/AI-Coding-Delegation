@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
 import { acquireArtifactLease, publishArtifactFile } from './artifact-lease.mjs';
+import { COMMAND_SKILL_NAMES, PLUGIN_FILES } from '../src/command-skills.mjs';
 
 // These hooks can execute while a consumer installs this package or while it is packed/published.
 // Keep the published artifact declarative: this project has an explicit installer instead.
@@ -47,12 +48,7 @@ export function isForbiddenPackagePath(path) {
 }
 
 const productionFields = ['dependencies', 'optionalDependencies', 'bundleDependencies', 'bundledDependencies'];
-const offloadPluginFiles = [
-  'plugins/offload/plugin.json',
-  'plugins/offload/.codex-plugin/plugin.json',
-  'plugins/offload/skills/offload_sonnet/SKILL.md',
-  'plugins/offload/skills/offload_opus/SKILL.md',
-];
+const offloadPluginFiles = PLUGIN_FILES.map((path) => `plugins/offload/${path}`);
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
@@ -102,7 +98,7 @@ export function validateOffloadPluginArtifacts(marketplace, codex, skill) {
         !metadata.description
       )
         errors.push('plugin SKILL.md frontmatter requires non-empty name and description');
-      else if (isPlainObject(marketplace) && !['offload_sonnet', 'offload_opus'].includes(metadata.name))
+      else if (isPlainObject(marketplace) && !COMMAND_SKILL_NAMES.includes(metadata.name))
         errors.push('plugin SKILL.md name differs from plugin manifest');
     } catch {
       errors.push('plugin SKILL.md frontmatter must be strict JSON');

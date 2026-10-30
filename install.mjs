@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /** Idempotent, reversible client-routing installer. It never overwrites unmanaged content. */
-import { access, lstat, link, mkdir, open, readdir, rename, rm, rmdir, writeFile } from 'node:fs/promises';
+import { lstat, link, mkdir, open, readdir, rename, rm, rmdir, writeFile } from 'node:fs/promises';
 import { constants, realpathSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,11 +20,18 @@ import { parseKeyRef, resolveKeyRef, storeKeychainSecret } from './src/secrets.m
 import { doctor, doctorLive, keysSummary, routeKeyTargets } from './src/doctor.mjs';
 import { resolveClientPaths } from './src/client-paths.mjs';
 import { runtimeIdentityFor } from './src/identity.mjs';
+import {
+  COMMAND_SKILL_NAMES as commandSkillNames,
+  LEGACY_SKILL_NAMES as legacySkillNames,
+  PLUGIN_FILES as pluginFiles,
+} from './src/command-skills.mjs';
+export { pluginFiles };
 
 const BEGIN = '<!-- BEGIN offload';
 const END = '<!-- END offload -->';
 const here = dirname(fileURLToPath(import.meta.url));
 const MAX_ARTIFACT_BYTES = 1_048_576;
+const MAX_CLIENT_FILE_BYTES = 16 * MAX_ARTIFACT_BYTES;
 const BIGINT_STAT_OPTIONS = Object.freeze({ bigint: true });
 export function sameModulePath(left, right, platform = process.platform) {
   return platform === 'win32' ? left.replaceAll('\\', '/').toLowerCase() === right.replaceAll('\\', '/').toLowerCase() : left === right;
@@ -127,11 +134,15 @@ export function parseInstallerArgs(argv) {
   if (parsed.uninstall && parsed.approvalMode !== undefined) throw new Error('--approval-mode cannot be used with --uninstall');
   return parsed;
 }
-const exists = async (p) =>
-  access(p, constants.F_OK).then(
-    () => true,
-    () => false,
-  );
+const exists = async (p) => {
+  try {
+    await lstat(p);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+};
 async function read(p, { withMetadata = false } = {}) {
   // Client state is user data, but never follow a substituted final symlink
   // while inspecting it or creating a backup. The descriptor identity check
@@ -139,11 +150,11 @@ async function read(p, { withMetadata = false } = {}) {
   let before, after, handle, bytes;
   try {
     before = await lstat(p, BIGINT_STAT_OPTIONS);
-    if (!before.isFile() || before.isSymbolicLink()) throw new Error('unsafe');
-    handle = await open(p, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+    if (!before.isFile() || before.isSymbolicLink() || before.size > BigInt(MAX_CLIENT_FILE_BYTES)) throw new Error('unsafe');
+    handle = await open(p, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
     const opened = await handle.stat(BIGINT_STAT_OPTIONS);
     if (!opened.isFile() || !sameArtifactMetadata(before, opened)) throw new Error('unsafe');
-    bytes = await handle.readFile();
+    bytes = await readHandleBytes(handle, opened.size, MAX_CLIENT_FILE_BYTES);
     after = await handle.stat(BIGINT_STAT_OPTIONS);
     if (!sameArtifactMetadata(opened, after)) throw new Error('unsafe');
   } catch (error) {
@@ -167,10 +178,10 @@ async function requiredArtifact(path) {
     // A package root may be selected through an environment/client hook. Read
     // its static routing artifacts through the checked descriptor rather than
     // following a final-component replacement into an unrelated host file.
-    handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+    handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
     const opened = await handle.stat(BIGINT_STAT_OPTIONS);
     if (!opened.isFile() || !sameArtifactMetadata(before, opened)) throw new Error('invalid');
-    bytes = await handle.readFile();
+    bytes = await readHandleBytes(handle, opened.size, MAX_ARTIFACT_BYTES);
     const after = await handle.stat(BIGINT_STAT_OPTIONS);
     if (!sameArtifactMetadata(opened, after) || !safeArtifactSize(BigInt(bytes.length))) throw new Error('invalid');
   } catch {
@@ -190,6 +201,17 @@ async function requiredArtifact(path) {
 }
 function safeArtifactSize(size) {
   return typeof size === 'bigint' && size > 0n && size <= BigInt(MAX_ARTIFACT_BYTES);
+}
+async function readHandleBytes(handle, size, maximum) {
+  if (typeof size !== 'bigint' || size < 0n || size > BigInt(maximum)) throw new Error('file exceeds installer size limit');
+  const bytes = Buffer.allocUnsafe(Number(size));
+  let offset = 0;
+  while (offset < bytes.length) {
+    const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+    if (!bytesRead) throw new Error('installer file changed while reading');
+    offset += bytesRead;
+  }
+  return bytes;
 }
 function sameArtifactMetadata(left, right) {
   return ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].every((key) => typeof left?.[key] === 'bigint' && left[key] === right?.[key]);
@@ -445,10 +467,11 @@ async function migrateConfigFile(configPath, backups, changed) {
   try {
     stat = await lstat(configPath, BIGINT_STAT_OPTIONS);
     if (!stat.isFile()) throw new Error('unsafe');
-    const handle = await open(configPath, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+    const handle = await open(configPath, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
     try {
       if (!sameArtifactMetadata(stat, await handle.stat(BIGINT_STAT_OPTIONS))) throw new Error('unsafe');
-      bytes = await handle.readFile();
+      bytes = await readHandleBytes(handle, stat.size, MAX_ARTIFACT_BYTES);
+      if (!sameArtifactMetadata(stat, await handle.stat(BIGINT_STAT_OPTIONS))) throw new Error('unsafe');
     } finally {
       await handle.close().catch(() => {});
     }
@@ -543,8 +566,21 @@ async function reserveBackupPath(preferred) {
 async function preserveSkillBackup(skillPath, backupDirectory, content, backups, clientRoot) {
   await assertNoSymlinkAncestry(clientRoot, skillPath);
   await ensureSafeBackupDirectory(clientRoot, backupDirectory);
-  const backup = skillBackupPath(backupDirectory, skillPath);
-  if (await atomicIfMissing(backup, content)) backups.push(backup);
+  const preferred = skillBackupPath(backupDirectory, skillPath);
+  for (let index = 0; index < 10_000; index++) {
+    const backup = index ? `${preferred}.legacy-${index}` : preferred;
+    await assertNoSymlinkAncestry(clientRoot, backup);
+    const existing = await read(backup, { withMetadata: true });
+    if (existing) {
+      if (existing.content === content) return;
+      continue;
+    }
+    if (await atomicIfMissing(backup, content)) {
+      backups.push(backup);
+      return;
+    }
+  }
+  throw new Error(`refusing to create an unbounded number of offload backups: ${preferred}`);
 }
 /**
  * Older installers put recovery material directly next to SKILL.md, inside a
@@ -626,8 +662,7 @@ async function installOwnedFile(path, content, uninstall, backups, manifest, bac
   return false;
 }
 const pluginName = 'offload';
-export const pluginFiles = ['plugin.json', '.codex-plugin/plugin.json', 'skills/offload_sonnet/SKILL.md', 'skills/offload_opus/SKILL.md'];
-const legacyPluginSkill = 'skills/offload/SKILL.md';
+const legacyPluginSkills = legacySkillNames.map((name) => `skills/${name}/SKILL.md`);
 const pluginEntry = () => ({
   name: pluginName,
   source: { source: 'local', path: './plugins/offload' },
@@ -648,7 +683,7 @@ function validPluginState(state, home) {
   if (!safeRecord(state)) return false;
   const source = join(home, 'plugins', pluginName);
   if (state.source !== source || !safeRecord(state.files)) return false;
-  const allowed = new Set([...pluginFiles, legacyPluginSkill].map((path) => join(source, path)));
+  const allowed = new Set([...pluginFiles, ...legacyPluginSkills].map((path) => join(source, path)));
   if (Object.entries(state.files).some(([path, hash]) => !allowed.has(path) || typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash)))
     return false;
   if (state.marketplace !== undefined && !validPluginCatalog(state.marketplace, home)) return false;
@@ -1087,7 +1122,7 @@ async function manageClaudeMcp({ root, home, uninstall, env, platform, commandEx
   );
 }
 async function safeOwnedPluginFile(path, source) {
-  const expected = new Set([...pluginFiles, legacyPluginSkill].map((file) => join(source, file)));
+  const expected = new Set([...pluginFiles, ...legacyPluginSkills].map((file) => join(source, file)));
   if (!expected.has(path)) return false;
   try {
     const parent = await lstat(dirname(source));
@@ -1115,7 +1150,7 @@ async function safeOwnedPluginFile(path, source) {
   }
 }
 async function safePluginDestination(path, source) {
-  const expected = new Set([...pluginFiles, legacyPluginSkill].map((file) => join(source, file)));
+  const expected = new Set([...pluginFiles, ...legacyPluginSkills].map((file) => join(source, file)));
   if (!expected.has(path)) return false;
   try {
     const parent = await lstat(dirname(source));
@@ -1154,9 +1189,7 @@ async function removePluginSource(state) {
   }
   if (!Object.keys(state.files || {}).length && state.source) {
     for (const directory of [
-      join(state.source, 'skills', 'offload'),
-      join(state.source, 'skills', 'offload_sonnet'),
-      join(state.source, 'skills', 'offload_opus'),
+      ...[...legacySkillNames, ...commandSkillNames].map((name) => join(state.source, 'skills', name)),
       join(state.source, 'skills'),
       join(state.source, '.codex-plugin'),
       state.source,
@@ -1190,18 +1223,20 @@ async function manageCodexPlugin({
   const source = join(home, 'plugins', pluginName);
   if (state && state.source !== source) throw new Error('refusing invalid offload Codex plugin installer state');
   if (state) {
-    for (const name of ['offload', 'offload_sonnet', 'offload_opus'])
+    for (const name of [...legacySkillNames, ...commandSkillNames])
       await migrateLegacySkillBackup(join(source, 'skills', name, 'SKILL.md'), skillBackupDirectory, backups, home);
   }
   if (state) {
-    const legacy = join(source, legacyPluginSkill);
-    if (state.files[legacy] && (await safeOwnedPluginFile(legacy, source))) {
-      const current = await read(legacy);
-      if (state.files[legacy] === digest(current)) {
-        await preserveSkillBackup(legacy, skillBackupDirectory, current, backups, home);
-        await rm(legacy);
-        delete state.files[legacy];
-        changed.push(legacy);
+    for (const relativePath of legacyPluginSkills) {
+      const legacy = join(source, relativePath);
+      if (state.files[legacy] && (await safeOwnedPluginFile(legacy, source))) {
+        const current = await read(legacy);
+        if (state.files[legacy] === digest(current)) {
+          await preserveSkillBackup(legacy, skillBackupDirectory, current, backups, home);
+          await rm(legacy);
+          delete state.files[legacy];
+          changed.push(legacy);
+        }
       }
     }
   }
@@ -1798,7 +1833,7 @@ export async function install({
   // a partial or moved package checkout.
   const artifacts = uninstall ? [] : [join(root, 'bin', 'offload.mjs'), join(root, 'install.mjs'), join(root, 'config.example.json')];
   if (!uninstall && (selected.has('codex') || selected.has('claude')))
-    artifacts.push(...['offload_sonnet', 'offload_opus'].map((name) => join(root, 'plugins', 'offload', 'skills', name, 'SKILL.md')));
+    artifacts.push(...commandSkillNames.map((name) => join(root, 'plugins', 'offload', 'skills', name, 'SKILL.md')));
   if (!uninstall && selected.has('codex'))
     artifacts.push(join(root, 'plugins', 'offload', 'plugin.json'), join(root, 'plugins', 'offload', '.codex-plugin', 'plugin.json'));
   if (!uninstall && selected.has('claude')) artifacts.push(join(root, 'templates', 'CLAUDE.md.block.md'));
@@ -1950,15 +1985,17 @@ export async function install({
         nativeSkillBlocksPlugin: nativeSkill,
       })
     : { active: false };
-  // Retire only installer-owned copies of the removed command.
+  // Retire only installer-owned copies of removed or renamed commands.
   for (const client of ['claude', 'codex']) {
     if (!selected.has(client)) continue;
     const directory = clientPaths[`${client}Dir`];
     const backup = clientPaths[`${client}SkillBackupDir`];
-    const legacy = join(directory, 'skills', 'offload', 'SKILL.md');
-    await migrateLegacySkillBackup(legacy, backup, backups, directory);
-    if (await installOwnedFile(legacy, '', true, backups, manifest, backup, directory)) changed.push(legacy);
-    for (const name of ['offload_sonnet', 'offload_opus']) {
+    for (const name of legacySkillNames) {
+      const legacy = join(directory, 'skills', name, 'SKILL.md');
+      await migrateLegacySkillBackup(legacy, backup, backups, directory);
+      if (await installOwnedFile(legacy, '', true, backups, manifest, backup, directory)) changed.push(legacy);
+    }
+    for (const name of commandSkillNames) {
       const target = join(directory, 'skills', name, 'SKILL.md');
       const skill = uninstall ? '' : artifactContents.get(join(root, 'plugins', 'offload', 'skills', name, 'SKILL.md'));
       await migrateLegacySkillBackup(target, backup, backups, directory);

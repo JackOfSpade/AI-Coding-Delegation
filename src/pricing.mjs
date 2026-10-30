@@ -30,7 +30,7 @@ export function validatePricingTable(table) {
       if (
         !Array.isArray(window) ||
         window.length !== 2 ||
-        !window.every((value) => typeof value === 'string' && /^\d{2}:\d{2}$/.test(value) && value >= '00:00' && value <= '23:59') ||
+        !window.every((value) => typeof value === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value)) ||
         window[0] >= window[1]
       )
         throw new TypeError('pricing peak window is invalid');

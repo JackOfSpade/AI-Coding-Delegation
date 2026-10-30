@@ -447,7 +447,8 @@ export function readLeaseJson(file, cap, { platform = process.platform, fs = def
     if (!before.isFile() || before.isSymbolicLink() || beforeSize === undefined || beforeSize < 1)
       throw lockReadError('lock exceeds size limit', 'E_LEASE_INVALID');
     const noFollow = platform === 'win32' ? 0 : fs.constants.O_NOFOLLOW || 0;
-    fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow);
+    const nonBlock = platform === 'win32' ? 0 : fs.constants.O_NONBLOCK || 0;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow | nonBlock);
     const opened = fs.fstatSync(fd, BIGINT_STAT_OPTIONS);
     const openedSize = checkedLockSize(opened.size, cap);
     if (!opened.isFile() || !sameLockMetadata(before, opened) || openedSize === undefined || openedSize < 1)

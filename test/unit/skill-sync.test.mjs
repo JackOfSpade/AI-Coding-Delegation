@@ -15,15 +15,15 @@ function splitSkill(text) {
   return { metadata: JSON.parse(match[1]), body: match[2] };
 }
 
-test('the opus and sonnet skills are identical apart from frontmatter name and description', async () => {
-  const opus = splitSkill(await readFile(join(skills, 'offload_opus', 'SKILL.md'), 'utf8'));
-  const sonnet = splitSkill(await readFile(join(skills, 'offload_sonnet', 'SKILL.md'), 'utf8'));
-  assert.equal(opus.body, sonnet.body, 'edit both SKILL.md bodies together; only frontmatter may differ');
-  assert.equal(opus.metadata.name, 'offload_opus');
-  assert.equal(sonnet.metadata.name, 'offload_sonnet');
-  assert.equal(opus.metadata.description, sonnet.metadata.description.replaceAll('/offload_sonnet', '/offload_opus'));
+test('the premium and economy skills are identical apart from frontmatter name and description', async () => {
+  const premium = splitSkill(await readFile(join(skills, 'offload_premium', 'SKILL.md'), 'utf8'));
+  const economy = splitSkill(await readFile(join(skills, 'offload_economy', 'SKILL.md'), 'utf8'));
+  assert.equal(premium.body, economy.body, 'edit both SKILL.md bodies together; only frontmatter may differ');
+  assert.equal(premium.metadata.name, 'offload_premium');
+  assert.equal(economy.metadata.name, 'offload_economy');
+  assert.equal(premium.metadata.description, economy.metadata.description.replaceAll('/offload_economy', '/offload_premium'));
   const rest = ({ name: _name, description: _description, ...other }) => other;
-  assert.deepEqual(rest(opus.metadata), rest(sonnet.metadata));
+  assert.deepEqual(rest(premium.metadata), rest(economy.metadata));
 });
 
 test('the plugin manifests carry the current content version', async () => {
@@ -35,7 +35,7 @@ test('plugin:version rewrites only the content hash after a skill edit', async (
   const temporary = await mkdtemp(join(tmpdir(), 'offload-plugin-version-'));
   try {
     await cp(join(root, 'plugins'), join(temporary, 'plugins'), { recursive: true });
-    const skill = join(temporary, 'plugins', 'offload', 'skills', 'offload_opus', 'SKILL.md');
+    const skill = join(temporary, 'plugins', 'offload', 'skills', 'offload_premium', 'SKILL.md');
     await writeFile(skill, `${await readFile(skill, 'utf8')}\nExtra rule.\n`);
     const manifest = join(temporary, 'plugins', 'offload', 'plugin.json');
     const before = JSON.parse(await readFile(manifest, 'utf8')).version;

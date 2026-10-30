@@ -58,6 +58,8 @@ import { DEFAULT_ATTEMPT_TIMEOUT_MS, OpenAIChatProvider, ProviderError } from '.
 import { OpenAIResponsesProvider } from './provider/openai-responses.mjs';
 import { AnthropicMessagesProvider, resolveLatestAnthropicSonnet, resolveLatestAnthropicOpus } from './provider/anthropic-messages.mjs';
 import { CreditFallbackProvider } from './provider/fallback.mjs';
+import { resolveLatestDeepSeekFlash, resolveLatestOpenAI } from './provider/model-discovery.mjs';
+export { resolveLatestDeepSeekFlash, resolveLatestOpenAI };
 import { PathPolicy } from './policy.mjs';
 import { LocalTools, availableToolDefinitions } from './agent/tools.mjs';
 import { AgentLoop } from './agent/loop.mjs';
@@ -70,12 +72,9 @@ import {
   OFFLOAD_ANTHROPIC_LATEST_OPUS,
   isDeepSeekEndpoint,
   isOpenAIEndpoint,
-  isOpenAITerraModel,
-  isOpenAISolModel,
   OFFLOAD_OPENAI_LATEST_TERRA,
   OFFLOAD_OPENAI_LATEST_SOL,
   OFFLOAD_DEEPSEEK_LATEST_FLASH,
-  OFFLOAD_DEEPSEEK_MODEL,
 } from './model-policy.mjs';
 import { resolveModel, validatePricingTable } from './pricing.mjs';
 import { readRegularFileSync } from './regular-file.mjs';
@@ -204,69 +203,6 @@ function pricingFile(path) {
   return table;
 }
 
-export async function resolveLatestDeepSeekFlash({ baseUrl, apiKey, fetchImpl = globalThis.fetch, signal } = {}) {
-  let response;
-  try {
-    response = await fetchImpl(new URL('models', `${baseUrl.replace(/\/+$/, '')}/`).href, {
-      headers: { authorization: `Bearer ${apiKey}` },
-      signal,
-      redirect: 'error',
-    });
-  } catch {
-    throw new Error('DeepSeek model discovery failed');
-  }
-  if (!response.ok) throw new Error(`DeepSeek model discovery failed (HTTP ${response.status})`);
-  let body;
-  try {
-    body = await response.json();
-  } catch {
-    throw new Error('DeepSeek model discovery returned invalid JSON');
-  }
-  const model = Array.isArray(body?.data) ? body.data.find((entry) => entry?.id === OFFLOAD_DEEPSEEK_MODEL) : undefined;
-  if (!model) throw new Error('No provider-maintained DeepSeek Flash model is available');
-  return model.id;
-}
-
-const OPENAI_LINES = {
-  terra: { label: 'Terra', matches: isOpenAITerraModel },
-  sol: { label: 'Sol', matches: isOpenAISolModel },
-};
-/** Highest `gpt-<major>[.<minor>]-<line>` by numeric version, never by `created` or list order. */
-export async function resolveLatestOpenAI(line, { baseUrl, key, apiKey = key, fetch, fetchImpl = fetch ?? globalThis.fetch, signal } = {}) {
-  const spec = OPENAI_LINES[line];
-  if (!spec) throw new TypeError('unsupported OpenAI model line');
-  let response;
-  try {
-    response = await fetchImpl(new URL('models', `${baseUrl.replace(/\/+$/, '')}/`).href, {
-      headers: { authorization: `Bearer ${apiKey}` },
-      signal,
-      redirect: 'error',
-    });
-  } catch {
-    throw new ProviderError('OpenAI model discovery failed');
-  }
-  if (!response.ok) throw new ProviderError('OpenAI model discovery failed', { status: response.status, kind: 'http' });
-  let body;
-  try {
-    body = await response.json();
-  } catch {
-    throw new ProviderError('OpenAI model discovery returned invalid JSON');
-  }
-  const version = (id) => {
-    const [, major, minor] = /^gpt-(\d+)(?:\.(\d+))?-/.exec(id);
-    return [Number(major), Number(minor ?? 0)];
-  };
-  let best;
-  for (const entry of Array.isArray(body?.data) ? body.data : []) {
-    const id = entry?.id;
-    if (!spec.matches(id)) continue;
-    const [major, minor] = version(id);
-    if (!best || major > best.major || (major === best.major && minor > best.minor)) best = { id, major, minor };
-  }
-  if (!best) throw new ProviderError(`No supported OpenAI ${spec.label} model is available`);
-  return best.id;
-}
-
 // Only a ProviderError's bare HTTP status is safe to surface from discovery;
 // its message, body and every other field may carry provider detail.
 function safeDiscoveryStatusSuffix(error) {
@@ -283,15 +219,18 @@ function keySaveHint(keyRef, provider) {
 }
 
 async function resolveProfileModel(profile, provider, key, { fetchImpl, signal } = {}) {
-  if (profile.model === OFFLOAD_ANTHROPIC_LATEST_OPUS)
-    return resolveLatestAnthropicOpus({ baseUrl: provider.baseUrl, apiKey: key, fetchImpl, signal });
-  if (profile.model === OFFLOAD_ANTHROPIC_LATEST_SONNET)
-    return resolveLatestAnthropicSonnet({ baseUrl: provider.baseUrl, apiKey: key, fetchImpl, signal });
-  if (profile.model === OFFLOAD_DEEPSEEK_LATEST_FLASH)
-    return resolveLatestDeepSeekFlash({ baseUrl: provider.baseUrl, apiKey: key, fetchImpl, signal });
-  if (profile.model === OFFLOAD_OPENAI_LATEST_TERRA)
-    return resolveLatestOpenAI('terra', { baseUrl: provider.baseUrl, key, fetchImpl, signal });
-  if (profile.model === OFFLOAD_OPENAI_LATEST_SOL) return resolveLatestOpenAI('sol', { baseUrl: provider.baseUrl, key, fetchImpl, signal });
+  const options = {
+    baseUrl: provider.baseUrl,
+    apiKey: key,
+    fetchImpl,
+    signal,
+    timeoutMs: provider.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS,
+  };
+  if (profile.model === OFFLOAD_ANTHROPIC_LATEST_OPUS) return resolveLatestAnthropicOpus(options);
+  if (profile.model === OFFLOAD_ANTHROPIC_LATEST_SONNET) return resolveLatestAnthropicSonnet(options);
+  if (profile.model === OFFLOAD_DEEPSEEK_LATEST_FLASH) return resolveLatestDeepSeekFlash(options);
+  if (profile.model === OFFLOAD_OPENAI_LATEST_TERRA) return resolveLatestOpenAI('terra', options);
+  if (profile.model === OFFLOAD_OPENAI_LATEST_SOL) return resolveLatestOpenAI('sol', options);
   return profile.model;
 }
 
@@ -390,6 +329,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
   let injectedStoreRoot;
   let mcpRepoHint;
   let closing = false;
+  const shutdownController = new AbortController();
   const integrityAdapter = ({ repoPath, gitDir, statePath, platform = process.platform, vault } = {}) => {
     const root =
       platform === 'win32'
@@ -647,6 +587,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
                 },
               }),
           pathAliases: failurePathAliases(executionPath, job.repoPath),
+          secrets: state.store.secrets,
         });
         // The initial prompt is durable conversation state. A repair appends only
         // its defect user turn; it never repeats system/task/history prefixes.
@@ -1066,8 +1007,10 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       mcpRepoHint = canonicalRepo(path);
       return mcpRepoHint;
     },
-    async start(input, { launch = true } = {}) {
+    async start(input, { launch = true, signal } = {}) {
       if (closing) throw new Error('offload core is shutting down');
+      const startSignal = signal ? AbortSignal.any([signal, shutdownController.signal]) : shutdownController.signal;
+      startSignal.throwIfAborted();
       // Reject caller-controlled structure before makeState initializes a
       // repository's durable store, integrity root, or recovery machinery.
       // JobManager repeats this after Core has added trusted config snapshots.
@@ -1080,10 +1023,11 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       assertStartRuntimeCurrent(startHealth, { requireCurrentSkill: config.enforceInstalledSkillPreflight === true });
       const state = await makeState(input?.repoPath);
       if (closing) throw new Error('offload core is shutting down');
+      startSignal.throwIfAborted();
       const loaded = config.loaded || loadConfig({ configPath: config.configPath, repoPath: state.repoPath });
       if (loaded.disabled) throw new Error('offload is disabled for this repository');
       if (input.mode !== 'report') assertVerifierCommand(input.testCommand ?? loaded.repoConfig.testCommand);
-      if (input?.profile && !loaded.config.profiles[input.profile]) throw new Error(`unknown profile: ${input.profile}`);
+      if (input?.profile && !Object.hasOwn(loaded.config.profiles, input.profile)) throw new Error(`unknown profile: ${input.profile}`);
       const profileName = input.profile || loaded.config.default;
       const profile = loaded.config.profiles[profileName];
       const providerConfig = loaded.config.providers[profile.provider];
@@ -1142,8 +1086,14 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       const models = [];
       for (const [index, route] of chain.entries()) {
         try {
-          models.push(await resolveProfileModel(route.profile, route.providerConfig, keys[index], { fetchImpl: config.fetchImpl }));
+          models.push(
+            await resolveProfileModel(route.profile, route.providerConfig, keys[index], {
+              fetchImpl: config.fetchImpl,
+              signal: startSignal,
+            }),
+          );
         } catch (error) {
+          startSignal.throwIfAborted();
           throw new Error(`${index === 0 ? 'primary' : 'fallback'} provider model discovery failed${safeDiscoveryStatusSuffix(error)}`);
         }
         assertModelAllowed({ type: route.providerConfig.type, baseUrl: route.providerConfig.baseUrl, model: models[index] });
@@ -1209,6 +1159,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         maxUsd: input.budget?.maxUsd ?? loaded.config.limits.maxUsd,
         timeoutMinutes: input.budget?.timeoutMinutes ?? loaded.config.limits.timeoutMinutes,
       };
+      startSignal.throwIfAborted();
       const result = await state.manager.start(
         {
           ...input,
@@ -1239,6 +1190,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         },
         {
           launch,
+          signal: startSignal,
           // This is a trusted fact about the accepted start boundary, not a
           // re-check of files on disk. A worker can legitimately edit this
           // checkout, which makes a still-running MCP process stale only
@@ -1252,8 +1204,9 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           },
         },
       );
-      if (closing) {
+      if (closing || startSignal.aborted) {
         await state.manager.cancel(result.jobId);
+        startSignal.throwIfAborted();
         throw new Error('offload core is shutting down');
       }
       // A Python project has no JavaScript dependencies to report, so its start
@@ -1621,6 +1574,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
     },
     async shutdown(options) {
       closing = true;
+      shutdownController.abort(new Error('offload core is shutting down'));
       const pending = [...pendingStates.values()];
       await Promise.allSettled(pending);
       await Promise.all([...states.values()].map((state) => state.manager.shutdown(options)));

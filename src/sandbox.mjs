@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve, sep, relative, isAbsolute, posix } from 'node:path';
 import { normalizePath } from './glob.mjs';
 import { DEFAULT_DENY_READ, DEFAULT_DENY_WRITE } from './policy.mjs';
+import { stripTerminalControls } from './redact.mjs';
 
 const SECRET =
   /(?:^|_)(?:api[_-]?key|access[_-]?key(?:[_-]?id)?|token|secret|password|authorization|credential(?:s)?|private[_-]?key)(?:$|_)/i;
@@ -49,6 +50,10 @@ export function scrubEnv(env = process.env, { home, temp, platform = process.pla
   if (windows) result.USERPROFILE = safeHome;
   result.TMPDIR = result.TMP = result.TEMP = temp || safeHome;
   result.NO_COLOR = '1';
+  // Node propagates this ambient capability even into an explicitly supplied
+  // environment unless the key is present. An own undefined value blocks that
+  // injection and is omitted from the actual child environment by spawn.
+  result.NODE_V8_COVERAGE = undefined;
   return result;
 }
 /**
@@ -73,8 +78,7 @@ export function sandboxToolEnv({ exists = existsSync } = {}) {
 const SANDBOX_PROBE_COMMAND = `${SANDBOX_EXECUTABLE} -p <generated-offload-profile> /usr/bin/true`;
 const SANDBOX_PROBE_OUTPUT_CAP = 4 * 1024;
 const probeText = (value) =>
-  String(value || '')
-    .replace(/\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g, '')
+  stripTerminalControls(value || '')
     .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '')
     .trim()
     .slice(0, SANDBOX_PROBE_OUTPUT_CAP);
@@ -205,7 +209,11 @@ function seatbeltGlobSource(pattern, { deny = false } = {}) {
       const characterClass = raw?.startsWith('!') ? `^${raw.slice(1)}` : raw;
       try {
         if (raw === null || !characterClass || characterClass === '^' || /[\\/]/.test(characterClass)) throw new Error('invalid class');
-        new RegExp(`[${characterClass}]`);
+        const classPattern = new RegExp(`[${characterClass}]`);
+        // A range such as [.-0] contains '/' without spelling it. Seatbelt
+        // has no supported lookaround to subtract that separator from an
+        // allow class, so refuse it rather than widen a one-segment scope.
+        if (!characterClass.startsWith('^') && classPattern.test('/')) throw new Error('class includes separator');
         // Negated classes must not consume a separator; put `/` directly in
         // the excluded class rather than relying on unsupported lookaround.
         source += characterClass.startsWith('^') ? `[^/${characterClass.slice(1)}]` : `[${characterClass}]`;
@@ -499,7 +507,9 @@ function capture(limit) {
       // Never concatenate that whole chunk only to trim it back to the cap.
       if (value.length >= tailLimit) {
         omitted += tail.length + value.length - tailLimit;
-        tail = value.subarray(value.length - tailLimit);
+        // A subarray retains the whole source allocation and is mutable by
+        // its producer. Copy only the bounded suffix into capture ownership.
+        tail = Buffer.from(value.subarray(value.length - tailLimit));
         return;
       }
       if (tail.length + value.length > tailLimit) {

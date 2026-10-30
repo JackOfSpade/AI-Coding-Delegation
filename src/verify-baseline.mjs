@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { TOOL_CACHE } from './verify-env.mjs';
+import { stripTerminalControls } from './redact.mjs';
 
 /**
  * Pure helpers for the baseline-diff verifier: extract failing test identities
@@ -23,7 +24,6 @@ const MAX_RUN_BYTES = 32 * 1024 * 1024;
 // per byte than ordinary logs, so the byte cap alone still allows a long stall.
 const MAX_PARSE_MS = 10_000;
 const MAX_REPORTED_NAMES = 50;
-const ANSI = /\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g;
 const CONTROLS = /[\x00-\x08\x0B-\x1F\x7F-\x9F‎‏‪-‮⁦-⁩]/g;
 // The same test, run in two private worktrees, prints two different absolute
 // paths. Normalising them is what lets a baseline and a result agree on a name.
@@ -76,7 +76,7 @@ const STOP_FLAG = /(?:^|\s)(?:-{1,2}(?:test\.)?failfast|--bail)(?:=(?!false\b|0\
 /** True when the test command asks its runner to stop at the first failure. */
 export const commandStopsEarly = (command) => typeof command === 'string' && STOP_FLAG.test(command);
 
-const stripText = (value) => String(value).replace(ANSI, '').replace(CONTROLS, '');
+const stripText = (value) => stripTerminalControls(value).replace(CONTROLS, '');
 const escapeRegExp = (value) => value.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&');
 
 // Replace each `<anything>/offload-worktree-<id>/workspace` token with `<ws>`.

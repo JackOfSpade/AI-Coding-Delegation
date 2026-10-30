@@ -8,6 +8,7 @@ import { healthIdentity } from './identity.mjs';
 import { resolveClientPaths } from './client-paths.mjs';
 import { DEFAULT_ATTEMPT_TIMEOUT_MS, OpenAIChatProvider } from './provider/openai-chat.mjs';
 import { OpenAIResponsesProvider } from './provider/openai-responses.mjs';
+import { resolveLatestOpenAI } from './provider/model-discovery.mjs';
 import { AnthropicMessagesProvider, resolveLatestAnthropicOpus, resolveLatestAnthropicSonnet } from './provider/anthropic-messages.mjs';
 import {
   OFFLOAD_ANTHROPIC_LATEST_OPUS,
@@ -23,6 +24,7 @@ import { priceUsage, resolveModel, samePricedModel, validatePricingTable } from 
 import { snapshotGitEnv } from './git-snapshot.mjs';
 import { readRegularFileSync } from './regular-file.mjs';
 import { skillCopyStatus, skillFileHash } from './skill-health.mjs';
+import { ECONOMY_SKILL, PREMIUM_SKILL, packagedSkillPath } from './command-skills.mjs';
 
 const MAX_PRICING_BYTES = 1024 * 1024;
 const read = (file) => {
@@ -236,16 +238,15 @@ function registrations(home, root, platform, env) {
 // Health (offload_job) reaches the same verdict for the same file through
 // skillCopyStatus, so the hook banner and `server.skill` cannot disagree.
 function skillStatus(paths, root, path) {
-  const packaged = skillFileHash(path.join(root, 'plugins', 'offload', 'skills', 'offload_sonnet', 'SKILL.md'));
+  const packaged = skillFileHash(path.join(root, packagedSkillPath(ECONOMY_SKILL.name)));
   const status = (file, expectedHash = packaged.hash) => {
     const { status: state } = skillCopyStatus(file, expectedHash);
     return state === 'unreadable' ? 'missing' : state;
   };
-  const opus = skillFileHash(path.join(root, 'plugins', 'offload', 'skills', 'offload_opus', 'SKILL.md'));
+  const opus = skillFileHash(path.join(root, packagedSkillPath(PREMIUM_SKILL.name)));
   const combined = (sonnetFile, opusFile) => {
-    const sonnet = status(sonnetFile),
-      other = status(opusFile, opus.hash);
-    return sonnet === 'stale' || other === 'stale' ? 'stale' : sonnet;
+    const statuses = [status(sonnetFile), status(opusFile, opus.hash)];
+    return statuses.includes('stale') ? 'stale' : statuses.includes('current') ? 'current' : statuses[0];
   };
   return { claude: combined(paths.claudeSkill, paths.claudeOpusSkill), codex: combined(paths.codexSkill, paths.codexOpusSkill) };
 }
@@ -475,31 +476,6 @@ async function chatProbe(provider, messages, options = {}) {
  * `probe` remains an injection seam for callers that only need budget plumbing.
  */
 const OPENAI_LINE = { [OFFLOAD_OPENAI_LATEST_TERRA]: 'terra', [OFFLOAD_OPENAI_LATEST_SOL]: 'sol' };
-async function resolveLatestOpenAILive(line, { baseUrl, apiKey, fetchImpl = globalThis.fetch }) {
-  const pattern = new RegExp(`^gpt-(\\d+)(?:\\.(\\d+))?-${line}$`);
-  let body;
-  try {
-    const response = await fetchImpl(new URL('models', `${baseUrl.replace(/\/+$/, '')}/`).href, {
-      headers: { authorization: `Bearer ${apiKey}` },
-      redirect: 'error',
-    });
-    if (!response.ok) throw new Error('discovery failed');
-    body = await response.json();
-  } catch {
-    throw new Error('OpenAI model discovery failed');
-  }
-  let best;
-  for (const entry of Array.isArray(body?.data) ? body.data : []) {
-    const match = typeof entry?.id === 'string' ? pattern.exec(entry.id) : null;
-    if (!match) continue;
-    const version = [Number(match[1]), Number(match[2] ?? 0)];
-    if (!best || version[0] > best.version[0] || (version[0] === best.version[0] && version[1] > best.version[1]))
-      best = { id: entry.id, version };
-  }
-  if (!best) throw new Error('No supported OpenAI model is available');
-  return best.id;
-}
-
 export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = process.env, fetchImpl, now = () => new Date() } = {}) {
   if (!Number.isFinite(maxUsd) || maxUsd <= 0 || maxUsd > MAX_LIVE_USD)
     throw new Error('live probe requires maxUsd greater than 0 and at most 0.02');
@@ -515,13 +491,16 @@ export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = pr
     throw new Error('live probe key is unavailable');
   }
   let model = profile.model;
+  const discovery = {
+    baseUrl: providerConfig.baseUrl,
+    apiKey,
+    fetchImpl,
+    timeoutMs: providerConfig.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS,
+  };
   try {
-    if (model === OFFLOAD_ANTHROPIC_LATEST_SONNET)
-      model = await resolveLatestAnthropicSonnet({ baseUrl: providerConfig.baseUrl, apiKey, fetchImpl });
-    else if (model === OFFLOAD_ANTHROPIC_LATEST_OPUS)
-      model = await resolveLatestAnthropicOpus({ baseUrl: providerConfig.baseUrl, apiKey, fetchImpl });
-    else if (OPENAI_LINE[model])
-      model = await resolveLatestOpenAILive(OPENAI_LINE[model], { baseUrl: providerConfig.baseUrl, apiKey, fetchImpl });
+    if (model === OFFLOAD_ANTHROPIC_LATEST_SONNET) model = await resolveLatestAnthropicSonnet(discovery);
+    else if (model === OFFLOAD_ANTHROPIC_LATEST_OPUS) model = await resolveLatestAnthropicOpus(discovery);
+    else if (Object.hasOwn(OPENAI_LINE, model)) model = await resolveLatestOpenAI(OPENAI_LINE[model], discovery);
     else if (model === OFFLOAD_DEEPSEEK_LATEST_FLASH) model = OFFLOAD_DEEPSEEK_MODEL;
   } catch {
     throw new Error('live probe model discovery failed');

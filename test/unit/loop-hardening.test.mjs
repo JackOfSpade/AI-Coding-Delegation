@@ -8,6 +8,7 @@ import { AgentContext } from '../../src/agent/context.mjs';
 import { LocalTools, availableToolDefinitions } from '../../src/agent/tools.mjs';
 import { buildSystemPrompt } from '../../src/agent/prompt.mjs';
 import { OpenAIChatProvider, ProviderError } from '../../src/provider/openai-chat.mjs';
+import { CreditFallbackProvider } from '../../src/provider/fallback.mjs';
 import { JobStore } from '../../src/store.mjs';
 import { FAILURE_ERRORS, continuableFailure, wallTimeoutError } from '../../src/failure.mjs';
 import { cleanup, tempDir } from './helpers.mjs';
@@ -2325,12 +2326,14 @@ test('finite budgets elide only old provider tool results when the raw reservati
 });
 
 test('provider budget elision honors the context configured recent-tool retention', () => {
-  const context = new AgentContext(toolTranscript({ results: 5 }), { keepRecentToolResults: 2 });
+  const messages = toolTranscript({ results: 5 });
+  messages[3].content = 'y'.repeat(1000);
+  const context = new AgentContext(messages, { keepRecentToolResults: 2 });
   const variants = [...context.providerBudgetElisionSnapshots()];
   assert.equal(variants.length, 2);
   assert.match(variants[0].messages[1].content, /^\[tool output elided: 70000 chars;/);
-  assert.equal(variants[0].messages[3].content, 'result-1', 'the second eligible result is elided only in the next projection');
-  assert.match(variants[1].messages[3].content, /^\[tool output elided: 8 chars;/);
+  assert.equal(variants[0].messages[3].content, 'y'.repeat(1000), 'the second eligible result is elided only in the next projection');
+  assert.match(variants[1].messages[3].content, /^\[tool output elided: 1000 chars;/);
   for (const index of [2, 3, 4]) assert.equal(variants[1].messages[index * 2 + 1].content, `result-${index}`);
 });
 
@@ -2374,14 +2377,14 @@ test('keepRecentToolResults zero still sends the newest complete multi-result tr
   const context = new AgentContext(source, { keepRecentToolResults: 0 });
   const original = context.snapshot();
   const variants = [...context.providerBudgetElisionSnapshots()];
-  assert.equal(variants.length, 8, 'only the eight older results may be tier-one candidates');
+  assert.equal(variants.length, 2, 'only older results longer than their replacement marker are candidates');
   assert.deepEqual(
     variants.at(-1).messages.slice(-3),
     original.slice(-3),
     'the safe final tier-one projection retains every current result',
   );
   const definitions = availableToolDefinitions({ allowCommand: true });
-  const beforeLargeOldResult = conservativeRequestUsd(variants[1].messages, definitions, 16);
+  const beforeLargeOldResult = conservativeRequestUsd(variants[0].messages, definitions, 16);
   const fullyElidedOlderResults = conservativeRequestUsd(variants.at(-1).messages, definitions, 16);
   assert.ok(beforeLargeOldResult > fullyElidedOlderResults);
   const budget = (beforeLargeOldResult + fullyElidedOlderResults) / 2;
@@ -2413,17 +2416,17 @@ test('finite budgets progressively elide older provider results only after tier 
   const tierOne = [...context.providerBudgetElisionSnapshots()];
   const deep = [...context.providerBudgetDeepElisionSnapshots()];
   assert.equal(tierOne.length, 0, 'the configured retention keeps all eight older results as well as the latest multi-result transaction');
-  assert.equal(deep.length, 8, 'deep fallback progressively relaxes only the eight older results');
-  assert.match(deep[2].messages[5].content, /^\[tool output elided: 24024 chars;/, 'deep fallback next elides that old large result');
+  assert.equal(deep.length, 2, 'deep fallback compacts the two large older results and retains short outputs');
+  assert.match(deep[1].messages[5].content, /^\[tool output elided: 24024 chars;/, 'deep fallback next elides that old large result');
   assert.deepEqual(
-    deep[2].messages.slice(-3),
+    deep[1].messages.slice(-3),
     original.slice(-3),
     'every result of the newest complete multi-call transaction remains raw',
   );
   const zeroRetention = new AgentContext(source, { keepRecentToolResults: 0 });
   const tierOneWithNoOrdinaryRetention = [...zeroRetention.providerBudgetElisionSnapshots()];
   const deepWithNoOrdinaryRetention = [...zeroRetention.providerBudgetDeepElisionSnapshots()];
-  assert.equal(tierOneWithNoOrdinaryRetention.length, 8, 'tier one may elide every old result but not the current transaction');
+  assert.equal(tierOneWithNoOrdinaryRetention.length, 2, 'tier one compacts large old results while retaining short and current results');
   assert.equal(deepWithNoOrdinaryRetention.length, 0, 'deep fallback skips the tier-one projection it already knows was tried');
   assert.deepEqual(
     tierOneWithNoOrdinaryRetention.at(-1).messages.slice(-3),
@@ -2439,8 +2442,8 @@ test('finite budgets progressively elide older provider results only after tier 
 
   const definitions = availableToolDefinitions({ allowCommand: true });
   const tierOneMinimum = conservativeRequestUsd(source, definitions, 16);
-  const preSuccessMinimum = conservativeRequestUsd(deep[1].messages, definitions, 16);
-  const deepMinimum = conservativeRequestUsd(deep[2].messages, definitions, 16);
+  const preSuccessMinimum = conservativeRequestUsd(deep[0].messages, definitions, 16);
+  const deepMinimum = conservativeRequestUsd(deep[1].messages, definitions, 16);
   assert.ok(tierOneMinimum > preSuccessMinimum && preSuccessMinimum > deepMinimum);
   const budget = (preSuccessMinimum + deepMinimum) / 2;
   let request;
@@ -2460,7 +2463,7 @@ test('finite budgets progressively elide older provider results only after tier 
     progress: async (event) => progress.push(event),
   }).run();
   assert.equal(result.status, 'DONE');
-  assert.deepEqual(request.messages, deep[2].messages, 'the first affordable deep projection is the only provider payload');
+  assert.deepEqual(request.messages, deep[1].messages, 'the first affordable deep projection is the only provider payload');
   assert.deepEqual(context.snapshot().slice(0, original.length), original, 'the raw transcript remains replayable after the provider call');
   assert.equal(progress.filter((event) => event.action === 'provider_context_budget_elided').length, 1);
 });
@@ -4548,4 +4551,130 @@ test('a credit-fallback chain reserves output at its costliest route, not the ch
   assert.ok(costlyOnly < cheapOnly);
   // An OpenAI primary can hop to a pricier Claude route inside one request.
   assert.equal(await requested({ routes: [{ model: 'cheap' }, { model: 'costly' }] }, 'cheap'), costlyOnly);
+});
+
+test('elision preserves short tool output and every provider projection reduces its size', () => {
+  const source = toolTranscript({ results: 4, firstContent: 'x'.repeat(1000) });
+  source[5].content = 'y'.repeat(1000);
+  const context = new AgentContext(source, { keepRecentToolResults: 0, maxToolChars: 1 });
+  const durable = context.snapshot();
+  assert.equal(durable[3].content, 'result-1');
+  assert.equal(durable[3].elided, undefined);
+  assert.equal(durable[7].content, 'result-3');
+  assert.equal(durable[1].elided, true);
+  assert.equal(durable[5].elided, true);
+
+  for (const retention of [0, 8]) {
+    const context = new AgentContext(source, { keepRecentToolResults: retention });
+    let prior = JSON.stringify(context.snapshot()).length;
+    for (const variant of [...context.providerBudgetElisionSnapshots(), ...context.providerBudgetDeepElisionSnapshots()]) {
+      const length = JSON.stringify(variant.messages).length;
+      assert.ok(length < prior, 'a budget projection must save space');
+      assert.equal(variant.messages[3].content, 'result-1', 'short older output stays useful');
+      assert.equal(variant.messages[7].content, 'result-3', 'the current transaction stays intact');
+      prior = length;
+    }
+  }
+});
+
+test('credit fallback authorizes model metadata only for its active route and declared pricing aliases', async () => {
+  for (const [stage, echoed, expected] of [
+    [0, 'fallback', 'BUDGET'],
+    [1, 'primary', 'BUDGET'],
+    [1, 'fallback-alias', 'DONE'],
+  ]) {
+    const response = {
+      async *chat() {
+        yield { model: echoed, toolCalls: [call('finish', '{"summary":"ok"}')], usage: { inputTokens: 1, outputTokens: 1 } };
+      },
+    };
+    const provider = new CreditFallbackProvider({
+      routes: [
+        { provider: response, model: 'primary' },
+        { provider: response, model: 'fallback' },
+      ],
+      stage,
+    });
+    assert.equal(provider.allowsResponseModel('primary', stage === 0 ? 'fallback' : 'primary'), false);
+    let executions = 0;
+    const result = await new AgentLoop({
+      provider,
+      model: 'primary',
+      pricing: { ...priceTable(['primary', 'fallback']), legacy_aliases: { 'fallback-alias': 'fallback' } },
+      maxUsd: 1,
+      tools: {
+        execute: async () => {
+          executions++;
+          return { finish: { summary: 'ok' } };
+        },
+      },
+    }).run({ task: 'finish' });
+    assert.equal(result.status, expected, `stage ${stage}: ${echoed}`);
+    assert.equal(result.usage.inputTokens, 1, 'refused output is still metered');
+    assert.equal(executions, expected === 'DONE' ? 1 : 0);
+  }
+});
+
+test('resumed fallback budgets reserve only the active route and its reachable successors', async () => {
+  const pricing = priceTable(['expensive', 'cheap']);
+  pricing.models.expensive.usd_per_1m.output = { off_peak: 1_000_000, peak: 1_000_000 };
+  let executions = 0;
+  const provider = new CreditFallbackProvider({
+    stage: 1,
+    routes: [
+      {
+        model: 'expensive',
+        provider: {
+          async *chat() {
+            assert.fail('the exhausted route cannot be retried');
+          },
+        },
+      },
+      {
+        model: 'cheap',
+        provider: {
+          async *chat() {
+            yield { model: 'cheap', usage: { inputTokens: 1, outputTokens: 1 }, toolCalls: [call('finish', '{"summary":"done"}')] };
+          },
+        },
+      },
+    ],
+  });
+  const result = await new AgentLoop({
+    provider,
+    model: 'expensive',
+    pricing,
+    maxUsd: 1,
+    tools: {
+      execute: async () => {
+        executions++;
+        return { finish: { summary: 'done' } };
+      },
+    },
+  }).run({ task: 'finish' });
+  assert.equal(result.status, 'DONE');
+  assert.equal(executions, 1);
+});
+
+test('loop diagnostics redact configured opaque secrets before argument and error clipping', async () => {
+  const secret = 'hiddenPhraseForAccount987654321';
+  const args = JSON.stringify({ path: `${'p'.repeat(105)}${secret}/file.js` });
+  const result = await new AgentLoop({
+    provider: {
+      async *chat() {
+        yield { toolCalls: [call('read_file', args)] };
+      },
+    },
+    secrets: [secret],
+    maxTurns: 3,
+    tools: {
+      execute: async () => {
+        throw new Error(`${'e'.repeat(280)}${secret} trailing detail`);
+      },
+    },
+  }).run({ task: 'read' });
+  assert.equal(result.failureKind, 'tool-loop');
+  assert.match(result.toolFailure.args, /\[REDACTED\]/);
+  assert.match(result.toolFailure.error, /\[REDACTED\]/);
+  assert.ok(!JSON.stringify(result.toolFailure).includes(secret.slice(0, 6)), 'a clipped secret prefix must never escape');
 });

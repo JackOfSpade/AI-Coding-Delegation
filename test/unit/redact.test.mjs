@@ -1,6 +1,42 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { redact, redactError, redactText, redactTokenShapes, RedactionProjector } from '../../src/redact.mjs';
+import {
+  redact,
+  redactError,
+  redactText,
+  redactTokenShapes,
+  RedactionProjector,
+  stripTerminalControls,
+  safeErrorText,
+} from '../../src/redact.mjs';
+
+test('client error sanitization recognizes credentials split by terminal formatting', () => {
+  assert.equal(safeErrorText('API_\x1b[31mKEY=opaque-secret'), 'API_KEY=[REDACTED]');
+  assert.equal(safeErrorText('sk-\x1b[0m1234567890abcdefghijklmnop'), '[REDACTED]');
+  assert.equal(safeErrorText('before\n\tmessage\x1b]unfinished'), 'beforemessage');
+});
+
+test('terminal stripping follows ANSI boundaries and drops unfinished escapes without rescanning the suffix', () => {
+  for (const [source, expected] of [
+    ['before\x1b[31mred\x1b[0m after', 'beforered after'],
+    ['\x1b]first\x1b\\visible\x1b]second\x1b\\tail', 'visibletail'],
+    ['\x1b]title\x07visible', 'visible'],
+    ['before\x1b]unfinished title', 'before'],
+    ['before\x1b[31', 'before'],
+    [`before${'\x1b]'.repeat(64_000)}`, 'before'],
+    ['café 🐈\n\t\r\x00\x07\x7f', 'café 🐈\n\t\r'],
+    ['before\x1bMafter', 'beforeMafter'],
+  ]) {
+    assert.equal(stripTerminalControls(source), expected);
+    let streamed = '';
+    const projector = new RedactionProjector(({ text }) => {
+      streamed += text;
+    });
+    for (let index = 0; index < source.length; index++) projector.push(source[index], index, index + 1);
+    projector.finish(source.length);
+    assert.equal(streamed, expected, 'whole-value and streaming terminal stripping agree');
+  }
+});
 
 test('redaction removes explicit secrets and credential-looking text', () => {
   const value = redactText('Authorization: Bearer abc.def SECRET_TOKEN=xyz', ['abc.def']);

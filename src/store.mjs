@@ -246,8 +246,8 @@ export async function readStoredBytes(path, cap, fallback = null, { platform = p
     // O_NOFOLLOW closes the final-component swap on POSIX. Windows falls
     // back to lstat/fstat identity comparison, which detects a redirected
     // target after the initial check.
-    const noFollow = platform === 'win32' ? 0 : fs.constants.O_NOFOLLOW || 0;
-    handle = await fs.open(path, fs.constants.O_RDONLY | noFollow);
+    const protectedFlags = platform === 'win32' ? 0 : (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
+    handle = await fs.open(path, fs.constants.O_RDONLY | protectedFlags);
     const opened = await handle.stat({ bigint: true });
     if (!validStoredReadStat(opened, cap) || !sameStoredReadStat(before, opened))
       throw new Error('stored file is invalid or changed while opening');
@@ -485,28 +485,10 @@ export class JobStore {
     return authenticate ? this.#authenticate(job) : job;
   }
   async update(id, changes) {
-    return this.#withJobLock(id, () =>
-      this.#serial(async () => {
-        let job = await this.get(id);
-        job = await this.#healPublicationsUnlocked(job, await this.#assertJobDirectory(id));
-        if (!this.verifyJob(job)) throw new Error('stored job integrity check failed');
-        const safe = redact(changes);
-        if (safe.id !== undefined && safe.id !== id) throw new Error('job id cannot be changed');
-        return this.#writeJob({ ...job, ...safe });
-      }),
-    );
+    return this.#update(id, changes, { authenticate: true });
   }
   async updateOperational(id, changes) {
-    return this.#withJobLock(id, () =>
-      this.#serial(async () => {
-        let job = await this.getOperational(id);
-        job = await this.#healPublicationsUnlocked(job, await this.#assertJobDirectory(id));
-        if (!this.verifyJob(job)) throw new Error('stored job integrity check failed');
-        const safe = redact(changes);
-        if (safe.id !== undefined && safe.id !== id) throw new Error('job id cannot be changed');
-        return this.#writeJob({ ...job, ...safe });
-      }),
-    );
+    return this.#update(id, changes, { authenticate: false });
   }
   /**
    * Atomically publish an operational lifecycle transition only if the small
@@ -521,12 +503,15 @@ export class JobStore {
    */
   async updateOperationalIf(id, expected, changes) {
     if (!expected || typeof expected !== 'object' || Array.isArray(expected)) throw new TypeError('expected job state is required');
+    return this.#update(id, changes, { authenticate: false, expected });
+  }
+  async #update(id, changes, { authenticate, expected }) {
     return this.#withJobLock(id, () =>
       this.#serial(async () => {
-        let job = await this.getOperational(id);
+        let job = await this.#readJob(id, { authenticate });
         job = await this.#healPublicationsUnlocked(job, await this.#assertJobDirectory(id));
         if (!this.verifyJob(job)) throw new Error('stored job integrity check failed');
-        if (!Object.entries(expected).every(([key, value]) => Object.is(job[key], value))) return null;
+        if (expected && !Object.entries(expected).every(([key, value]) => Object.is(job[key], value))) return null;
         const safe = redact(changes);
         if (safe.id !== undefined && safe.id !== id) throw new Error('job id cannot be changed');
         return this.#writeJob({ ...job, ...safe });
@@ -1336,16 +1321,16 @@ export class JobStore {
     if (Buffer.byteLength(line) > MAX_TRANSCRIPT_BYTES) throw new Error('transcript record exceeds size limit');
     const bytes = Buffer.byteLength(line);
     const before = await lstat(path).catch((error) => (error.code === 'ENOENT' ? null : Promise.reject(error)));
-    if (before && (!before.isFile() || before.isSymbolicLink())) throw new Error('transcript file is invalid');
+    if (before && (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1)) throw new Error('transcript file is invalid');
     let handle;
     try {
       // appendFile(path) re-opens by pathname after the lstat above.  That
       // makes messages/events vulnerable to a final-component symlink swap.
       // Use one checked descriptor instead, with O_NOFOLLOW where Node
       // exposes it; the identity checks remain the Windows fallback.
-      const noFollow = process.platform === 'win32' ? 0 : constants.O_NOFOLLOW || 0;
+      const protectedFlags = this.platform === 'win32' ? 0 : (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0);
       try {
-        handle = await openFile(path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | noFollow, 0o600);
+        handle = await openFile(path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | protectedFlags, 0o600);
       } catch (error) {
         if (error?.code === 'ELOOP') throw new Error('transcript file is invalid');
         throw error;
@@ -1354,6 +1339,7 @@ export class JobStore {
       const current = await lstat(path);
       if (
         !opened.isFile() ||
+        opened.nlink !== 1 ||
         current.isSymbolicLink() ||
         opened.dev !== current.dev ||
         opened.ino !== current.ino ||
@@ -1361,6 +1347,7 @@ export class JobStore {
       )
         throw new Error('transcript file is invalid');
       if (opened.size + bytes > MAX_TRANSCRIPT_BYTES) throw new Error('transcript exceeds size limit');
+      if (this.#posix()) await handle.chmod(0o600);
       await handle.writeFile(line, 'utf8');
     } finally {
       await handle?.close().catch(() => {});

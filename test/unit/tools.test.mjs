@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, mkdir, readFile, readdir, stat, symlink, writeFile } from 'node:fs/promises';
 import * as nodeFs from 'node:fs/promises';
-import { renameSync, symlinkSync, writeFileSync } from 'node:fs';
+import { constants, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -656,6 +656,88 @@ test('grep streams beyond the read_file window with bounded literal matching', a
   const { dir, tools } = await fixture();
   await writeFile(path.join(dir, 'later.txt'), `${'x'.repeat(70_000)}needle-after-window`);
   assert.match(await tools.grep({ pattern: 'needle-after-window' }), /later\.txt/);
+});
+test('grep searches only the requested subtree and uses raw discovered filenames', async () => {
+  const { dir } = await fixture();
+  const root = await nodeFs.realpath(dir);
+  await mkdir(path.join(dir, 'nested'));
+  await writeFile(path.join(dir, 'nested', '[notes].txt'), 'needle in notes');
+  const opened = [];
+  const tools = new LocalTools({
+    repoPath: dir,
+    ownedPaths: ['**'],
+    fileSystem: {
+      ...nodeFs,
+      opendir: async (directory, ...args) => {
+        opened.push(path.relative(root, directory));
+        return nodeFs.opendir(directory, ...args);
+      },
+    },
+  });
+  const result = await tools.grep({ pattern: 'needle', path: 'nested' });
+  assert.match(result, /nested\/\[notes\]\.txt:1:needle/);
+  assert.deepEqual(opened, ['nested'], 'unrelated files cannot exhaust discovery before the requested subtree');
+});
+test('grep enforces one match cap across files and reports direct-file truncation', async () => {
+  const { dir } = await fixture();
+  await writeFile(path.join(dir, 'first.txt'), 'needle\n'.repeat(200));
+  await writeFile(path.join(dir, 'second.txt'), 'needle\n'.repeat(200));
+  const tools = new LocalTools({ repoPath: dir, ownedPaths: ['*.txt'], outputCap: 128_000 });
+  const result = await tools.grep({ pattern: 'needle' });
+  assert.equal(result.split('\n').filter((line) => /^(?:first|second)\.txt:\d+:/.test(line)).length, 300);
+  assert.match(result, /\[truncated after 300 matches\]$/);
+  await writeFile(path.join(dir, 'many.txt'), 'needle\n'.repeat(301));
+  assert.match(await tools.grep({ pattern: 'needle', path: 'many.txt' }), /\[truncated after 300 matches\]$/);
+});
+test('grep redacts before snippet clipping and retains redaction state across read chunks', async () => {
+  const { dir, tools } = await fixture();
+  await writeFile(path.join(dir, 'secrets.txt'), `API_KEY=${'a'.repeat(70_000)}private-suffix\nvisible needle\n`);
+  assert.equal(await tools.grep({ pattern: 'private-suffix', path: 'secrets.txt' }), '');
+  const visible = await tools.grep({ pattern: 'needle', path: 'secrets.txt' });
+  assert.match(visible, /secrets\.txt:2:/);
+  assert.doesNotMatch(visible, /private-suffix|a{20}/);
+  assert.match(visible, /\[REDACTED\]/);
+  await writeFile(path.join(dir, 'secrets.txt'), '\x1b]title\nhidden\x07visible needle\n');
+  assert.match(await tools.grep({ pattern: 'needle', path: 'secrets.txt' }), /secrets\.txt:2:/);
+});
+test('read_file rejects non-regular paths before opening and closes on descriptor inspection failures', async () => {
+  const { dir } = await fixture();
+  let opens = 0,
+    closes = 0;
+  const nonRegular = new LocalTools({
+    repoPath: dir,
+    ownedPaths: ['*.txt'],
+    fileSystem: {
+      ...nodeFs,
+      lstat: async () => ({ isSymbolicLink: () => false, isFile: () => false }),
+      open: async () => {
+        opens++;
+        throw new Error('must not open a FIFO/device');
+      },
+    },
+  });
+  await assert.rejects(() => nonRegular.read_file({ path: 'a.txt' }), /non-regular/);
+  assert.equal(opens, 0);
+  const statFailure = new LocalTools({
+    repoPath: dir,
+    ownedPaths: ['*.txt'],
+    fileSystem: {
+      ...nodeFs,
+      open: async (_file, flags) => {
+        if (process.platform !== 'win32') assert.ok(flags & constants.O_NONBLOCK, 'a FIFO replacement cannot block open');
+        return {
+          stat: async () => {
+            throw new Error('stat failed');
+          },
+          close: async () => {
+            closes++;
+          },
+        };
+      },
+    },
+  });
+  await assert.rejects(() => statFailure.read_file({ path: 'a.txt' }), /stat failed/);
+  assert.equal(closes, 1);
 });
 test('grep caps direct-file output including its omission marker', async () => {
   const { dir } = await fixture();

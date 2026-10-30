@@ -334,6 +334,7 @@ export class AgentLoop {
     // `[[absolutePrefix, label], ...]` applied to the failing call recorded when
     // the loop guard trips, so a temp or home directory never reaches a report.
     pathAliases = [],
+    secrets = [],
   } = {}) {
     if (!provider || typeof provider.chat !== 'function') throw new TypeError('provider.chat is required');
     if (!tools || typeof tools.execute !== 'function') throw new TypeError('tools.execute is required');
@@ -364,6 +365,9 @@ export class AgentLoop {
     )
       throw new TypeError('pathAliases must be up to 16 [prefix, label] string pairs');
     this.pathAliases = pathAliases;
+    if (!Array.isArray(secrets) || secrets.some((secret) => typeof secret !== 'string'))
+      throw new TypeError('secrets must be an array of strings');
+    this.secrets = [...secrets];
     this.provider = provider;
     this.tools = tools;
     this.context = context ?? new AgentContext();
@@ -395,6 +399,12 @@ export class AgentLoop {
       throw new TypeError('reportMode requires read-only tools');
     this.reportMode = reportMode;
     this.serverVerifierConfigured = serverVerifierConfigured;
+  }
+  #currentReservationModels() {
+    const stage = this.provider.stage;
+    return Number.isSafeInteger(stage) && stage >= 0 && stage < this.reservationModels.length
+      ? this.reservationModels.slice(stage)
+      : this.reservationModels;
   }
   async #execute(calls, signal, errors = [], timings = []) {
     const result = new Array(calls.length);
@@ -637,7 +647,7 @@ export class AgentLoop {
           this.reportMode && this.maxUsd !== Infinity
             ? reserveRequestBudget(
                 this.meter.table,
-                this.reservationModels,
+                this.#currentReservationModels(),
                 this.context.snapshot(),
                 this.toolDefinitions,
                 (this.maxUsd - this.meter.usd) / 2,
@@ -703,7 +713,7 @@ export class AgentLoop {
           // afford the minimum response, never as a cheaper normal path.
           let reservation = reserveRequestBudget(
             this.meter.table,
-            this.reservationModels,
+            this.#currentReservationModels(),
             messagesForTurn,
             activeToolDefinitions,
             this.maxUsd - this.meter.usd,
@@ -721,7 +731,7 @@ export class AgentLoop {
             for (const candidate of candidates) {
               const compactReservation = reserveRequestBudget(
                 this.meter.table,
-                this.reservationModels,
+                this.#currentReservationModels(),
                 candidate.messages,
                 activeToolDefinitions,
                 this.maxUsd - this.meter.usd,
@@ -750,7 +760,7 @@ export class AgentLoop {
             for (const candidate of candidates) {
               const compactReservation = reserveRequestBudget(
                 this.meter.table,
-                this.reservationModels,
+                this.#currentReservationModels(),
                 candidate.messages,
                 activeToolDefinitions,
                 this.maxUsd - this.meter.usd,
@@ -796,7 +806,7 @@ export class AgentLoop {
                 : undefined;
               budgetFinishReservation = reserveRequestBudget(
                 this.meter.table,
-                this.reservationModels,
+                this.#currentReservationModels(),
                 [{ role: 'user', content: BUDGET_FINISH_RECOVERY_MESSAGE }],
                 finishOnlyTools,
                 remainingUsd,
@@ -973,7 +983,7 @@ export class AgentLoop {
               // substitute a more expensive model after the request begins.
               if (
                 this.maxUsd !== Infinity &&
-                !samePricedModel(this.meter.table, this.model, event.model) &&
+                !samePricedModel(this.meter.table, this.provider.activeModel ?? this.model, event.model) &&
                 this.provider.allowsResponseModel?.(this.model, event.model) !== true
               )
                 unauthorizedResponseModel ??= event.model;
@@ -1453,6 +1463,7 @@ export class AgentLoop {
               turn,
               repeats: n,
               pathAliases: this.pathAliases,
+              secrets: this.secrets,
             }),
             ...modelMeta(),
           };

@@ -57,36 +57,37 @@ function applyAliases(text, aliases) {
   return out;
 }
 // Redact before clipping so a secret is never cut into an unrecognizable prefix.
-const sanitize = (value, limit, aliases = []) =>
+const sanitize = (value, limit, aliases = [], secrets = []) =>
   clip(
-    stripTerminalControls(redactText(applyAliases(String(value), aliases)))
+    redactText(applyAliases(redactText(stripTerminalControls(String(value)), secrets), aliases), secrets)
       .replace(/[\r\n\t]+/g, ' ')
       .trim(),
     limit,
   );
 
-function summarizeArgs(parsed, aliases) {
+function summarizeArgs(parsed, aliases, secrets) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return '{}';
   const reduced = {};
   for (const [key, value] of Object.entries(parsed).slice(0, MAX_ARG_KEYS)) {
-    const label = sanitize(key, 40);
-    if (typeof value === 'string') reduced[label] = BODY_KEYS.has(key) ? `<${value.length} chars>` : sanitize(value, VALUE_CHARS, aliases);
+    const label = sanitize(key, 40, [], secrets);
+    if (typeof value === 'string')
+      reduced[label] = BODY_KEYS.has(key) ? `<${value.length} chars>` : sanitize(value, VALUE_CHARS, aliases, secrets);
     else if (value === null || typeof value === 'number' || typeof value === 'boolean') reduced[label] = value;
     else reduced[label] = Array.isArray(value) ? '<array>' : '<object>';
   }
   // Key-aware pass: a `token`/`password` argument is masked wholesale.
-  return sanitize(JSON.stringify(redact(reduced)), FIELD_CHARS, aliases);
+  return sanitize(JSON.stringify(redact(reduced, secrets)), FIELD_CHARS, aliases, secrets);
 }
 
-function summarizeError(error, aliases) {
+function summarizeError(error, aliases, secrets) {
   const message = typeof error === 'string' ? error : String(error?.message ?? '');
-  const first = stripTerminalControls(message)
+  const first = redactText(stripTerminalControls(message), secrets)
     .split(/\r?\n/)
     .map((line) => line.trim())
     .find(Boolean);
   if (!first) return 'Tool execution failed';
   const code = typeof error?.code === 'string' && ERROR_CODE.test(error.code) && !first.includes(error.code) ? `${error.code}: ` : '';
-  return sanitize(`${code}${first.slice(0, 4_000)}`, FIELD_CHARS, aliases);
+  return sanitize(`${code}${first}`, FIELD_CHARS, aliases, secrets);
 }
 
 // Key-sorted JSON, so the same call hashes the same whatever order the model wrote its keys in.
@@ -120,16 +121,16 @@ function callSignature(tool, parsedArgs, rawArguments, summary) {
  * worker is never shown this error (see toolErrorHint); a primary needs it to
  * tell a bad brief from a bad worker.
  */
-export function summarizeToolFailure({ calls, parsed = [], values, errors = [], turn, repeats, pathAliases = [] }) {
+export function summarizeToolFailure({ calls, parsed = [], values, errors = [], turn, repeats, pathAliases = [], secrets = [] }) {
   const index = values.findIndex((value) => typeof value === 'string' && value.startsWith('TOOL_ERROR:'));
   if (index < 0) return undefined;
   const name = String(calls[index]?.name ?? '');
   const tool = TOOL_NAME.test(name) ? name : 'unknown';
-  const args = summarizeArgs(parsed[index], pathAliases);
+  const args = summarizeArgs(parsed[index], pathAliases, secrets);
   return {
     tool,
     args,
-    error: summarizeError(errors[index], pathAliases),
+    error: summarizeError(errors[index], pathAliases, secrets),
     turn,
     repeats,
     signature: callSignature(tool, parsed[index], calls[index]?.arguments, args),
@@ -143,7 +144,7 @@ export function summarizeToolFailure({ calls, parsed = [], values, errors = [], 
  * `args`, `error` and `signature` are optional: a report job keeps only
  * `{tool, turn, repeats}` because its transcripts are deliberately ephemeral.
  */
-export function safeToolFailure(value) {
+export function safeToolFailure(value, { secrets = [] } = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   if (typeof value.tool !== 'string' || !TOOL_NAME.test(value.tool)) return undefined;
   if (!Number.isSafeInteger(value.turn) || value.turn < 0 || value.turn > MAX_TURN) return undefined;
@@ -152,7 +153,7 @@ export function safeToolFailure(value) {
   for (const key of ['args', 'error']) {
     if (value[key] === undefined) continue;
     if (typeof value[key] !== 'string' || value[key].length > 4 * FIELD_CHARS) return undefined;
-    out[key] = sanitize(value[key], FIELD_CHARS);
+    out[key] = sanitize(value[key], FIELD_CHARS, [], secrets);
   }
   if (value.signature !== undefined) {
     if (typeof value.signature !== 'string' || !SIGNATURE.test(value.signature)) return undefined;

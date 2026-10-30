@@ -118,6 +118,16 @@ test('a symlinked venv interpreter pulls in the installation it points at', { sk
   assert.deepEqual([...resolved.roots].sort(), [base, join(root, 'venv')].sort());
 });
 
+test('an oversized pyvenv.cfg cannot derive an external interpreter read grant', { skip: POSIX_SKIP }, async (t) => {
+  const { root, context } = await sandboxRoot(t);
+  const base = join(root, 'base');
+  await installation(base);
+  const venv = join(root, 'venv');
+  await copiedVenv(venv, base);
+  await writeFile(join(venv, 'pyvenv.cfg'), `home = ${join(base, 'bin')}\n${'#'.repeat(8192)}`);
+  assert.deepEqual(resolveVerifierInterpreters(venv, context).roots, [venv]);
+});
+
 test('a standalone interpreter resolves to its installation prefix', { skip: POSIX_SKIP }, async (t) => {
   const { root, context } = await sandboxRoot(t);
   const real = await installation(join(root, 'opt', 'py'));
@@ -356,6 +366,12 @@ test('probing a declaration runs python -c inside the sandbox and reports each o
     (await probeVerifierInterpreter(join(root, 'venv'), { ...context, run: run({ code: null, timedOut: true }) })).reason,
     'probe-timed-out',
   );
+  const cancelled = await probeVerifierInterpreter(join(root, 'venv'), {
+    ...context,
+    run: run({ code: 0, stdout: '3.99.0\n', cancelled: true }),
+  });
+  assert.equal(cancelled.status, 'partial', 'a cancelled process is not a successful interpreter probe even if its exit code is zero');
+  assert.equal(cancelled.reason, 'probe-failed');
   const sandboxless = await probeVerifierInterpreter(join(root, 'venv'), {
     ...context,
     run: run(new Error('Required macOS sandbox is unavailable for this command')),

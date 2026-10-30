@@ -163,7 +163,8 @@ test('N-route fallback: Claude -> OpenAI, then OpenAI -> Flash, persisting each 
   assert.deepEqual(log, ['claude', 'persist:1', 'openai:gpt-6.1-terra', 'persist:2', 'flash:deepseek-flash']);
   assert.equal(provider.stage, 2);
   assert.equal(provider.fallbackUsed, true);
-  assert.equal(provider.allowsResponseModel('x', 'gpt-6.1-terra'), true);
+  assert.equal(provider.allowsResponseModel('x', 'gpt-6.1-terra'), false);
+  assert.equal(provider.allowsResponseModel('x', 'deepseek-flash'), true);
   assert.equal(provider.allowsResponseModel('x', 'gpt-9-terra'), false);
   await collect(provider);
   assert.equal(log.at(-1), 'flash:deepseek-flash');

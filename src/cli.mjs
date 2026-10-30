@@ -6,7 +6,7 @@ import { normalizeInterpreterDeclaration, normalizeVerifierImports } from './ver
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { doctor, doctorLive, keysSummary } from './doctor.mjs';
-import { redactText } from './redact.mjs';
+import { safeErrorText as safeText } from './redact.mjs';
 import { MAX_RETROSPECTIVE_JOBS } from './retrospective.mjs';
 
 const binPath = fileURLToPath(new URL('../bin/offload.mjs', import.meta.url));
@@ -62,7 +62,7 @@ export function parseArgs(argv) {
   const [command, ...rest] = argv;
   const flags = Object.create(null);
   const positionals = [];
-  const shape = CLI_COMMANDS[command];
+  const shape = Object.hasOwn(CLI_COMMANDS, command) ? CLI_COMMANDS[command] : undefined;
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
     // Treat the conventional end-of-options marker as positional input. This
@@ -115,11 +115,6 @@ export function parseArgs(argv) {
   }
   return { command, positionals, flags: Object.fromEntries(Object.entries(flags)) };
 }
-const safeText = (value) =>
-  redactText(String(value))
-    .replace(/\x1B\][\s\S]*?(?:\x07|\x1B\\)/g, '')
-    .replace(/\x1B\[[0-?]*[ -\/]*[@-~]/g, '')
-    .replace(/[\x00-\x1F\x7F]/g, '');
 const decode = (value, fallback) => {
   if (value == null) return fallback;
   try {
@@ -224,7 +219,7 @@ function logWindowFlags(flags) {
   };
 }
 function validateInvocation(command, flags, positionals) {
-  const shape = CLI_COMMANDS[command];
+  const shape = Object.hasOwn(CLI_COMMANDS, command) ? CLI_COMMANDS[command] : undefined;
   if (!shape) throw new Error('usage: offload <start|wait|job|repair|revert|cancel|retrospective|doctor|mcp>');
   const allowed = new Set([...shape.valueFlags, ...shape.booleanFlags]);
   for (const key of Object.keys(flags)) if (!allowed.has(key)) throw new Error(`unknown option --${key} for ${command}`);

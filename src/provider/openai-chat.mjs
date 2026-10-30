@@ -280,6 +280,168 @@ export async function openAICreditExhausted(response, signal) {
   }
 }
 
+function billableChatUsage(chunks, { openai, requestModel }) {
+  const records = chunks.filter((chunk) => chunk?.usage != null);
+  if (records.length !== 1) return undefined;
+  try {
+    const models = chunks
+      .filter((chunk) => validModel(chunk?.model))
+      .map((chunk) => {
+        const model = chunk.model;
+        return openai && model.startsWith(requestModel) && /^-\d{4}-\d{2}-\d{2}$/.test(model.slice(requestModel.length))
+          ? requestModel
+          : model;
+      });
+    return {
+      usage: normalizeUsage(records[0].usage),
+      model: models[0] ?? requestModel,
+      ...(new Set(models).size > 1 ? { modelConflict: true } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function* chatResponseEvents(chunks, { openai, requestModel }) {
+  const calls = new Map();
+  let assistantChars = 0;
+  let model,
+    usageSeen = false,
+    modelConflict = false,
+    conflictReported = false,
+    providerFinishReason;
+  for (const chunk of chunks) {
+    if (!chunk || typeof chunk !== 'object' || Array.isArray(chunk)) throw new ProviderError('Invalid SSE response chunk');
+    if (chunk?.model !== undefined && !validModel(chunk.model)) throw new ProviderError('Invalid response model');
+    // OpenAI may echo the dated snapshot of the requested alias; it is the same priced model.
+    if (
+      openai &&
+      typeof chunk.model === 'string' &&
+      /^-\d{4}-\d{2}-\d{2}$/.test(chunk.model.slice(requestModel.length)) &&
+      chunk.model.startsWith(requestModel)
+    )
+      chunk.model = requestModel;
+    if (chunk.choices !== undefined) {
+      if (!Array.isArray(chunk.choices)) throw new ProviderError('Invalid SSE response choices');
+      const choice = chunk.choices[0];
+      if (
+        choice !== undefined &&
+        (!choice ||
+          typeof choice !== 'object' ||
+          Array.isArray(choice) ||
+          (choice.delta !== undefined && (!choice.delta || typeof choice.delta !== 'object' || Array.isArray(choice.delta))))
+      )
+        throw new ProviderError('Invalid SSE response choices');
+      if (choice && Object.hasOwn(choice, 'finish_reason')) {
+        const normalizedFinishReason = normalizeProviderFinishReason(choice.finish_reason);
+        if (normalizedFinishReason !== undefined)
+          providerFinishReason =
+            providerFinishReason === undefined || providerFinishReason === normalizedFinishReason ? normalizedFinishReason : 'other';
+      }
+    }
+    if (chunk.model !== undefined) {
+      if (model !== undefined && model !== chunk.model) modelConflict = true;
+      model ??= chunk.model;
+    }
+    const delta = chunk?.choices?.[0]?.delta ?? {};
+    const echoedModel = chunk.model ?? model;
+    const conflict = modelConflict ? { modelConflict: true } : {};
+    // OpenAI-compatible streaming tool-call chunks (including DeepSeek's)
+    // may carry `content: null` while the assistant emits no text.
+    if (delta.content !== undefined && delta.content !== null && typeof delta.content !== 'string')
+      throw new ProviderError('Invalid response content');
+    if (delta.reasoning_content !== undefined && delta.reasoning_content !== null && typeof delta.reasoning_content !== 'string')
+      throw new ProviderError('Invalid response reasoning');
+    if (delta.reasoning !== undefined && delta.reasoning !== null && typeof delta.reasoning !== 'string')
+      throw new ProviderError('Invalid response reasoning');
+    const hasReasoningContent = Object.hasOwn(delta, 'reasoning_content');
+    const hasReasoningAlias = Object.hasOwn(delta, 'reasoning');
+    if (hasReasoningContent && hasReasoningAlias && delta.reasoning_content !== delta.reasoning)
+      throw new ProviderError('Conflicting response reasoning aliases');
+    assistantChars += (delta.content?.length ?? 0) + ((hasReasoningContent ? delta.reasoning_content : delta.reasoning)?.length ?? 0);
+    if (assistantChars > MAX_MESSAGE_CHARS) throw new ProviderError('Response exceeds assistant size limit', { kind: 'response' });
+    if (delta.content) {
+      if (modelConflict) conflictReported = true;
+      yield { text: delta.content, model: echoedModel, ...conflict };
+    }
+    // DeepSeek uses an explicit null reasoning_content for non-thinking
+    // tool calls. It is part of the assistant message shape and must be
+    // replayed exactly, rather than silently dropped or replaced with an
+    // invented empty string on a later request.
+    const responseReasoning = hasReasoningContent ? delta.reasoning_content : delta.reasoning;
+    if (responseReasoning !== undefined) {
+      if (modelConflict) conflictReported = true;
+      yield { reasoning: responseReasoning, model: echoedModel, ...conflict };
+    }
+    if (delta.tool_calls !== undefined && !Array.isArray(delta.tool_calls)) throw new ProviderError('Invalid tool call list');
+    for (const part of delta.tool_calls ?? []) {
+      if (
+        !part ||
+        typeof part !== 'object' ||
+        Array.isArray(part) ||
+        (part.type !== undefined && part.type !== 'function') ||
+        (part.function !== undefined && (!part.function || typeof part.function !== 'object' || Array.isArray(part.function)))
+      )
+        throw new ProviderError('Invalid tool call fragment');
+      if (!Number.isSafeInteger(part.index) || part.index < 0) throw new ProviderError('Tool call is missing a valid index');
+      if (!calls.has(part.index) && calls.size >= MAX_TOOL_CALLS) throw new ProviderError('Too many tool calls');
+      const prior = calls.get(part.index) ?? { id: '', name: '', arguments: '' };
+      if (part.id !== undefined && !validToolIdentifier(part.id, 512)) throw new ProviderError('Tool call id fragment is invalid');
+      if (part.function?.name !== undefined && !validToolIdentifier(part.function.name, 128))
+        throw new ProviderError('Tool call name fragment is invalid');
+      if (part.id !== undefined && prior.id && part.id !== prior.id) throw new ProviderError('Conflicting tool call id fragments');
+      if (part.function?.name !== undefined && prior.name && part.function.name !== prior.name)
+        throw new ProviderError('Conflicting tool call name fragments');
+      prior.id ||= part.id ?? '';
+      prior.name ||= part.function?.name ?? '';
+      if (part.function?.arguments !== undefined && typeof part.function.arguments !== 'string')
+        throw new ProviderError('Tool arguments fragment must be a string');
+      prior.arguments += part.function?.arguments ?? '';
+      if (prior.arguments.length > MAX_TOOL_ARGUMENT_CHARS) throw new ProviderError('Tool arguments exceed size limit');
+      calls.set(part.index, prior);
+    }
+    // With include_usage enabled, a completed request has one aggregate
+    // record. Multiple records would double-charge callers that account per
+    // turn, so reject rather than silently accumulating them.
+    if (chunk.usage != null) {
+      if (!chunk.usage || typeof chunk.usage !== 'object' || Array.isArray(chunk.usage) || usageSeen)
+        throw new ProviderError(usageSeen ? 'Duplicate SSE usage record' : 'Invalid SSE usage');
+      usageSeen = true;
+      if (modelConflict) conflictReported = true;
+      yield { usage: normalizeUsage(chunk.usage), model: echoedModel, ...conflict };
+    }
+  }
+  const toolCalls = [];
+  for (const [, call] of [...calls.entries()].sort(([left], [right]) => left - right)) {
+    let complete = Boolean(call.id && call.name);
+    if (complete)
+      try {
+        JSON.parse(call.arguments || '{}');
+      } catch {
+        complete = false;
+      }
+    if (complete) toolCalls.push(call);
+    // An output cap can cut a tool call mid-arguments. That is a completed,
+    // billed `length` response, not a malformed one: drop the unexecutable
+    // fragment and let the loop's output-cap recovery see the finish reason.
+    else if (providerFinishReason !== 'length')
+      throw new ProviderError(call.id && call.name ? 'Incomplete tool JSON' : 'Incomplete tool call: missing id or function name', {
+        kind: 'response',
+      });
+  }
+  if (toolCalls.reduce((total, call) => total + call.arguments.length, 0) > MAX_TOOL_ARGUMENT_CHARS)
+    throw new ProviderError('Tool arguments exceed size limit', { kind: 'response' });
+  if (toolCalls.length) {
+    if (modelConflict) conflictReported = true;
+    yield { toolCalls, model, ...(modelConflict ? { modelConflict: true } : {}) };
+  }
+  // A provider may append a metadata-only chunk after the terminal usage
+  // record. Surface that conflict too: otherwise a loop would account the
+  // response yet proceed to execute a previously accumulated tool call.
+  if (modelConflict && !conflictReported) yield { model, modelConflict: true };
+  if (providerFinishReason !== undefined) yield { providerFinishReason };
+}
+
 /** OpenAI chat-completions adapter. A whole successful attempt is buffered
  * before yielding: retrying a broken stream can therefore never duplicate a
  * previously emitted delta. The request timeout stays live through body EOF. */
@@ -449,138 +611,17 @@ export class OpenAIChatProvider {
       signal,
       retryLimit,
     );
-    const calls = new Map();
-    let model,
-      usageSeen = false,
-      modelConflict = false,
-      conflictReported = false,
-      providerFinishReason;
-    for (const chunk of chunks) {
-      if (!chunk || typeof chunk !== 'object' || Array.isArray(chunk)) throw new ProviderError('Invalid SSE response chunk');
-      if (chunk?.model !== undefined && !validModel(chunk.model)) throw new ProviderError('Invalid response model');
-      // OpenAI may echo the dated snapshot of the requested alias; it is the same priced model.
-      if (
-        openai &&
-        typeof chunk.model === 'string' &&
-        /^-\d{4}-\d{2}-\d{2}$/.test(chunk.model.slice(requestModel.length)) &&
-        chunk.model.startsWith(requestModel)
-      )
-        chunk.model = requestModel;
-      if (chunk.choices !== undefined) {
-        if (!Array.isArray(chunk.choices)) throw new ProviderError('Invalid SSE response choices');
-        const choice = chunk.choices[0];
-        if (
-          choice !== undefined &&
-          (!choice ||
-            typeof choice !== 'object' ||
-            Array.isArray(choice) ||
-            (choice.delta !== undefined && (!choice.delta || typeof choice.delta !== 'object' || Array.isArray(choice.delta))))
-        )
-          throw new ProviderError('Invalid SSE response choices');
-        if (choice && Object.hasOwn(choice, 'finish_reason')) {
-          const normalizedFinishReason = normalizeProviderFinishReason(choice.finish_reason);
-          if (normalizedFinishReason !== undefined)
-            providerFinishReason =
-              providerFinishReason === undefined || providerFinishReason === normalizedFinishReason ? normalizedFinishReason : 'other';
-        }
-      }
-      if (chunk.model !== undefined) {
-        if (model !== undefined && model !== chunk.model) modelConflict = true;
-        model ??= chunk.model;
-      }
-      const delta = chunk?.choices?.[0]?.delta ?? {};
-      const echoedModel = chunk.model ?? model;
-      const conflict = modelConflict ? { modelConflict: true } : {};
-      // OpenAI-compatible streaming tool-call chunks (including DeepSeek's)
-      // may carry `content: null` while the assistant emits no text.
-      if (delta.content !== undefined && delta.content !== null && typeof delta.content !== 'string')
-        throw new ProviderError('Invalid response content');
-      if (delta.reasoning_content !== undefined && delta.reasoning_content !== null && typeof delta.reasoning_content !== 'string')
-        throw new ProviderError('Invalid response reasoning');
-      if (delta.reasoning !== undefined && delta.reasoning !== null && typeof delta.reasoning !== 'string')
-        throw new ProviderError('Invalid response reasoning');
-      const hasReasoningContent = Object.hasOwn(delta, 'reasoning_content');
-      const hasReasoningAlias = Object.hasOwn(delta, 'reasoning');
-      if (hasReasoningContent && hasReasoningAlias && delta.reasoning_content !== delta.reasoning)
-        throw new ProviderError('Conflicting response reasoning aliases');
-      if (delta.content) {
-        if (modelConflict) conflictReported = true;
-        yield { text: delta.content, model: echoedModel, ...conflict };
-      }
-      // DeepSeek uses an explicit null reasoning_content for non-thinking
-      // tool calls. It is part of the assistant message shape and must be
-      // replayed exactly, rather than silently dropped or replaced with an
-      // invented empty string on a later request.
-      const responseReasoning = hasReasoningContent ? delta.reasoning_content : delta.reasoning;
-      if (responseReasoning !== undefined) {
-        if (modelConflict) conflictReported = true;
-        yield { reasoning: responseReasoning, model: echoedModel, ...conflict };
-      }
-      if (delta.tool_calls !== undefined && !Array.isArray(delta.tool_calls)) throw new ProviderError('Invalid tool call list');
-      for (const part of delta.tool_calls ?? []) {
-        if (
-          !part ||
-          typeof part !== 'object' ||
-          Array.isArray(part) ||
-          (part.type !== undefined && part.type !== 'function') ||
-          (part.function !== undefined && (!part.function || typeof part.function !== 'object' || Array.isArray(part.function)))
-        )
-          throw new ProviderError('Invalid tool call fragment');
-        if (!Number.isSafeInteger(part.index) || part.index < 0) throw new ProviderError('Tool call is missing a valid index');
-        if (!calls.has(part.index) && calls.size >= MAX_TOOL_CALLS) throw new ProviderError('Too many tool calls');
-        const prior = calls.get(part.index) ?? { id: '', name: '', arguments: '' };
-        if (part.id !== undefined && !validToolIdentifier(part.id, 512)) throw new ProviderError('Tool call id fragment is invalid');
-        if (part.function?.name !== undefined && !validToolIdentifier(part.function.name, 128))
-          throw new ProviderError('Tool call name fragment is invalid');
-        if (part.id !== undefined && prior.id && part.id !== prior.id) throw new ProviderError('Conflicting tool call id fragments');
-        if (part.function?.name !== undefined && prior.name && part.function.name !== prior.name)
-          throw new ProviderError('Conflicting tool call name fragments');
-        prior.id ||= part.id ?? '';
-        prior.name ||= part.function?.name ?? '';
-        if (part.function?.arguments !== undefined && typeof part.function.arguments !== 'string')
-          throw new ProviderError('Tool arguments fragment must be a string');
-        prior.arguments += part.function?.arguments ?? '';
-        if (prior.arguments.length > MAX_TOOL_ARGUMENT_CHARS) throw new ProviderError('Tool arguments exceed size limit');
-        calls.set(part.index, prior);
-      }
-      // With include_usage enabled, a completed request has one aggregate
-      // record. Multiple records would double-charge callers that account per
-      // turn, so reject rather than silently accumulating them.
-      if (chunk.usage != null) {
-        if (!chunk.usage || typeof chunk.usage !== 'object' || Array.isArray(chunk.usage) || usageSeen)
-          throw new ProviderError(usageSeen ? 'Duplicate SSE usage record' : 'Invalid SSE usage');
-        usageSeen = true;
-        if (modelConflict) conflictReported = true;
-        yield { usage: normalizeUsage(chunk.usage), model: echoedModel, ...conflict };
-      }
+    let events;
+    try {
+      events = [...chatResponseEvents(chunks, { openai, requestModel })];
+    } catch (error) {
+      // The transport already completed and may be billed despite unusable
+      // output. Report one unambiguous aggregate before surfacing its failure.
+      const billed = billableChatUsage(chunks, { openai, requestModel });
+      if (billed) yield billed;
+      throw error;
     }
-    const toolCalls = [];
-    for (const [, call] of [...calls.entries()].sort(([left], [right]) => left - right)) {
-      let complete = Boolean(call.id && call.name);
-      if (complete)
-        try {
-          JSON.parse(call.arguments || '{}');
-        } catch {
-          complete = false;
-        }
-      if (complete) toolCalls.push(call);
-      // An output cap can cut a tool call mid-arguments. That is a completed,
-      // billed `length` response, not a malformed one: drop the unexecutable
-      // fragment and let the loop's output-cap recovery see the finish reason.
-      else if (providerFinishReason !== 'length')
-        throw new ProviderError(call.id && call.name ? 'Incomplete tool JSON' : 'Incomplete tool call: missing id or function name', {
-          kind: 'response',
-        });
-    }
-    if (toolCalls.length) {
-      if (modelConflict) conflictReported = true;
-      yield { toolCalls, model, ...(modelConflict ? { modelConflict: true } : {}) };
-    }
-    // A provider may append a metadata-only chunk after the terminal usage
-    // record. Surface that conflict too: otherwise a loop would account the
-    // response yet proceed to execute a previously accumulated tool call.
-    if (modelConflict && !conflictReported) yield { model, modelConflict: true };
-    if (providerFinishReason !== undefined) yield { providerFinishReason };
+    yield* events;
   }
 }
 export const createOpenAIChatProvider = (options) => new OpenAIChatProvider(options);

@@ -14,6 +14,9 @@ test('glob matching supports path segments, recursive stars and character classe
   assert.equal(matchGlob('a/x', 'a/[]'), false);
   assert.equal(matchGlob('a/b', 'a/[!a]'), true);
   assert.equal(matchGlob('a/', 'a/[!a]'), false, 'a character class must never cross a path separator');
+  assert.equal(matchGlob('a/b', 'a[.-0]b'), false, 'a positive range must not match a path separator');
+  assert.equal(matchGlob('a.b', 'a[.-0]b'), true);
+  assert.equal(matchGlob('a0b', 'a[.-0]b'), true);
   assert.equal(normalizePath('./src/./a.mjs'), 'src/a.mjs');
   assert.throws(() => normalizePath('C:/outside'));
   assert.throws(() => normalizePath('../secret'));
@@ -27,6 +30,8 @@ test('overlap detection proves obvious disjoint scopes and is conservative for w
   assert.equal(globsOverlap('src/**/a.js', 'src/a.js'), true);
   assert.equal(globsOverlap('src/a/**', 'src/a'), true);
   assert.equal(pathsOverlap(['src/**'], ['docs/**', 'src/x/**']), true);
+  assert.equal(pathsOverlap(['SRC/a.mjs'], ['src/a.mjs'], { caseInsensitive: true }), true);
+  assert.equal(pathsOverlap(['SRC/a.mjs'], ['src/a.mjs'], { caseInsensitive: false, platform: 'linux' }), false);
 });
 
 test('Windows matching is case-insensitive and rejects ADS/device aliases', () => {

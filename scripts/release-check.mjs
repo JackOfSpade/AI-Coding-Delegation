@@ -4,16 +4,10 @@ import { spawn } from 'node:child_process';
 import { posix, resolve, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ARTIFACT_LEASE_ENV, acquireArtifactLease } from './artifact-lease.mjs';
+import { processExit } from './process-exit.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const phases = Object.freeze(['artifacts:clean', 'static', 'lint', 'format:check', 'test:ci', 'coverage', 'package:check']);
-
-function processExit(child) {
-  return new Promise((resolveExit, reject) => {
-    child.once('error', reject);
-    child.once('exit', (code) => resolveExit(code ?? 1));
-  });
-}
 
 export function npmInvocation({ phase, environment = process.env, platform = process.platform, node = process.execPath } = {}) {
   if (!phases.includes(phase)) throw new TypeError('release phase is invalid');

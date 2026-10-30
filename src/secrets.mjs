@@ -136,7 +136,7 @@ export function readSecretFile(
     // O_NOFOLLOW closes the final-component swap on POSIX. On Windows the
     // flag is not available, so compare lstat/fstat identity as a best effort.
     const noFollow = platform === 'win32' ? 0 : constants.O_NOFOLLOW || 0;
-    fd = open(path, constants.O_RDONLY | noFollow);
+    fd = open(path, constants.O_RDONLY | noFollow | (constants.O_NONBLOCK || 0));
     const opened = fstat(fd);
     // The descriptor, rather than pathname, is our authority after open.  It
     // must still name precisely the private file inspected above; this closes

@@ -803,19 +803,21 @@ export function storedRecord(result) {
   const source = object(result) ?? {};
   const record = Object.fromEntries(STORED_KEYS.filter((key) => source[key] !== undefined).map((key) => [key, source[key]]));
   if (Array.isArray(record.jobs))
-    record.jobs = record.jobs.map((job) => Object.fromEntries(Object.entries(job).filter(([key]) => key !== 'task')));
+    record.jobs = record.jobs
+      .filter((job) => object(job))
+      .map((job) => Object.fromEntries(Object.entries(job).filter(([key]) => key !== 'task')));
   return record;
 }
 
 /** One stored line back to a record, redacted again, or undefined for anything that is not one of ours. */
 export function parseStoredRecord(line) {
-  let value;
   try {
-    value = JSON.parse(line);
+    const value = JSON.parse(line);
+    if (!object(value) || value.v !== RETROSPECTIVE_VERSION || typeof value.at !== 'string' || !Array.isArray(value.signals))
+      return undefined;
+    return scrub(storedRecord(value), {});
   } catch {
+    // Valid JSON can still be foreign or too deeply nested to sanitize.
     return undefined;
   }
-  if (!object(value) || value.v !== RETROSPECTIVE_VERSION || typeof value.at !== 'string' || !Array.isArray(value.signals))
-    return undefined;
-  return scrub(storedRecord(value), {});
 }

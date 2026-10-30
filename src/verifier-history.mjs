@@ -112,6 +112,7 @@ export function expectedVerifierMs(jobs, { repoPath, testCommand, excludeId } = 
         job.verify?.result?.code === 0 &&
         job.verify.result.sandbox === 'macos' &&
         job.verify.result.timedOut !== true &&
+        job.verify.result.cancelled !== true &&
         finiteMs(job.verify.result.durationMs) !== undefined,
     )
     .sort((a, b) => String(b.finishedAt || b.updatedAt || '').localeCompare(String(a.finishedAt || a.updatedAt || '')))

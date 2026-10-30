@@ -270,11 +270,7 @@ function truncateUtf8(value, maxBytes) {
 function safeReportString(value, maxChars = MAX_REPORT_TEXT) {
   if (typeof value !== 'string' || value.length === 0 || value.length > maxChars || Buffer.byteLength(value, 'utf8') > MAX_REPORT_TEXT)
     return undefined;
-  const sanitized = redactText(
-    value
-      .replace(/\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g, '')
-      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, ''),
-  );
+  const sanitized = redactText(stripTerminalControls(value).replace(/[\x7F-\x9F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, ''));
   // Lists use their existing 1,500-character contract as a tighter byte
   // budget; full reports retain the documented global result limit.
   const bounded = truncateUtf8(sanitized, Math.min(MAX_REPORT_TEXT, maxChars));
@@ -640,9 +636,8 @@ const baselineRunSummary = (value, { cached = false } = {}) =>
 const safeVerifyBaseline = (value) => {
   if (value?.mode !== 'baseline-diff' || !BASELINE_STATUSES.has(value.status)) return undefined;
   const text = (item, max) =>
-    String(item ?? '')
-      .replace(/\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g, '')
-      .replace(/[\x00-\x1F\x7F-\x9F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, ' ')
+    stripTerminalControls(String(item ?? ''))
+      .replace(/[\t\r\n\x7F-\x9F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, ' ')
       .trim()
       .slice(0, max);
   const baseline = baselineRunSummary(value.baseline, { cached: true });
@@ -942,6 +937,11 @@ export function sameRepositoryPath(left, right, { platform = process.platform } 
   return platform === 'win32' ? normalizeWindows(a) === normalizeWindows(b) : a === b;
 }
 
+// Cleanup helpers may resolve while retaining a private root for a later retry.
+// An explicit failure must keep the durable path; legacy void helpers still succeed.
+const workspaceCleanupSucceeded = (result) =>
+  result !== false && result?.retained !== true && !(result?.removed === false && result.alreadyAbsent !== true && result.cleaned !== true);
+
 /** Lifecycle manager. Its worker/snapshot/lease collaborators are intentionally injected. */
 export class JobManager {
   constructor({
@@ -1023,8 +1023,7 @@ export class JobManager {
         const result = await this.config.isolation.cleanup({ repoPath: job.repoPath, workspacePath });
         // A helper may explicitly report a retained/failed private root. A
         // resolved promise alone is not proof that retryable cleanup happened.
-        if (result?.retained === true) cleaned = false;
-        else if (result && result.removed === false && result.alreadyAbsent !== true && result.cleaned !== true) cleaned = false;
+        if (!workspaceCleanupSucceeded(result)) cleaned = false;
       } catch {
         cleaned = false;
       }
@@ -1552,7 +1551,8 @@ export class JobManager {
     // would reintroduce a time-of-check/time-of-use repository redirect.
     return { ...job, repoPath: this.repoPath };
   }
-  async start(input, { launch = true, turnBudget, runtimePreflight } = {}) {
+  async start(input, { launch = true, turnBudget, runtimePreflight, signal } = {}) {
+    signal?.throwIfAborted();
     this.validate(input);
     assertVerifierCommand(input.testCommand);
     if (runtimePreflight !== undefined && !validRuntimePreflight(runtimePreflight))
@@ -1590,6 +1590,7 @@ export class JobManager {
     } catch {
       throw new Error('repoPath must be inside a git working tree');
     }
+    signal?.throwIfAborted();
     if (this.repoPath && !sameRepositoryPath(repoPath, this.repoPath)) throw new Error('repoPath does not match this manager');
     this.repoPath ||= repoPath;
     if (this.config.disabled) throw new Error('offload is disabled for this repository');
@@ -1608,6 +1609,7 @@ export class JobManager {
     });
     if (input.mode !== 'report') {
       const previousFailures = await this.verifierEnvironmentFailures();
+      signal?.throwIfAborted();
       if (previousFailures.length) {
         verifierPreflight ||= { scannedFiles: 0, resolvedFiles: [], limited: true, warnings: [] };
         // Only files this testCommand still runs are worth dropping; a narrowed
@@ -1644,7 +1646,9 @@ export class JobManager {
       }
     }
     const branch = this.config.git ? await this.config.git.branch(repoPath) : git(repoPath, ['branch', '--show-current']);
+    signal?.throwIfAborted();
     const head = this.config.git ? await this.config.git.head(repoPath) : git(repoPath, ['rev-parse', 'HEAD']);
+    signal?.throwIfAborted();
     // The built-in LeaseManager takes (jobId, paths); lightweight test/custom
     // managers may instead accept one descriptive object.
     let job, workspace;
@@ -1659,13 +1663,16 @@ export class JobManager {
       const concurrentScopes = this.leases.list
         ? (await this.leases.list({ reclaimStale: true })).flatMap((lease) => lease.ownedPaths || [])
         : [];
+      signal?.throwIfAborted();
       const before = this.snapshots.create ? await this.snapshots.create(repoPath) : null;
+      signal?.throwIfAborted();
       const primaryIndexBefore = this.isolated ? primaryIndexTree(repoPath) : undefined;
       if (this.isolated) {
         if (!validGitObjectId(before)) throw new Error('could not create an isolated baseline snapshot');
         workspace = await this.config.isolation.create({ repoPath, baselineTree: before });
         if (!workspace?.path || typeof workspace.path !== 'string') throw new Error('could not create an isolated workspace');
       }
+      signal?.throwIfAborted();
       const inputManifest =
         input.mode === 'report' && input.inputFiles?.length
           ? await copyReportInputs({
@@ -1674,9 +1681,11 @@ export class JobManager {
               roots: await reportInputRoots(this.config.reportInputRoots || []),
             })
           : [];
+      signal?.throwIfAborted();
       const sizing = turnBudget
         ? await this.#sizeTurnBudget({ input, turnBudget, root: workspace?.path ?? repoPath, inputManifest })
         : undefined;
+      signal?.throwIfAborted();
       const leaseOwnerNonce = randomUUID();
       // Input paths name caller-controlled scratch locations. Recovery needs
       // only the private manifest after copying, never those host paths.
@@ -1724,20 +1733,25 @@ export class JobManager {
         runnerHeartbeatAt: this.now().toISOString(),
         handoffState: launch ? 'LOCAL' : 'PARENT_QUEUED',
       });
+      signal?.throwIfAborted();
       // Report jobs never diff, integrate, repair, or revert. Their live
       // isolated-worktree pins cover cleanup; a durable per-job tree pin
       // would retain an otherwise unreachable snapshot indefinitely.
       if (workspace && input.mode !== 'report') await this.#pinTrees(job, { before });
+      signal?.throwIfAborted();
       if (writePaths.length && this.leases.acquire) {
         if (this.leases.acquire.length >= 2) await this.leases.acquire(job.id, writePaths, { ownerNonce: leaseOwnerNonce });
         else await this.leases.acquire({ jobId: job.id, repoPath, ownedPaths: writePaths });
       }
+      signal?.throwIfAborted();
       if (this.leases.bind) await this.leases.bind(job.id);
+      signal?.throwIfAborted();
       await this.store.event(job.id, { type: 'started', reason: 'start', round: 0, status: job.status });
+      signal?.throwIfAborted();
       if (launch) this._launch(job.id, 'start', undefined, job);
       return this.public(job);
     } catch (error) {
-      if (job) await this.#finishOwnedTerminal(job, 'FAILED', { error: String(error.message || error) });
+      if (job) await this.#finishOwnedTerminal(job, signal?.aborted ? 'CANCELLED' : 'FAILED', { error: String(error?.message ?? error) });
       let cleanupFailure;
       if (workspace && !job) {
         try {
@@ -1746,13 +1760,14 @@ export class JobManager {
           // lifecycle to perform the ordinary cleanup, so restore only that
           // private directory before asking Git to remove the worktree.
           if (input.mode === 'report') await prepareReportInputsForCleanup(workspace.path);
-          await workspace.cleanup?.();
+          if (typeof workspace.cleanup !== 'function' || !workspaceCleanupSucceeded(await workspace.cleanup()))
+            throw new Error('isolated workspace cleanup was not confirmed');
         } catch (cleanupError) {
           cleanupFailure = cleanupError;
         }
       }
       if (cleanupFailure && !job) {
-        throw new Error(`${String(error.message || error)}; isolated workspace cleanup failed at ${workspace.path} and must be retried`);
+        throw new Error(`${String(error?.message ?? error)}; isolated workspace cleanup failed at ${workspace.path} and must be retried`);
       }
       throw error;
     }
@@ -2934,13 +2949,12 @@ export class JobManager {
     } finally {
       let removed = false;
       try {
-        await workspace.cleanup?.();
-        removed = true;
+        if (typeof workspace.cleanup === 'function') removed = workspaceCleanupSucceeded(await workspace.cleanup());
       } catch {
         // The persisted path stays so the job's own cleanup retries it.
-        await this.#verifyPhase(job.id, { phase: 'baseline', status: 'cleanup-failed' });
       }
       if (removed) await this.store.update(job.id, { verifyBaselineWorkspacePath: undefined }).catch(() => {});
+      else await this.#verifyPhase(job.id, { phase: 'baseline', status: 'cleanup-failed' });
     }
     // Only a run that finished under the sandbox can stand for the snapshot.
     if (outcome.run.sandboxed && !outcome.run.timedOut && !outcome.run.cancelled && outcome.run.code != null) {
@@ -3760,6 +3774,7 @@ export class JobManager {
     // A worker-side FAILED continuation tells the worker what actually went
     // wrong (the loop guard's failing call); the primary's note is kept.
     const effective = continuation && job.status === 'FAILED' ? [failureContinueDefect(job), ...defects.slice(1)] : defects;
+    const previousStatus = job.status;
     const leaseOwnerNonce = randomUUID();
     let workspace, reservation;
     try {
@@ -3863,7 +3878,7 @@ export class JobManager {
         const sizing = safeBudgetSizing(next.budgetSizing);
         await this.store.event(id, {
           type: 'continuation',
-          fromStatus: job.status,
+          fromStatus: previousStatus,
           round: job.rounds || 0,
           ...(sizing ? { turnSizingSource: sizing.initialTurnsSource ?? sizing.turnsSource } : {}),
         });
@@ -3878,7 +3893,7 @@ export class JobManager {
         costUsd: next.costUsd || 0,
         recentActions: ['repair_queued'],
       });
-      if (launch) this._launch(id, 'repair', effective, next);
+      if (launch) this._launch(id, 'repair', next.pendingDefects, next);
       return this.public(next);
     } catch (error) {
       if (reservation)
@@ -3895,7 +3910,8 @@ export class JobManager {
         ).catch(() => {});
       let cleanupFailure;
       try {
-        await workspace?.cleanup?.();
+        if (workspace && (typeof workspace.cleanup !== 'function' || !workspaceCleanupSucceeded(await workspace.cleanup())))
+          throw new Error('replacement isolated workspace cleanup was not confirmed');
       } catch (cleanupError) {
         cleanupFailure = cleanupError;
       }
@@ -4513,8 +4529,7 @@ export class JobManager {
     } finally {
       let removed = false;
       try {
-        await workspace.cleanup?.();
-        removed = true;
+        if (typeof workspace.cleanup === 'function') removed = workspaceCleanupSucceeded(await workspace.cleanup());
       } catch {
         // The persisted path stays so the job's own cleanup retries it.
       }

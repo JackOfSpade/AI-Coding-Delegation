@@ -885,3 +885,10 @@ test('maintainerPromptSkeleton rebuilds the same prompt from an unshrunk digest 
   assert.equal(maintainerPromptSkeleton(digest, { maintainerRoot: ROOT }), built);
   assert.equal(JSON.stringify(digest), frozen);
 });
+
+test('history parsing tolerates malformed job entries and skips excessively nested records', () => {
+  const source = { v: 1, at: '2026-10-07T12:00:00.000Z', signals: [], jobs: [null, false, 'foreign', [], { id: 'job', task: 'drop' }] };
+  assert.deepEqual(parseStoredRecord(JSON.stringify(source)).jobs, [{ id: 'job' }]);
+  const nested = '{"v":1,"at":"x","signals":[],"health":' + '['.repeat(5000) + '0' + ']'.repeat(5000) + '}';
+  assert.equal(parseStoredRecord(nested), undefined);
+});

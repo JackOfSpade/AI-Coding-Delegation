@@ -38,7 +38,7 @@ export class CreditFallbackProvider {
     return this.stage > 0;
   }
   allowsResponseModel(_requested, response) {
-    return this.routes.some((route) => route.model === response);
+    return this.activeModel === response;
   }
   async *chat(request) {
     let emitted = false;

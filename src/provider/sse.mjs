@@ -28,7 +28,9 @@ export async function* sseEvents(body, { maxEventBytes, maxAttemptBytes, signal 
     if (!line) return emit();
     if (!line.startsWith(':') && line.startsWith('data:')) {
       const value = line.slice(5).replace(/^ /, '');
-      eventBytes += Buffer.byteLength(value);
+      // The assembled event inserts one LF between consecutive data fields.
+      // Count those bytes too, including when the fields themselves are empty.
+      eventBytes += Buffer.byteLength(value) + (data.length ? 1 : 0);
       if (eventBytes > maxEventBytes) throw new Error('SSE event exceeds configured size limit');
       data.push(value);
     }

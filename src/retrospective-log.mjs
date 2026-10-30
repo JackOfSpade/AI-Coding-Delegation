@@ -30,7 +30,7 @@ export function createRetrospectiveLog({
   // Match the file-secret boundary: chmod(0600) cannot establish Windows ACL
   // privacy. Refuse persistence before constructing a logger or reading a path.
   // The platform seam may tighten this policy for tests, never bypass the host.
-  if (process.platform === 'win32' || platform === 'win32')
+  if (env.OFFLOAD_LOG === 'off' || process.platform === 'win32' || platform === 'win32')
     return {
       path: null,
       append() {},
@@ -40,7 +40,13 @@ export function createRetrospectiveLog({
   return {
     path: log.path,
     /** Append one retrospective result (the skeleton and brief text are dropped). Never throws. */
-    append: (result) => log.record(storedRecord(result)),
+    append(result) {
+      try {
+        log.record(storedRecord(result));
+      } catch {
+        // A malformed digest must not fail the caller's completed job.
+      }
+    },
     /** The newest `limit` stored records, oldest first, and their signal counts. Unreadable or foreign lines are skipped. */
     history({ limit = 100 } = {}) {
       const records = [];

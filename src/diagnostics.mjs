@@ -73,7 +73,19 @@ export function createDiagnosticLog({
       ready = true;
     }
     const noFollow = process.platform === 'win32' ? 0 : constants.O_NOFOLLOW || 0;
-    return openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | noFollow, 0o600);
+    // O_NONBLOCK prevents a substituted FIFO from hanging the synchronous logger.
+    const fd = openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | noFollow | (constants.O_NONBLOCK || 0), 0o600);
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile() || stat.nlink !== 1) throw new Error('log is not a private regular file');
+      // Existing files can predate this logger or have had their mode changed.
+      // Establish privacy before appending, including the rotated generation.
+      if (process.platform !== 'win32' && (stat.mode & 0o777) !== 0o600) fchmodSync(fd, 0o600);
+      return fd;
+    } catch (error) {
+      closeSync(fd);
+      throw error;
+    }
   };
 
   const write = (line) => {
@@ -89,9 +101,6 @@ export function createDiagnosticLog({
         fd = open();
       }
       if (fstatSync(fd).size === 0) {
-        try {
-          fchmodSync(fd, 0o600);
-        } catch {}
         if (header) writeSync(fd, `${header}\n---\n`);
       }
       writeSync(fd, line);
@@ -107,15 +116,24 @@ export function createDiagnosticLog({
         const safe = { at: now().toISOString(), ...entry };
         if (safe.error) {
           safe.error = {
-            message: redactText(clip(safe.error.message, limits.maxMessageChars), secrets),
-            ...(safe.error.stack ? { stack: redactText(clip(safe.error.stack, limits.maxStackChars), secrets) } : {}),
-            ...(safe.error.code ? { code: clip(safe.error.code, 64) } : {}),
+            message: clip(redactText(String(safe.error.message ?? ''), secrets), limits.maxMessageChars),
+            ...(safe.error.stack ? { stack: clip(redactText(String(safe.error.stack), secrets), limits.maxStackChars) } : {}),
+            ...(safe.error.code ? { code: clip(redactText(String(safe.error.code), secrets), 64) } : {}),
           };
         }
         let line = JSON.stringify(safe);
         // A record must always fit, or rotation could never make room for it.
         const room = Math.min(limits.maxLineBytes, limits.maxBytes - headerBytes - 1);
-        if (Buffer.byteLength(line) > room) line = JSON.stringify({ at: safe.at, tool: safe.tool, ok: safe.ok, truncated: true });
+        if (Buffer.byteLength(line) > room)
+          line = JSON.stringify({
+            at: clip(redactText(String(safe.at), secrets), 40),
+            ...(typeof safe.tool === 'string' ? { tool: clip(redactText(safe.tool, secrets), 64) } : {}),
+            ...(typeof safe.ok === 'boolean' ? { ok: safe.ok } : {}),
+            truncated: true,
+          });
+        // Even the fallback's metadata is untrusted, and a custom cap may be
+        // smaller than one marker. Drop that record instead of exceeding it.
+        if (Buffer.byteLength(line) > room) return;
         write(`${line}\n`);
       } catch {
         // Logging is advisory.
@@ -124,7 +142,7 @@ export function createDiagnosticLog({
   };
 }
 
-const TERMINAL_OK = new Set(['DONE']);
+const TERMINAL_OK = new Set(['DONE', 'DONE_VERIFIED', 'DONE_UNVERIFIED']);
 
 /**
  * `offload_job include:"log"` is bounded so the default response always fits a
@@ -175,20 +193,20 @@ const sameBlock = (shapes, left, right, period) => {
     if (shapes[left + offset] === null || shapes[left + offset] !== shapes[right + offset]) return false;
   return true;
 };
-const labelOf = (event) => {
+const labelOf = (event, secrets) => {
   const action = Array.isArray(event.recentActions) ? event.recentActions.find((value) => typeof value === 'string') : undefined;
   const label = action ?? event.phase ?? (event.providerFinishReason ? `finish_reason:${event.providerFinishReason}` : 'progress');
-  return clip(String(label).replace(/\s+/g, ' '), LABEL_CHARS);
+  return clip(redactText(String(label), secrets).replace(/\s+/g, ' '), LABEL_CHARS);
 };
-const stampOf = (event) => clip(String(event.at ?? '?'), 40);
-function repeatLine(run, period) {
-  const labels = run.slice(0, period).map(labelOf);
+const stampOf = (event, secrets) => clip(redactText(String(event.at ?? '?'), secrets), 40);
+function repeatLine(run, period, secrets) {
+  const labels = run.slice(0, period).map((event) => labelOf(event, secrets));
   const turns = run.map((event) => event.turns).filter(Number.isSafeInteger);
   const delays = run.map((event) => event.prevMs).filter(Number.isFinite);
   const what = period > 1 ? `[${labels.join(' > ')}]` : labels[0];
   return JSON.stringify({
     type: 'progress-repeat',
-    repeat: `${what} x${run.length / period} (${stampOf(run[0])}..${stampOf(run.at(-1))})`,
+    repeat: `${what} x${run.length / period} (${stampOf(run[0], secrets)}..${stampOf(run.at(-1), secrets)})`,
     events: run.length,
     ...(turns.length ? { turns: `${Math.min(...turns)}..${Math.max(...turns)}` } : {}),
     // The slowest phase in the run survives: a stalled provider call must not hide inside a repeat.
@@ -205,7 +223,7 @@ function repeatLine(run, period) {
  * Runs once, over the whole log, BEFORE `tail` counts and `limit` measures, so
  * a repeat line is one event to both. Returns the lines and how much it folded.
  */
-export function collapseRepeats(lines, events) {
+export function collapseRepeats(lines, events, secrets = []) {
   const shapes = events.map(shapeOf);
   const out = [];
   let repeatLines = 0;
@@ -225,7 +243,7 @@ export function collapseRepeats(lines, events) {
       continue;
     }
     const covered = best.period * best.reps;
-    out.push(repeatLine(events.slice(at, at + covered), best.period));
+    out.push(repeatLine(events.slice(at, at + covered), best.period, secrets));
     repeatLines++;
     repeatedEvents += covered;
     at += covered;
@@ -260,7 +278,7 @@ export function jobLogWindow(job, eventsText, { tail, limit } = LOG_DEFAULTS, se
       return { type: 'unparseable-line' };
     }
   });
-  const { lines, repeatLines, repeatedEvents } = collapseRepeats(stored, events);
+  const { lines, repeatLines, repeatedEvents } = collapseRepeats(stored, events, secrets);
   const counts = {};
   for (const event of events) counts[event.type || 'unknown'] = (counts[event.type || 'unknown'] || 0) + 1;
   const first = events[0]?.at;
@@ -280,7 +298,7 @@ export function jobLogWindow(job, eventsText, { tail, limit } = LOG_DEFAULTS, se
     // The loop guard's last failing call, so a loop needs no log archaeology.
     ...(toolFailure ? { lastFailingCall: toolFailure } : {}),
     ...(job?.providerFailure ? { providerFailure: job.providerFailure } : {}),
-    ...(job?.error ? { error: clip(job.error, 1_500) } : {}),
+    ...(job?.error ? { error: clip(redactText(String(job.error), secrets), 1_500) } : {}),
     rounds: job?.rounds,
     // Where the wall clock went (milliseconds, summed over rounds); per-call
     // provider latency is `prevMs` on the progress event after each call.

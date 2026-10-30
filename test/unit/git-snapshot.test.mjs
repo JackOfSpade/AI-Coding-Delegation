@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import {
@@ -87,6 +87,24 @@ test('temporary-index snapshots include untracked files, exclude ignored files, 
     assert.deepEqual(readFileSync(join(repo, '.git', 'index')), indexBefore);
     assert.deepEqual(readFileSync(join(repo, '.git', 'HEAD')), headFileBefore);
     assert.equal(git(repo, ['status', '--porcelain']), 'M tracked.txt\n?? .gitignore\n?? new.txt');
+  } finally {
+    cleanup(repo);
+  }
+});
+test('patch publication removes its private temporary file when the final rename fails', () => {
+  const repo = makeRepo();
+  try {
+    const before = snapshotWorkingTree(repo);
+    write(join(repo, 'tracked.txt'), 'changed\n');
+    const after = snapshotWorkingTree(repo);
+    const parent = join(repo, '.git');
+    const target = join(parent, 'patch-target');
+    mkdirSync(target);
+    assert.throws(() => createPatch(repo, before, after, target));
+    assert.equal(
+      readdirSync(parent).some((name) => name.startsWith('patch-target.')),
+      false,
+    );
   } finally {
     cleanup(repo);
   }

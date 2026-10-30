@@ -58,7 +58,10 @@ export function globToRegExp(pattern, options) {
         try {
           if (!characterClass || characterClass === '^' || /[\\\\/]/.test(characterClass)) throw new Error('invalid class');
           new RegExp(`[${characterClass}]`);
-          out += characterClass.startsWith('^') ? `(?=[^/])[${characterClass}]` : `[${characterClass}]`;
+          // A positive range can contain '/' without spelling it literally
+          // (for example [.-0]). Both positive and negated classes must stay
+          // within one path segment before scope authorization uses them.
+          out += `(?=[^/])[${characterClass}]`;
           i = close;
         } catch {
           out += '\\[';
@@ -100,7 +103,7 @@ export function pathsOverlap(leftPatterns, rightPatterns, options) {
 }
 
 function segmentMayIntersect(a, b, options) {
-  if (windows(options?.platform) ? a.toLowerCase() === b.toLowerCase() : a === b) return true;
+  if (windows(options?.platform) || options?.caseInsensitive === true ? a.toLowerCase() === b.toLowerCase() : a === b) return true;
   if (!hasMagic(a) && !hasMagic(b)) return false;
   // Literal is exactly decidable against the other segment's regexp.
   if (!hasMagic(a)) return globToRegExp(a, options).test(a) && segmentRegExp(b, options).test(a);

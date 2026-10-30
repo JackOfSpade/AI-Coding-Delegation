@@ -879,9 +879,11 @@ test('fixed assertion pass enforces file and USD boundaries on the worker', asyn
   for (const violation of ['scope', 'usd', 'none']) {
     const h = await harness({
       check: red,
-      worker: async (job, round) => {
+      worker: async (job, round, api) => {
         writeSrc(job, 'a.js', A_BYTES);
         if (round === 1) return failedProtocol({ costUsd: 3 });
+        assert.match(api.defects[0], /Fix only these named assertions in src\/a\.js\. Six turns and \$0\.50 total/);
+        assert.equal(api.defects[1], 'src/a.js: fix expected value');
         assert.deepEqual(job.ownedPaths, ['src/a.js']);
         assert.deepEqual(job.extraWritable, []);
         if (violation === 'scope') writeSrc(job, 'b.js', 'unauthorized\n');

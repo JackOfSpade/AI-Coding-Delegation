@@ -421,6 +421,26 @@ test('event envelopes retain the store timestamp when a caller supplies at', asy
     cleanup(gitDir);
   }
 });
+test('event append refuses hard links and protects existing log permissions', async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir });
+    const job = await store.create({ task: 'test', ownedPaths: ['a'] });
+    const events = join(store.path(job.id), 'events.jsonl');
+    const target = join(gitDir, 'unrelated.txt');
+    writeFileSync(target, 'unchanged');
+    nodeFs.linkSync(target, events);
+    await assert.rejects(store.event(job.id, { type: 'progress' }), /transcript file is invalid/);
+    assert.equal(readFileSync(target, 'utf8'), 'unchanged');
+    rmSync(events);
+    writeFileSync(events, '', { mode: 0o644 });
+    await store.event(job.id, { type: 'progress' });
+    if (process.platform !== 'win32') assert.equal(statSync(events).mode & 0o777, 0o600);
+    assert.match(readFileSync(events, 'utf8'), /progress/);
+  } finally {
+    cleanup(gitDir);
+  }
+});
 
 test('two stale publication-lock reclaimers cannot lose either concurrent append', async () => {
   const gitDir = tempDir();

@@ -4,6 +4,7 @@ import { lstatSync, readdirSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readRegularFileSync } from './regular-file.mjs';
+import { ECONOMY_SKILL, PREMIUM_SKILL, packagedSkillPath } from './command-skills.mjs';
 
 export const IDENTITY_SCHEMA_REVISION = 2;
 export const RUNTIME_CAPABILITIES = Object.freeze({
@@ -46,7 +47,7 @@ const hash = (parts) => {
   }
   return `sha256:${digest.digest('hex')}`;
 };
-const SKILL_ENTRY = 'plugins/offload/skills/offload_sonnet/SKILL.md';
+const SKILL_ENTRY = packagedSkillPath(ECONOMY_SKILL.name);
 /** The identity hash of one skill file's bytes: what a runtime expects an installed copy to hash to. */
 export const skillHashOf = (bytes) => hash([[SKILL_ENTRY, bytes]]);
 const sameDirectory = (left, right) => left.dev === right.dev && left.ino === right.ino && left.ctimeNs === right.ctimeNs;
@@ -124,10 +125,10 @@ export function runtimeIdentityFor(root = packageRoot) {
   const skillDirectory = checkedDirectory(join(root, 'plugins'));
   const offloadDirectory = checkedDirectory(join(root, 'plugins', 'offload'));
   const skillsDirectory = checkedDirectory(join(root, 'plugins', 'offload', 'skills'));
-  const skillRoot = checkedDirectory(join(root, 'plugins', 'offload', 'skills', 'offload_sonnet'));
+  const skillRoot = checkedDirectory(join(skillsDirectory.path, ECONOMY_SKILL.name));
   const skillDirectories = [...directories, skillDirectory, offloadDirectory, skillsDirectory, skillRoot];
   const skill = boundedRead(join(skillRoot.path, 'SKILL.md'), 'skill', skillDirectories, total);
-  const opusRoot = checkedDirectory(join(skillsDirectory.path, 'offload_opus'));
+  const opusRoot = checkedDirectory(join(skillsDirectory.path, PREMIUM_SKILL.name));
   const opusDirectories = [...directories, skillDirectory, offloadDirectory, skillsDirectory, opusRoot];
   const opus = boundedRead(join(opusRoot.path, 'SKILL.md'), 'opus skill', opusDirectories, total);
   const source = [];
@@ -138,8 +139,8 @@ export function runtimeIdentityFor(root = packageRoot) {
     ['package.json', metadata.bytes],
     ['bin/offload.mjs', bin],
     ...source.map((file) => [relative(root, file.path).replaceAll('\\', '/'), boundedRead(file.path, 'source', file.directories, total)]),
-    ['plugins/offload/skills/offload_sonnet/SKILL.md', skill],
-    ['plugins/offload/skills/offload_opus/SKILL.md', opus],
+    [SKILL_ENTRY, skill],
+    [packagedSkillPath(PREMIUM_SKILL.name), opus],
   ];
   checkDirectories(directories);
   checkDirectories(skillDirectories);

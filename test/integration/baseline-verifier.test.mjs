@@ -147,6 +147,37 @@ test('pre-existing failures are tolerated: DONE_VERIFIED means no new failures, 
   }
 });
 
+test('a baseline cleanup that retains its workspace keeps the retry path and records the failure', async () => {
+  const h = await harness({ verify: () => spec(['old failure']) });
+  try {
+    const isolation = h.m.config.isolation;
+    const create = isolation.create;
+    let creates = 0;
+    let baselinePath;
+    isolation.create = async (options) => {
+      const workspace = await create(options);
+      creates += 1;
+      if (creates !== 2) return workspace;
+      baselinePath = workspace.path;
+      return { ...workspace, cleanup: async () => ({ removed: false }) };
+    };
+    isolation.cleanup = async (options) => (options.workspacePath === baselinePath ? { retained: true } : cleanupIsolatedWorktree(options));
+    const started = await start(h);
+    assert.equal((await h.m.wait(started.jobId, { timeoutSec: TIMEOUT_SEC })).status, 'DONE_VERIFIED');
+    const retained = await h.m.store.get(started.jobId);
+    assert.equal(retained.verifyBaselineWorkspacePath, baselinePath);
+    assert.equal(existsSync(baselinePath), true);
+    assert.match(retained.workspaceCleanupError, /could not be completed/);
+    assert.match(await h.m.store.readArtifact(started.jobId, 'events.jsonl'), /"phase":"baseline","status":"cleanup-failed"/);
+    isolation.cleanup = cleanupIsolatedWorktree;
+    assert.equal(await h.m.cleanupWorkspace(started.jobId), true);
+    assert.equal(existsSync(baselinePath), false);
+    assert.equal((await h.m.store.get(started.jobId)).verifyBaselineWorkspacePath, undefined);
+  } finally {
+    h.finish();
+  }
+});
+
 test('a new failure queues repair that targets only it, and the baseline run is reused by the next round', async () => {
   let round = 0;
   const h = await harness({

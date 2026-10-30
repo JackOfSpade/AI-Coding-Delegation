@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { chmodSync, linkSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -28,6 +28,44 @@ test('log starts with the self-improvement header and records redacted errors', 
   assert.match(text, /\[\+\d+\]/);
 });
 
+test('diagnostics redact secrets before clipping error fields and progress-repeat labels', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offload-log-boundary-'));
+  const secret = 'credential-crossing-the-clip-boundary';
+  const prefix = 'x'.repeat(90);
+  const log = createDiagnosticLog({ dir, limits, env: {}, secrets: [secret] });
+  log.record({ tool: 't', ok: false, error: { message: prefix + secret, stack: prefix + secret } });
+  const logged = readFileSync(log.path, 'utf8');
+  assert.doesNotMatch(logged, /credential/);
+  assert.match(logged, /REDACTED/);
+
+  const events = Array.from({ length: 3 }, (_, index) => ({
+    type: 'progress',
+    at: 'x'.repeat(30) + secret,
+    turns: index,
+    recentActions: ['x'.repeat(50) + secret],
+  }));
+  const folded = jobLogWindow({ id: 'j', status: 'FAILED', error: 'x'.repeat(1490) + secret }, jsonl(events), LOG_DEFAULTS, [secret]);
+  assert.doesNotMatch(folded.text, /credential/);
+});
+
+test('diagnostic logging refuses hard links and repairs an existing public file mode before appending', (t) => {
+  if (process.platform === 'win32') return t.skip('requires POSIX file modes and hard links');
+  const dir = mkdtempSync(join(tmpdir(), 'offload-log-file-'));
+  const log = createDiagnosticLog({ dir, limits, env: {} });
+  const target = join(dir, 'target');
+  writeFileSync(target, 'untouched\n');
+  linkSync(target, log.path);
+  log.record({ tool: 't', ok: true });
+  assert.equal(readFileSync(target, 'utf8'), 'untouched\n');
+
+  const second = createDiagnosticLog({ dir, file: 'private.log', limits, env: {} });
+  writeFileSync(second.path, 'existing\n');
+  chmodSync(second.path, 0o644);
+  second.record({ tool: 't', ok: true });
+  assert.equal(statSync(second.path).mode & 0o777, 0o600);
+  assert.match(readFileSync(second.path, 'utf8'), /"tool":"t"/);
+});
+
 test('log is bounded: rotates once and never exceeds two generations', () => {
   const dir = mkdtempSync(join(tmpdir(), 'offload-log-'));
   const log = createDiagnosticLog({ dir, limits, env: {} });
@@ -43,6 +81,11 @@ test('oversized records are replaced by a truncation marker; failures never thro
   const log = createDiagnosticLog({ dir, limits, env: {} });
   log.record({ tool: 't', ok: true, blob: 'y'.repeat(5000) });
   assert.match(readFileSync(log.path, 'utf8'), /"truncated":true/);
+  log.record({ at: 'a'.repeat(5000), tool: 't'.repeat(5000), ok: true });
+  for (const name of readdirSync(dir)) assert.ok(statSync(join(dir, name)).size <= limits.maxBytes);
+  const tiny = createDiagnosticLog({ dir, file: 'tiny.log', limits: { ...limits, maxLineBytes: 2 }, env: {} });
+  tiny.record({ tool: 't', ok: true });
+  assert.equal(readdirSync(dir).includes('tiny.log'), false, 'a marker that cannot fit is dropped');
   const broken = createDiagnosticLog({ dir: join(dir, 'offload.log', 'nested'), limits, env: {} });
   assert.doesNotThrow(() => broken.record({ tool: 't', ok: true }));
 });
@@ -50,6 +93,12 @@ test('oversized records are replaced by a truncation marker; failures never thro
 test('OFFLOAD_LOG=off disables and OFFLOAD_LOG_DIR overrides the location', () => {
   assert.equal(createDiagnosticLog({ env: { OFFLOAD_LOG: 'off' } }).path, null);
   assert.equal(defaultLogDir({ OFFLOAD_LOG_DIR: '/x' }), '/x');
+});
+
+test('a successfully completed job is not marked as needing failure diagnosis', () => {
+  for (const status of ['DONE', 'DONE_VERIFIED', 'DONE_UNVERIFIED'])
+    assert.doesNotMatch(renderJobLog({ id: 'successful', status }, ''), /needsDiagnosis/);
+  assert.match(renderJobLog({ id: 'failed', status: 'FAILED' }, ''), /"needsDiagnosis": true/);
 });
 
 test('job log digest leads with header, error, and non-progress tail', () => {

@@ -8,6 +8,10 @@ export async function createMockOpenAIServer(scripts = []) {
     sockets = new Set();
   const wait = (ms, res) =>
     new Promise((resolve) => {
+      if (res.destroyed || res.writableEnded) {
+        resolve();
+        return;
+      }
       const timer = setTimeout(done, ms);
       const closed = () => done();
       function done() {
@@ -28,6 +32,7 @@ export async function createMockOpenAIServer(scripts = []) {
       ],
     };
     if (script.stallMs) await wait(script.stallMs, res);
+    if (res.destroyed || res.writableEnded) return;
     if (script.status && script.status !== 200) {
       res.writeHead(script.status, { 'content-type': 'application/json' });
       res.end(JSON.stringify(script.body ?? { error: { message: 'mock error' } }));
@@ -37,6 +42,7 @@ export async function createMockOpenAIServer(scripts = []) {
     for (const line of script.comments ?? []) res.write(`: ${line}\n\n`);
     let index = 0;
     for (const chunk of script.chunks ?? []) {
+      if (res.destroyed || res.writableEnded) return;
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       index++;
       // `hangAfterChunks` never finishes the body: the response stays open until
@@ -46,6 +52,7 @@ export async function createMockOpenAIServer(scripts = []) {
       if (script.stallAfterChunks === index) await wait(script.stallMs ?? 60_000, res);
       else if (script.delayMs) await wait(script.delayMs, res);
     }
+    if (res.destroyed || res.writableEnded) return;
     if (!script.noDone) res.end('data: [DONE]\n\n');
     else res.end();
   });

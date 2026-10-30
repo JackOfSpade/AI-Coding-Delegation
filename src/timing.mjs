@@ -174,6 +174,9 @@ export class RoundClock {
   /** Move to `phase` at `atMs`. A repeat of the current phase only refreshes its detail. */
   enter(phase, atMs, detail = {}, { restart = false } = {}) {
     if (!PHASES.includes(phase)) return undefined;
+    // A wall-clock adjustment must not rewind the phase boundary and bill the
+    // overlapping interval to two phases when time catches up again.
+    atMs = Math.max(this.#since, atMs);
     if (phase === this.#phase && !restart) {
       this.#detail = { ...this.#detail, ...detail };
       return undefined;

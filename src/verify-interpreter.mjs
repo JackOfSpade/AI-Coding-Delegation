@@ -9,13 +9,14 @@
  * roots to the verifier. Nothing here ever widens a write scope, and nothing
  * under a credential, host-configuration or home-directory root is grantable.
  */
-import { closeSync, lstatSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { closeSync, constants, lstatSync, mkdtempSync, openSync, readSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { matchesAny, pathsOverlap } from './glob.mjs';
 import { DEFAULT_DENY_READ } from './policy.mjs';
 import { MACOS_HOST_CONFIG_DENY, runCommand } from './sandbox.mjs';
 import { classifyVerifierEnvironment } from './verify-env.mjs';
+import { readRegularFileSync } from './regular-file.mjs';
 
 export const MAX_VERIFIER_INTERPRETERS = 4;
 export const MAX_VERIFIER_IMPORTS = 16;
@@ -191,7 +192,7 @@ const runnableIn = (root) => ['python3', 'python'].map((name) => join(root, 'bin
 
 function pyvenvHome(root) {
   try {
-    const text = readFileSync(join(root, 'pyvenv.cfg'), 'utf8').slice(0, PYVENV_CFG_BYTES);
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(readRegularFileSync(join(root, 'pyvenv.cfg'), PYVENV_CFG_BYTES));
     const line = text.split(/\r?\n/).find((entry) => /^home\s*=/i.test(entry));
     const value = line?.slice(line.indexOf('=') + 1).trim();
     return value && isAbsolute(value) && !/[\x00-\x1f\x7f]/.test(value) ? value : undefined;
@@ -202,7 +203,7 @@ function pyvenvHome(root) {
 function startsWithShebang(file) {
   let fd;
   try {
-    fd = openSync(file, 'r');
+    fd = openSync(file, constants.O_RDONLY | (process.platform === 'win32' ? 0 : constants.O_NONBLOCK || 0));
     const bytes = Buffer.alloc(2);
     return readSync(fd, bytes, 0, 2, 0) === 2 && bytes.toString('latin1') === '#!';
   } catch {
@@ -461,7 +462,7 @@ export async function probeVerifierInterpreter(
           imports.length ? lines.findLast((line) => line.startsWith(VERSION_MARKER))?.slice(VERSION_MARKER.length) : lines[0],
           120,
         );
-        if (result?.code === 0 && !result.timedOut && version && (!imports.length || lines.includes(IMPORTS_COMPLETE)))
+        if (result?.code === 0 && !result.timedOut && !result.cancelled && version && (!imports.length || lines.includes(IMPORTS_COMPLETE)))
           interpreters.push({ ...entry, status: 'ok', version });
         else {
           const environment = classifyVerifierEnvironment({ command, verdict: 'FAIL', result });

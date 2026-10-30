@@ -19,7 +19,7 @@ const loaded = {
     limits: { maxTurns: 2, timeoutMinutes: 1, maxUsd: 1 },
   },
 };
-const packaged = await readFile(new URL('../../plugins/offload/skills/offload_sonnet/SKILL.md', import.meta.url));
+const packaged = await readFile(new URL('../../plugins/offload/skills/offload_economy/SKILL.md', import.meta.url));
 const OLDER = `${packaged}\nolder protocol\n`;
 
 /** A temp HOME holding the given Claude/Codex skill copies; never the developer's real ~/.claude. */
@@ -31,8 +31,8 @@ async function homeWith(t, { claude, codex } = {}) {
     ['.codex', codex],
   ]) {
     if (content === undefined) continue;
-    await mkdir(join(home, directory, 'skills', 'offload_sonnet'), { recursive: true });
-    await writeFile(join(home, directory, 'skills', 'offload_sonnet', 'SKILL.md'), content);
+    await mkdir(join(home, directory, 'skills', 'offload_economy'), { recursive: true });
+    await writeFile(join(home, directory, 'skills', 'offload_economy', 'SKILL.md'), content);
   }
   return home;
 }

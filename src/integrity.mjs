@@ -89,7 +89,7 @@ async function readRootFile(path, fs = defaultRootFileSystem) {
     // final component with a link before readFile opens it. O_NOFOLLOW and the
     // lstat/fstat identity comparison make the opened descriptor authoritative.
     if (!constants.O_NOFOLLOW) throw rootError('integrity root is unavailable');
-    handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | (constants.O_NONBLOCK || 0));
     opened = await handle.stat(BIGINT_STAT_OPTIONS);
     if (!validRootMetadata(opened, uid) || !sameRootMetadata(details, opened)) throw rootError('integrity root is invalid');
     text = await handle.readFile({ encoding: 'utf8' });

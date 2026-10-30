@@ -1,5 +1,5 @@
 artifacts/
 coverage/
-plugins/offload/skills/offload_sonnet/SKILL.md
-plugins/offload/skills/offload_opus/SKILL.md
+plugins/offload/skills/offload_economy/SKILL.md
+plugins/offload/skills/offload_premium/SKILL.md
 node_modules/

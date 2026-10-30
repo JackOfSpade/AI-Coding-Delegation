@@ -15,12 +15,8 @@ export const MAX_APPLY_VERIFY_COMMAND = 8_192;
 export const APPLY_VERIFY_RECORD_COMMAND = 500;
 export const MAX_APPLY_VERIFY_TAIL_CHARS = 8_000;
 export const MAX_APPLY_VERIFY_TAIL_LINES = 40;
-// Tail extraction works on this much raw output at most, so a pathological
-// run (megabytes of unterminated escape sequences) cannot make the cleaning
-// regular expressions quadratic. The runner already caps output at 256 KiB.
+// Keep tail extraction bounded even for a custom runner's unusually large output.
 const TAIL_SCAN_CHARS = 64 * 1024;
-const OSC_BODY_MAX = 2048;
-const OSC_SEQUENCE = new RegExp(`\\x1B\\][^\\x07\\x1B]{0,${OSC_BODY_MAX}}(?:\\x07|\\x1B\\\\)?`, 'g');
 export const APPLY_VERIFY_PHASES = new Set(['applying', 'verifying', 'reverting']);
 export const APPLY_VERIFY_OUTCOMES = new Set(['PASSED', 'FAILED', 'TIMED_OUT', 'CANCELLED', 'NOT_RUN', 'PRIMARY_CHANGED', 'INTERRUPTED']);
 // Where the command runs: the read-only primary checkout, or a disposable,
@@ -111,11 +107,7 @@ export function applyVerifyTail(result) {
   let scan = joined.length > TAIL_SCAN_CHARS ? joined.slice(-TAIL_SCAN_CHARS) : joined;
   // A slice may start inside a line (or inside a credential); drop that fragment.
   if (scan.length < joined.length) scan = scan.slice(scan.indexOf('\n') + 1);
-  // stripTerminalControls' OSC pattern rescans to the end of the text for every
-  // unterminated introducer; remove OSC sequences here with a bounded form (an
-  // unterminated one swallows at most OSC_BODY_MAX characters) so the cost stays
-  // linear, and leave the rest of the cleaning to it.
-  const lines = redactText(stripTerminalControls(scan.replace(OSC_SEQUENCE, ''))).split(/\r?\n/);
+  const lines = redactText(stripTerminalControls(scan)).split(/\r?\n/);
   while (lines.length && !lines.at(-1).trim()) lines.pop();
   let tail = lines.slice(-MAX_APPLY_VERIFY_TAIL_LINES);
   let text = tail.join('\n');

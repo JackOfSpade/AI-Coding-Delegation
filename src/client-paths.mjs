@@ -1,5 +1,6 @@
 /** Resolve native client homes once so installer and doctor inspect the same files. */
 import { join } from 'node:path';
+import { ECONOMY_SKILL, PREMIUM_SKILL } from './command-skills.mjs';
 
 export function resolveClientPaths({ home, env = process.env, platform = process.platform } = {}) {
   const userHome = home || (platform === 'win32' ? env.USERPROFILE || env.HOME : env.HOME || env.USERPROFILE) || process.cwd();
@@ -14,8 +15,8 @@ export function resolveClientPaths({ home, env = process.env, platform = process
     claudeState,
     claudeSettings: join(claudeDir, 'settings.json'),
     claudeMemory: join(claudeDir, 'CLAUDE.md'),
-    claudeOpusSkill: join(claudeDir, 'skills', 'offload_opus', 'SKILL.md'),
-    claudeSkill: join(claudeDir, 'skills', 'offload_sonnet', 'SKILL.md'),
+    claudeOpusSkill: join(claudeDir, 'skills', PREMIUM_SKILL.name, 'SKILL.md'),
+    claudeSkill: join(claudeDir, 'skills', ECONOMY_SKILL.name, 'SKILL.md'),
     // Keep installer recovery material outside the live skill tree.  Clients
     // may discover every file below `skills`, including old adjacent backups.
     claudeSkillBackupDir: join(claudeDir, 'offload-backups'),
@@ -23,8 +24,8 @@ export function resolveClientPaths({ home, env = process.env, platform = process
     codexDir,
     codexConfig: join(codexDir, 'config.toml'),
     codexMemory: join(codexDir, 'AGENTS.md'),
-    codexOpusSkill: join(codexDir, 'skills', 'offload_opus', 'SKILL.md'),
-    codexSkill: join(codexDir, 'skills', 'offload_sonnet', 'SKILL.md'),
+    codexOpusSkill: join(codexDir, 'skills', PREMIUM_SKILL.name, 'SKILL.md'),
+    codexSkill: join(codexDir, 'skills', ECONOMY_SKILL.name, 'SKILL.md'),
     codexSkillBackupDir: join(codexDir, 'offload-backups'),
     cursorConfig: join(userHome, '.cursor', 'mcp.json'),
     cursorRule: join(userHome, '.cursor', 'rules', 'offload.md'),

@@ -143,6 +143,25 @@ test('CLI rejects unknown, duplicate, and incompatible options before calling an
   assert.equal(duplicate, 2);
   assert.match(err.get(), /duplicate option --task/);
 });
+test('CLI rejects inherited command names and redacts terminal-split credentials in errors', async () => {
+  for (const command of ['toString', 'valueOf', 'hasOwnProperty']) {
+    const err = sink();
+    assert.equal(await runCli([command, '--anything'], { core: {}, stdout: sink().stream, stderr: err.stream }), 2);
+    assert.match(err.get(), /usage: offload/);
+  }
+  const err = sink();
+  await runCli(['job'], {
+    core: {
+      job: async () => {
+        throw new Error('API_\x1b[31mKEY=opaque-secret');
+      },
+    },
+    stdout: sink().stream,
+    stderr: err.stream,
+  });
+  assert.match(err.get(), /API_KEY=\[REDACTED\]/);
+  assert.doesNotMatch(err.get(), /opaque-secret/);
+});
 test('CLI preserves positional start task text but rejects an ambiguous mix with --task', async () => {
   const out = sink(),
     err = sink();

@@ -33,6 +33,22 @@ const HOMEBREW_NODE = process.platform === 'darwin' && process.execPath.startsWi
 // are not shell literals: a template literal in the embedded Node program
 // would otherwise let `/bin/sh` expand `${...}` before Node sees it.
 const shellQuote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
+test('runner blocks Node automatic coverage propagation into a scrubbed child', async () => {
+  const coverage = await mkdtemp(join(tmpdir(), 'offload-ambient-coverage-'));
+  const previous = process.env.NODE_V8_COVERAGE;
+  try {
+    process.env.NODE_V8_COVERAGE = coverage;
+    const result = await runCommand('node -e "console.log(process.env.NODE_V8_COVERAGE === undefined)"', { sandbox: false });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stdout.trim(), 'true');
+    assert.equal(result.stderr, '');
+    assert.deepEqual(await readdir(coverage), [], 'the child must never write coverage into the host directory');
+  } finally {
+    if (previous === undefined) delete process.env.NODE_V8_COVERAGE;
+    else process.env.NODE_V8_COVERAGE = previous;
+    await rm(coverage, { recursive: true, force: true });
+  }
+});
 test('runner scrubs secrets and captures timeout', async () => {
   const scrubbed = scrubEnv({
     API_KEY: 'no',
@@ -40,6 +56,7 @@ test('runner scrubs secrets and captures timeout', async () => {
     GOOGLE_APPLICATION_CREDENTIALS: '/secret.json',
     AWS_SHARED_CREDENTIALS_FILE: '/credentials',
     SSH_AUTH_SOCK: '/agent.sock',
+    NODE_V8_COVERAGE: '/host/coverage',
     PATH: '/bin',
     LANG: 'C',
   });
@@ -47,6 +64,8 @@ test('runner scrubs secrets and captures timeout', async () => {
     assert.equal(scrubbed[name], undefined);
   assert.equal(scrubbed.PATH, '/bin');
   assert.equal(scrubbed.LANG, 'C');
+  assert.equal(Object.hasOwn(scrubbed, 'NODE_V8_COVERAGE'), true, 'block Node automatic coverage injection');
+  assert.equal(scrubbed.NODE_V8_COVERAGE, undefined);
   // A synthetic child queues output before the timeout timer is installed.
   // Microtasks run before timers, so this proves that output delivered before
   // termination remains available without depending on OS process startup or
@@ -199,6 +218,11 @@ test('runner honors pre-abort and compiles globs to static sandbox roots', async
   );
   const negatedScope = macosProfile({ repoPath: '/repo', writablePaths: ['src/[!a]*'] });
   assert.ok(negatedScope.includes('src[/][^/a][^/]*'));
+  assert.throws(
+    () => macosProfile({ repoPath: '/repo', writablePaths: ['src/a[.-0]b'] }),
+    /unsupported character class/,
+    'a positive range must never grant writes across a separator',
+  );
   const broad = macosProfile({ repoPath: '/repo', writablePaths: ['**'] });
   assert.match(
     broad,
@@ -409,7 +433,9 @@ test('runner bounds a single oversized output chunk without retaining the whole 
     outputCap: 1024,
     spawnProcess: () => {
       queueMicrotask(() => {
-        child.stdout.emit('data', Buffer.alloc(1024 * 1024, 0x61));
+        const chunk = Buffer.alloc(1024 * 1024, 0x61);
+        child.stdout.emit('data', chunk);
+        chunk.fill(0x62);
         child.emit('close', 0, null);
       });
       return child;
@@ -417,6 +443,7 @@ test('runner bounds a single oversized output chunk without retaining the whole 
   });
   assert.match(result.stdout, /output truncated \(1048064 bytes omitted\)/);
   assert.ok(result.stdout.length < 1024, 'retained output stays bounded despite a 1 MiB chunk');
+  assert.doesNotMatch(result.stdout, /b{2}/, 'retained bytes are owned by the capture rather than a mutable oversized source buffer');
 });
 test('required macOS sandbox refuses a failed exact profile before spawning a worker command', async () => {
   let spawned = false;

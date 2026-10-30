@@ -841,3 +841,43 @@ test('catch-all provider failures keep a bounded reason slug and never provider 
   assert.equal(providerFailure(new ProviderError('timeout', { kind: 'transport', retryable: true })).reason, undefined);
   assert.match(providerFailure(new ProviderError(`x ${'y'.repeat(500)} <script>`)).reason, /^[a-z][a-z0-9_]{0,63}$/);
 });
+
+test('SSE event byte limits include newlines inserted between empty data fields', async () => {
+  const { sseEvents } = await import('../../src/provider/sse.mjs');
+  const collect = async (maxEventBytes) => {
+    const events = [];
+    const body = new Response('data:\ndata:\ndata:\n\n').body;
+    for await (const event of sseEvents(body, { maxEventBytes })) events.push(event);
+    return events;
+  };
+  await assert.rejects(collect(1), /SSE event exceeds configured size limit/);
+  assert.deepEqual(await collect(2), [{ data: '\n\n' }]);
+});
+
+test('buffered Chat output failures retain terminal usage before any unusable event escapes', async () => {
+  const usage = { prompt_tokens: 11, completion_tokens: 17 };
+  for (const chunks of [
+    [{ choices: [{ delta: { tool_calls: [{ index: 0, id: 'bad', function: { name: 'write_file', arguments: 42 } }] } }] }],
+    [{ choices: [{ delta: { content: 'x'.repeat(600_000) } }] }, { choices: [{ delta: { content: 'y'.repeat(600_000) } }] }],
+  ]) {
+    const provider = new OpenAIChatProvider({
+      baseUrl: 'https://example.test',
+      model: 'mock',
+      retries: 0,
+      fetchImpl: async () =>
+        new Response(
+          [...chunks, { choices: [], usage }].map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n',
+        ),
+    });
+    const observed = [];
+    await assert.rejects(
+      async () => {
+        for await (const event of provider.chat({ messages: [], tools: [] })) observed.push(event);
+      },
+      (error) => error instanceof ProviderError,
+    );
+    assert.deepEqual(observed, [
+      { usage: { inputTokens: 11, outputTokens: 17, cacheHitTokens: 0, cacheMissTokens: 11, totalTokens: 28 }, model: 'mock' },
+    ]);
+  }
+});

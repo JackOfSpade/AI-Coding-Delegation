@@ -145,6 +145,11 @@ test('applyVerifyTail stays linear on unterminated escape introducers', () => {
   assert.equal(applyVerifyTail({ stdout: 'a\u001b]0;title\u0007b\u001b]8;;x\u001b\\c', stderr: '' }), 'abc');
 });
 
+test('applyVerifyTail shares terminal parsing for repeated OSC sequences and unterminated tails', () => {
+  assert.equal(applyVerifyTail({ stdout: 'a\u001b]0;first\u001b\\b\u001b]0;second\u001b\\c' }), 'abc');
+  assert.equal(applyVerifyTail({ stdout: 'visible\u001b]0;unterminated private payload' }), 'visible');
+});
+
 test('publicApplyVerify is a bounded whitelist that never carries the output tail', () => {
   const view = publicApplyVerify({
     command: `npm test ${'x'.repeat(1000)}`,

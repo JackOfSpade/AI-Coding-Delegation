@@ -112,7 +112,7 @@ test('the npm package contains the runnable product and excludes legacy or test 
       'templates/AGENTS.md.block.md',
       'plugins/offload/plugin.json',
       'plugins/offload/.codex-plugin/plugin.json',
-      'plugins/offload/skills/offload_sonnet/SKILL.md',
+      'plugins/offload/skills/offload_economy/SKILL.md',
     ])
       assert.equal(paths.has(path), true, `${path} must ship`);
     assert.ok(paths.has('docs/TESTING.md'));
@@ -128,7 +128,7 @@ test('the npm package contains the runnable product and excludes legacy or test 
     );
     assert.equal(paths.has('templates/commands/offload.md'), false, 'the legacy duplicate command must not ship');
     assert.equal(paths.has('plugins/offload/skills/offload/SKILL.md'), false);
-    assert.ok(paths.has('plugins/offload/skills/offload_opus/SKILL.md'));
+    assert.ok(paths.has('plugins/offload/skills/offload_premium/SKILL.md'));
   } finally {
     await rm(cache, { recursive: true, force: true });
   }
@@ -196,7 +196,7 @@ test('the extracted npm package installs, serves MCP, and uninstalls without tou
           id: 4,
           method: 'skills/get',
           params: {
-            uri: 'skill://offload/offload_sonnet/SKILL.md',
+            uri: 'skill://offload/offload_economy/SKILL.md',
             _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28', 'io.modelcontextprotocol/clientCapabilities': {} },
           },
         },
@@ -205,7 +205,7 @@ test('the extracted npm package installs, serves MCP, and uninstalls without tou
           id: 5,
           method: 'resources/read',
           params: {
-            uri: 'skill://offload/offload_sonnet/SKILL.md',
+            uri: 'skill://offload/offload_economy/SKILL.md',
             _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28', 'io.modelcontextprotocol/clientCapabilities': {} },
           },
         },
@@ -242,23 +242,23 @@ test('the extracted npm package installs, serves MCP, and uninstalls without tou
     const byId = (id) => replies.find((reply) => reply.id === id).result;
     assert.equal(byId(1).serverInfo.name, 'offload');
     assert.equal(byId(2).resultType, 'complete');
-    const skillText = await readFile(join(destination, 'plugins', 'offload', 'skills', 'offload_sonnet', 'SKILL.md'), 'utf8');
+    const skillText = await readFile(join(destination, 'plugins', 'offload', 'skills', 'offload_economy', 'SKILL.md'), 'utf8');
     const pluginManifest = JSON.parse(await readFile(join(destination, 'plugins', 'offload', 'plugin.json'), 'utf8'));
     const codexPluginManifest = JSON.parse(await readFile(join(destination, 'plugins', 'offload', '.codex-plugin', 'plugin.json'), 'utf8'));
     for (const manifest of [pluginManifest, codexPluginManifest]) {
-      assert.match(manifest.description, /only after an explicit \/offload_sonnet or \/offload_opus slash-command invocation/);
+      assert.match(manifest.description, /only after an explicit \/offload_economy or \/offload_premium slash-command invocation/);
       assert.match(manifest.description, /ordinary prose does not invoke it/);
       assert.doesNotMatch(manifest.description, /delegate|delegation|DeepSeek|implementation|testing|debugging|analysis/i);
       assert.deepEqual(manifest.keywords, ['slash-command']);
     }
-    assert.equal(codexPluginManifest.interface.shortDescription, 'Explicit /offload_sonnet or /offload_opus slash command only');
+    assert.equal(codexPluginManifest.interface.shortDescription, 'Explicit /offload_economy or /offload_premium slash command only');
     assert.match(codexPluginManifest.interface.longDescription, /only after the user explicitly enters \/offload/);
     assert.doesNotMatch(
       codexPluginManifest.interface.longDescription,
       /delegate|delegation|DeepSeek|implementation|testing|debugging|analysis/i,
     );
-    assert.deepEqual(codexPluginManifest.interface.defaultPrompt, ['/offload_sonnet ', '/offload_opus ']);
-    assert.match(skillText, /Run only after the user explicitly enters \/offload_sonnet as a slash command/);
+    assert.deepEqual(codexPluginManifest.interface.defaultPrompt, ['/offload_economy ', '/offload_premium ']);
+    assert.match(skillText, /Run only after the user explicitly enters \/offload_economy as a slash command/);
     assert.match(skillText, /Ordinary prose does not invoke this skill/);
     assert.doesNotMatch(
       skillText.match(/^---[\s\S]*?---/)?.[0] || '',
@@ -267,7 +267,7 @@ test('the extracted npm package installs, serves MCP, and uninstalls without tou
     assert.match(skillText, /On macOS, `\/private\/tmp` is also accepted/);
     assert.match(skillText, /If the pre-job rejection identifies canonical allowed roots/);
     const resource = {
-      uri: 'skill://offload/offload_sonnet/SKILL.md',
+      uri: 'skill://offload/offload_economy/SKILL.md',
       digest: `sha256:${createHash('sha256').update(Buffer.from(skillText)).digest('hex')}`,
       size: Buffer.byteLength(skillText),
     };

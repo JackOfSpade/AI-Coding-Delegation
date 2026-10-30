@@ -374,6 +374,10 @@ test('the history refuses a symlink, skips foreign or tampered lines, re-redacts
       off.append(record(8));
       assert.equal(off.path, null);
       assert.equal(existsSync(join(clean, 'off')), false);
+      const existingOff = createRetrospectiveLog({ dir: clean, env: { OFFLOAD_LOG: 'off' } });
+      existingOff.append(record(8));
+      assert.deepEqual(existingOff.history(), { path: null, records: [], aggregate: { retrospectives: 0, warranted: 0, signals: [] } });
+      assert.equal(readFileSync(historyPath, 'utf8'), bytes, 'disabled history neither reads nor appends existing records');
     } finally {
       cleanup(clean);
     }

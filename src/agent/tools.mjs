@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { PathPolicy } from '../policy.mjs';
 import { RedactionProjector, redactText, stripTerminalControls } from '../redact.mjs';
 import { snapshotGitEnv } from '../git-snapshot.mjs';
+import { globToRegExp } from '../glob.mjs';
 
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const MAX_READ_CAP = 256_000;
@@ -25,6 +26,7 @@ const MAX_READ_PREFIX_SCAN = 8 * 1024 * 1024;
 const MAX_EDITABLE_BYTES = 8 * 1024 * 1024;
 const MAX_EDIT_ARG_CAP = 64_000;
 const MAX_GREP_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_GREP_MATCHES = 300;
 const MAX_DIRECTORY_ENTRIES = 500;
 const MAX_WALK_ENTRIES = 10_000;
 const MAX_WALK_DEPTH = 32;
@@ -382,24 +384,25 @@ export class LocalTools {
     if (current !== canonical) throw new Error('Refusing path changed since policy check');
     const before = await this.fs.lstat(canonical, BIGINT_STAT_OPTIONS);
     if (before.isSymbolicLink()) throw new Error('Refusing symbolic link');
+    if (!before.isFile()) throw new Error('Refusing non-regular file');
     const noFollow = process.platform === 'win32' ? 0 : constants.O_NOFOLLOW || 0;
-    const handle = await this.fs.open(canonical, constants.O_RDONLY | noFollow);
-    const stat = await handle.stat(BIGINT_STAT_OPTIONS);
-    // Windows supplies a file identity from fstat too.  Skipping this check
-    // there turns the documented lstat/fstat fallback into a TOCTOU gap when
-    // a reparse point or regular file is swapped between the policy check and
-    // open.  O_NOFOLLOW is unavailable on Windows, but identity comparison is
-    // still meaningful and is the portable best available guard.
-    if (!stat.isFile() || before.dev !== stat.dev || before.ino !== stat.ino) {
-      await handle.close();
-      throw new Error('Refusing path changed while opening');
+    const nonBlock = process.platform === 'win32' ? 0 : constants.O_NONBLOCK || 0;
+    const handle = await this.fs.open(canonical, constants.O_RDONLY | noFollow | nonBlock);
+    try {
+      const stat = await handle.stat(BIGINT_STAT_OPTIONS);
+      // Windows supplies a file identity from fstat too.  Skipping this check
+      // there turns the documented lstat/fstat fallback into a TOCTOU gap when
+      // a reparse point or regular file is swapped between the policy check and
+      // open.  O_NOFOLLOW is unavailable on Windows, but identity comparison is
+      // still meaningful and is the portable best available guard.
+      if (!stat.isFile() || before.dev !== stat.dev || before.ino !== stat.ino) throw new Error('Refusing path changed while opening');
+      const size = safeStatSize(stat.size);
+      if (size === undefined) throw new Error('Refusing file too large to address safely');
+      return { handle, size, mode: Number(stat.mode), identity: this.#identity(stat) };
+    } catch (error) {
+      await handle.close().catch(() => {});
+      throw error;
     }
-    const size = safeStatSize(stat.size);
-    if (size === undefined) {
-      await handle.close();
-      throw new Error('Refusing file too large to address safely');
-    }
-    return { handle, size, mode: Number(stat.mode), identity: this.#identity(stat) };
   }
   async #prepareWriteParent(logical, canonical) {
     // `mkdir(..., { recursive: true })` follows a substituted intermediate
@@ -736,10 +739,9 @@ export class LocalTools {
       (truncated ? `\n[truncated after ${MAX_DIRECTORY_ENTRIES} entries]` : '')
     );
   }
-  async glob({ pattern } = {}) {
-    if (typeof pattern !== 'string' || !pattern || pattern.includes('\\') || pattern.length > 1024)
-      throw new Error('pattern must be a slash-normalized non-empty string up to 1024 chars');
-    const { matchGlob } = await import('../glob.mjs');
+  async #discoverFiles({ pattern = '**', base = '.' } = {}) {
+    const matches = globToRegExp(pattern);
+    const root = this.#readable(base, { directory: true });
     const found = [];
     let visited = 0,
       truncated = false;
@@ -768,7 +770,7 @@ export class LocalTools {
             continue;
           }
           if (entry.isDirectory()) await walk(this.policy.resolve(child), child, depth + 1);
-          else if (matchGlob(child, pattern)) found.push(child);
+          else if (matches.test(child)) found.push(child);
           if (found.length >= 500) {
             truncated = true;
             return;
@@ -778,14 +780,28 @@ export class LocalTools {
         await handle.close().catch(() => {});
       }
     };
-    await walk(this.root);
+    await walk(root, base === '.' || base === '' ? '' : base.replace(/\/$/, ''));
+    return { files: found, truncated };
+  }
+  async glob({ pattern } = {}) {
+    if (typeof pattern !== 'string' || !pattern || pattern.includes('\\') || pattern.length > 1024)
+      throw new Error('pattern must be a slash-normalized non-empty string up to 1024 chars');
+    const { files: found, truncated } = await this.#discoverFiles({ pattern });
     return sanitizeToolText(found.join('\n')) + (truncated ? '\n[truncated: result, traversal, or depth limit reached]' : '');
   }
   async grep({ pattern, path: base = '.' } = {}) {
     if (typeof pattern !== 'string' || !pattern || pattern.length > 4096)
       throw new Error('pattern must be a non-empty string up to 4096 chars');
     const lines = [];
-    let skippedLarge = false;
+    let skippedLarge = false,
+      matchesTruncated = false;
+    const result = (discoveryTruncated = false) =>
+      capText(
+        sanitizeToolText(
+          `${lines.join('\n')}${matchesTruncated ? `\n[truncated after ${MAX_GREP_MATCHES} matches]` : ''}${discoveryTruncated ? '\n[file discovery truncated before all files were searched]' : ''}${skippedLarge ? '\n[files truncated at 8388608 bytes each]' : ''}`,
+        ),
+        this.outputCap,
+      );
     const searchFile = async (file, suppliedCanonical) => {
       try {
         const canonical = suppliedCanonical ?? this.#readable(file);
@@ -796,20 +812,34 @@ export class LocalTools {
           let position = 0,
             tail = '',
             tailLine = 1;
-          const scanLimit = Math.min(size, MAX_GREP_FILE_BYTES);
-          while (position < scanLimit) {
-            const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, scanLimit - position), position);
-            if (!bytesRead) break;
-            const bytes = buffer.subarray(0, bytesRead);
-            if (bytes.includes(0)) throw new Error('binary');
-            let text;
-            try {
-              text = decoder.decode(bytes, { stream: position + bytesRead < scanLimit });
-            } catch {
-              throw new Error('invalid utf8');
+          let projected = '',
+            sourceOffset = 0,
+            sourceLine = 1,
+            projectedLine = 1;
+          // Redact from the beginning of the file before retaining chunks or
+          // slicing snippets. Otherwise a match far inside a long credential
+          // loses the API_KEY=/Bearer prefix that makes it recognizable.
+          const projector = new RedactionProjector(({ text }) => {
+            // An OSC terminal sequence can hide source newlines. Preserve
+            // their count so grep still reports the original file's lines.
+            if (sourceLine > projectedLine) {
+              projected += '\n'.repeat(sourceLine - projectedLine);
+              projectedLine = sourceLine;
             }
+            projected += text;
+            if (text === '\n') projectedLine++;
+          });
+          const project = (text) => {
+            for (const char of text) {
+              projector.push(char, sourceOffset, sourceOffset + char.length);
+              sourceOffset += char.length;
+              if (char === '\n') sourceLine++;
+            }
+          };
+          const searchText = () => {
             const priorTailLength = tail.length;
-            const combined = tail + text;
+            const combined = tail + projected;
+            projected = '';
             let from = 0;
             while (true) {
               const index = combined.indexOf(pattern, from);
@@ -820,8 +850,10 @@ export class LocalTools {
                   .slice(Math.max(0, index - 120), Math.min(combined.length, index + pattern.length + 120))
                   .replaceAll('\n', '↩');
                 lines.push(`${file}:${line}:${snippet}`);
-                if (lines.length >= 300)
-                  return capText(sanitizeToolText(`${lines.join('\n')}\n[truncated after 300 matches]`), this.outputCap);
+                if (lines.length >= MAX_GREP_MATCHES) {
+                  matchesTruncated = true;
+                  return;
+                }
               }
               from = index + Math.max(1, pattern.length);
             }
@@ -829,10 +861,30 @@ export class LocalTools {
             const cut = combined.length - keep;
             tailLine += combined.slice(0, cut).match(/\n/g)?.length ?? 0;
             tail = combined.slice(cut);
+          };
+          const scanLimit = Math.min(size, MAX_GREP_FILE_BYTES);
+          while (position < scanLimit) {
+            const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, scanLimit - position), position);
+            if (!bytesRead) break;
+            const bytes = buffer.subarray(0, bytesRead);
+            if (bytes.includes(0)) throw new Error('binary');
+            let text;
+            try {
+              text = decoder.decode(bytes, { stream: true });
+            } catch {
+              throw new Error('invalid utf8');
+            }
+            project(text);
+            searchText();
+            if (matchesTruncated) return;
             position += bytesRead;
           }
           try {
-            decoder.decode();
+            // A byte cap may split a scalar. Omit that incomplete scalar;
+            // only an actual EOF must pass the decoder's final validation.
+            if (scanLimit === size) project(decoder.decode());
+            projector.finish(sourceOffset);
+            searchText();
           } catch {
             /* invalid tail: omit file */
           }
@@ -844,7 +896,6 @@ export class LocalTools {
         /* unreadable/non-text */
       }
     };
-    let discoveryTruncated = false;
     if (base !== '.' && base !== '') {
       // Authorize the exact file before inspecting its type. This preserves
       // canonical path and deny-list checks and prevents a file request from
@@ -853,28 +904,16 @@ export class LocalTools {
       const details = await this.fs.lstat(canonical);
       if (details.isFile()) {
         await searchFile(base, canonical);
-        return capText(
-          sanitizeToolText(`${lines.join('\n')}${skippedLarge ? '\n[files truncated at 8388608 bytes each]' : ''}`),
-          this.outputCap,
-        );
+        return result();
       }
       if (!details.isDirectory()) throw new Error('grep path must be a readable regular file or directory');
     }
-    this.#readable(base, { directory: true });
-    const discovered = await this.glob({ pattern: '**' });
-    discoveryTruncated = discovered.split('\n').some((line) => line.startsWith('[truncated:'));
-    const files = discovered.split('\n').filter((line) => line && !line.startsWith('['));
-    const prefix = base === '.' || base === '' ? '' : `${String(base).replace(/\/$/, '')}/`;
+    const { files, truncated: discoveryTruncated } = await this.#discoverFiles({ base });
     for (const file of files) {
-      if (!file.startsWith(prefix)) continue;
       await searchFile(file);
+      if (matchesTruncated) break;
     }
-    return capText(
-      sanitizeToolText(
-        `${lines.join('\n')}${discoveryTruncated ? '\n[file discovery truncated before all files were searched]' : ''}${skippedLarge ? '\n[files truncated at 8388608 bytes each]' : ''}`,
-      ),
-      this.outputCap,
-    );
+    return result(discoveryTruncated);
   }
   async edit_file({ path: file, old_string, new_string, replace_all = false } = {}) {
     if (

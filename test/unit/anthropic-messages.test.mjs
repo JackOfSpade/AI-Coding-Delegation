@@ -694,3 +694,182 @@ test('fallback refuses partial streams, transport and ordinary HTTP errors', asy
     assert.equal(fallbackCalls, 0);
   }
 });
+
+test('Anthropic output validation failures still yield one terminal billable usage record', async () => {
+  const cases = [
+    truncatedToolUse('tool_use'),
+    [
+      { type: 'message_start', message: { model: 'claude-opus-5-5', usage: { input_tokens: 10 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: 'unsigned' } },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 7 } },
+      { type: 'message_stop' },
+    ],
+    [
+      { type: 'message_start', message: { model: 'claude-opus-5-5', usage: { input_tokens: 10 } } },
+      { type: 'content_block_delta', index: 99, delta: { type: 'text_delta', text: 'orphan' } },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 7 } },
+      { type: 'message_stop' },
+    ],
+  ];
+  for (const stream of cases) {
+    const observed = [];
+    await assert.rejects(
+      async () => {
+        for await (const event of cappedProvider(stream).chat({ messages: [], tools: [] })) observed.push(event);
+      },
+      (error) => error instanceof ProviderError && error.kind === 'response',
+    );
+    assert.equal(observed.length, 1);
+    assert.equal(observed[0].model, 'claude-opus-5-5');
+    assert.equal(observed[0].usage.inputTokens, stream[0].message.usage.input_tokens);
+    assert.equal(observed[0].usage.outputTokens, stream.at(-2).usage.output_tokens);
+  }
+});
+
+test('Anthropic discovery cancels abort-ignoring headers, success bodies and error bodies', async () => {
+  for (const phase of ['headers', 'body', 'error body']) {
+    const controller = new AbortController();
+    const reason = new Error('cancel model discovery');
+    let releaseHeaders;
+    let cancels = 0;
+    const body = new ReadableStream({
+      cancel() {
+        cancels++;
+        return new Promise(() => {});
+      },
+    });
+    const response = new Response(body, { status: phase === 'error body' ? 403 : 200 });
+    const pending = resolveLatestAnthropicSonnet({
+      baseUrl: 'https://api.anthropic.com',
+      apiKey: 'test-key',
+      signal: controller.signal,
+      fetchImpl: async () =>
+        phase === 'headers'
+          ? new Promise((resolve) => {
+              releaseHeaders = resolve;
+            })
+          : response,
+    });
+    let outcome;
+    pending.catch((error) => {
+      outcome = error;
+    });
+    for (let i = 0; i < 10; i++) await settle();
+    controller.abort(reason);
+    for (let i = 0; i < 10; i++) await settle();
+    assert.equal(outcome, reason, `cancellation must not wait for ${phase}`);
+    await assert.rejects(pending, (error) => error === reason);
+    if (releaseHeaders) {
+      releaseHeaders(response);
+      for (let i = 0; i < 10; i++) await settle();
+    }
+    assert.equal(cancels, 1);
+  }
+  let requests = 0;
+  const reason = new Error('pre-cancelled');
+  await assert.rejects(
+    resolveLatestAnthropicSonnet({
+      baseUrl: 'https://api.anthropic.com',
+      apiKey: 'test-key',
+      signal: AbortSignal.abort(reason),
+      fetchImpl: async () => {
+        requests++;
+      },
+    }),
+    (error) => error === reason,
+  );
+  assert.equal(requests, 0);
+});
+
+test('Anthropic discovery has a deadline even when its transport ignores abort', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let requests = 0;
+  const pending = resolveLatestAnthropicSonnet({
+    baseUrl: 'https://api.anthropic.com',
+    apiKey: 'test-key',
+    timeoutMs: 30_000,
+    fetchImpl: async () => {
+      requests++;
+      return new Promise(() => {});
+    },
+  });
+  let outcome;
+  pending.catch((error) => {
+    outcome = error;
+  });
+  await settle();
+  assert.equal(requests, 1);
+  t.mock.timers.tick(30_000);
+  for (let i = 0; i < 10; i++) await settle();
+  assert.equal(outcome?.kind, 'attempt_timeout');
+  assert.equal(outcome?.timeoutMs, 30_000);
+  await assert.rejects(pending, (error) => error === outcome);
+});
+
+test('Anthropic stream errors cannot authorize tool execution even beside terminal metadata', async () => {
+  const observed = [];
+  const events = [
+    { type: 'message_start', message: { model: 'claude-opus-5-5', usage: { input_tokens: 10 } } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_write', name: 'write_file' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{}' } },
+    { type: 'error', error: { type: 'overloaded_error', message: 'provider-private-body' } },
+    { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 7 } },
+    { type: 'message_stop' },
+  ];
+  await assert.rejects(
+    async () => {
+      for await (const event of cappedProvider(events).chat({ messages: [], tools: [] })) observed.push(event);
+    },
+    (error) => error.kind === 'response' && !error.message.includes('provider-private-body'),
+  );
+  assert.deepEqual(observed, [
+    { usage: { inputTokens: 10, outputTokens: 7, cacheHitTokens: 0, cacheMissTokens: 10, totalTokens: 17 }, model: 'claude-opus-5-5' },
+  ]);
+});
+
+test('Anthropic discovery rejects explicitly inactive models even when the server accepts its lifecycle filter', async () => {
+  const selected = await resolveLatestAnthropicSonnet({
+    baseUrl: 'https://api.anthropic.com',
+    apiKey: 'test-key',
+    fetchImpl: async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            { id: 'claude-sonnet-6-0', line: 'sonnet', lifecycle: 'deprecated' },
+            { id: 'claude-sonnet-5-5', line: 'sonnet', lifecycle: 'active' },
+          ],
+        }),
+      ),
+  });
+  assert.equal(selected, 'claude-sonnet-5-5');
+});
+
+test('Anthropic aggregate output limits fail before exposing output and preserve its usage', async () => {
+  for (const content of [
+    [
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'x'.repeat(600_000) } },
+      { type: 'content_block_start', index: 1, content_block: { type: 'text', text: 'y'.repeat(600_000) } },
+    ],
+    [
+      { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'duplicate', name: 'write_file' } },
+      { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'duplicate', name: 'write_file' } },
+    ],
+  ]) {
+    const observed = [];
+    const provider = cappedProvider([
+      { type: 'message_start', message: { model: 'claude-opus-5-5', usage: { input_tokens: 10 } } },
+      ...content,
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 7 } },
+      { type: 'message_stop' },
+    ]);
+    await assert.rejects(
+      async () => {
+        for await (const event of provider.chat({ messages: [], tools: [] })) observed.push(event);
+      },
+      (error) => error.kind === 'response',
+    );
+    assert.deepEqual(observed, [
+      { usage: { inputTokens: 10, outputTokens: 7, cacheHitTokens: 0, cacheMissTokens: 10, totalTokens: 17 }, model: 'claude-opus-5-5' },
+    ]);
+  }
+});

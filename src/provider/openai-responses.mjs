@@ -1,4 +1,4 @@
-import { abortableBody, bestEffort, fetchAbortable } from './abort.mjs';
+import { bestEffort, fetchAbortable, readJsonAbortable } from './abort.mjs';
 import {
   DEFAULT_ATTEMPT_TIMEOUT_MS,
   ProviderError,
@@ -305,20 +305,14 @@ export class OpenAIResponsesProvider {
     if (!this.maxResponseBytes) throw new TypeError('maxResponseBytes must be positive');
   }
   async #readJson(body, signal) {
-    if (!body) throw invalidResponse('Response has no body');
-    const chunks = [];
-    let bytes = 0;
-    for await (const chunk of abortableBody(body, signal)) {
-      bytes += chunk.byteLength ?? Buffer.byteLength(chunk);
-      // A billed but oversized body is not retried: a second attempt would
-      // spend again for an answer this adapter would refuse the same way.
-      if (bytes > this.maxResponseBytes) throw invalidResponse('Response exceeds configured size limit');
-      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
-    }
     try {
-      return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
-    } catch {
-      throw invalidResponse('Invalid response JSON');
+      return await readJsonAbortable(body, { signal, maxBytes: this.maxResponseBytes });
+    } catch (error) {
+      // A billed but unusable body is not retried: a second attempt would
+      // spend again for an answer this adapter would refuse the same way.
+      if (['Response has no body', 'Response exceeds configured size limit', 'Invalid response JSON'].includes(error?.message))
+        throw invalidResponse(error.message);
+      throw error;
     }
   }
   async #collect(payload, externalSignal, retryLimit = this.retries) {

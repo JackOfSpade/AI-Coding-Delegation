@@ -101,7 +101,8 @@ export async function copyReportInputs({ inputFiles = [], workspacePath, roots =
             .join(', ')}`,
         );
       }
-      const handle = await open(requested, constants.O_RDONLY | (process.platform === 'win32' ? 0 : constants.O_NOFOLLOW));
+      const readFlags = process.platform === 'win32' ? 0 : (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0);
+      const handle = await open(requested, constants.O_RDONLY | readFlags);
       let bytes;
       try {
         const opened = await handle.stat(BIGINT);

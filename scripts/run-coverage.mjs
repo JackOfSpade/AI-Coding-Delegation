@@ -6,7 +6,8 @@ import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { posix, resolve, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { acquireArtifactLease } from './artifact-lease.mjs';
+import { acquireArtifactLease, publishArtifactFile } from './artifact-lease.mjs';
+import { processExit } from './process-exit.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const c8Program = fileURLToPath(new URL('../node_modules/c8/bin/c8.js', import.meta.url));
@@ -38,26 +39,6 @@ export function coverageInvocation({
       paths.join(cwd, 'scripts', 'test-ci.mjs'),
     ],
   };
-}
-
-function processExit(child) {
-  return new Promise((resolveExit, reject) => {
-    child.once('error', reject);
-    child.once('exit', (code) => resolveExit(code ?? 1));
-  });
-}
-
-async function publishFile(source, destination, { makeDirectory, copy, move, remove, unique, paths, pid }) {
-  await makeDirectory(paths.dirname(destination), { recursive: true });
-  const staged = paths.join(paths.dirname(destination), `.${paths.basename(destination)}.${pid}.${unique()}.tmp`);
-  try {
-    await copy(source, staged);
-    // A same-directory rename replaces the whole report atomically. Concurrent
-    // callers may publish in either order, but never leave a partial JSON file.
-    await move(staged, destination);
-  } finally {
-    await remove(staged, { force: true });
-  }
 }
 
 async function preserveFile(source, backup, { copy }) {
@@ -127,22 +108,28 @@ export async function runCoverage({
         move,
         remove,
         unique,
-        paths,
+        platform,
         pid,
       };
+      const publish = (source, destination) => publishArtifactFile({ source, destination, ...publishOptions });
       let coveragePublished = false;
       try {
-        await publishFile(coverageSummary, publicCoverage, publishOptions);
+        await publish(coverageSummary, publicCoverage);
         coveragePublished = true;
-        await publishFile(testSummary, publicTest, publishOptions);
+        await publish(testSummary, publicTest);
       } catch (error) {
         if (coveragePublished) {
           try {
-            if (hadCoverage) await publishFile(coverageBackup, publicCoverage, publishOptions);
+            if (hadCoverage) await publish(coverageBackup, publicCoverage);
             else await remove(publicCoverage, { force: true });
-            if (hadTest) await publishFile(testBackup, publicTest, publishOptions);
+            if (hadTest) await publish(testBackup, publicTest);
             else await remove(publicTest, { force: true });
-          } catch {}
+          } catch (rollbackError) {
+            throw new AggregateError(
+              [error, rollbackError],
+              'coverage artifact publication failed and previous artifacts could not be restored',
+            );
+          }
         }
         throw error;
       }
