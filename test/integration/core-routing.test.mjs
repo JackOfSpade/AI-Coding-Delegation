@@ -660,6 +660,13 @@ test('Core passes the current write-job turn allowance into the initial system p
       const system = server.requests[0].body.messages.find((message) => message.role === 'system')?.content;
       assert.match(system, /2 model turns available/);
       assert.ok(system.split('\n').includes('Assertions must be falsifiable; no substring checks that match unrelated text.'));
+      assert.match(system, /verifierInterpreter grants read and exec, never write, only to the server verifier and applyThenVerify\./);
+      assert.match(system, /does not grant the worker run_command access to that interpreter or virtualenv/);
+      assert.match(
+        system,
+        /Never stub, fake, mock, or replace an import or dependency to run a generator whose output will be integrated\./,
+      );
+      assert.match(system, /report the missing dependency and blocked generator in finish.concerns/);
       // The range is converted to the exact byte offset of line 21, and a plain entry is untouched.
       const offset = Buffer.byteLength(`${noteLines.slice(0, 20).join('\n')}\n`);
       assert.ok(

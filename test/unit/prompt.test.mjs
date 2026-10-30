@@ -7,7 +7,9 @@ import { LocalTools, availableToolDefinitions } from '../../src/agent/tools.mjs'
 import {
   WORKER_ASSERTION_PRESERVATION_RULE,
   WORKER_COMPLETION_RULE,
+  WORKER_GENERATOR_DEPENDENCY_RULE,
   WORKER_TEST_QUALITY_RULE,
+  WORKER_VERIFIER_INTERPRETER_RULE,
   annotateRelevantPaths,
   buildSystemPrompt,
   repoConventions,
@@ -122,6 +124,44 @@ test('every worker prompt preserves existing assertion intent and sends conflict
       /An exception requires the primary to explicitly identify the incorrect assertion and specify its intended correction/,
     );
     assert.match(rules[0], /a passing check alone is never authorization\./);
+  }
+});
+test('every worker brief explains that declared verifier interpreters do not grant worker shell access', async () => {
+  for (const mode of ['write', 'report']) {
+    for (const allowCommand of [true, false]) {
+      for (const serverVerifierConfigured of [true, false]) {
+        const options = { mode, allowCommand, serverVerifierConfigured, ownedPaths: ['src/**'] };
+        const prompt = await buildSystemPrompt(options);
+        const rules = prompt.split('\n').filter((line) => line === WORKER_VERIFIER_INTERPRETER_RULE);
+        assert.equal(rules.length, 1, JSON.stringify(options));
+        assert.match(rules[0], /verifierInterpreter grants read and exec, never write, only to the server verifier and applyThenVerify\./);
+        assert.match(rules[0], /does not grant the worker run_command access to that interpreter or virtualenv/);
+        assert.match(rules[0], /worker shells may lack dependencies available to the verifier/);
+        assert.match(rules[0], /report the missing dependency and blocked command in finish.concerns\./);
+      }
+    }
+  }
+});
+test('every worker brief forbids fake generator imports and reports missing real dependencies honestly', async () => {
+  for (const mode of ['write', 'report']) {
+    for (const allowCommand of [true, false]) {
+      for (const serverVerifierConfigured of [true, false]) {
+        const options = { mode, allowCommand, serverVerifierConfigured, ownedPaths: ['task_plan/**'] };
+        const prompt = await buildSystemPrompt(options);
+        const rules = prompt.split('\n').filter((line) => line === WORKER_GENERATOR_DEPENDENCY_RULE);
+        assert.equal(rules.length, 1, JSON.stringify(options));
+        assert.match(
+          rules[0],
+          /Never stub, fake, mock, or replace an import or dependency to run a generator whose output will be integrated\./,
+        );
+        assert.match(rules[0], /Generated files must come from the real dependencies\./);
+        assert.match(rules[0], /If a required dependency is missing, leave the generator unrun/);
+        assert.match(rules[0], /report the missing dependency and blocked generator in finish.concerns/);
+        assert.match(rules[0], /primary can run it with the real environment/);
+        assert.match(rules[0], /List only checks actually run in finish.testsRun/);
+        assert.match(rules[0], /a passing server verifier does not validate output produced with fake dependencies\./);
+      }
+    }
   }
 });
 test('the range guidance line appears only when a relevant path carries a line range', async () => {

@@ -15,6 +15,10 @@ const RANGE_ENTRY = /:\d{1,7}-\d{1,7}(?: \(read_file offset |$)/;
 export const WORKER_TEST_QUALITY_RULE = 'Assertions must be falsifiable; no substring checks that match unrelated text.';
 export const WORKER_ASSERTION_PRESERVATION_RULE =
   'Never edit, remove, weaken, or invert an existing assertion solely to make your change pass. Preserve its original behavioral intent; if it conflicts with the requested change, leave the assertion unchanged and report the conflict in finish.concerns. An exception requires the primary to explicitly identify the incorrect assertion and specify its intended correction; a passing check alone is never authorization.';
+export const WORKER_VERIFIER_INTERPRETER_RULE =
+  'Interpreter access: verifierInterpreter grants read and exec, never write, only to the server verifier and applyThenVerify. It does not grant the worker run_command access to that interpreter or virtualenv; worker shells may lack dependencies available to the verifier. If a real dependency is unavailable, report the missing dependency and blocked command in finish.concerns.';
+export const WORKER_GENERATOR_DEPENDENCY_RULE =
+  'Never stub, fake, mock, or replace an import or dependency to run a generator whose output will be integrated. Generated files must come from the real dependencies. If a required dependency is missing, leave the generator unrun and report the missing dependency and blocked generator in finish.concerns so the primary can run it with the real environment. List only checks actually run in finish.testsRun; a passing server verifier does not validate output produced with fake dependencies.';
 // Keep the terminal protocol after repository conventions too: a normal
 // assistant summary ends an Anthropic turn, but does not complete an Offload job.
 export const WORKER_COMPLETION_RULE =
@@ -167,6 +171,8 @@ export async function buildSystemPrompt({
     `read_file's limit is a byte count of at most ${DEFAULT_READ_CAP} per call (omit it for that default); a call returns at most about ${DEFAULT_OUTPUT_CAP} characters, so page through a large file by continuing at the exact offset N printed after [truncated; next offset N].`,
     WORKER_TEST_QUALITY_RULE,
     WORKER_ASSERTION_PRESERVATION_RULE,
+    WORKER_VERIFIER_INTERPRETER_RULE,
+    WORKER_GENERATOR_DEPENDENCY_RULE,
     !reportMode && finiteRemainingTurns
       ? `You have ${finiteRemainingTurns} model turn${finiteRemainingTurns === 1 ? '' : 's'} available. Batch independent reads and lists, then after their required reads make an allowed tool call immediately. Do not emit source code, a plan, progress update, or other narrative outside tool calls; put source only in write_file.content. Prefer read_file, list_dir, glob, and grep for ordinary inspection. When read_file returns [truncated; next offset N], continue that file with exactly offset N. ${allowCommand ? (serverVerifierConfigured ? 'The configured focused verifier runs server-side after finish, so reserve one final response containing only finish rather than rerunning or searching for tests. ' : 'Reserve run_command for focused build, test, or diagnostic work after changes. ') : ''}Prefer writing complete final file content with write_file over a write-then-edit sequence. If several new files are needed, write one complete file per tool-call response, then continue with the next file. edit_file requires a fresh read of that file, including after write_file. Reserve time for the configured verifier and the mandatory single finish call.`
       : '',
