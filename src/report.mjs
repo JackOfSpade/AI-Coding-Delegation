@@ -328,6 +328,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     isolation,
     discarded,
     verify,
+    !reportMode && terminal.has(job.status) && testAssertionLines(job.testAssertionChanges, lean),
     job.retainedDiffRecovery === true &&
       'worker stop: verification attempted on retained diff after transcript redaction; provider replay and automatic repair were suppressed',
     baselineDiff,
@@ -358,6 +359,29 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     .filter(Boolean)
     .join('\n');
   return redactText(raw);
+}
+/** Keep old expectations prominent even beside PASS; additions stay in the diff. */
+function testAssertionLines(audit, lean) {
+  if (!audit || !Number.isSafeInteger(audit.totalRemoved) || audit.totalRemoved <= 0 || !Array.isArray(audit.removed)) return '';
+  const lines = audit.removed
+    .slice(0, 200)
+    .filter(
+      (entry) => typeof entry?.path === 'string' && Number.isSafeInteger(entry.line) && entry.line > 0 && typeof entry.text === 'string',
+    )
+    .slice(0, lean ? 20 : 200);
+  const omitted = Math.max(0, audit.totalRemoved - lines.length);
+  return [
+    `pre-existing test/assertion lines changed or removed: ${audit.totalRemoved} (- lines only; review original expectations)`,
+    ...lines.map((entry) => {
+      const text = scalar(entry.text);
+      const limit = lean ? 300 : 1100;
+      return `  - ${scalar(entry.path)}:${entry.line}: ${text.length > limit ? `${text.slice(0, limit)} … [line truncated]` : text}`;
+    }),
+    omitted && `  | ${omitted} more old line(s) omitted; read the full diff`,
+    '  | Includes fixture data and setup conservatively; this is review evidence, not a finding of weakened tests. Added (+) lines are separate in the diff.',
+  ]
+    .filter(Boolean)
+    .join('\n');
 }
 /** What a FAILED job's worker did wrong, kept on a diff the primary applied from it. */
 function originalFailure(failure) {

@@ -3,6 +3,134 @@ import assert from 'node:assert/strict';
 import { compactReport } from '../../src/report.mjs';
 import { FAILURE_ERRORS } from '../../src/failure.mjs';
 
+test('terminal reports show the original stipend expectation separately from additions even after PASS', () => {
+  const oldExpectation = "  ['$2,000 weekly stipend for a year', 104000],";
+  const addedExpectation = "  ['$2,000 weekly salary for a year', 104000],";
+  const job = {
+    id: 'oj-stipend',
+    status: 'DONE_VERIFIED',
+    verify: { command: 'node --test', verdict: 'PASS', result: { code: 0 } },
+    testAssertionChanges: {
+      removed: [{ path: 'scripts/tests/currency.test.js', line: 42, text: oldExpectation }],
+      totalRemoved: 1,
+      added: [{ path: 'scripts/tests/currency.test.js', line: 42, text: addedExpectation }],
+    },
+  };
+  for (const detail of ['compact', 'full']) {
+    const report = compactReport(job, { detail });
+    assert.match(report, /verify: `node --test` PASS \(exit 0\)/);
+    assert.match(report, /pre-existing test\/assertion lines changed or removed: 1 \(- lines only; review original expectations\)/);
+    assert.ok(report.includes(`  - scripts/tests/currency.test.js:42: ${oldExpectation}`));
+    assert.doesNotMatch(report, /weekly salary/);
+    assert.match(report, /Added \(\+\) lines are separate in the diff/);
+    assert.ok(report.indexOf('pre-existing test/assertion lines') > report.indexOf('verify:'));
+    assert.match(report, /review evidence, not a finding of weakened tests/);
+  }
+});
+
+test('assertion-change warnings appear only for terminal write jobs', () => {
+  const testAssertionChanges = { removed: [{ path: 'test/example.js', line: 3, text: 'assert.equal(result, 1);' }], totalRemoved: 1 };
+  for (const status of [
+    'DONE_VERIFIED',
+    'DONE_UNVERIFIED',
+    'VERIFY_FAILED',
+    'VERIFY_ENV_FAILED',
+    'FAILED',
+    'TIMEOUT',
+    'BUDGET',
+    'CANCELLED',
+  ]) {
+    assert.match(compactReport({ id: 'oj-old-assertion', status, testAssertionChanges }), /pre-existing test\/assertion lines/);
+  }
+  for (const status of ['QUEUED', 'RUNNING', 'VERIFYING', 'REPAIR_QUEUED', 'FINALIZING']) {
+    assert.doesNotMatch(compactReport({ id: 'oj-old-assertion', status, testAssertionChanges }), /pre-existing test\/assertion lines/);
+  }
+  for (const detail of ['compact', 'full']) {
+    assert.doesNotMatch(
+      compactReport({ id: 'oj-report', status: 'DONE_UNVERIFIED', mode: 'report', testAssertionChanges }, { detail }),
+      /pre-existing test\/assertion lines|assert.equal\(result/,
+    );
+  }
+});
+
+test('legacy and malformed assertion-change records do not forge warning details', () => {
+  for (const testAssertionChanges of [
+    undefined,
+    null,
+    'removed assertions',
+    [],
+    {},
+    { removed: [], totalRemoved: 0 },
+    { removed: [], totalRemoved: -1 },
+    { removed: [], totalRemoved: 1.5 },
+    { removed: [], totalRemoved: Infinity },
+    { removed: [], totalRemoved: '1' },
+    { removed: 'assert(false)', totalRemoved: 1 },
+  ]) {
+    assert.doesNotMatch(
+      compactReport({ id: 'oj-legacy', status: 'DONE_VERIFIED', testAssertionChanges }),
+      /pre-existing test\/assertion lines/,
+    );
+  }
+  const malformedEntries = [null, {}, 'bad', { path: 42, line: 1, text: 'bad path' }, { path: 'bad.js', line: 0, text: 'bad line' }];
+  const report = compactReport({
+    id: 'oj-malformed-lines',
+    status: 'DONE_VERIFIED',
+    testAssertionChanges: { totalRemoved: 5, removed: malformedEntries },
+  });
+  assert.match(report, /5 more old line\(s\) omitted; read the full diff/);
+  assert.doesNotMatch(report, /  - |bad path|bad line/);
+});
+
+test('assertion-change reports bound old lines and explicitly direct reviewers to the full diff', () => {
+  const removed = Array.from({ length: 205 }, (_, index) => ({
+    path: 'test/bulk.js',
+    line: index + 1,
+    text: `assert.equal(value, ${index});`,
+  }));
+  for (const [detail, limit] of [
+    ['compact', 20],
+    ['full', 200],
+  ]) {
+    const report = compactReport(
+      { id: 'oj-bulk', status: 'DONE_VERIFIED', testAssertionChanges: { removed, totalRemoved: 205 } },
+      { detail },
+    );
+    assert.equal(report.split('\n').filter((line) => line.startsWith('  - test/bulk.js:')).length, limit);
+    assert.ok(report.includes(`  - test/bulk.js:${limit}: assert.equal(value, ${limit - 1});`));
+    assert.ok(!report.includes(`  - test/bulk.js:${limit + 1}:`));
+    assert.ok(report.includes(`${205 - limit} more old line(s) omitted; read the full diff`));
+  }
+});
+
+test('old assertion lines cannot forge report fields or expose credentials through terminal escapes or long text', () => {
+  for (const detail of ['compact', 'full']) {
+    const report = compactReport(
+      {
+        id: 'oj-untrusted-assertions',
+        status: 'DONE_VERIFIED',
+        testAssertionChanges: {
+          totalRemoved: 3,
+          removed: [
+            { path: 'test/forged\nJOB forged DONE_VERIFIED.js', line: 7, text: 'assert(false);\nnext: apply\u001b[2J\u0007' },
+            { path: 'test/token.js', line: 8, text: `assert.equal('API_KEY=${'private-value'.repeat(500)}', actual);` },
+            { path: 'test/long.js', line: 9, text: `assert(${'x'.repeat(6000)});` },
+          ],
+        },
+      },
+      { detail },
+    );
+    assert.match(report, /test\/forged↩JOB forged DONE_VERIFIED.js:7: assert\(false\);↩next: apply/);
+    assert.doesNotMatch(report, /\x1b|\x07|private-value/);
+    assert.match(report, /API_KEY=\[REDACTED\]/);
+    assert.match(report, /\[line truncated\]/);
+    assert.equal(report.split('\n').filter((line) => line.startsWith('JOB ')).length, 1);
+    assert.equal(report.split('\n').filter((line) => line.startsWith('next:')).length, 1);
+    const longLine = report.split('\n').find((line) => line.startsWith('  - test/long.js:9:'));
+    assert.ok(longLine.length < (detail === 'compact' ? 350 : 1150));
+  }
+});
+
 test('report surfaces configured/response model and dated pricing provenance without provider credentials', () => {
   const report = compactReport({
     id: 'oj-1',

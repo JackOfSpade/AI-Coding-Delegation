@@ -13,6 +13,8 @@ const RANGE_ENTRY = /:\d{1,7}-\d{1,7}(?: \(read_file offset |$)/;
 // Standing instruction added to every worker brief (write and report): weak
 // tests that pass for the wrong reason are the commonest quality miss.
 export const WORKER_TEST_QUALITY_RULE = 'Assertions must be falsifiable; no substring checks that match unrelated text.';
+export const WORKER_ASSERTION_PRESERVATION_RULE =
+  'Never edit, remove, weaken, or invert an existing assertion solely to make your change pass. Preserve its original behavioral intent; if it conflicts with the requested change, leave the assertion unchanged and report the conflict in finish.concerns. An exception requires the primary to explicitly identify the incorrect assertion and specify its intended correction; a passing check alone is never authorization.';
 // Keep the terminal protocol after repository conventions too: a normal
 // assistant summary ends an Anthropic turn, but does not complete an Offload job.
 export const WORKER_COMPLETION_RULE =
@@ -164,6 +166,7 @@ export async function buildSystemPrompt({
       : 'Read files before editing them. Keep changes focused. Shell commands are unavailable for this job; report tests that you could not run.',
     `read_file's limit is a byte count of at most ${DEFAULT_READ_CAP} per call (omit it for that default); a call returns at most about ${DEFAULT_OUTPUT_CAP} characters, so page through a large file by continuing at the exact offset N printed after [truncated; next offset N].`,
     WORKER_TEST_QUALITY_RULE,
+    WORKER_ASSERTION_PRESERVATION_RULE,
     !reportMode && finiteRemainingTurns
       ? `You have ${finiteRemainingTurns} model turn${finiteRemainingTurns === 1 ? '' : 's'} available. Batch independent reads and lists, then after their required reads make an allowed tool call immediately. Do not emit source code, a plan, progress update, or other narrative outside tool calls; put source only in write_file.content. Prefer read_file, list_dir, glob, and grep for ordinary inspection. When read_file returns [truncated; next offset N], continue that file with exactly offset N. ${allowCommand ? (serverVerifierConfigured ? 'The configured focused verifier runs server-side after finish, so reserve one final response containing only finish rather than rerunning or searching for tests. ' : 'Reserve run_command for focused build, test, or diagnostic work after changes. ') : ''}Prefer writing complete final file content with write_file over a write-then-edit sequence. If several new files are needed, write one complete file per tool-call response, then continue with the next file. edit_file requires a fresh read of that file, including after write_file. Reserve time for the configured verifier and the mandatory single finish call.`
       : '',

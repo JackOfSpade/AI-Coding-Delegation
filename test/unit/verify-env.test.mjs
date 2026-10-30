@@ -321,6 +321,57 @@ test('an undeclared interpreter or virtualenv is a permission denial that says t
   );
 });
 
+test('interpreter denials retain the complete Stock-Trading path through spaces and shell prefixes', () => {
+  const python = '/Users/jack/Desktop/My Apps/Stock-Trading/.venv/bin/python';
+  const escaped = python.replace(/ /g, '\\ ');
+  const command = "'" + python + "' -m pytest";
+  const lines = [
+    'offload-command.sh: line 2: ' + python + ': Operation not permitted',
+    '/bin/bash: line 2: ' + python + ': Operation not permitted',
+    '/private/tmp/offload-command.sh: line 2: ' + python + ': Permission denied',
+    "/bin/sh: '" + python + "': Operation not permitted",
+    '/bin/sh: "' + python + '": Permission denied',
+    '/bin/sh: ' + String.fromCharCode(96) + python + String.fromCharCode(96) + ': Permission denied',
+    '/bin/bash: line 2: ' + escaped + ': Operation not permitted',
+    'zsh: operation not permitted: ' + python,
+    "PermissionError: [Errno 1] Operation not permitted: '" + python + "'",
+    'Error: EACCES: permission denied, open ' + python,
+  ];
+  for (const stderr of lines) {
+    const diagnosis = classifyVerifierEnvironment({ command, ...failed(stderr, { code: 126 }) });
+    assert.equal(diagnosis?.kind, 'permission-denied', stderr);
+    assert.ok(diagnosis.detail.includes(python), diagnosis.detail);
+    assert.match(diagnosis.detail, /verifierInterpreter/);
+    assert.doesNotMatch(diagnosis.detail, /outside the job's write scope/);
+    assert.ok(diagnosis.detail.length <= 240);
+  }
+});
+
+test('space-containing permission paths still respect owned files, Windows separators, quotes and redaction', () => {
+  const workspacePath = '/Users/runner/Work Tree';
+  for (const stderr of [
+    '/bin/sh: ' + workspacePath + '/src/a file.js: Permission denied',
+    'Error: EACCES: permission denied, open ' + workspacePath + '/src/a file.js',
+    'PermissionError: Operation not permitted: "' + workspacePath + '/src/can\'t.py"',
+  ])
+    assert.equal(classifyVerifierEnvironment(failed(stderr), { workspacePath, writeScope: scope }), null, stderr);
+  const windows = 'C:\\Users\\runner\\My Apps\\project';
+  assert.equal(
+    classifyVerifierEnvironment(failed('EACCES: permission denied, open ' + windows + '\\src\\a file.js'), {
+      workspacePath: windows,
+      writeScope: scope,
+    }),
+    null,
+  );
+  const secret = 'not-for-diagnostic-output';
+  const diagnosis = classifyVerifierEnvironment(
+    failed('/bin/sh: /Users/runner/My Apps/API_KEY=' + secret + '/.venv/bin/python: Operation not permitted'),
+  );
+  assert.equal(diagnosis?.kind, 'permission-denied');
+  assert.match(diagnosis.detail, /API_KEY=\[REDACTED\]/);
+  assert.doesNotMatch(diagnosis.detail, /not-for-diagnostic/);
+});
+
 test('a denied tool-cache write is a warning, not an environment failure, so a failing suite stays repairable', () => {
   const warning =
     "/venv/lib/python3.14/site-packages/_pytest/cacheprovider.py:469: PytestCacheWarning: could not create cache path /w/.pytest_cache/v/cache/nodeids: [Errno 1] Operation not permitted: '/w/pytest-cache-files-q0myw0ky'";

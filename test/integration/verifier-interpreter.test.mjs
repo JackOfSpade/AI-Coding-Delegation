@@ -2,9 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, rmSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { createCore, gitPatchApplier, gitSnapshots } from '../../src/core.mjs';
 import { createMcpServer } from '../../src/mcp.mjs';
@@ -13,7 +13,7 @@ import { JobManager } from '../../src/job-manager.mjs';
 import { JobStore } from '../../src/store.mjs';
 import { macosProfile, runCommand, sandboxAvailable } from '../../src/sandbox.mjs';
 import { installedSkillHealth } from '../../src/skill-health.mjs';
-import { probeVerifierInterpreter, resolveVerifierInterpreters } from '../../src/verify-interpreter.mjs';
+import { interpreterPathsOption, probeVerifierInterpreter, resolveVerifierInterpreters } from '../../src/verify-interpreter.mjs';
 import { cleanupIsolatedWorktree, createIsolatedWorktree, integrateRecordedTree, openIsolatedWorktree } from '../../src/worktree.mjs';
 import { cleanup, git, makeRepo, write } from '../unit/helpers.mjs';
 
@@ -160,6 +160,126 @@ test(
     assert.equal((await run(`echo ok > ${shellQuote(join(repo, 'src', 'a.txt'))}`)).code, 0, 'owned scope still writable');
     denied(await run(`echo no > ${shellQuote(join(repo, 'outside.txt'))}`), 'a write outside the owned scope');
     assert.equal(existsSync(join(repo, 'outside.txt')), false);
+  },
+);
+
+test(
+  'a declared in-repo virtualenv with spaces and an aliased base prefix runs through Core health with metadata-only hops',
+  { skip: (!sandboxAvailable() && SANDBOX_SKIP) || (!PYTHON && PYTHON_SKIP) || posixSkip },
+  async (t) => {
+    const root = await scratch(t);
+    const repo = join(root, 'My Apps', 'Stock Trading');
+    const venv = join(repo, '.venv');
+    const python = join(venv, 'bin', 'python');
+    const probeCwd = join(root, 'health probe');
+    await mkdir(join(repo, 'src'), { recursive: true });
+    await mkdir(probeCwd);
+    write(join(repo, 'pyproject.toml'), '[project]\nname = "space-path-fixture"\n');
+    write(join(repo, '.gitignore'), '.venv/\n');
+    git(repo, ['init']);
+    git(repo, ['config', 'user.email', 'tests@example.invalid']);
+    git(repo, ['config', 'user.name', 'Tests']);
+    git(repo, ['add', '.']);
+    git(repo, ['commit', '-m', 'fixture']);
+    execFileSync(PYTHON, ['-m', 'venv', '--without-pip', venv], { stdio: 'ignore' });
+    const realPython = await realpath(python);
+    const sitePackages = execFileSync(python, ['-c', 'import sysconfig; print(sysconfig.get_path("purelib"))'], {
+      encoding: 'utf8',
+    }).trim();
+    const module = `offload_venv_only_${basename(root).replace(/[^A-Za-z0-9_]/g, '_')}`;
+    await writeFile(join(sitePackages, `${module}.py`), 'VALUE = "venv-only-import"\n');
+
+    // Match uv's layout: the venv's python follows a prefix alias outside the
+    // canonical base grant, and python3 uses a relative link back to python.
+    const aliasParent = join(root, 'uv python');
+    const aliasPrefix = join(aliasParent, 'cpython-minor-alias');
+    await mkdir(aliasParent);
+    await symlink(dirname(dirname(realPython)), aliasPrefix, 'dir');
+    await rm(python);
+    await symlink(join(aliasPrefix, 'bin', basename(realPython)), python);
+    await rm(join(venv, 'bin', 'python3'));
+    await symlink('python', join(venv, 'bin', 'python3'));
+    const sibling = join(aliasParent, 'private-sibling.txt');
+    await writeFile(sibling, 'private fixture data\n');
+    const declaration = resolveVerifierInterpreters(venv, { repoPath: repo, writeScope: ['src/**'] });
+    assert.equal(declaration.grants[0].interpreter, python, 'a venv-root declaration probes its conventional python executable');
+    assert.ok(declaration.metadataPaths?.length, 'the out-of-root alias chain needs exact metadata nodes');
+    assert.ok(declaration.metadataPaths.some((path) => path === aliasPrefix || path.startsWith(`${aliasPrefix}/`)));
+    assert.equal(declaration.roots.includes(aliasParent), false, 'the alias parent gains no data capability');
+    const jobOptions = interpreterPathsOption({
+      repoPath: repo,
+      ownedPaths: ['src/**'],
+      verifierInterpreter: [python],
+      verifierInterpreterRoots: declaration.roots,
+    });
+    assert.deepEqual(jobOptions.interpreterMetadataPaths, declaration.metadataPaths, 'a stored job re-derives the validated metadata hops');
+    const run = (command, withMetadata = true) =>
+      runCommand(command, {
+        cwd: probeCwd,
+        requireSandbox: true,
+        timeoutSec: 30,
+        ...jobOptions,
+        ...(!withMetadata ? { interpreterMetadataPaths: [] } : {}),
+      });
+    const command = `${shellQuote(python)} -c ${shellQuote(`import sys, json, ${module}; print(json.dumps([sys.prefix, sys.executable, ${module}.VALUE]))`)}`;
+    const withoutMetadata = await run(command, false);
+    assert.notEqual(withoutMetadata.code, 0, 'canonical read/exec roots alone cannot traverse the alias during Python startup');
+    const started = await run(command);
+    assert.equal(started.code, 0, started.stderr);
+    assert.deepEqual(JSON.parse(started.stdout), [venv, python, 'venv-only-import']);
+    const moduleRun = await run(`echo '{"ok":true}' | ${shellQuote(python)} -m json.tool`);
+    assert.equal(moduleRun.code, 0, moduleRun.stderr);
+    assert.deepEqual(JSON.parse(moduleRun.stdout), { ok: true });
+
+    const profile = macosProfile({
+      repoPath: probeCwd,
+      interpreterPaths: declaration.roots,
+      interpreterMetadataPaths: declaration.metadataPaths,
+    });
+    const allows = profile.split('\n').filter((line) => line.startsWith('(allow '));
+    for (const path of declaration.metadataPaths) {
+      const quoted = JSON.stringify(path);
+      assert.ok(allows.includes(`(allow file-read-metadata (literal ${quoted}))`), `${path} is an exact metadata grant`);
+      assert.equal(
+        allows.some((line) => line.includes(quoted) && /file-read(?:-data|\*)|file-write|process-exec|subpath/.test(line)),
+        false,
+      );
+    }
+    for (const forbidden of [`cat ${shellQuote(sibling)}`, `ls ${shellQuote(aliasParent)}`, `echo changed > ${shellQuote(sibling)}`]) {
+      const denied = await run(forbidden);
+      assert.notEqual(denied.code, 0, forbidden);
+      assert.match(denied.stderr, /Operation not permitted|Permission denied/i, forbidden);
+    }
+    assert.equal(await readFile(sibling, 'utf8'), 'private fixture data\n');
+    const writeVenv = await run(`echo changed > ${shellQuote(join(venv, 'blocked-write'))}`);
+    assert.notEqual(writeVenv.code, 0);
+    assert.equal(existsSync(join(venv, 'blocked-write')), false);
+
+    const probes = [];
+    const core = coreFor({
+      config: {
+        runVerifierProbe: async (command, options) => {
+          probes.push({ command, options });
+          return runCommand(command, options);
+        },
+      },
+    });
+    t.after(() => core.shutdown({ timeoutMs: 2_000 }));
+    for (const declared of [venv, python]) {
+      const { health } = await core.job(undefined, { repoPath: repo, verifierInterpreter: declared, verifierImports: [module] });
+      assert.equal(health.verifierPython.status, 'ok', JSON.stringify(health.verifierPython));
+      assert.equal(health.verifierPython.interpreters[0].interpreter, python);
+      assert.equal(health.verifierDeps, 'ok');
+      assert.deepEqual(health.verifierPython.imports, [module]);
+      const actual = probes.at(-1);
+      assert.ok(
+        actual.command.startsWith(`${shellQuote(python)} `),
+        'health invokes the exact venv executable rather than its canonical base',
+      );
+      assert.deepEqual([...actual.options.interpreterMetadataPaths].sort(), [...declaration.metadataPaths].sort());
+      assert.notEqual(actual.options.cwd, repo, 'health proves startup from its independent scratch directory');
+    }
+    assert.equal(probes.length, 2);
   },
 );
 

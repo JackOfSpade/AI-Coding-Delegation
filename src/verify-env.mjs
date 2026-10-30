@@ -2,6 +2,7 @@ import { realpathSync } from 'node:fs';
 import { posix, win32 } from 'node:path';
 import { matchesAny } from './glob.mjs';
 import { TSX_LOADER_FIX } from './verifier-command.mjs';
+import { redactText, stripTerminalControls } from './redact.mjs';
 
 const MAX_SCAN_CHARS = 64 * 1024;
 const MAX_DETAIL = 200;
@@ -89,7 +90,7 @@ function nativeCrashModule(text) {
 }
 
 const clip = (value, max = MAX_DETAIL) =>
-  String(value)
+  redactText(stripTerminalControls(String(value)))
     .replace(/[\x00-\x1f\x7f]/g, ' ')
     .slice(0, max);
 // Actionable, and honest about the grant: read and exec of the declared roots,
@@ -97,12 +98,29 @@ const clip = (value, max = MAX_DETAIL) =>
 const interpreterDetail = (path) =>
   `an interpreter or virtualenv outside the worktree must be declared with verifierInterpreter (read and exec only) and called by absolute path; denied: ${path ? clip(path, 90) : 'interpreter startup'}`;
 
-// The first absolute path named on a permission-error line, quoted or bare.
+// Shell diagnostics put the target immediately before the denial reason,
+// while Python/Node errors usually put it after. Prefer those positions over
+// an earlier absolute shell/script name, and preserve spaces inside the path.
 function permissionPath(line) {
-  const quoted = line.match(/['"`]((?:[A-Za-z]:[/\\]|\\\\|\/)[^'"`\n]+)['"`]/);
-  if (quoted) return quoted[1];
-  const bare = line.match(/(?:^|[\s:(])((?:[A-Za-z]:[/\\]|\\\\|\/)[^\s'"`:,)]+)/);
-  return bare ? bare[1] : undefined;
+  const reason = /permission denied|operation not permitted/i.exec(line);
+  if (reason) {
+    const after = line.slice(reason.index + reason[0].length);
+    const following = diagnosticPath(after);
+    if (following) return following;
+    const before = line.slice(0, reason.index).replace(/:\s*$/, '').trim();
+    const target = before.split(/:\s+/).at(-1);
+    return diagnosticPath(target);
+  }
+  return diagnosticPath(line);
+}
+
+function diagnosticPath(text) {
+  const quoted = text.match(/(['"\x60])((?:[A-Za-z]:[/\\]|\\\\|\/)[^\r\n]*?)\1/);
+  const bare = quoted ? undefined : text.match(/(?:^|[\s:(])((?:[A-Za-z]:[/\\]|\\\\|\/)[^'"\x60\r\n,]+)/);
+  const found = (quoted?.[2] ?? bare?.[1])?.trim();
+  // Some shell diagnostics print escaped whitespace rather than quoting it.
+  // Windows backslashes are separators and must retain their original bytes.
+  return found && !/^(?:[A-Za-z]:[/\\]|\\\\)/.test(found) ? found.replace(/\\([ \t'"\x60\\()])/g, '$1') : found;
 }
 
 // A diagnostic can name either platform's absolute path, regardless of the

@@ -9,7 +9,19 @@
  * roots to the verifier. Nothing here ever widens a write scope, and nothing
  * under a credential, host-configuration or home-directory root is grantable.
  */
-import { closeSync, constants, lstatSync, mkdtempSync, openSync, readSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  lstatSync,
+  mkdtempSync,
+  openSync,
+  readSync,
+  readlinkSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+} from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { matchesAny, pathsOverlap } from './glob.mjs';
@@ -188,7 +200,7 @@ const prefixOf = (file) => {
   return basename(directory) === 'bin' ? dirname(directory) : directory;
 };
 const prefixOfDirectory = (directory) => (basename(directory) === 'bin' ? dirname(directory) : directory);
-const runnableIn = (root) => ['python3', 'python'].map((name) => join(root, 'bin', name)).find((path) => statOf(path)?.isFile());
+const runnableIn = (root) => ['python', 'python3'].map((name) => join(root, 'bin', name)).find((path) => statOf(path)?.isFile());
 
 function pyvenvHome(root) {
   try {
@@ -217,6 +229,33 @@ function startsWithShebang(file) {
 }
 // Roots that contain nothing outside another root add no access.
 const minimal = (roots) => roots.filter((root) => !roots.some((other) => other !== root && within(root, other)));
+
+// realpath gives the final executable but hides intermediate directory links.
+// Seatbelt also checks those nodes (for example uv's version alias). Preserve
+// only exact metadata access to validated hops, never another readable tree.
+function symlinkMetadataPaths(interpreter, roots, context) {
+  let pending = resolve(interpreter).split(sep).filter(Boolean);
+  let current = sep;
+  let links = 0;
+  const metadata = new Set();
+  while (pending.length) {
+    current = join(current, pending.shift());
+    const stat = statOf(current, { follow: false });
+    if (!stat) throw reject('the interpreter symlink path changed during resolution', 'not-found');
+    if (!stat.isSymbolicLink()) continue;
+    if (++links > 40) throw reject('the interpreter has too many symlink hops', 'symlink-path');
+    const target = safeRealpath(current);
+    if (!target) throw reject('the interpreter symlink path cannot be resolved', 'not-found');
+    if (!roots.some((root) => within(current, root)) && roots.some((root) => within(target, root) || within(root, target))) {
+      checkedPath(current);
+      assertGrantable(current, context);
+      metadata.add(current);
+    }
+    pending = [...resolve(dirname(current), readlinkSync(current)).split(sep).filter(Boolean), ...pending];
+    current = sep;
+  }
+  return [...metadata];
+}
 
 function resolveOne(declared, context) {
   const lexical = resolve(declared);
@@ -278,7 +317,8 @@ function resolveOne(declared, context) {
       `${declared} uses a symlink path outside the verifier grants; resolved path: ${safeRealpath(lexical)}. Declare the resolved path and use it in testCommand.`,
       'symlink-path',
     );
-  return { declared, kind, interpreter, location, roots: found };
+  const metadataPaths = symlinkMetadataPaths(interpreter, found, context);
+  return { declared, kind, interpreter, location, roots: found, ...(metadataPaths.length ? { metadataPaths } : {}) };
 }
 
 /**
@@ -293,7 +333,8 @@ export function resolveVerifierInterpreters(declared, context = {}) {
   const grants = normalized.map((entry) => resolveOne(entry, full));
   const roots = minimal(unique(grants.flatMap((grant) => grant.roots)));
   if (roots.length > MAX_ROOTS) throw reject(`the declared interpreters resolve to more than ${MAX_ROOTS} directories`, 'too-many');
-  return { declared: normalized, grants, roots };
+  const metadataPaths = unique(grants.flatMap((grant) => grant.metadataPaths || []));
+  return { declared: normalized, grants, roots, ...(metadataPaths.length ? { metadataPaths } : {}) };
 }
 
 /**
@@ -322,12 +363,25 @@ export function usableInterpreterRoots(roots, context = {}) {
 /** The runCommand option for a job's declared roots, or nothing when it declared none. */
 export function interpreterPathsOption(job) {
   if (!Array.isArray(job?.verifierInterpreterRoots) || !job.verifierInterpreterRoots.length) return {};
-  const interpreterPaths = usableInterpreterRoots(job.verifierInterpreterRoots, {
+  const context = {
     repoPath: job.repoPath,
     writeScope: [...(job.ownedPaths || []), ...(job.extraWritable || [])],
     denyRead: job.denyRead || [],
-  });
-  return interpreterPaths.length ? { interpreterPaths } : {};
+  };
+  const interpreterPaths = usableInterpreterRoots(job.verifierInterpreterRoots, context);
+  if (!interpreterPaths.length) return {};
+  let metadataPaths;
+  if (Array.isArray(job.verifierInterpreter) && job.verifierInterpreter.length) {
+    try {
+      metadataPaths = resolveVerifierInterpreters(job.verifierInterpreter, context).metadataPaths?.filter((path) => {
+        const target = safeRealpath(path);
+        return target && interpreterPaths.some((root) => within(target, root) || within(root, target));
+      });
+    } catch {
+      // A declaration that changed or vanished cannot acquire new access.
+    }
+  }
+  return { interpreterPaths, ...(metadataPaths?.length ? { interpreterMetadataPaths: metadataPaths } : {}) };
 }
 
 /** What offload_start/offload_job echo about a job's declaration. */
@@ -456,6 +510,7 @@ export async function probeVerifierInterpreter(
           requireSandbox: true,
           timeoutSec,
           interpreterPaths: resolved.roots,
+          ...(resolved.metadataPaths?.length ? { interpreterMetadataPaths: resolved.metadataPaths } : {}),
         });
         const lines = String(result?.stdout ?? '').split(/\r?\n/);
         const version = clip(
@@ -508,6 +563,7 @@ export async function probeVerifierInterpreter(
     interpreter: resolved.grants[0].interpreter,
     interpreters,
     readExecRoots: resolved.roots,
+    ...(resolved.metadataPaths?.length ? { metadataReadPaths: resolved.metadataPaths } : {}),
     ...(imports.length ? { imports } : {}),
     note: failed
       ? failed.phase === 'imports'

@@ -2,6 +2,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { compactReport, terminalStatuses } from './report.mjs';
+import { auditTestAssertions } from './test-assertion-audit.mjs';
 import { matchesAny, normalizePath, pathsOverlap } from './glob.mjs';
 import { parseKeyRef } from './secrets.mjs';
 import { isDeepSeekEndpoint, isOpenAIEndpoint, modelPolicyViolation } from './model-policy.mjs';
@@ -1327,6 +1328,7 @@ export class JobManager {
       patchRound: job.rounds || 0,
       files: audited.owned,
       allFiles: audited.all,
+      testAssertionChanges: auditTestAssertions(audited.allPatch, audited.all),
       scopeViolations: audited.violations,
       revertFiles: audited.revertPaths,
       discardedEphemeralOutputs: audited.discardedEphemeralOutputs,
@@ -2567,6 +2569,7 @@ export class JobManager {
                 after,
                 files: owned,
                 allFiles: all,
+                testAssertionChanges: auditTestAssertions(revertPatch, owned),
                 scopeViolations: violations,
                 revertFiles: revertPaths,
               });
@@ -5179,6 +5182,7 @@ export class JobManager {
           finalJob.patchRound = job.rounds || 0;
           finalJob.files = audited.owned;
           finalJob.allFiles = audited.all;
+          finalJob.testAssertionChanges = auditTestAssertions(audited.allPatch, audited.all);
           finalJob.revertFiles = audited.revertPaths;
           finalJob.scopeViolations = audited.violations;
           finalJob.discardedEphemeralOutputs = audited.discardedEphemeralOutputs;
@@ -5212,6 +5216,7 @@ export class JobManager {
           // only a compatibility fallback for injected test adapters.
           finalJob.files = owned;
           finalJob.allFiles = all;
+          finalJob.testAssertionChanges = auditTestAssertions(revertPatch, owned);
           finalJob.scopeViolations = violations;
           finalJob.revertFiles = revertFiles;
         }

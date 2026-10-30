@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { LocalTools, availableToolDefinitions } from '../../src/agent/tools.mjs';
 import {
+  WORKER_ASSERTION_PRESERVATION_RULE,
   WORKER_COMPLETION_RULE,
   WORKER_TEST_QUALITY_RULE,
   annotateRelevantPaths,
@@ -97,6 +98,30 @@ test('every worker prompt carries the falsifiable-assertions rule exactly once, 
   for (const prompt of prompts) {
     const lines = prompt.split('\n');
     assert.equal(lines.filter((line) => line === WORKER_TEST_QUALITY_RULE).length, 1);
+  }
+});
+test('every worker prompt preserves existing assertion intent and sends conflicts to finish.concerns', async () => {
+  for (const options of [
+    { ownedPaths: ['src/**'] },
+    { ownedPaths: ['src/**'], remainingTurns: 12 },
+    { ownedPaths: ['src/**'], allowCommand: false },
+    { ownedPaths: ['src/**'], serverVerifierConfigured: true },
+    { ownedPaths: ['src/**'], allowCommand: false, serverVerifierConfigured: true, remainingTurns: 12 },
+    { mode: 'report' },
+    { mode: 'report', allowCommand: false, remainingTurns: 12 },
+  ]) {
+    const prompt = await buildSystemPrompt(options);
+    const rules = prompt.split('\n').filter((line) => line === WORKER_ASSERTION_PRESERVATION_RULE);
+    assert.equal(rules.length, 1, JSON.stringify(options));
+    assert.match(rules[0], /Never edit, remove, weaken, or invert an existing assertion solely to make your change pass\./);
+    assert.match(rules[0], /Preserve its original behavioral intent/);
+    assert.match(rules[0], /if it conflicts with the requested change, leave the assertion unchanged/);
+    assert.match(rules[0], /report the conflict in finish.concerns\./);
+    assert.match(
+      rules[0],
+      /An exception requires the primary to explicitly identify the incorrect assertion and specify its intended correction/,
+    );
+    assert.match(rules[0], /a passing check alone is never authorization\./);
   }
 });
 test('the range guidance line appears only when a relevant path carries a line range', async () => {

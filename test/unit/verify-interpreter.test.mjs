@@ -487,3 +487,113 @@ test(
     );
   },
 );
+
+async function uvAliasVenv(t) {
+  const fixture = await sandboxRoot(t);
+  const repo = join(fixture.root, 'repo with spaces');
+  const venv = join(repo, '.venv');
+  const family = join(fixture.home, '.local', 'share', 'uv', 'python');
+  const base = join(family, 'cpython-3.13.13-macos');
+  const binary = await installation(base);
+  await symlink('python3.99', join(base, 'bin', 'python'));
+  await symlink('python', join(base, 'bin', 'python3'));
+  const alias = join(family, 'cpython-3.13-macos');
+  await symlink('cpython-3.13.13-macos', alias);
+  await mkdir(join(venv, 'bin'), { recursive: true });
+  await symlink(join(alias, 'bin', 'python3.99'), join(venv, 'bin', 'python'));
+  await symlink('python', join(venv, 'bin', 'python3'));
+  await writeFile(join(venv, 'pyvenv.cfg'), `home = ${join(alias, 'bin')}\n`);
+  return { ...fixture, repo, venv, family, base, binary, alias };
+}
+
+test(
+  'a uv-backed venv preserves only directory-alias metadata and prefers its bin/python invocation',
+  { skip: SYMLINK_SKIP || POSIX_SKIP },
+  async (t) => {
+    const { context, repo, venv, base, alias, family } = await uvAliasVenv(t);
+    const options = { ...context, repoPath: repo, writeScope: ['src/**', 'tests/**'] };
+    for (const declared of [venv, join(venv, 'bin', 'python'), join(venv, 'bin', 'python3')]) {
+      const resolved = resolveVerifierInterpreters(declared, options);
+      assert.deepEqual(resolved.roots, [venv, base]);
+      assert.deepEqual(resolved.metadataPaths, [alias]);
+      assert.deepEqual(resolved.grants[0].metadataPaths, [alias]);
+      assert.equal(resolved.grants[0].interpreter, declared === venv ? join(venv, 'bin', 'python') : declared);
+      assert.ok(!resolved.roots.includes(alias), 'the alias is never a readable interpreter subtree');
+      assert.ok(!resolved.roots.includes(family), 'the uv installation directory is never broadly readable');
+    }
+    const calls = [];
+    const probe = await probeVerifierInterpreter(venv, {
+      ...options,
+      run: async (command, options) => {
+        calls.push({ command, options });
+        return { code: 0, stdout: '3.13.13 (fake startup)\n', stderr: '' };
+      },
+    });
+    assert.equal(probe.status, 'ok');
+    assert.equal(probe.interpreter, join(venv, 'bin', 'python'));
+    assert.deepEqual(probe.readExecRoots, [venv, base]);
+    assert.deepEqual(probe.metadataReadPaths, [alias]);
+    assert.equal(calls[0].command, `'${join(venv, 'bin', 'python')}' -c "import sys; print(sys.version)"`);
+    assert.deepEqual(calls[0].options.interpreterPaths, [venv, base]);
+    assert.deepEqual(calls[0].options.interpreterMetadataPaths, [alias]);
+    assert.equal(calls[0].options.requireSandbox, true);
+  },
+);
+
+test(
+  'job interpreter metadata is derived from its declaration and restricted to its recorded roots',
+  { skip: SYMLINK_SKIP || POSIX_SKIP },
+  async (t) => {
+    const { context, repo, venv, base, alias } = await uvAliasVenv(t);
+    const resolved = resolveVerifierInterpreters(venv, { ...context, repoPath: repo });
+    const job = { repoPath: repo, ownedPaths: ['src/**'], verifierInterpreter: [venv], verifierInterpreterRoots: resolved.roots };
+    assert.deepEqual(interpreterPathsOption(job), { interpreterPaths: [venv, base], interpreterMetadataPaths: [alias] });
+    assert.deepEqual(interpreterPathsOption({ ...job, verifierInterpreter: undefined }), { interpreterPaths: [venv, base] });
+    assert.deepEqual(
+      interpreterPathsOption({ ...job, verifierInterpreterRoots: [venv] }),
+      { interpreterPaths: [venv] },
+      'metadata cannot grant access to an unrecorded base installation',
+    );
+    assert.deepEqual(interpreterPathsOption({ ...job, verifierInterpreterRoots: [] }), {});
+  },
+);
+
+test(
+  'retargeting a uv alias cannot add metadata or read roots for an unrecorded or unsafe installation',
+  { skip: SYMLINK_SKIP || POSIX_SKIP },
+  async (t) => {
+    const { root, home, context, repo, venv, base, alias } = await uvAliasVenv(t);
+    const resolved = resolveVerifierInterpreters(venv, { ...context, repoPath: repo });
+    const job = { repoPath: repo, ownedPaths: ['src/**'], verifierInterpreter: [venv], verifierInterpreterRoots: resolved.roots };
+    for (const target of [join(root, 'unrecorded-base'), join(home, '.ssh', 'unsafe-base')]) {
+      await installation(target);
+      await rm(alias);
+      await symlink(target, alias);
+      assert.deepEqual(
+        interpreterPathsOption(job),
+        { interpreterPaths: [venv, base] },
+        'a changed declaration cannot widen durable access',
+      );
+      if (target.includes('.ssh')) refusal(() => resolveVerifierInterpreters(venv, { ...context, repoPath: repo }), 'denied-root');
+      else
+        assert.ok(
+          resolveVerifierInterpreters(venv, { ...context, repoPath: repo }).roots.includes(target),
+          'the live target differs from the persisted grant',
+        );
+    }
+  },
+);
+
+test(
+  'metadata support for a venv does not allow declaring its external uv alias directly',
+  { skip: SYMLINK_SKIP || POSIX_SKIP },
+  async (t) => {
+    const { context, repo, venv, alias, base } = await uvAliasVenv(t);
+    const options = { ...context, repoPath: repo };
+    assert.deepEqual(resolveVerifierInterpreters(venv, options).metadataPaths, [alias]);
+    for (const declared of [alias, join(alias, 'bin', 'python'), join(alias, 'bin', 'python3')]) {
+      refusal(() => resolveVerifierInterpreters(declared, options), 'symlink-path');
+    }
+    assert.deepEqual(resolveVerifierInterpreters(base, options).roots, [base]);
+  },
+);

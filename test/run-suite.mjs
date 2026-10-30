@@ -99,15 +99,22 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
     ...[
       'a symlinked venv interpreter pulls in the installation it points at',
       'uv installation aliases outside canonical grants are refused with the resolved invocation path',
+      'a uv-backed venv preserves only directory-alias metadata and prefers its bin/python invocation',
+      'job interpreter metadata is derived from its declaration and restricted to its recorded roots',
+      'retargeting a uv alias cannot add metadata or read roots for an unrecorded or unsafe installation',
+      'metadata support for a venv does not allow declaring its external uv alias directly',
       'a symlinked skill copy is unreadable, never trusted as current',
     ].map((name) => [name, 'Windows symlink creation requires Developer Mode or elevation']),
     ...[
       'requires an available macOS sandbox',
       'requires a python3 that can create a virtualenv',
       'POSIX interpreter layouts are not applicable on Windows',
-    ].map((reason) => [
-      'macOS sandbox lets a verifier read and run a declared virtualenv but never write it, and undeclared interpreters stay denied',
-      reason,
+    ].flatMap((reason) => [
+      [
+        'macOS sandbox lets a verifier read and run a declared virtualenv but never write it, and undeclared interpreters stay denied',
+        reason,
+      ],
+      ['a declared in-repo virtualenv with spaces and an aliased base prefix runs through Core health with metadata-only hops', reason],
     ]),
     ...['requires a Homebrew Node on macOS', 'requires an available macOS sandbox'].map((reason) => [
       'macOS temp sockets support child IPC while outside sockets, symlink escapes and IP remain denied',

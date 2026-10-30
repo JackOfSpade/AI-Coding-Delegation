@@ -315,6 +315,7 @@ export function macosProfile({
   tempPath,
   cachePaths = [],
   interpreterPaths = [],
+  interpreterMetadataPaths = [],
   allowNetwork = false,
   allowTempSockets = false,
 }) {
@@ -326,7 +327,13 @@ export function macosProfile({
     throw new TypeError('denyRead must be relative glob strings');
   if (!Array.isArray(denyWrite) || denyWrite.some((path) => typeof path !== 'string'))
     throw new TypeError('denyWrite must be relative glob strings');
-  if (!Array.isArray(writablePaths) || !Array.isArray(readablePaths) || !Array.isArray(cachePaths) || !Array.isArray(interpreterPaths))
+  if (
+    !Array.isArray(writablePaths) ||
+    !Array.isArray(readablePaths) ||
+    !Array.isArray(cachePaths) ||
+    !Array.isArray(interpreterPaths) ||
+    !Array.isArray(interpreterMetadataPaths)
+  )
     throw new TypeError('sandbox writable/readable/cache/interpreter paths must be arrays');
   for (const value of [repoPath, gitDir, tempPath, ...writablePaths, ...readablePaths, ...cachePaths, ...interpreterPaths].filter(
     (value) => value !== undefined,
@@ -361,6 +368,10 @@ export function macosProfile({
     if (!isAbsolute(value)) throw new TypeError('sandbox interpreter paths must be absolute');
     return resolve(value);
   });
+  for (const path of interpreterMetadataPaths) {
+    seatbeltPath(path);
+    if (!isAbsolute(path)) throw new TypeError('sandbox interpreter metadata paths must be absolute');
+  }
   // Exact metadata on each server-controlled path ancestor permits path
   // traversal/getcwd without granting directory contents. This matters when
   // macOS presents a lexical `/var` path physically under `/private/var`.
@@ -369,12 +380,14 @@ export function macosProfile({
   // libraries; this grants no child data (and /opt/homebrew/etc remains
   // explicitly denied below).
   const traversalMetadata = new Set(['/opt']);
+  for (const path of interpreterMetadataPaths) traversalMetadata.add(path);
   for (const path of [
     root,
     resolvedTemp,
     ...resolvedReadable,
     ...resolvedCache,
     ...resolvedInterpreter,
+    ...interpreterMetadataPaths,
     dirname(MACOS_SHELL_SELECTOR),
   ].filter(Boolean))
     for (const parent of sandboxTraversalAncestors(path, dirname)) traversalMetadata.add(parent);
@@ -584,6 +597,7 @@ export async function runCommand(command, options = {}) {
     tempPath: options.tempPath || tmpdir(),
     cachePaths: options.cachePaths || [],
     interpreterPaths: options.interpreterPaths || [],
+    interpreterMetadataPaths: options.interpreterMetadataPaths || [],
     allowNetwork: options.allowNetwork === true,
   };
   const probeProfile = options.sandbox !== false && platform === 'darwin' ? compileSandboxProfile(profileInput) : undefined;
@@ -687,6 +701,7 @@ export async function runCommand(command, options = {}) {
             tempPath: sandboxTempPath,
             cachePaths: [...sandboxCachePaths, ...(options.tempPath ? [sandboxPath(options.tempPath)] : [])],
             interpreterPaths: sandboxInterpreterPaths,
+            interpreterMetadataPaths: options.interpreterMetadataPaths || [],
             allowNetwork: options.allowNetwork === true,
             allowTempSockets: true,
           })
