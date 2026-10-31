@@ -3339,11 +3339,9 @@ for (const [provider, label] of [
     try {
       await assert.rejects(
         () => harness.core.start(reviewInput(path)),
+        // The installer stores a keychain key on macOS, Linux and Windows alike, so the hint does not vary by platform.
         new RegExp(
-          `${label} worker key is unavailable${named}; ` +
-            (process.platform === 'darwin'
-              ? `save it with: node install\\.mjs --key=${provider}`
-              : 'run offload doctor or configure keyRef'),
+          `${label} worker key is unavailable${named}; save it with: node install\\.mjs --key=${provider} \\(from the Offload checkout\\)`,
         ),
       );
       assert.equal(harness.calls.length, 0);

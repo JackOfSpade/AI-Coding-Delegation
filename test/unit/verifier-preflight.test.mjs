@@ -514,3 +514,48 @@ test('narrowTestCommand never leaves an option without its value or a runner wit
     { command: 'node scripts/test-runner.js scripts/tests/a.js', drop: ['scripts/tests/diag.js'] },
   );
 });
+
+test('the path, comment, interpolation and import patterns resolve as before after the backtracking rewrite', (t) => {
+  const { root, write } = fixture(t);
+  write(
+    'tests/test_paths.py',
+    [
+      'import os',
+      'from pathlib import Path',
+      '   import numpy as np',
+      "A = Path(os.getcwd()).resolve().parent / 'out' / 'a'",
+      'os.makedirs(A)',
+      "B = 'gen/b'    # a comment, with # inside",
+      'os.makedirs(B)',
+    ].join('\n'),
+  );
+  write('test/interp.test.mjs', "import { mkdirSync } from 'node:fs';\nconst name = 'x';\nmkdirSync(`build/${name}/${{ a: 1 }.a}`);");
+  const py = preflightVerifier({ repoPath: root, testCommand: 'pytest tests/test_paths.py', writeScope: [] });
+  assert.deepEqual(
+    py.blocking.map((finding) => finding.target),
+    ['out/a', 'gen/b'],
+  );
+  assert.ok(py.warnings.some((warning) => warning.code === 'native-import'));
+  const js = preflightVerifier({ repoPath: root, testCommand: 'node --test test/interp.test.mjs', writeScope: [] });
+  assert.match(js.blocking[0].target, /^build\/x\//);
+});
+
+test('long adversarial source lines are scanned in linear time', (t) => {
+  const { root, write } = fixture(t);
+  const n = 80_000;
+  // Each input made the earlier patterns backtrack quadratically (seconds at this size).
+  const cases = {
+    'test/path.test.mjs': `const p = Path(${' '.repeat(n)}\nmkdirSync(p)`,
+    'test/resolve.test.mjs': `const p = Path(a)${'.resolve()'.repeat(n / 10)}x\nmkdirSync(p)`,
+    'test/interp.test.mjs': `const p = \`${'${{'.repeat(n / 3)}\`;\nmkdirSync(p);`,
+    'tests/test_comment.py': `p = 'x'${' '.repeat(n)}y\nos.makedirs(p)`,
+    'tests/test_lines.py': `\n${'\n'.repeat(n)}x`,
+    'tests/test_import.py': `\nimport ${' '.repeat(n)}x`,
+  };
+  for (const [path, text] of Object.entries(cases)) write(path, text);
+  const started = performance.now();
+  for (const path of Object.keys(cases))
+    preflightVerifier({ repoPath: root, testCommand: path.endsWith('.py') ? `pytest ${path}` : `node --test ${path}`, writeScope: [] });
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 2_000, `${Math.round(elapsed)} ms`);
+});

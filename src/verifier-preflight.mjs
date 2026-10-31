@@ -123,7 +123,7 @@ function localReferences(text, argv = []) {
     if (/^(['"])[^'"\\]*\1$/.test(expr)) return [expr.slice(1, -1)];
     if (expr.startsWith('`') && expr.endsWith('`') && !expr.includes('\\')) {
       const body = expr.slice(1, -1),
-        parts = body.split(/(\$\{[^}]+\})/);
+        parts = body.split(/(\$\{[^{}]+\})/);
       let result = [''];
       for (const part of parts) {
         const options = part.startsWith('${') ? values(part.slice(2, -1), depth + 1) : [part];
@@ -209,6 +209,26 @@ function callArguments(text, from) {
   return undefined;
 }
 
+// A `${...}` interpolation. It never spans another `{`, so a run of `${`
+// cannot be rescanned from every position.
+const INTERPOLATION = /\$\{[^{}]*\}/g;
+/** The index of the `)` closing the `(` just before `from`, skipping quoted text; -1 when unbalanced. */
+function closingParen(text, from) {
+  for (let i = from, depth = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"' || c === "'" || c === '`') {
+      const end = text.indexOf(c, i + 1);
+      if (end < 0) return -1;
+      i = end;
+    } else if (c === '(') depth++;
+    else if (c === ')') {
+      if (depth === 0) return i;
+      depth--;
+    }
+  }
+  return -1;
+}
+
 /**
  * Statically resolve a path expression in `file` to where it lands:
  * `{ kind: 'repo', path }` (relative to the worktree root, where the verifier
@@ -244,8 +264,8 @@ function resolvePathExpression(expression, context, depth = 0) {
   if (expr.startsWith('`') && expr.endsWith('`')) {
     const body = expr.slice(1, -1);
     const lead = /^\$\{([^}]+)\}(.*)$/s.exec(body);
-    if (lead) return append(resolvePathExpression(lead[1], context, depth + 1), lead[2].replace(/\$\{[^}]*\}/g, 'x'));
-    return literal(body.replace(/\$\{[^}]*\}/g, 'x'));
+    if (lead) return append(resolvePathExpression(lead[1], context, depth + 1), lead[2].replace(INTERPOLATION, 'x'));
+    return literal(body.replace(INTERPOLATION, 'x'));
   }
   if (/^(?:process\.cwd\(\)|os\.getcwd\(\)|(?:pathlib\.)?Path\.cwd\(\))$/.test(expr)) return { kind: 'repo', path: '' };
   if (/^(?:os\.)?tmpdir\(\)$|^process\.env\.(?:TMPDIR|TMP|TEMP)\b|^tempfile\.gettempdir\(\)$/.test(expr)) return { kind: 'tmp' };
@@ -259,15 +279,18 @@ function resolvePathExpression(expression, context, depth = 0) {
   )
     return literal(posix.join(fileDir || '.', match[2]));
   // Python: Path(__file__).resolve().parent.parent / 'x'
+  // The argument is found by matching its parenthesis, not by a lazy regex
+  // group, so a long expression cannot make the match backtrack.
+  const pathCall = /^(?:pathlib\.)?Path\(/.exec(expr);
+  const close = pathCall ? closingParen(expr, pathCall[0].length) : -1;
   if (
-    (match = /^(?:pathlib\.)?Path\(\s*(.+?)\s*\)((?:\.(?:resolve|absolute)\(\))*)((?:\.parent)*)((?:\s*\/\s*(['"])[^'"\\]*\5)*)$/s.exec(
-      expr,
-    ))
+    close > 0 &&
+    (match = /^((?:\.(?:resolve|absolute)\(\))*)((?:\.parent)*)((?:\s*\/\s*(['"])[^'"\\]*\4)*)$/.exec(expr.slice(close + 1)))
   ) {
-    let base = resolvePathExpression(match[1], context, depth + 1);
-    for (let n = match[3].split('.parent').length - 1; n > 0 && base?.kind === 'repo'; n--)
+    let base = resolvePathExpression(expr.slice(pathCall[0].length, close), context, depth + 1);
+    for (let n = match[2].split('.parent').length - 1; n > 0 && base?.kind === 'repo'; n--)
       base = { kind: 'repo', path: dirname(base.path) === '.' ? '' : dirname(base.path) };
-    for (const [, , part] of match[4].matchAll(/(['"])([^'"\\]*)\1/g)) base = append(base, part);
+    for (const [, , part] of match[3].matchAll(/(['"])([^'"\\]*)\1/g)) base = append(base, part);
     return base;
   }
   if ((match = /^(?:os\.path\.|path\.|posix\.)?dirname\((.+)\)$/s.exec(expr))) {
@@ -282,7 +305,7 @@ function resolvePathExpression(expression, context, depth = 0) {
     for (const part of parts.slice(1)) {
       // Literal segments join as written, so `..` climbs from the base;
       // interpolations become `x`.
-      const quoted = /^(['"])([^'"\\]*)\1$/.exec(part)?.[2] ?? /^`([^`]*)`$/.exec(part)?.[1].replace(/\$\{[^}]*\}/g, 'x');
+      const quoted = /^(['"])([^'"\\]*)\1$/.exec(part)?.[2] ?? /^`([^`]*)`$/.exec(part)?.[1].replace(INTERPOLATION, 'x');
       if (quoted !== undefined) base = append(base, quoted);
       else base = resolvePathExpression(part, context, depth + 1)?.kind === 'system' ? { kind: 'other' } : append(base, 'x');
     }
@@ -295,7 +318,12 @@ function resolvePathExpression(expression, context, depth = 0) {
     const pattern = new RegExp(`(?:\\b(?:const|let|var)\\s+${escaped}\\s*=|^[ \\t]*${escaped}\\s*=(?!=))\\s*([^;\\n]+)`, 'gm');
     let binding;
     for (const match of text.matchAll(pattern)) if (match.index < (at ?? text.length) && (!inCode || inCode(match.index))) binding = match;
-    if (binding) return resolvePathExpression(binding[1].replace(/\s+#.*$/, ''), { file, text, at: binding.index, inCode }, depth + 1);
+    if (binding) {
+      // A trailing Python comment: cut at the first `#` after whitespace, then the whitespace.
+      const comment = binding[1].search(/\s#/);
+      const value = comment < 0 ? binding[1] : binding[1].slice(0, comment).trimEnd();
+      return resolvePathExpression(value, { file, text, at: binding.index, inCode }, depth + 1);
+    }
   }
   return undefined;
 }
@@ -520,7 +548,7 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
     // Advisory only: common native dependencies can fail at import time even
     // when the interpreter declaration is accepted. Never import repo code here.
     if (
-      /(?:^|[;\n])\s*(?:from\s+(?:torch|numpy|scipy|tensorflow|jax|cv2|pandas)(?:[.\s])|import\s+[^;\n#]*\b(?:torch|numpy|scipy|tensorflow|jax|cv2|pandas)\b)/.test(
+      /(?:^|[;\n])[ \t]*(?:from\s+(?:torch|numpy|scipy|tensorflow|jax|cv2|pandas)(?:[.\s])|import\s[^;\n#]*\b(?:torch|numpy|scipy|tensorflow|jax|cv2|pandas)\b)/.test(
         text,
       )
     )
@@ -673,7 +701,7 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
     inspect(text, path);
     references(text, path, argv);
     if (path.endsWith('.py')) {
-      for (const [, module] of text.matchAll(/(?:^|\n)\s*(?:from|import)\s+([\w.]+)/g)) {
+      for (const [, module] of text.matchAll(/(?:^|\n)[ \t]*(?:from|import)\s+([\w.]+)/g)) {
         const target = module.replaceAll('.', '/');
         for (const candidate of [`${target}.py`, `${dirname(path)}/${target}.py`])
           if (available.has(candidate)) {

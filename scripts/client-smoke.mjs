@@ -25,13 +25,18 @@ const cleanEnv = {
   CLAUDE_CONFIG_DIR: join(home, '.claude'),
 };
 for (const name of ['ComSpec', 'PATHEXT', 'SystemRoot', 'TEMP', 'TMP']) if (process.env[name]) cleanEnv[name] = process.env[name];
-function run(command, args, label) {
+// A client --version probe is quick. The installer runs several client
+// commands of its own, each allowed 10 s, and on Windows each one starts
+// cmd.exe and Node, so its whole run needs more than any single step.
+const PROBE_TIMEOUT_MS = 10_000;
+const INSTALLER_TIMEOUT_MS = 120_000;
+function run(command, args, label, timeout = PROBE_TIMEOUT_MS) {
   const result = spawnSync(command, args, {
     cwd: root,
     env: cleanEnv,
     encoding: 'utf8',
     maxBuffer: 64 * 1024,
-    timeout: 10_000,
+    timeout,
     // Only the fixed client --version probes need Windows batch lookup.
     // Invoke Node directly so spaces in its path never enter cmd.exe parsing.
     shell: process.platform === 'win32' && command !== process.execPath,
@@ -56,9 +61,19 @@ function assertRegistrations(expected, installerResult) {
 }
 try {
   for (const client of clients) run(commands[client], ['--version'], `${client} --version`);
-  const installed = run(process.execPath, ['install.mjs', '--skip-key', `--clients=${requested}`], 'disposable-home install');
+  const installed = run(
+    process.execPath,
+    ['install.mjs', '--skip-key', `--clients=${requested}`],
+    'disposable-home install',
+    INSTALLER_TIMEOUT_MS,
+  );
   assertRegistrations(true, installed);
-  const uninstalled = run(process.execPath, ['install.mjs', '--uninstall', `--clients=${requested}`], 'disposable-home uninstall');
+  const uninstalled = run(
+    process.execPath,
+    ['install.mjs', '--uninstall', `--clients=${requested}`],
+    'disposable-home uninstall',
+    INSTALLER_TIMEOUT_MS,
+  );
   assertRegistrations(false, uninstalled);
   process.stdout.write(`client smoke passed install, registration, and uninstall for ${clients.join(', ')} using a disposable home\n`);
 } finally {
