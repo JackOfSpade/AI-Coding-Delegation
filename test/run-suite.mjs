@@ -47,6 +47,14 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
       'real sandbox: the command sees the applied diff, cannot write the primary, and can use its temp dir',
       'requires an available macOS sandbox',
     ],
+    [
+      'real sandbox: a project-root mkdtemp is denied in the primary check but passes in a scratch copy',
+      'requires an available macOS sandbox',
+    ],
+    [
+      'real sandbox: the extraWritable glob the preflight suggests lets the job verifier make that temp dir',
+      'requires an available macOS sandbox',
+    ],
     ['Darwin default roots accept /private/tmp and its /tmp alias after canonicalization', 'requires Darwin /private/tmp alias semantics'],
     [
       'a sandboxed command in the worktree imports a primary dependency, read-only, and cannot reach other host files',
@@ -95,7 +103,12 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
       'health reports verifierPython for a Python project, mirrors it into verifierDeps, and probes a declared interpreter',
       'the declared roots reach both the job verifier and applyThenVerify, and nothing else',
       'uv symlink declarations are rejected before a job or paid worker starts',
+      'an oversized pyvenv.cfg cannot derive an external interpreter read grant',
     ].map((name) => [name, 'POSIX interpreter layouts are not applicable on Windows']),
+    [
+      'diagnostic logging refuses hard links and repairs an existing public file mode before appending',
+      'requires POSIX file modes and hard links',
+    ],
     ...[
       'a symlinked venv interpreter pulls in the installation it points at',
       'uv installation aliases outside canonical grants are refused with the resolved invocation path',

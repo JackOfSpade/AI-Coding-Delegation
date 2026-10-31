@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, mkdir, readFile, readdir, stat, symlink, writeFile } from 'node:fs/promises';
 import * as nodeFs from 'node:fs/promises';
-import { constants, renameSync, symlinkSync, writeFileSync } from 'node:fs';
+import { constants, realpathSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -659,7 +659,9 @@ test('grep streams beyond the read_file window with bounded literal matching', a
 });
 test('grep searches only the requested subtree and uses raw discovered filenames', async () => {
   const { dir } = await fixture();
-  const root = await nodeFs.realpath(dir);
+  // The tools' root is PathPolicy's realpathSync form. On Windows the async
+  // realpath expands an 8.3 temp alias (RUNNER~1) that realpathSync keeps.
+  const root = realpathSync(path.resolve(dir));
   await mkdir(path.join(dir, 'nested'));
   await writeFile(path.join(dir, 'nested', '[notes].txt'), 'needle in notes');
   const opened = [];
