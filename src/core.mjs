@@ -892,18 +892,23 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
     (retrospectiveLog ||= config.retrospectiveLog || createRetrospectiveLog({ dir: config.retrospectiveLogDir }));
   const healthWithoutRepo = async (opts = {}) => {
     const listings = await Promise.all(
-      [...states.values()].map((state) =>
-        state.manager.listing({
+      [...states.values()].map(async (state) => {
+        const listing = await state.manager.listing({
           ...(opts.all !== undefined ? { all: opts.all } : {}),
           ...(opts.maxJobs !== undefined ? { maxJobs: opts.maxJobs } : {}),
-        }),
-      ),
+          ...(opts.detail !== undefined ? { detail: opts.detail } : {}),
+        });
+        // Compact rows omit `repo`; merged across repositories, each row still says which one it is.
+        return states.size > 1 ? { ...listing, jobs: listing.jobs.map((job) => ({ repo: state.repoPath, ...job })) } : listing;
+      }),
     );
     if (!listings.length) {
       // Same validation as a bound repository, with nothing to list.
       if (opts.all !== undefined && typeof opts.all !== 'boolean') throw new Error('all must be a boolean');
       if (opts.maxJobs !== undefined && (!Number.isInteger(opts.maxJobs) || opts.maxJobs < 1 || opts.maxJobs > 100))
         throw new Error('maxJobs must be an integer from 1 to 100');
+      if (opts.detail !== undefined && opts.detail !== 'compact' && opts.detail !== 'full')
+        throw new Error('detail must be compact or full');
     }
     const merged = mergeListings(listings, opts.maxJobs !== undefined ? { maxJobs: opts.maxJobs } : {});
     const scoped = opts.all !== true;
@@ -1196,6 +1201,9 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           // checkout, which makes a still-running MCP process stale only
           // after the job has already begun.
           runtimePreflight: { server: 'current' },
+          ...(loaded.config.limits.creditCooldownMinutes !== undefined
+            ? { creditCooldownMs: loaded.config.limits.creditCooldownMinutes * 60_000 }
+            : {}),
           turnBudget: {
             requested: requestedTurns,
             configured: loaded.config.limits.maxTurns,
@@ -1425,6 +1433,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       const listOptions = {
         ...(opts.all !== undefined ? { all: opts.all } : {}),
         ...(opts.maxJobs !== undefined ? { maxJobs: opts.maxJobs } : {}),
+        ...(opts.detail !== undefined ? { detail: opts.detail } : {}),
       };
       // `verifierInterpreter` makes health actually run the declared interpreter
       // inside the verifier sandbox, so the primary learns before spending a job.

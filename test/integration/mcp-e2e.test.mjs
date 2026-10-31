@@ -725,10 +725,11 @@ test(
       // Cancelling is the primary's own call: the retrospective keeps it as context, never as a reason for a prompt.
       const cancelled = await mcp.call('offload_job', { repoPath: repo, include: 'retrospective' });
       assert.ok(cancelled.signals.some((signal) => signal.code === 'cancelled-by-user' && signal.attributable === false));
+      // A finished compact row keeps the duration; its round clock is in the full row.
       const finished = (await mcp.call('offload_job', { repoPath: repo })).jobs.find((job) => job.jobId === started.jobId);
-      assert.ok(
-        Number.isFinite(Date.parse(finished.finishedAt)) && finished.durationSec >= running.durationSec && !('running' in finished),
-      );
+      assert.ok(finished.durationSec >= running.durationSec && !('running' in finished) && !('finishedAt' in finished));
+      const full = (await mcp.call('offload_job', { repoPath: repo, detail: 'full' })).jobs.find((job) => job.jobId === started.jobId);
+      assert.ok(Number.isFinite(Date.parse(full.finishedAt)));
       const time = lines(done.report).find((line) => line.startsWith('time: '));
       assert.match(time, /provider \d/, time);
       const [round] = done.timing.rounds;

@@ -100,5 +100,8 @@ test('runtime identity advertises the OpenAI credit tier as an additive capabili
   const identity = runtimeIdentity();
   assert.equal(identity.capabilities.openaiCreditTier, true);
   assert.equal(identity.capabilities.openaiFirst, true);
+  assert.equal(identity.capabilities.creditCooldown, true);
+  assert.equal(identity.capabilities.compactPreflight, true);
+  assert.equal(identity.capabilities.runnerScopedPreflight, true);
   assert.equal(identity.schemaRevision, 2, 'an additive capability does not bump the schema revision');
 });

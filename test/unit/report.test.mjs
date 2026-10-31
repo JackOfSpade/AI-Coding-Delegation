@@ -1710,3 +1710,24 @@ test('report names every provider hop actually taken, and a legacy creditFallbac
     'provider transition: claude-sonnet-5-5 -> deepseek-flash (explicit credit exhaustion; work and conversation retained)',
   ]);
 });
+
+test('a job started past cooling routes names the skipped routes, and only its own hops as transitions', () => {
+  const route = (model) => ({ type: 'openai-chat', baseUrl: 'https://x.test/v1', keyRef: 'env:K', model });
+  const executionProfile = {
+    ...route('gpt-6.1-sol'),
+    fallback: route('claude-opus-5-5'),
+    fallbacks: [route('claude-opus-5-5'), route('deepseek-flash')],
+  };
+  const creditCooldown = { sourceJobId: 'oj-20261030-a', exhaustedAt: '2026-10-30T20:00:00.000Z', until: '2026-10-30T20:30:00.000Z' };
+  const lines = (job) =>
+    compactReport({ id: 'oj-1', status: 'DONE_UNVERIFIED', executionProfile, creditFallback: true, creditCooldown, ...job })
+      .split('\n')
+      .filter((line) => /^provider (?:transition|cool-down):/.test(line));
+  assert.deepEqual(lines({ providerStage: 1, providerStartStage: 1 }), [
+    'provider cool-down: started on claude-opus-5-5, skipping gpt-6.1-sol (explicit credit exhaustion in oj-20261030-a at 2026-10-30T20:00:00.000Z; cool-down until 2026-10-30T20:30:00.000Z)',
+  ]);
+  assert.deepEqual(lines({ providerStage: 2, providerStartStage: 1 }), [
+    'provider cool-down: started on claude-opus-5-5, skipping gpt-6.1-sol (explicit credit exhaustion in oj-20261030-a at 2026-10-30T20:00:00.000Z; cool-down until 2026-10-30T20:30:00.000Z)',
+    'provider transition: claude-opus-5-5 -> deepseek-flash (explicit credit exhaustion; work and conversation retained)',
+  ]);
+});

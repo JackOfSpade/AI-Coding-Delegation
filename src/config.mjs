@@ -240,10 +240,13 @@ export function validateConfig(config) {
   if (!Object.hasOwn(config.profiles, config.default)) throw new ConfigError(`Default profile does not exist: ${config.default}`);
   if (!isPlainObject(config.limits)) throw new ConfigError('Config.limits must be an object');
   assertSafeKeys(config.limits);
-  assertAllowedKeys(config.limits, ['maxTurns', 'timeoutMinutes', 'maxUsd'], 'Config.limits');
+  assertAllowedKeys(config.limits, ['maxTurns', 'timeoutMinutes', 'maxUsd', 'creditCooldownMinutes'], 'Config.limits');
   numeric(config.limits.maxTurns, 'limits.maxTurns', 1, 1000, true);
   numeric(config.limits.timeoutMinutes, 'limits.timeoutMinutes', 1, 1440);
   numeric(config.limits.maxUsd, 'limits.maxUsd', 0, 10000);
+  // How long later starts skip a route after its explicit credit exhaustion; 0 disables.
+  if (config.limits.creditCooldownMinutes !== undefined)
+    numeric(config.limits.creditCooldownMinutes, 'limits.creditCooldownMinutes', 0, 1440);
   if (config.verifier !== undefined) {
     if (!isPlainObject(config.verifier)) throw new ConfigError('Config.verifier must be an object');
     assertSafeKeys(config.verifier);

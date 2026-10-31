@@ -317,7 +317,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     meta,
     spendLine,
     cacheLine,
-    ...verifierPreflightLines(job.verifierPreflight),
+    ...verifierPreflightLines(job.verifierPreflight, { lean }),
     remaining,
     ...timingLines(job, { lean, elapsed }),
     stallLine(stall),
@@ -708,13 +708,25 @@ function stripControls(value) {
 }
 function providerTransitionLines(job) {
   const stage = Number.isSafeInteger(job.providerStage) && job.providerStage > 0 ? job.providerStage : job.creditFallback === true ? 1 : 0;
+  // A job that began past route 0 under a credit cool-down took no hop for the routes it skipped.
+  const start = Number.isSafeInteger(job.providerStartStage) && job.providerStartStage > 0 ? Math.min(job.providerStartStage, stage) : 0;
   const execution = job.executionProfile;
   const routes = [execution, ...(execution?.fallbacks ?? (execution?.fallback ? [execution.fallback] : []))];
-  return Array.from(
-    { length: Math.min(stage, 2) },
-    (_, hop) =>
-      `provider transition: ${scalar(routes[hop]?.model)} -> ${scalar(routes[hop + 1]?.model)} (explicit credit exhaustion; work and conversation retained)`,
-  );
+  const cooldown = job.creditCooldown;
+  return [
+    start > 0 &&
+      `provider cool-down: started on ${scalar(routes[start]?.model)}, skipping ${routes
+        .slice(0, start)
+        .map((route) => scalar(route?.model))
+        .join(
+          ', ',
+        )} (explicit credit exhaustion${cooldown?.sourceJobId ? ` in ${scalar(cooldown.sourceJobId)}` : ''}${cooldown?.exhaustedAt ? ` at ${scalar(cooldown.exhaustedAt)}` : ''}; cool-down until ${scalar(cooldown?.until ?? 'unknown')})`,
+    ...Array.from(
+      { length: Math.max(0, Math.min(stage, 2) - start) },
+      (_, hop) =>
+        `provider transition: ${scalar(routes[start + hop]?.model)} -> ${scalar(routes[start + hop + 1]?.model)} (explicit credit exhaustion; work and conversation retained)`,
+    ),
+  ].filter(Boolean);
 }
 function scalar(value) {
   // Strip an entire terminal sequence before clipping. Clipping first could

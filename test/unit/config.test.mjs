@@ -433,3 +433,15 @@ test('only exact shipped shapes migrate; customized chains and Claude-name confl
   assert.deepEqual(result.config.profiles['claude-sonnet'], conflict.profiles['claude-sonnet']);
   assert.deepEqual(migrateLegacyCommandProfiles({}).migrated, []);
 });
+
+test('limits.creditCooldownMinutes is optional, 0 to 1440 minutes', () => {
+  const base = structuredClone(DEFAULT_CONFIG);
+  assert.equal(validateConfig(base).limits.creditCooldownMinutes, undefined);
+  for (const minutes of [0, 30, 1440])
+    assert.equal(
+      validateConfig({ ...base, limits: { ...base.limits, creditCooldownMinutes: minutes } }).limits.creditCooldownMinutes,
+      minutes,
+    );
+  for (const minutes of [-1, 1441, '30', Number.NaN])
+    assert.throws(() => validateConfig({ ...base, limits: { ...base.limits, creditCooldownMinutes: minutes } }), /creditCooldownMinutes/);
+});

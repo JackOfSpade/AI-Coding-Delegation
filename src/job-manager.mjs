@@ -31,7 +31,7 @@ import {
 import { isolatedDependencyReadPaths } from './worktree.mjs';
 import { classifyVerifierEnvironment, isVerifierEnvironmentKind } from './verify-env.mjs';
 import { continuationBlocker, promptCacheSummary } from './continuation.mjs';
-import { narrowTestCommand, preflightVerifier, verifierBlockingMessage } from './verifier-preflight.mjs';
+import { compactVerifierPreflight, narrowTestCommand, preflightVerifier, verifierBlockingMessage } from './verifier-preflight.mjs';
 import {
   expectedVerifierMs,
   sessionVerifierFailures,
@@ -173,7 +173,8 @@ const MAX_CONTINUE_TURNS = 500,
 // The no-argument job list: active jobs plus this server session's, newest first.
 const DEFAULT_LIST_JOBS = 20,
   MAX_LIST_JOBS = 100,
-  LIST_TASK_CHARS = 100;
+  LIST_TASK_CHARS = 100,
+  COMPACT_LIST_TASK_CHARS = 80;
 // Waiting for a worker to claim the round: `startedAt` still names an earlier round, if any.
 const QUEUED_STATUSES = new Set(['QUEUED', 'REPAIR_QUEUED']);
 // A job that has not finished a round or reported usage yet has no costUsd: it
@@ -504,6 +505,52 @@ function publicRoutes(job) {
 export function recordedProviderStage(job) {
   if (Number.isSafeInteger(job?.providerStage) && job.providerStage >= 0) return job.providerStage;
   return job?.creditFallback === true ? 1 : 0;
+}
+/**
+ * The route a job runs on now, for the job list: `stage` of `of` routes, and
+ * why it is past the first (a hop inside this job, or a start under another
+ * job's credit cool-down). Undefined for a job without a fallback chain.
+ */
+function activeRoute(job) {
+  const routes = publicRoutes(job);
+  if (!routes || routes.length < 2) return undefined;
+  const stage = Math.min(recordedProviderStage(job), routes.length - 1);
+  const start = Number.isSafeInteger(job.providerStartStage) ? job.providerStartStage : 0;
+  return {
+    stage,
+    of: routes.length,
+    model: routes[stage].model,
+    ...(stage > start ? { reason: 'credit-fallback' } : stage > 0 ? { reason: 'credit-cooldown' } : {}),
+  };
+}
+const safeCreditCooldown = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const fields = ['sourceJobId', 'exhaustedAt', 'until'].filter((key) => typeof value[key] === 'string' && value[key].length <= 128);
+  return fields.length ? Object.fromEntries(fields.map((key) => [key, value[key]])) : undefined;
+};
+// A credit-exhausted route is skipped by later starts for this long (Core
+// passes the configured limits.creditCooldownMinutes).
+export const DEFAULT_CREDIT_COOLDOWN_MS = 30 * 60_000;
+// Credit belongs to an account key on an endpoint, not to one model, so every
+// profile that uses the same key and endpoint shares a cool-down.
+const creditRouteKey = (route) =>
+  route && typeof route.baseUrl === 'string' ? JSON.stringify([route.type, route.baseUrl, route.keyRef ?? null]) : undefined;
+/**
+ * The newest explicit credit exhaustion per route among `jobs` (their
+ * recorded `providerTransitions`), within `windowMs` of `nowMs`.
+ */
+export function creditExhaustions(jobs, { nowMs, windowMs }) {
+  const newest = new Map();
+  for (const job of jobs) {
+    const chain = [job?.executionProfile, ...executionFallbacks(job?.executionProfile)];
+    for (const transition of Array.isArray(job?.providerTransitions) ? job.providerTransitions : []) {
+      const at = Date.parse(transition?.at ?? '');
+      const key = Number.isSafeInteger(transition?.from) ? creditRouteKey(chain[transition.from]) : undefined;
+      if (!key || !Number.isFinite(at) || at > nowMs || nowMs - at >= windowMs) continue;
+      if (!newest.has(key) || newest.get(key).atMs < at) newest.set(key, { atMs: at, jobId: job.id });
+    }
+  }
+  return newest;
 }
 function validExecutionProfile(value) {
   if (value == null) return true;
@@ -1553,7 +1600,32 @@ export class JobManager {
     // would reintroduce a time-of-check/time-of-use repository redirect.
     return { ...job, repoPath: this.repoPath };
   }
-  async start(input, { launch = true, turnBudget, runtimePreflight, signal } = {}) {
+  /**
+   * The route a new job starts on when an earlier job in this store hit an
+   * explicit credit exhaustion on the routes ahead of it within the cool-down:
+   * it starts on the first route not cooling down (the last route at worst),
+   * so it does not pay a refused first request. Undefined: start on route 0.
+   */
+  async #creditCooldownStart(execution, windowMs) {
+    const chain = [execution, ...executionFallbacks(execution)];
+    if (chain.length < 2 || !Number.isFinite(windowMs) || windowMs <= 0) return undefined;
+    const nowMs = this.#nowMs();
+    const exhausted = creditExhaustions(await this.store.list({ limit: Number.MAX_SAFE_INTEGER }), { nowMs, windowMs });
+    let stage = 0;
+    while (stage < chain.length - 1 && exhausted.has(creditRouteKey(chain[stage]))) stage++;
+    if (!stage) return undefined;
+    const newest = exhausted.get(creditRouteKey(chain[stage - 1]));
+    const oldest = Math.min(...chain.slice(0, stage).map((route) => exhausted.get(creditRouteKey(route)).atMs));
+    return {
+      stage,
+      view: {
+        sourceJobId: newest.jobId,
+        exhaustedAt: new Date(newest.atMs).toISOString(),
+        until: new Date(oldest + windowMs).toISOString(),
+      },
+    };
+  }
+  async start(input, { launch = true, turnBudget, runtimePreflight, signal, creditCooldownMs = DEFAULT_CREDIT_COOLDOWN_MS } = {}) {
     signal?.throwIfAborted();
     this.validate(input);
     assertVerifierCommand(input.testCommand);
@@ -1647,6 +1719,8 @@ export class JobManager {
         verifierPreflight.blockersAccepted = true;
       }
     }
+    const cooldown = await this.#creditCooldownStart(input.executionProfile, creditCooldownMs);
+    signal?.throwIfAborted();
     const branch = this.config.git ? await this.config.git.branch(repoPath) : git(repoPath, ['branch', '--show-current']);
     signal?.throwIfAborted();
     const head = this.config.git ? await this.config.git.head(repoPath) : git(repoPath, ['rev-parse', 'HEAD']);
@@ -1705,6 +1779,9 @@ export class JobManager {
         ...(verifierPreflight ? { verifierPreflight } : {}),
         ...(sizing?.budgetSizing ? { budgetSizing: sizing.budgetSizing } : {}),
         ...(runtimePreflight ? { runtimePreflight: structuredClone(runtimePreflight) } : {}),
+        ...(cooldown
+          ? { providerStage: cooldown.stage, providerStartStage: cooldown.stage, creditFallback: true, creditCooldown: cooldown.view }
+          : {}),
         repoPath,
         branch,
         head,
@@ -2003,6 +2080,7 @@ export class JobManager {
           let cappedFinishRecoveryState = job.cappedFinishRecovery;
           let budgetFinishRecoveryState = job.budgetFinishRecovery;
           let providerStageState = recordedProviderStage(job);
+          let providerTransitionsState = Array.isArray(job.providerTransitions) ? job.providerTransitions : [];
           const workerJob =
             job.assertionRepair?.round === (job.rounds || 0) ? { ...job, ownedPaths: job.assertionRepair.paths, extraWritable: [] } : job;
           // limits.timeoutMinutes bounds the worker round from its claim, as the
@@ -2034,8 +2112,15 @@ export class JobManager {
                 const routeCount = 1 + executionFallbacks(job.executionProfile).length;
                 const requested = event.providerStage ?? (event.creditFallback === true ? 1 : undefined);
                 if (Number.isSafeInteger(requested) && requested >= 1 && requested < routeCount && requested > providerStageState) {
+                  // When each route was refused, so later starts can skip it for the cool-down.
+                  const at = this.now().toISOString();
+                  providerTransitionsState = [
+                    ...providerTransitionsState,
+                    ...Array.from({ length: requested - providerStageState }, (_, hop) => ({ from: providerStageState + hop, at })),
+                  ].slice(-4);
                   providerStageState = requested;
                   progress.providerStage = requested;
+                  progress.providerTransitions = providerTransitionsState;
                   progress.creditFallback = true;
                 }
               }
@@ -3167,7 +3252,7 @@ export class JobManager {
         : {}),
     });
   }
-  public(job) {
+  public(job, { detail = 'compact' } = {}) {
     return {
       jobId: job.id,
       repo: job.repoPath,
@@ -3196,7 +3281,9 @@ export class JobManager {
       // primary can cancel before spending budget on a testCommand that
       // imports a package the worktree cannot resolve.
       ...(job.mode !== 'report' ? publicVerifierDeps(job) : {}),
-      ...(job.verifierPreflight ? { verifierPreflight: job.verifierPreflight } : {}),
+      ...(job.verifierPreflight
+        ? { verifierPreflight: detail === 'full' ? job.verifierPreflight : compactVerifierPreflight(job.verifierPreflight) }
+        : {}),
       ...(promptCacheSummary(job.usage) ? { promptCache: promptCacheSummary(job.usage) } : {}),
       ...(['BUDGET', 'TIMEOUT', 'FAILED'].includes(job.status) && continuationBlocker(job)
         ? { continuation: { resumable: false, reason: continuationBlocker(job) } }
@@ -3216,6 +3303,9 @@ export class JobManager {
       ...(job.workspaceRetained === true ? { workspaceRetained: true } : {}),
       ...(job.creditFallback === true || recordedProviderStage(job) > 0 ? { creditFallback: true } : {}),
       ...(recordedProviderStage(job) > 0 ? { providerStage: recordedProviderStage(job) } : {}),
+      ...(job.providerStartStage > 0 && safeCreditCooldown(job.creditCooldown)
+        ? { creditCooldown: safeCreditCooldown(job.creditCooldown) }
+        : {}),
       ...(publicRoutes(job) ? { routes: publicRoutes(job) } : {}),
       ...(safeProviderFailure(job.providerFailure) ? { providerFailure: safeProviderFailure(job.providerFailure) } : {}),
       ...(safeProviderFinishReason(job.providerFinishReason)
@@ -3268,7 +3358,12 @@ export class JobManager {
     if (final(job.status) && !applying) {
       this.lastWaitSignature.delete(id);
       const timing = detail === 'full' ? sanitizeTiming(job.timing) : undefined;
-      return { ...this.public(job), report: await this.#interactiveReport(job, { detail }), done: true, ...(timing ? { timing } : {}) };
+      return {
+        ...this.public(job, { detail }),
+        report: await this.#interactiveReport(job, { detail }),
+        done: true,
+        ...(timing ? { timing } : {}),
+      };
     }
     // A running round that has outlived its own limits. Its (kind, level) is part
     // of the change signature below: a new or worsened stall is returned once in
@@ -3317,7 +3412,7 @@ export class JobManager {
         },
       };
     this.lastWaitSignature.set(id, signature);
-    return { ...this.public(job), ...(cancel || {}), done: false, progress };
+    return { ...this.public(job, { detail }), ...(cancel || {}), done: false, progress };
   }
   /**
    * An applyThenVerify run still owns this job. Liveness is the journal owner's
@@ -3409,8 +3504,9 @@ export class JobManager {
    * the provider spend of the rows returned (each job's cumulative cost counted
    * once; jobs cut by maxJobs or scope are in `storeCostUsd` only).
    */
-  async listing({ all = false, maxJobs = DEFAULT_LIST_JOBS } = {}) {
+  async listing({ all = false, maxJobs = DEFAULT_LIST_JOBS, detail = 'compact' } = {}) {
     if (typeof all !== 'boolean') throw new Error('all must be a boolean');
+    assertDetail(detail);
     if (!Number.isInteger(maxJobs) || maxJobs < 1 || maxJobs > MAX_LIST_JOBS)
       throw new Error(`maxJobs must be an integer from 1 to ${MAX_LIST_JOBS}`);
     const stored = await this.store.list({ limit: Number.MAX_SAFE_INTEGER });
@@ -3430,9 +3526,10 @@ export class JobManager {
     const nowMs = this.#nowMs();
     return {
       jobs: shown.map((job) => ({
-        ...this.public(job),
+        ...(detail === 'full' ? this.public(job, { detail }) : this.#listingRow(job)),
+        ...(activeRoute(job) ? { activeRoute: activeRoute(job) } : {}),
         createdAt: job.createdAt,
-        ...this.#listingDetail(job, nowMs),
+        ...this.#listingDetail(job, nowMs, { lean: detail !== 'full' }),
         costUsd: costOf(job),
         rounds: job.rounds || 0,
       })),
@@ -3451,6 +3548,26 @@ export class JobManager {
     };
   }
   /**
+   * A compact list row: identity, status and what needs attention. The full
+   * job view (report text, sizing, routes, every preflight list) is one
+   * offload_job jobId call away, or every row's with detail "full".
+   */
+  #listingRow(job) {
+    const preflight = job.verifierPreflight;
+    return {
+      jobId: job.id,
+      status: job.status,
+      ...(job.mode === 'report' ? { mode: 'report' } : {}),
+      ...(job.profile ? { profile: job.profile } : {}),
+      ...(job.status === 'FAILED' && safeFailureKind(job.failureKind) ? { failureKind: safeFailureKind(job.failureKind) } : {}),
+      ...(Array.isArray(preflight?.blocking) && preflight.blocking.length
+        ? { verifierBlockers: `${preflight.blocking.length}${preflight.blockersAccepted ? ' accepted' : ''}` }
+        : {}),
+      ...(job.appliedUnverified ? { appliedUnverified: true } : {}),
+      ...(job.workspaceCleanupRequired === true ? { workspaceCleanupRequired: true } : {}),
+    };
+  }
+  /**
    * What a list row says beyond status and cost: a one-line redacted summary of
    * the brief (never the brief) and the latest round's clock. `startedAt` is
    * the worker's claim of that round, so a job still waiting in the queue has
@@ -3458,8 +3575,8 @@ export class JobManager {
    * terminal job's `finishedAt` closes the duration; an active one's duration
    * is elapsed so far and carries `running: true`.
    */
-  #listingDetail(job, nowMs) {
-    const task = redactedSummary(job.task, { max: LIST_TASK_CHARS, secrets: this.store?.secrets || [] });
+  #listingDetail(job, nowMs, { lean = false } = {}) {
+    const task = redactedSummary(job.task, { max: lean ? COMPACT_LIST_TASK_CHARS : LIST_TASK_CHARS, secrets: this.store?.secrets || [] });
     const started = QUEUED_STATUSES.has(job.status) ? NaN : Date.parse(job.startedAt ?? '');
     const done = final(job.status);
     const finished = done ? Date.parse(job.finishedAt ?? '') : NaN;
@@ -3467,8 +3584,9 @@ export class JobManager {
     const end = done ? finished : nowMs;
     return {
       ...(task ? { task } : {}),
-      ...(Number.isFinite(started) ? { startedAt: iso(started) } : {}),
-      ...(Number.isFinite(finished) ? { finishedAt: iso(finished) } : {}),
+      // A compact row keeps the duration, and an active round's start; the rest of the clock is in the full row.
+      ...(Number.isFinite(started) && (!lean || !done) ? { startedAt: iso(started) } : {}),
+      ...(Number.isFinite(finished) && !lean ? { finishedAt: iso(finished) } : {}),
       ...(Number.isFinite(started) && Number.isFinite(end)
         ? { durationSec: Math.max(0, Math.round((end - started) / 1000)), ...(done ? {} : { running: true }) }
         : {}),
@@ -3553,14 +3671,16 @@ export class JobManager {
     const windowed = tail !== undefined || limit !== undefined;
     if (windowed && !id) throw new Error('tail and limit require a jobId and include "log"');
     if (id && (all !== undefined || maxJobs !== undefined)) throw new Error('all and maxJobs apply only to the job list; omit jobId');
-    if (!id)
+    if (!id) {
+      assertDetail(detail);
       return {
-        ...(await this.listing({ ...(all !== undefined ? { all } : {}), ...(maxJobs !== undefined ? { maxJobs } : {}) })),
+        ...(await this.listing({ ...(all !== undefined ? { all } : {}), ...(maxJobs !== undefined ? { maxJobs } : {}), detail })),
         health: {
           ...(this.config.health ? await this.config.health() : { sandbox: 'unknown' }),
           verifierEnvironmentFailures: await this.verifierEnvironmentFailures(),
         },
       };
+    }
     const job = await this.#settleOrphanedWorker(await this.store.get(id));
     if (!['summary', 'diff', 'files', 'log'].includes(include)) throw new Error('include must be summary, diff, files, or log');
     if (windowed && include !== 'log') throw new Error('tail and limit apply only to include "log"');
@@ -3577,7 +3697,7 @@ export class JobManager {
     const stall = assessStall(job, this.#nowMs());
     const cancel = await this.#cancelState(job);
     const result = {
-      ...this.public(job),
+      ...this.public(job, { detail }),
       report: await this.#interactiveReport(job, { detail, ...(stall ? { stall } : {}) }),
       ...(stall ? { stall } : {}),
       ...(cancel || {}),
@@ -3636,7 +3756,8 @@ export class JobManager {
     // the marker and perform the owned terminal cleanup.
     if (!final(job.status) && !controller && ['QUEUED', 'REPAIR_QUEUED'].includes(job.status)) job = await get(id);
     const cancel = await this.#cancelState(job);
-    return { ...this.public(job), ...(cancel || {}), report: this.report(job) };
+    // The same compact view start and wait return: the full report is one offload_job detail "full" away.
+    return { ...this.public(job), ...(cancel || {}), report: this.report(job, { detail: 'compact' }) };
   }
   async continue(id, { extraTurns, extraUsd, note, launch = true } = {}) {
     if (extraTurns !== undefined && (!Number.isInteger(extraTurns) || extraTurns < 1 || extraTurns > MAX_CONTINUE_TURNS))

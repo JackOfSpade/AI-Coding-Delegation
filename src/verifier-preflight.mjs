@@ -64,6 +64,39 @@ function commandSegments(text) {
   return { segments: kept.map(([part]) => part), spans: kept.map(([, span]) => span), incomplete: !!quote };
 }
 
+// Options of a script interpreter that take the next word as their value.
+const VALUE_FLAGS = new Set([
+  '--import',
+  '--require',
+  '-r',
+  '--loader',
+  '--experimental-loader',
+  '--env-file',
+  '--conditions',
+  '-C',
+  '--input-type',
+  '--title',
+  '-W',
+  '-X',
+]);
+/**
+ * The index of the script word a `node`/`python`-style segment runs (its
+ * program; every later word is that program's argument), or -1 when the
+ * segment runs no script file (`-e`, `-c`, `-m`, `node --test`, another tool).
+ */
+const interpreter = (words) => /^(?:node(?:\d+)?|nodejs|bun|tsx|ts-node|python(?:\d+(?:\.\d+)?)?)$/.test(posix.basename(words[0] ?? ''));
+function interpreterScriptIndex(words) {
+  if (!interpreter(words)) return -1;
+  for (let index = 1; index < words.length; index++) {
+    const word = words[index];
+    if (word === '--') return index + 1 < words.length ? index + 1 : -1;
+    if (['-e', '--eval', '-p', '--print', '-c', '-m', '--test'].includes(word)) return -1;
+    if (!word.startsWith('-')) return index;
+    if (VALUE_FLAGS.has(word)) index++;
+  }
+  return -1;
+}
+
 // A deliberately small string grammar covers literal test lists and argv-based
 // group runners. No eval, module loading, arbitrary expressions or repo execution.
 function localReferences(text, argv = []) {
@@ -135,6 +168,11 @@ function localReferences(text, argv = []) {
 
 const SYSTEM_TEMP_PATH = /^\/(?:private\/)?(?:tmp|var\/folders)(?:\/|$)/;
 const MAX_FINDINGS = 24;
+// Findings a compact response or refusal names before counting the rest.
+const COMPACT_FINDINGS = 3;
+// Collected before runner scoping demotes some, so that a selected suite's
+// finding is never crowded out by the suites the runner was not given.
+const MAX_SCAN_FINDINGS = 256;
 // Calls that create or write a path. Only their first argument (Python: dir=)
 // is resolved; a call whose target cannot be resolved statically is ignored.
 const JS_WRITE_CALL = /\b(mkdtemp(?:Sync)?|mkdir(?:Sync)?|writeFile(?:Sync)?|appendFile(?:Sync)?|createWriteStream)\s*\(/g;
@@ -322,6 +360,14 @@ function writeFindings(text, file, { repoPath, writeScope }) {
   const findings = [];
   const add = (call, index, target, temp) => {
     if (!target || findings.length >= MAX_FINDINGS) return;
+    const before = findings.length;
+    record(call, index, target, temp);
+    // Not serialized: only runner scoping reads it.
+    for (const finding of findings.slice(before))
+      if (atModuleScope?.(index)) Object.defineProperty(finding, 'moduleScope', { value: true });
+  };
+  let atModuleScope;
+  const record = (call, index, target, temp) => {
     const line = lineOf(text, index);
     if (target.kind === 'system')
       findings.push({ code: 'system-temp-write', path: file, line, call, target: temp ? `${target.path}XXXXXX` : target.path });
@@ -361,6 +407,17 @@ function writeFindings(text, file, { repoPath, writeScope }) {
     return findings;
   }
   const inCode = codeMask(text, file.endsWith('.py'));
+  // A write at module scope runs whenever the file is imported, whatever a
+  // runner then selects; one inside a function or callback runs only if called.
+  const depth = new Int32Array(text.length + 1);
+  for (let i = 0, level = 0; i < text.length; i++) {
+    depth[i] = level;
+    if (!inCode(i)) continue;
+    if ('([{'.includes(text[i])) level++;
+    else if (')]}'.includes(text[i])) level = Math.max(0, level - 1);
+  }
+  atModuleScope = (index) =>
+    file.endsWith('.py') ? !/[ \t]/.test(text[text.lastIndexOf('\n', index - 1) + 1] ?? '') && depth[index] === 0 : depth[index] === 0;
   const context = (index) => ({ file, text, at: index, inCode });
   const calls = (pattern) => [...text.matchAll(pattern)].filter((match) => inCode(match.index));
   if (file.endsWith('.py')) {
@@ -448,7 +505,7 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
   const block = (findings) => {
     for (const finding of findings) {
       const key = `${finding.code}:${finding.path}:${finding.line}`;
-      if (blocking.length >= MAX_FINDINGS || seenWarnings.has(key)) continue;
+      if (blocking.length >= MAX_SCAN_FINDINGS || seenWarnings.has(key)) continue;
       seenWarnings.add(key);
       blocking.push(finding);
     }
@@ -474,9 +531,13 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
     if (/(?:['"`]\/?(?:bin\/)?ps['"`]|(?:^|[;&|]\s*|\s)ps\s+-)/m.test(text)) warn('process-inspection', path);
   };
   const queue = [];
+  // The suites a file-filtered runner is given, and what they import, are
+  // read ahead of the rest so the scan limits cannot leave them unread.
+  const urgent = [];
+  const pressing = new Set();
   const selected = new Set();
   const available = new Set(candidates);
-  const enqueue = (path, argv = []) => {
+  const enqueue = (path, argv = [], from) => {
     const key = JSON.stringify([path, argv]);
     if (selected.has(key) || !available.has(path)) return false;
     if (selected.size >= MAX_FILES * 2) {
@@ -484,7 +545,13 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
       return false;
     }
     selected.add(key);
-    queue.push({ path, argv });
+    const given = runners.some(
+      (runner) => runner.path === from && runner.operands.some((operand) => path === operand || path.endsWith(`/${operand}`)),
+    );
+    if (given || pressing.has(from)) {
+      pressing.add(path);
+      urgent.push({ path, argv });
+    } else queue.push({ path, argv });
     return true;
   };
   const references = (text, path, argv) => {
@@ -511,7 +578,7 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
       ]) {
         if (!available.has(target + suffix)) continue;
         edge(path, target + suffix);
-        enqueue(target + suffix, argv);
+        enqueue(target + suffix, argv, path);
         resolved = true;
         break;
       }
@@ -524,6 +591,9 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
   const named = new Set();
   // The top-level command's words and the files each one names, for narrowing.
   const words0 = [];
+  // Script runners given explicit test-file arguments (`node runner.js a.js`):
+  // a runner that loads every suite but runs only the ones it is given.
+  const runners = [];
   const command = (text, depth = 0) => {
     if (commands.has(text) || depth > 8) {
       limited = true;
@@ -538,6 +608,15 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
       const script = /\b(?:npm|pnpm|yarn)\s+(?:run\s+)?([\w:-]+)/.exec(words.join(' '))?.[1];
       const matched = words.map(() => new Set());
       if (depth === 0) words0.push({ words, spans: parsed.spans[segment], matched, script });
+      const scriptAt = interpreterScriptIndex(words);
+      if (scriptAt >= 0) {
+        const operands = words
+          .slice(scriptAt + 1)
+          .filter((word) => !word.startsWith('-') && TEST_CODE.test(word))
+          .map((word) => posix.normalize(word));
+        // Recorded without operands too: a runner some segment runs unfiltered is never scoped.
+        runners.push({ path: posix.normalize(words[scriptAt]), operands });
+      }
       for (let index = 0; index < words.length; index++) {
         const word = words[index].replace(/^--(?:import|require|loader)=/, '').replace(/^\.\//, '');
         if (['-e', '--eval', '-p', '--print', '-c'].includes(words[index])) {
@@ -573,12 +652,12 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
   const resolvedFiles = new Set();
   const cache = new Map();
   let commandBytes = 0;
-  for (let index = 0; index < queue.length; index++) {
+  for (let index = 0; urgent.length || index < queue.length;) {
     if (resolvedFiles.size >= MAX_FILES || bytes >= MAX_BYTES) {
       limited = true;
       break;
     }
-    const { path, argv } = queue[index];
+    const { path, argv } = urgent.length ? urgent.shift() : queue[index++];
     let text;
     try {
       text = cache.get(path) ?? read(path);
@@ -599,7 +678,7 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
         for (const candidate of [`${target}.py`, `${dirname(path)}/${target}.py`])
           if (available.has(candidate)) {
             edge(path, candidate);
-            enqueue(candidate);
+            enqueue(candidate, [], path);
           }
       }
     }
@@ -615,18 +694,68 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
   };
   // The test files the command names that run `file` (itself, or through imports).
   const testFilesFor = (file) => [...named].filter((root) => TEST_CODE.test(root) && reachable(root).has(file)).sort();
+  // A runner given test files (by path or bare name) runs only those suites
+  // even though it imports every one. Its suites are what it imports from the
+  // directories the selected ones are in; a write inside a suite it was not
+  // given is advisory, unless it sits at module scope (the import runs it).
+  // Whatever the runner reaches without passing through an unselected suite
+  // (a harness, a reporter) always runs and stays blocking. A runner that any
+  // segment runs without file arguments is never scoped, and a scope is
+  // trusted only when every file its selected suites reach was read.
+  const scopes = [...new Set(runners.map((runner) => runner.path))].flatMap((path) => {
+    const calls = runners.filter((runner) => runner.path === path);
+    if (!resolvedFiles.has(path) || calls.some((call) => !call.operands.length)) return [];
+    const operands = calls.flatMap((call) => call.operands);
+    const direct = [...(edges.get(path) ?? [])];
+    const selected = direct.filter((file) => operands.some((operand) => file === operand || file.endsWith(`/${operand}`)));
+    if (!selected.length) return [];
+    const closure = new Set(selected.flatMap((file) => [...reachable(file)]));
+    if (![...closure].every((file) => resolvedFiles.has(file))) return [];
+    const folders = new Set(selected.map((file) => dirname(file)));
+    const suites = direct.filter((file) => !selected.includes(file) && TEST_CODE.test(file) && folders.has(dirname(file)));
+    return suites.length ? [{ runner: path, selected, suites }] : [];
+  });
+  let advisory = [];
+  let scopedWarnings = 0;
+  if (scopes.length) {
+    const runnerPaths = new Set(scopes.map((scope) => scope.runner));
+    const unselectedSuites = new Set(scopes.flatMap((scope) => scope.suites));
+    const kept = new Set();
+    for (const root of [...named, 'testCommand', ...scopes.flatMap((scope) => scope.selected)])
+      if (!runnerPaths.has(root)) for (const file of reachable(root)) kept.add(file);
+    for (const file of runnerPaths)
+      if (!kept.has(file) && !unselectedSuites.has(file)) {
+        kept.add(file);
+        for (const next of edges.get(file) ?? []) if (!unselectedSuites.has(next)) runnerPaths.add(next);
+      }
+    const unselected = (path) => !kept.has(path) && scopes.find((scope) => scope.suites.some((suite) => reachable(suite).has(path)));
+    const demoted = blocking.filter((finding) => finding.path !== 'testCommand' && !finding.moduleScope && unselected(finding.path));
+    advisory = demoted.map((finding) => ({ ...finding, runner: unselected(finding.path).runner }));
+    blocking.splice(0, blocking.length, ...blocking.filter((finding) => !demoted.includes(finding)));
+    const before = warnings.length;
+    warnings.splice(0, warnings.length, ...warnings.filter((warning) => warning.path === 'testCommand' || !unselected(warning.path)));
+    scopedWarnings = before - warnings.length;
+  }
+  blocking.splice(MAX_FINDINGS);
   for (const finding of blocking) {
     const testFiles = finding.path === 'testCommand' ? [] : testFilesFor(finding.path);
     if (testFiles.length && !(testFiles.length === 1 && testFiles[0] === finding.path)) finding.testFiles = testFiles.slice(0, 8);
   }
   const result = {
-    status: blocking.length ? 'blocking' : warnings.length ? 'warning' : 'unknown',
+    status: blocking.length ? 'blocking' : warnings.length || advisory.length ? 'warning' : 'unknown',
     scannedFiles: resolvedFiles.size,
     resolvedFiles: [...resolvedFiles],
     commandBytes,
     limited: limited || !resolvedFiles.size,
     warnings,
     ...(blocking.length ? { blocking } : {}),
+    ...(scopes.length
+      ? {
+          scoped: scopes.map((scope) => ({ runner: scope.runner, files: scope.selected.sort().slice(0, MAX_FINDINGS) })),
+          ...(advisory.length ? { advisory: advisory.slice(0, MAX_FINDINGS), advisoryCount: advisory.length } : {}),
+          ...(scopedWarnings ? { scopedWarnings } : {}),
+        }
+      : {}),
     note: 'Static advisory; dynamic imports, runner configuration and external packages are not fully analyzed. No test was run.',
   };
   return { result, words: words0, named, testFilesFor, read };
@@ -665,19 +794,39 @@ function narrowCommandText(text, words0, drop) {
   for (const { words, spans, matched, script } of words0) {
     if (script) continue;
     const runner = segmentRunner(words);
+    const scriptAt = interpreterScriptIndex(words);
     const exclusions = [];
     let named = 0,
-      kept = 0;
+      kept = 0,
+      runnerFiles = 0,
+      runnerDropped = 0;
     for (const [index, files] of matched.entries()) {
       const tests = [...files].filter((file) => TEST_CODE.test(file));
       if (!tests.length) continue;
       named++;
+      if (scriptAt >= 0 && index > scriptAt) runnerFiles++;
       const dropped = tests.filter((file) => drop.has(file));
       if (!dropped.length) {
         kept++;
         continue;
       }
       if (tests.length === 1 && tests[0] === words[index].replace(/^\.\//, '')) {
+        // A preload (`--import x.mjs`) would leave its option without a value.
+        if (interpreter(words) && (scriptAt < 0 || index < scriptAt) && VALUE_FLAGS.has(words[index - 1]))
+          return {
+            reason: `${words[index]} is loaded by ${words[index - 1]} for the whole command, not run as a test file; remove that option by hand if it must go`,
+          };
+        // The program a `node runner.js a.js` segment runs: without it the
+        // interpreter would run its first argument, or nothing at all, so no
+        // rewrite of this word is executable as the same command.
+        if (index === scriptAt)
+          return {
+            reason:
+              index + 1 < words.length
+                ? `${words[index]} is the script this command runs and it is given arguments (${words.slice(index + 1, index + 3).join(' ')}${words.length > index + 3 ? ' …' : ''}); dropping it would run an argument as the program, so exclude the suites inside the runner instead`
+                : `${words[index]} is the script this command runs; dropping it would leave ${posix.basename(words[0])} with no program to run`,
+          };
+        if (scriptAt >= 0 && index > scriptAt) runnerDropped++;
         edits.push({ span: spans[index], text: '' });
       } else if (runner === 'node-test' && GLOB.test(words[index])) {
         const rest = tests.filter((file) => !drop.has(file));
@@ -694,6 +843,10 @@ function narrowCommandText(text, words0, drop) {
       for (const file of dropped) handled.add(file);
     }
     if (named && !kept) return { reason: 'every test file the command names would be dropped' };
+    if (runnerFiles && runnerDropped === runnerFiles)
+      return {
+        reason: `${words[scriptAt]} would get none of its test-file arguments and could then run every suite it loads; drop the suites by hand`,
+      };
     if (exclusions.length) edits.push({ span: [spans.at(-1)[1], spans.at(-1)[1]], text: ` ${exclusions.join(' ')}` });
   }
   let command = text;
@@ -758,15 +911,29 @@ const BLOCKING_ADVICE = {
     'the verifier can write only ownedPaths, extraWritable and its per-run TMPDIR; create it under os.tmpdir(), or declare it in extraWritable (never integrated)',
 };
 /** One line per blocking finding: file:line, the resolved target and the fix. */
-export function verifierBlockingLines(value) {
+export function verifierBlockingLines(value, { limit = MAX_FINDINGS } = {}) {
   if (!Array.isArray(value?.blocking)) return [];
-  return value.blocking
-    .filter((finding) => BLOCKING_ADVICE[finding?.code] && typeof finding.path === 'string')
-    .slice(0, MAX_FINDINGS)
+  const shown = value.blocking.filter((finding) => BLOCKING_ADVICE[finding?.code] && typeof finding.path === 'string');
+  const lines = shown
+    .slice(0, limit)
     .map(
       (finding) =>
         `verifier blocker: ${finding.path}${Number.isInteger(finding.line) ? `:${finding.line}` : ''}: ${finding.call || 'write'} ${finding.target} — ${BLOCKING_ADVICE[finding.code]}${finding.extraWritable ? ` (extraWritable: "${finding.extraWritable}")` : ''}${finding.testFiles?.length ? `; run by ${finding.testFiles.join(', ')}` : ''}`,
     );
+  return shown.length > lines.length
+    ? [...lines, `verifier blocker: ${shown.length - lines.length} more (detail "full" lists them)`]
+    : lines;
+}
+/** Writes in suites a file-filtered runner was not given: reported, never refused. */
+function verifierAdvisoryLines(value, { limit = MAX_FINDINGS } = {}) {
+  if (!Array.isArray(value?.advisory)) return [];
+  const total = Number.isInteger(value.advisoryCount) ? value.advisoryCount : value.advisory.length;
+  const files = [...new Set(value.advisory.filter((finding) => typeof finding?.path === 'string').map((finding) => finding.path))];
+  if (!files.length) return [];
+  const runner = value.advisory[0].runner;
+  return [
+    `verifier advisory: ${total} denied-write finding(s) in ${files.length === 1 ? files[0] : `${files.length} suites (${files.slice(0, limit).join(', ')}${files.length > limit ? ', …' : ''})`}, which ${runner || 'the runner'} imports but was not given as an argument; not refused (they fail the run only if the runner ignores its file arguments)`,
+  ];
 }
 const narrowingLine = (value) =>
   value?.suggestedTestCommand
@@ -780,7 +947,7 @@ export function verifierBlockingMessage(value) {
   return (
     [
       'verifier preflight refused the start: the testCommand runs writes the verifier sandbox is certain to deny, so the job would end VERIFY_ENV_FAILED after spending its budget.',
-      ...verifierBlockingLines(value),
+      ...verifierBlockingLines(value, { limit: COMPACT_FINDINGS }),
       narrowingLine(value),
       'Fix the tests, declare the listed extraWritable glob, drop the files from testCommand (and check them in the primary), or pass acceptVerifierBlockers: true to start anyway.',
     ]
@@ -791,8 +958,10 @@ export function verifierBlockingMessage(value) {
   );
 }
 
-export function verifierPreflightLines(value) {
+/** Report lines for a stored preflight; `lean` (the compact report) names at most three of each kind. */
+export function verifierPreflightLines(value, { lean = false } = {}) {
   if (!value || !Array.isArray(value.warnings)) return [];
+  const limit = lean ? COMPACT_FINDINGS : MAX_FINDINGS;
   const advice = {
     'native-import':
       'native Python imports may crash inside the verifier sandbox even with an accepted interpreter declaration; probe the dependencies with health verifierInterpreter + verifierImports before spending, and compare failures in the primary',
@@ -803,7 +972,8 @@ export function verifierPreflightLines(value) {
   };
   return [
     `verifier preflight: ${value.scannedFiles ?? 0} file(s) scanned; static advisory${value.limited ? ' (incomplete)' : ''}, not a sandbox test${value.blockersAccepted ? '; blocking findings accepted by the caller' : ''}`,
-    ...verifierBlockingLines(value),
+    ...verifierBlockingLines(value, { limit }),
+    ...verifierAdvisoryLines(value, { limit }),
     ...(value.previousFailures ?? []).map((failure) =>
       failure.inCommand?.length === 0 && failure.files?.length
         ? `verifier session note: ${failure.jobId} (${failure.kind}): ${failure.files.join(', ')} no longer run by this testCommand`
@@ -812,7 +982,68 @@ export function verifierPreflightLines(value) {
     narrowingLine(value),
     ...value.warnings
       .filter((w) => advice[w?.code] && typeof w.path === 'string')
-      .slice(0, 24)
+      .slice(0, limit)
       .map((w) => `verifier warning: ${w.path}: ${advice[w.code]}`),
+    lean && value.warnings.length > limit && `verifier warning: ${value.warnings.length - limit} more (detail "full" lists them)`,
   ].filter(Boolean);
+}
+
+const findingView = ({ code, path, line, call, target, extraWritable, runner }) => ({
+  code,
+  path,
+  ...(Number.isInteger(line) ? { line } : {}),
+  ...(call ? { call } : {}),
+  ...(target ? { target } : {}),
+  ...(extraWritable ? { extraWritable } : {}),
+  ...(runner ? { runner } : {}),
+});
+/**
+ * The preflight as start, cancel, wait and job responses carry it by default:
+ * counts and the first three findings (blocking, then advisory, then
+ * warnings). The stored record and detail "full" keep every list.
+ */
+export function compactVerifierPreflight(value) {
+  if (!value || typeof value !== 'object') return value;
+  const list = (key) => (Array.isArray(value[key]) ? value[key] : []);
+  const advisoryCount = Number.isInteger(value.advisoryCount) ? value.advisoryCount : list('advisory').length;
+  const findings = [
+    ...list('blocking').map((finding) => ({ severity: 'blocking', ...findingView(finding) })),
+    ...list('advisory').map((finding) => ({ severity: 'advisory', ...findingView(finding) })),
+    ...list('warnings').map(({ code, path }) => ({ severity: 'warning', code, path })),
+  ];
+  return {
+    ...(value.status ? { status: value.status } : {}),
+    scannedFiles: value.scannedFiles ?? 0,
+    limited: value.limited === true,
+    counts: {
+      blocking: list('blocking').length,
+      advisory: advisoryCount,
+      warnings: list('warnings').length,
+      resolvedFiles: list('resolvedFiles').length,
+      ...(list('previousFailures').length ? { previousFailures: list('previousFailures').length } : {}),
+    },
+    ...(findings.length ? { findings: findings.slice(0, COMPACT_FINDINGS) } : {}),
+    // Kept whole (a few per session): they name the files to exclude before spending again.
+    ...(list('previousFailures').length
+      ? {
+          previousFailures: list('previousFailures')
+            .slice(0, 8)
+            .map((failure) => ({
+              ...failure,
+              ...(Array.isArray(failure?.files) ? { files: failure.files.slice(0, 8) } : {}),
+              ...(Array.isArray(failure?.inCommand) ? { inCommand: failure.inCommand.slice(0, 8) } : {}),
+            })),
+        }
+      : {}),
+    ...(Array.isArray(value.scoped) ? { scoped: value.scoped.map(({ runner, files }) => ({ runner, files: (files ?? []).length })) } : {}),
+    ...(value.suggestedTestCommand ? { suggestedTestCommand: value.suggestedTestCommand } : {}),
+    ...(value.narrowing ? { narrowing: value.narrowing } : {}),
+    ...(Array.isArray(value.drop) && value.drop.length
+      ? { drop: value.drop.slice(0, COMPACT_FINDINGS), dropCount: value.drop.length }
+      : {}),
+    ...(value.blockersAccepted ? { blockersAccepted: true } : {}),
+    ...(findings.length > COMPACT_FINDINGS || list('resolvedFiles').length
+      ? { more: 'detail "full" (offload_job or offload_wait) lists every file and finding' }
+      : {}),
+  };
 }

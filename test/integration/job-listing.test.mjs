@@ -417,6 +417,7 @@ test('with no repository bound there is no working tree and the listing is empty
   assert.equal(everything.listing.scope, 'all');
   await assert.rejects(() => coreFor().job(undefined, { all: 'no' }), /all must be a boolean/);
   await assert.rejects(() => coreFor().job(undefined, { maxJobs: 101 }), /maxJobs must be an integer from 1 to 100/);
+  await assert.rejects(() => coreFor().job(undefined, { detail: 'verbose' }), /detail must be compact or full/);
 });
 
 test('with several repositories loaded the unbound list merges them newest first with summed counts', async () => {
@@ -443,6 +444,12 @@ test('with several repositories loaded the unbound list merges them newest first
       result.jobs.map((job) => job.jobId),
       [second.jobId, first.jobId],
     );
+    // Compact rows name their repository once the list merges several.
+    assert.equal(
+      result.jobs.every((job) => typeof job.repo === 'string' && job.repo.length > 0),
+      true,
+    );
+    assert.notEqual(result.jobs[0].repo, result.jobs[1].repo);
     assert.equal(result.listing.shown, 2);
     assert.equal(result.listing.omitted, 0);
     assert.equal(result.health.workingTree, undefined);
@@ -513,8 +520,21 @@ test('rows carry a redacted one-line task, the latest round clock and a running 
   ];
   const now = () => new Date(at('12:30:42'));
   const store = { list: async () => newestFirst(jobs), listOperational: async () => newestFirst(jobs), get: async () => undefined };
-  const { jobs: rows } = await new JobManager({ store, config: { sessionStartedAt: SESSION }, now }).job();
+  const listed = new JobManager({ store, config: { sessionStartedAt: SESSION }, now });
+  // The round's clock (startedAt, finishedAt) is in the full rows; compact rows keep the duration.
+  const { jobs: rows } = await listed.job(undefined, { detail: 'full' });
   const byId = Object.fromEntries(rows.map((job) => [job.jobId, job]));
+  const compact = Object.fromEntries((await listed.job()).jobs.map((job) => [job.jobId, job]));
+  assert.deepEqual(
+    [
+      compact.done.durationSec,
+      'startedAt' in compact.done,
+      'finishedAt' in compact.done,
+      compact.running.running,
+      compact.running.startedAt,
+    ],
+    [330, false, false, true, at('12:30:00')],
+  );
   assert.equal(byId.done.task, 'Add retries to the fetcher', 'a single line');
   assert.deepEqual(
     [byId.done.startedAt, byId.done.finishedAt, byId.done.durationSec, 'running' in byId.done],
@@ -577,4 +597,74 @@ test('an unknown cost is null on the row, never zero, beside the new detail fiel
   assert.equal(jobs[0].costUsd, null);
   assert.equal(listing.costUnknownJobs, 1);
   assert.equal(listing.totalCostUsd, 0, 'the total counts known costs only and the unknown ones are counted beside it');
+});
+
+test('the no-argument list is compact by default: 20 heavy jobs plus health stay under 10k characters', async () => {
+  const route = (provider, model) => ({
+    type: 'openai-chat',
+    baseUrl: `https://${provider}.example.test/v1`,
+    keyRef: `env:${provider}`,
+    model,
+  });
+  const executionProfile = {
+    ...route('openai', 'gpt-6.1-sol'),
+    fallback: route('anthropic', 'claude-opus-5-5'),
+    fallbacks: [route('anthropic', 'claude-opus-5-5'), route('deepseek', 'deepseek-flash')],
+  };
+  const heavy = (index) => ({
+    ...row(`oj-20261030-${String(index).padStart(32, '0')}`, index % 2 ? 'DONE_VERIFIED' : 'CANCELLED', {
+      createdAt: `2026-10-06T12:${String(10 + index).padStart(2, '0')}:00.000Z`,
+      costUsd: 1.234567,
+    }),
+    task: `Implement the interview helper render path number ${index} and keep the matcher regressions green across every suite`.repeat(3),
+    profile: 'opus',
+    executionProfile,
+    providerStage: index % 3 ? 1 : 0,
+    startedAt: `2026-10-06T12:${String(10 + index).padStart(2, '0')}:05.000Z`,
+    finishedAt: `2026-10-06T12:${String(10 + index).padStart(2, '0')}:59.000Z`,
+    verifierPreflight: {
+      status: 'blocking',
+      scannedFiles: 159,
+      resolvedFiles: Array.from({ length: 159 }, (_, file) => `scripts/tests/some-long-suite-name-${file}.js`),
+      warnings: [],
+      blocking: Array.from({ length: 24 }, (_, line) => ({
+        code: 'system-temp-write',
+        path: 'scripts/tests/job-diagnostics.js',
+        line,
+        target: '/tmp/x',
+      })),
+      blockersAccepted: true,
+    },
+    budgetSizing: {
+      source: 'auto',
+      maxTurns: 80,
+      files: Array.from({ length: 40 }, (_, file) => ({ path: `src/f${file}.js`, bytes: 1000 })),
+    },
+    mode: index === 3 ? 'report' : undefined,
+    reportText: 'r'.repeat(3_000),
+  });
+  const jobs = Array.from({ length: 20 }, (_, index) => heavy(index));
+  const health = async () => ({
+    sandbox: 'macos',
+    server: { notes: 'h'.repeat(1_400) },
+    workingTree: { clean: true, sample: 'w'.repeat(250) },
+  });
+  const m = manager(jobs, { config: { sessionStartedAt: SESSION, health } });
+  const result = await m.job();
+  assert.equal(result.jobs.length, 20);
+  const size = JSON.stringify(result).length;
+  assert.ok(size < 10_000, `compact list is ${size} characters`);
+  const first = result.jobs.find((job) => job.jobId.endsWith('1'));
+  assert.equal(first.verifierBlockers, '24 accepted');
+  assert.deepEqual(first.activeRoute, { stage: 1, of: 3, model: 'claude-opus-5-5', reason: 'credit-fallback' });
+  assert.ok(first.task.length <= 80);
+  for (const key of ['reportResult', 'budgetSizing', 'routes', 'repo', 'head', 'verifierPreflight', 'startedAt', 'finishedAt'])
+    assert.equal(key in first, false, key);
+  for (const key of ['jobId', 'status', 'profile', 'createdAt', 'task', 'durationSec', 'costUsd', 'rounds']) assert.ok(key in first, key);
+  // detail "full" keeps the full rows for a caller that wants them.
+  const full = await m.job(undefined, { detail: 'full' });
+  assert.equal(full.jobs[0].verifierPreflight.resolvedFiles.length, 159);
+  assert.ok(Array.isArray(full.jobs[0].routes));
+  assert.equal(typeof full.jobs[0].finishedAt, 'string');
+  await assert.rejects(() => m.job(undefined, { detail: 'everything' }), /detail must be compact or full/);
 });

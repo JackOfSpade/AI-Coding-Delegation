@@ -1230,7 +1230,8 @@ test('a blocking verifier finding refuses the start before any job or spend, unl
       { launch: false },
     );
     assert.equal(baseline.verifierPreflight.blockersAccepted, undefined);
-    assert.equal(baseline.verifierPreflight.blocking.length, 1);
+    // The start echo counts the blocker; the stored record keeps it.
+    assert.equal(baseline.verifierPreflight.counts.blocking, 1);
     await h.manager.cancel(baseline.jobId);
     assert.throws(() => validateJobRequest({ task: 't', ownedPaths: ['a'], acceptVerifierBlockers: 'yes' }), /must be boolean/);
     assert.throws(() => validateJobRequest({ task: 't', mode: 'report', acceptVerifierBlockers: true }), /verifier sandbox options/);

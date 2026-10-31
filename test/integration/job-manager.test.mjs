@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { existsSync, realpathSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { JobStore } from '../../src/store.mjs';
-import { JobManager, validateJobId, validateJobRequest } from '../../src/job-manager.mjs';
+import { JobManager, creditExhaustions, validateJobId, validateJobRequest } from '../../src/job-manager.mjs';
 import { terminalStatuses } from '../../src/report.mjs';
 import { gitPatchApplier, gitSnapshots } from '../../src/core.mjs';
 import { createIsolatedWorktree, openIsolatedWorktree, cleanupIsolatedWorktree } from '../../src/worktree.mjs';
@@ -3130,8 +3130,12 @@ test('start echoes persisted static verifier warnings before the worker is launc
   assert.equal(calls, 0);
   assert.equal(result.verifierPreflight.status, 'warning');
   assert.equal(result.verifierPreflight.scannedFiles, 2);
-  assert.equal(result.verifierPreflight.warnings.length, 3);
-  assert.deepEqual((await m.store.get(result.jobId)).verifierPreflight, result.verifierPreflight);
+  // The start echo is compact; the stored record keeps every list.
+  assert.equal(result.verifierPreflight.counts.warnings, 3);
+  assert.equal(result.verifierPreflight.findings.length, 3);
+  const stored = (await m.store.get(result.jobId)).verifierPreflight;
+  assert.equal(stored.warnings.length, 3);
+  assert.deepEqual((await m.job(result.jobId, { detail: 'full' })).verifierPreflight, stored);
   const report = (await m.job(result.jobId)).report;
   assert.match(report, /verifier warning:.*TMPDIR/);
   assert.match(report, /verifier warning:.*spawn EPERM/);
@@ -3596,4 +3600,163 @@ test('a provider_credit_fallback progress event persists a monotonic providerSta
   assert.equal(job.creditFallback, true);
   assert.equal(m.public(job).providerStage, 2);
   assert.equal(m.public(job).creditFallback, true);
+});
+
+test('an explicit credit exhaustion starts later jobs on the next route for the cool-down, and the list shows the active stage', async () => {
+  const route = (provider, model) => ({
+    type: 'openai-chat',
+    baseUrl: `https://${provider}.example.test/v1`,
+    keyRef: `env:${provider}`,
+    model,
+  });
+  const sol = route('openai', 'gpt-6.1-sol'),
+    opus = route('anthropic', 'claude-opus-5-5'),
+    flash = route('deepseek', 'deepseek-flash');
+  const executionProfile = { ...sol, fallback: opus, fallbacks: [opus, flash] };
+  // Another profile on the same OpenAI account shares its exhaustion.
+  const terraProfile = { ...route('openai', 'gpt-6.1-terra'), fallback: opus, fallbacks: [opus, flash] };
+  let clock = Date.parse('2026-10-30T20:00:00.000Z');
+  const gitDir = await mkdtemp(`${tmpdir()}/offload-jobs-`);
+  const stages = [];
+  let hop = true;
+  const m = new JobManager({
+    store: new JobStore({ gitDir }),
+    now: () => new Date(clock),
+    worker: {
+      run: async (job, api) => {
+        stages.push(job.providerStage ?? 0);
+        if (hop) await api.progress({ action: 'provider_credit_fallback', providerStage: 1, creditFallback: true });
+        return { status: 'DONE', summary: 'ok' };
+      },
+    },
+    runner: { verify: async (command) => ({ command, verdict: 'PASS', result: { code: 0, sandbox: 'macos' } }) },
+    snapshots: { create: async () => gitId, diff: async () => 'patch' },
+    config: { repoPath: process.cwd(), git: { branch: async () => 'main', head: async () => gitId } },
+  });
+  const settle = async (jobId) => {
+    for (let i = 0; i < 300 && !['DONE_VERIFIED', 'DONE_UNVERIFIED', 'FAILED'].includes((await m.store.get(jobId)).status); i++)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    return m.store.get(jobId);
+  };
+  const start = (profile = executionProfile, options = {}) =>
+    m.start({ task: 'x', ownedPaths: ['src/**'], executionProfile: profile, repoPath: process.cwd() }, options);
+
+  const first = await settle((await start()).jobId);
+  assert.equal(first.providerStage, 1);
+  assert.deepEqual(first.providerTransitions, [{ from: 0, at: '2026-10-30T20:00:00.000Z' }]);
+
+  hop = false;
+  clock += 10 * 60_000;
+  const second = await start(terraProfile);
+  assert.equal(second.providerStage, 1);
+  assert.deepEqual(second.creditCooldown, {
+    sourceJobId: first.id,
+    exhaustedAt: '2026-10-30T20:00:00.000Z',
+    until: '2026-10-30T20:30:00.000Z',
+  });
+  const secondDone = await settle(second.jobId);
+  assert.equal(stages.at(-1), 1, 'the worker begins on the fallback route');
+  assert.equal(secondDone.providerStartStage, 1);
+  // A cool-down start is not itself an exhaustion, so it never extends the cool-down.
+  assert.equal(secondDone.providerTransitions, undefined);
+  const report = (await m.job(second.jobId, { detail: 'full' })).report;
+  assert.match(report, /provider cool-down: started on claude-opus-5-5, skipping gpt-6\.1-terra \(explicit credit exhaustion in oj-/);
+  assert.doesNotMatch(report, /provider transition:/);
+
+  const listed = Object.fromEntries((await m.job(undefined, { all: true })).jobs.map((row) => [row.jobId, row.activeRoute]));
+  assert.deepEqual(listed[first.id], {
+    stage: 1,
+    of: 3,
+    model: 'claude-opus-5-5',
+    reason: 'credit-fallback',
+  });
+  assert.deepEqual(listed[second.jobId], {
+    stage: 1,
+    of: 3,
+    model: 'claude-opus-5-5',
+    reason: 'credit-cooldown',
+  });
+
+  // A configured cool-down of 0 disables it; past the window the primary is tried again.
+  assert.equal((await start(executionProfile, { creditCooldownMs: 0 })).providerStage, undefined);
+  clock += 21 * 60_000;
+  const later = await start();
+  assert.equal(later.providerStage, undefined);
+  assert.equal(later.creditCooldown, undefined);
+  await settle(later.jobId);
+  const fresh = Object.fromEntries((await m.job(undefined, { all: true })).jobs.map((row) => [row.jobId, row.activeRoute]));
+  assert.deepEqual(fresh[later.jobId], { stage: 0, of: 3, model: 'gpt-6.1-sol' });
+});
+
+test('a job whose every route but the last is cooling starts on the last; malformed or future records are ignored', async () => {
+  const route = (provider) => ({
+    type: 'openai-chat',
+    baseUrl: `https://${provider}.example.test/v1`,
+    keyRef: `env:${provider}`,
+    model: `${provider}-m`,
+  });
+  const executionProfile = { ...route('a'), fallback: route('b'), fallbacks: [route('b'), route('c')] };
+  const at = new Date(Date.now() - 60_000).toISOString();
+  const records = [
+    {
+      id: 'oj-a',
+      executionProfile,
+      providerTransitions: [
+        { from: 0, at },
+        { from: 1, at },
+      ],
+    },
+    { id: 'oj-bad', executionProfile, providerTransitions: [{ from: 'x', at }, { from: 2, at: '2999-01-01T00:00:00.000Z' }, { from: 2 }] },
+  ];
+  assert.equal(creditExhaustions(records, { nowMs: Date.now(), windowMs: 30 * 60_000 }).size, 2);
+  assert.equal(creditExhaustions(records, { nowMs: Date.now() + 30 * 60_000, windowMs: 30 * 60_000 }).size, 0);
+  const m = await manager({ run: async () => ({ status: 'DONE', summary: 'ok' }) });
+  for (const record of records) await m.store.create({ ...record, id: undefined, status: 'DONE_UNVERIFIED' });
+  const started = await m.start({ task: 'x', ownedPaths: ['src/**'], executionProfile, repoPath: process.cwd() });
+  assert.equal(started.providerStage, 2);
+  assert.deepEqual(m.public(await m.store.get(started.jobId)).routes, [
+    { provider: 'openai-compatible', model: 'a-m' },
+    { provider: 'openai-compatible', model: 'b-m' },
+    { provider: 'openai-compatible', model: 'c-m', active: true },
+  ]);
+});
+
+test('start, wait and job responses carry a compact verifier preflight unless detail is full', async () => {
+  const m = await manager({ run: async () => ({ status: 'DONE', summary: 'ok' }) });
+  const verifierPreflight = {
+    status: 'warning',
+    scannedFiles: 159,
+    resolvedFiles: Array.from({ length: 159 }, (_, index) => `scripts/tests/suite-${index}.js`),
+    limited: true,
+    warnings: [{ code: 'system-temp', path: 'scripts/tests/a.js' }],
+    advisory: Array.from({ length: 24 }, (_, index) => ({
+      code: 'system-temp-write',
+      path: 'scripts/tests/job-diagnostics.js',
+      line: index + 1,
+      call: 'mkdtempSync',
+      target: `/tmp/ic-${index}-XXXXXX`,
+      runner: 'scripts/test-runner.js',
+    })),
+    advisoryCount: 24,
+  };
+  const job = { id: 'oj-x', status: 'DONE_VERIFIED', repoPath: process.cwd(), verifierPreflight };
+  const compact = m.public(job).verifierPreflight;
+  assert.deepEqual(compact.counts, { blocking: 0, advisory: 24, warnings: 1, resolvedFiles: 159 });
+  assert.equal(compact.findings.length, 3);
+  assert.equal(JSON.stringify(m.public(job)).length < 2_000, true);
+  assert.deepEqual(m.public(job, { detail: 'full' }).verifierPreflight, verifierPreflight);
+  // Through the real start/wait/job paths too.
+  const started = await m.start({ task: 'x', ownedPaths: ['src/**'], repoPath: process.cwd() });
+  await m.store.update(started.jobId, { verifierPreflight });
+  const waited = await m.wait(started.jobId, { timeoutSec: 5 });
+  assert.equal(waited.verifierPreflight.resolvedFiles, undefined);
+  assert.equal(waited.verifierPreflight.counts.resolvedFiles, 159);
+  assert.equal((await m.wait(started.jobId, { timeoutSec: 0, detail: 'full' })).verifierPreflight.resolvedFiles.length, 159);
+  assert.equal((await m.job(started.jobId)).verifierPreflight.resolvedFiles, undefined);
+  assert.equal((await m.job(started.jobId, { detail: 'full' })).verifierPreflight.resolvedFiles.length, 159);
+  // Cancel answers with the same compact view, report included.
+  const cancelled = await m.cancel(started.jobId);
+  assert.equal(cancelled.verifierPreflight.resolvedFiles, undefined);
+  assert.equal(cancelled.report.split('\n').filter((line) => line.startsWith('verifier advisory:')).length, 1);
+  assert.ok(cancelled.report.length < (await m.job(started.jobId, { detail: 'full' })).report.length);
 });

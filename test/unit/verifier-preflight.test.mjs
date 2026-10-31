@@ -3,7 +3,13 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { narrowTestCommand, preflightVerifier, verifierBlockingMessage, verifierPreflightLines } from '../../src/verifier-preflight.mjs';
+import {
+  compactVerifierPreflight,
+  narrowTestCommand,
+  preflightVerifier,
+  verifierBlockingMessage,
+  verifierPreflightLines,
+} from '../../src/verifier-preflight.mjs';
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'offload-preflight-'));
@@ -323,4 +329,188 @@ test('narrowTestCommand uses runner exclusion flags for pytest directories', (t)
     command: '.venv/bin/python -m pytest tests -q --ignore=tests/test_b.py',
     drop: ['tests/test_b.py'],
   });
+});
+
+// The infinite-canvas shape: a runner statically imports every suite and runs
+// only the ones named on its command line (by bare file name).
+function runnerFixture(t, { suites = ['a.js', 'b.js', 'diag.js'], extra = '' } = {}) {
+  const { root, write } = fixture(t);
+  write('scripts/stubs/register.mjs', '');
+  write(
+    'scripts/test-runner.js',
+    `${suites.map((name, index) => `import s${index} from './tests/${name}';`).join('\n')}\n${extra}const requested = process.argv.slice(2);\n`,
+  );
+  for (const name of suites) write(`scripts/tests/${name}`, 'export default [];');
+  write('scripts/tests/diag.js', "import { mkdtempSync } from 'node:fs';\nexport default [() => mkdtempSync('/tmp/diag-')];");
+  return { root, write };
+}
+const RUNNER = 'node --import ./scripts/stubs/register.mjs scripts/test-runner.js';
+
+test('a runner given test-file arguments scopes blocking findings to those suites; the rest are advisory', (t) => {
+  const { root } = runnerFixture(t);
+  const result = preflightVerifier({ repoPath: root, testCommand: `npm run lint && ${RUNNER} a.js b.js`, writeScope: ['src/**'] });
+  assert.equal(result.blocking, undefined);
+  assert.equal(result.status, 'warning');
+  assert.deepEqual(result.scoped, [{ runner: 'scripts/test-runner.js', files: ['scripts/tests/a.js', 'scripts/tests/b.js'] }]);
+  assert.equal(result.advisoryCount, 1);
+  assert.deepEqual(
+    result.advisory.map(({ code, path, target, runner }) => ({ code, path, target, runner })),
+    [{ code: 'system-temp-write', path: 'scripts/tests/diag.js', target: '/tmp/diag-XXXXXX', runner: 'scripts/test-runner.js' }],
+  );
+  // The unselected suite's advisory system-temp warning is not repeated either.
+  assert.equal(
+    result.warnings.some((warning) => warning.path === 'scripts/tests/diag.js'),
+    false,
+  );
+  assert.match(
+    verifierPreflightLines(result).join('\n'),
+    /verifier advisory: 1 denied-write finding\(s\) in scripts\/tests\/diag\.js, which scripts\/test-runner\.js imports but was not given/,
+  );
+  // Selecting the suite, or giving the runner nothing to filter by, still blocks.
+  assert.equal(preflightVerifier({ repoPath: root, testCommand: `${RUNNER} diag.js`, writeScope: [] }).blocking.length, 1);
+  assert.equal(preflightVerifier({ repoPath: root, testCommand: `${RUNNER} scripts/tests/diag.js`, writeScope: [] }).blocking.length, 1);
+  assert.equal(preflightVerifier({ repoPath: root, testCommand: RUNNER, writeScope: [] }).blocking.length, 1);
+  // Arguments the runner does not import select nothing, so nothing is demoted.
+  assert.equal(preflightVerifier({ repoPath: root, testCommand: `${RUNNER} missing.js`, writeScope: [] }).blocking.length, 1);
+});
+
+test('runner scoping keeps a write in a helper that a selected suite imports blocking', (t) => {
+  const { root, write } = runnerFixture(t);
+  write('scripts/tests/a.js', "import './shared.js';\nexport default [];");
+  write('scripts/tests/shared.js', "import { mkdirSync } from 'node:fs';\nmkdirSync('/tmp/shared');");
+  write(
+    'scripts/tests/diag.js',
+    "import './shared.js';\nimport { mkdtempSync } from 'node:fs';\nexport default [() => mkdtempSync('/tmp/diag-')];",
+  );
+  const result = preflightVerifier({ repoPath: root, testCommand: `${RUNNER} a.js`, writeScope: [] });
+  assert.deepEqual(
+    result.blocking.map((finding) => finding.path),
+    ['scripts/tests/shared.js'],
+  );
+  assert.deepEqual(
+    result.advisory.map((finding) => finding.path),
+    ['scripts/tests/diag.js'],
+  );
+});
+
+test('the suites a runner is given are read first, so the scan limits cannot skip them', (t) => {
+  // 300 suites imported ahead of the selected one exceed the 256-file scan limit.
+  const filler = Array.from({ length: 300 }, (_, index) => `filler-${index}.js`);
+  const { root, write } = runnerFixture(t, { suites: [...filler, 'a.js', 'diag.js'] });
+  write('scripts/tests/a.js', "import { writeFileSync } from 'node:fs';\nwriteFileSync('/tmp/a-out', '');\nexport default [];");
+  const result = preflightVerifier({ repoPath: root, testCommand: `${RUNNER} a.js`, writeScope: [] });
+  assert.equal(result.limited, true);
+  assert.deepEqual(
+    result.blocking.map((finding) => finding.path),
+    ['scripts/tests/a.js'],
+  );
+  assert.deepEqual(result.scoped, [{ runner: 'scripts/test-runner.js', files: ['scripts/tests/a.js'] }]);
+});
+
+test('narrowTestCommand never drops a runner script while keeping its arguments', (t) => {
+  const { root } = runnerFixture(t);
+  const narrowed = narrowTestCommand({
+    repoPath: root,
+    testCommand: `npm run lint && ${RUNNER} a.js b.js`,
+    files: ['scripts/tests/diag.js'],
+  });
+  assert.equal(narrowed.command, undefined);
+  assert.match(narrowed.reason, /scripts\/test-runner\.js is the script this command runs and it is given arguments \(a\.js b\.js\)/);
+  assert.deepEqual(narrowed.drop, ['scripts/test-runner.js']);
+  // Options and their values before the script do not count as the script.
+  assert.match(
+    narrowTestCommand({
+      repoPath: root,
+      testCommand: `node --env-file .env ${RUNNER.slice(5)} --grep x`,
+      files: ['scripts/test-runner.js'],
+    }).reason,
+    /is the script this command runs/,
+  );
+  // Without arguments, dropping it would leave `node --import …` with no program at all.
+  assert.match(
+    narrowTestCommand({ repoPath: root, testCommand: RUNNER, files: ['scripts/tests/diag.js'] }).reason,
+    /is the script this command runs; dropping it would leave node with no program to run/,
+  );
+  // An ordinary file operand after another file is still dropped.
+  assert.deepEqual(
+    narrowTestCommand({
+      repoPath: root,
+      testCommand: 'node --test scripts/tests/a.js scripts/tests/diag.js',
+      files: ['scripts/tests/diag.js'],
+    }),
+    { command: 'node --test scripts/tests/a.js', drop: ['scripts/tests/diag.js'] },
+  );
+});
+
+test('a compact preflight carries counts and the first three findings; refusals name three and count the rest', (t) => {
+  const { root, write } = fixture(t);
+  write('test/many.test.mjs', Array.from({ length: 8 }, (_, index) => `mkdirSync('/tmp/many-${index}');`).join('\n'));
+  const result = preflightVerifier({ repoPath: root, testCommand: 'node --test test/many.test.mjs', writeScope: [] });
+  assert.equal(result.blocking.length, 8);
+  const compact = compactVerifierPreflight({ ...result, resolvedFiles: Array.from({ length: 159 }, (_, index) => `f${index}.js`) });
+  assert.deepEqual(compact.counts, { blocking: 8, advisory: 0, warnings: 1, resolvedFiles: 159 });
+  assert.equal(compact.findings.length, 3);
+  assert.deepEqual(compact.findings[0], {
+    severity: 'blocking',
+    code: 'system-temp-write',
+    path: 'test/many.test.mjs',
+    line: 1,
+    call: 'mkdirSync',
+    target: '/tmp/many-0',
+  });
+  assert.equal('resolvedFiles' in compact, false);
+  assert.equal('blocking' in compact, false);
+  assert.match(compact.more, /detail "full"/);
+  assert.ok(JSON.stringify(compact).length < 1_500);
+  const message = verifierBlockingMessage(result);
+  assert.equal(message.match(/verifier blocker: test\/many/g).length, 3);
+  assert.match(message, /verifier blocker: 5 more \(detail "full" lists them\)/);
+  assert.equal(verifierPreflightLines(result, { lean: true }).filter((line) => line.startsWith('verifier blocker:')).length, 4);
+  assert.equal(verifierPreflightLines(result).filter((line) => line.startsWith('verifier blocker:')).length, 8);
+  assert.equal(compactVerifierPreflight(undefined), undefined);
+});
+
+test('runner scoping never demotes what always runs: runner helpers, module-scope suite writes, or an unfiltered second run', (t) => {
+  const { root, write } = runnerFixture(t, { extra: "import './harness.js';\n" });
+  write('scripts/harness.js', "import { mkdtempSync } from 'node:fs';\nexport const run = () => mkdtempSync('/tmp/harness-');");
+  write('scripts/tests/b.js', "import { mkdtempSync } from 'node:fs';\nconst dir = mkdtempSync('/tmp/b-');\nexport default [];");
+  const result = preflightVerifier({ repoPath: root, testCommand: `${RUNNER} a.js`, writeScope: [] });
+  // The harness the runner imports itself, and b.js's import-time write, still block.
+  assert.deepEqual(result.blocking.map((finding) => finding.path).sort(), ['scripts/harness.js', 'scripts/tests/b.js']);
+  // Only diag.js's write inside a test callback is advisory.
+  assert.deepEqual(
+    result.advisory.map((finding) => finding.path),
+    ['scripts/tests/diag.js'],
+  );
+  assert.equal('moduleScope' in JSON.parse(JSON.stringify(result.blocking[0])), false);
+  // A second segment that runs the same runner with no arguments runs every suite.
+  const unfiltered = preflightVerifier({ repoPath: root, testCommand: `${RUNNER} a.js && ${RUNNER}`, writeScope: [] });
+  assert.equal(unfiltered.scoped, undefined);
+  assert.ok(unfiltered.blocking.some((finding) => finding.path === 'scripts/tests/diag.js'));
+});
+
+test('narrowTestCommand never leaves an option without its value or a runner with none of its file arguments', (t) => {
+  const { root, write } = runnerFixture(t);
+  write('scripts/stubs/register.mjs', "import { mkdirSync } from 'node:fs';\nmkdirSync('/tmp/stub');");
+  assert.match(
+    narrowTestCommand({ repoPath: root, testCommand: `${RUNNER} a.js`, files: ['scripts/stubs/register.mjs'] }).reason,
+    /is loaded by --import for the whole command/,
+  );
+  // With paths as arguments, dropping every one would let the runner run all suites.
+  assert.match(
+    narrowTestCommand({
+      repoPath: root,
+      testCommand: 'node scripts/test-runner.js scripts/tests/diag.js',
+      files: ['scripts/tests/diag.js'],
+    }).reason,
+    /would get none of its test-file arguments/,
+  );
+  assert.deepEqual(
+    narrowTestCommand({
+      repoPath: root,
+      testCommand: 'node scripts/test-runner.js scripts/tests/a.js scripts/tests/diag.js',
+      files: ['scripts/tests/diag.js'],
+    }),
+    { command: 'node scripts/test-runner.js scripts/tests/a.js', drop: ['scripts/tests/diag.js'] },
+  );
 });
