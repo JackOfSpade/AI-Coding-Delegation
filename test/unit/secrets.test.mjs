@@ -284,6 +284,14 @@ test('macOS keychain writes pipe a long secret to security -i, never argv, and v
       (error) => error.code === 'E_SECRET_INVALID',
     );
 });
+test('macOS non-interactive store rejects services that need shell quoting', () => {
+  for (const svc of ['my svc', 'a"b', "a'b", 'a\\b'])
+    assert.throws(
+      () => storeKeychainSecret(svc, 'Valid-Secret_1', { platform: 'darwin', execFile: () => assert.fail('must not run') }),
+      (error) => error.code === 'E_SECRET_STORE_INTERACTIVE',
+      svc,
+    );
+});
 test('Windows Credential Locker transport keeps secret out of argv and uses stdin', () => {
   const calls = [];
   const secret = 'Windows-Only-Secret';

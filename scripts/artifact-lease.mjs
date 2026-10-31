@@ -72,10 +72,9 @@ export function artifactLeaseRoot({
 } = {}) {
   const paths = platform === 'win32' ? win32 : posix;
   const canonicalWorkspace = realpath(paths.resolve(cwd));
-  // realpath is authoritative; distinct case-sensitive NTFS directories must
-  // not be merged by spelling normalization after resolution.
-  const workspaceIdentity = canonicalWorkspace;
-  const digest = createHash('sha256').update(workspaceIdentity, 'utf8').digest('hex');
+  // realpath is authoritative and hashed as-is: distinct case-sensitive NTFS
+  // directories must not be merged by spelling normalization.
+  const digest = createHash('sha256').update(canonicalWorkspace, 'utf8').digest('hex');
   return paths.join(temporaryRoot, 'offload-artifact-leases', digest);
 }
 
@@ -131,33 +130,20 @@ export async function acquireArtifactLease({
   ensureDirectory(gitDir, platform);
   const manager = makeLeaseManager({ gitDir, platform });
   const inherited = environment?.[ARTIFACT_LEASE_ENV];
-  if (allowInherited && inherited !== undefined) {
-    const marker = parseArtifactLeaseMarker(inherited);
-    if (marker.workspace !== paths.basename(gitDir))
-      return acquireArtifactLease({
-        cwd,
-        environment: {},
-        platform,
-        allowInherited: false,
-        maxWaitMs,
-        retryMs,
-        now,
-        wait,
-        createId,
-        pid,
-        temporaryRoot,
-        realpath,
-        ensureDirectory,
-        makeLeaseManager,
-      });
+  const inheritedMarker = allowInherited && inherited !== undefined ? parseArtifactLeaseMarker(inherited) : undefined;
+  // A marker naming another workspace is ignored: this workspace acquires its own lease below.
+  if (inheritedMarker && inheritedMarker.workspace === paths.basename(gitDir)) {
     const held = manager
       .list()
       .some(
         (lease) =>
-          lease.jobId === marker.jobId && lease.ownerNonce === marker.ownerNonce && lease.pid === marker.pid && ownsArtifactPaths(lease),
+          lease.jobId === inheritedMarker.jobId &&
+          lease.ownerNonce === inheritedMarker.ownerNonce &&
+          lease.pid === inheritedMarker.pid &&
+          ownsArtifactPaths(lease),
       );
     if (!held) throw new Error('artifact lease marker does not name a live lease');
-    return { marker, markerValue: inherited, inherited: true, release: () => false };
+    return { marker: inheritedMarker, markerValue: inherited, inherited: true, release: () => false };
   }
 
   const marker = {

@@ -1,19 +1,18 @@
-import { bestEffort, fetchAbortable, readJsonAbortable } from './abort.mjs';
+import { readJsonAbortable } from './abort.mjs';
 import {
   DEFAULT_ATTEMPT_TIMEOUT_MS,
   ProviderError,
-  isLoopbackHost,
-  openAICreditExhausted,
-  retryDelay,
+  checkedBaseUrl,
+  collectAttempts,
+  normalizeOpenAISnapshot,
+  positive,
   validModel,
-  validToolIdentifier,
 } from './openai-chat.mjs';
-import { assertModelAllowed, isOpenAIEndpoint, modelPolicyViolation } from '../model-policy.mjs';
+import { assertModelAllowed, modelPolicyViolation } from '../model-policy.mjs';
+import { plainObject } from '../plain-object.mjs';
 import { MAX_OPENAI_REASONING_ITEMS, cloneOpenAIReasoning, validOpenAIReasoning } from '../openai-reasoning.mjs';
+import { MAX_MESSAGE_CHARS, MAX_TOOL_ARGUMENT_CHARS, MAX_TOOL_CALLS, validToolIdentifier } from '../transcript-limits.mjs';
 
-const MAX_TOOL_CALLS = 64;
-const MAX_TOOL_ARGUMENT_CHARS = 512_000;
-const MAX_MESSAGE_CHARS = 1_000_000;
 const MAX_OUTPUT_ITEMS = 1_024;
 const MAX_CONTENT_PARTS = 256;
 // OpenAI rejects a smaller output cap. Clamping it upward would silently spend
@@ -29,16 +28,6 @@ const TOOL_CHOICES = new Set(['auto', 'none', 'required']);
 const SMALL_OUTPUT_TOKENS = 1_024;
 const SMALL_OUTPUT_EFFORT = 'none';
 
-const positive = (value, name, fallback) => {
-  value ??= fallback;
-  if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${name} must be a non-negative integer`);
-  return value;
-};
-const isPlainRecord = (value) => {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-};
 const validText = (value, limit = MAX_MESSAGE_CHARS) => typeof value === 'string' && value.length <= limit;
 const validCounter = (value) => Number.isSafeInteger(value) && value >= 0;
 const invalidResponse = (message) => new ProviderError(message, { kind: 'response' });
@@ -106,7 +95,7 @@ function wireTools(tools) {
       !functionTool ||
       !validToolIdentifier(functionTool.name, 128) ||
       (functionTool.description !== undefined && !validText(functionTool.description, 8_000)) ||
-      !isPlainRecord(functionTool.parameters)
+      !plainObject(functionTool.parameters)
     )
       throw new ProviderError('Invalid tool definition');
     return {
@@ -131,12 +120,12 @@ function wireToolChoice(value) {
 // cache_write_tokens is a subset of the uncached input. A finite budget needs
 // every counter to reconcile; never repair a disagreement by guessing.
 function normalizeResponsesUsage(usage) {
-  if (!isPlainRecord(usage)) throw invalidResponse('Invalid response usage');
+  if (!plainObject(usage)) throw invalidResponse('Invalid response usage');
   const { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: totalTokens } = usage;
   if (!validCounter(inputTokens) || !validCounter(outputTokens)) throw invalidResponse('Invalid response usage');
   const inputDetails = usage.input_tokens_details ?? {};
   const outputDetails = usage.output_tokens_details ?? {};
-  if (!isPlainRecord(inputDetails) || !isPlainRecord(outputDetails)) throw invalidResponse('Invalid response usage details');
+  if (!plainObject(inputDetails) || !plainObject(outputDetails)) throw invalidResponse('Invalid response usage details');
   const cacheHitTokens = inputDetails.cached_tokens ?? 0;
   const cacheWriteTokens = inputDetails.cache_write_tokens ?? 0;
   const reasoningTokens = outputDetails.reasoning_tokens ?? 0;
@@ -159,7 +148,7 @@ function normalizeResponsesUsage(usage) {
 function finishReason(json) {
   if (json.status === 'completed') return undefined;
   if (json.status === 'incomplete') {
-    const reason = isPlainRecord(json.incomplete_details) ? json.incomplete_details.reason : undefined;
+    const reason = plainObject(json.incomplete_details) ? json.incomplete_details.reason : undefined;
     return reason === 'max_output_tokens' ? 'length' : reason === 'content_filter' ? 'content_filter' : 'other';
   }
   // failed, cancelled, queued, in_progress, or a status we do not know: a
@@ -171,7 +160,7 @@ function summaryParts(value) {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw invalidResponse('Invalid reasoning summary');
   return value.map((part) => {
-    if (!isPlainRecord(part) || part.type !== 'summary_text' || !validText(part.text)) throw invalidResponse('Invalid reasoning summary');
+    if (!plainObject(part) || part.type !== 'summary_text' || !validText(part.text)) throw invalidResponse('Invalid reasoning summary');
     return { type: 'summary_text', text: part.text };
   });
 }
@@ -181,7 +170,7 @@ function messageText(item) {
     throw invalidResponse('Invalid response message');
   return item.content
     .map((part) => {
-      if (!isPlainRecord(part)) throw invalidResponse('Invalid response message part');
+      if (!plainObject(part)) throw invalidResponse('Invalid response message part');
       if (part.type === 'output_text' && validText(part.text)) return part.text;
       if (part.type === 'refusal' && validText(part.refusal)) return part.refusal;
       throw invalidResponse('Unsupported response message part');
@@ -191,7 +180,7 @@ function messageText(item) {
 
 const validArguments = (value) => {
   try {
-    return isPlainRecord(JSON.parse(value || '{}'));
+    return plainObject(JSON.parse(value || '{}'));
   } catch {
     return false;
   }
@@ -205,7 +194,7 @@ function responseOutput(json) {
   const reasoning = [];
   const calls = [];
   for (const item of json.output) {
-    if (!isPlainRecord(item) || typeof item.type !== 'string') throw invalidResponse('Invalid response output item');
+    if (!plainObject(item) || typeof item.type !== 'string') throw invalidResponse('Invalid response output item');
     if (item.type === 'message') {
       const itemText = messageText(item);
       if (itemText) texts.push(itemText);
@@ -271,24 +260,14 @@ export class OpenAIResponsesProvider {
     thinking: _thinking,
     maxResponseBytes = 8_000_000,
   } = {}) {
-    let parsed;
-    try {
-      parsed = new URL(baseUrl);
-    } catch {
-      throw new TypeError('baseUrl must be an http(s) URL');
-    }
-    if (!['http:', 'https:'].includes(parsed.protocol)) throw new TypeError('baseUrl must be an http(s) URL');
-    if (parsed.protocol === 'http:' && !isLoopbackHost(parsed.hostname))
-      throw new TypeError('baseUrl must use HTTPS unless its host is loopback');
-    if (parsed.username || parsed.password || parsed.search || parsed.hash)
-      throw new TypeError('baseUrl must not contain credentials, query, or fragment');
+    const { parsed, baseUrl: normalizedBaseUrl } = checkedBaseUrl(baseUrl);
     if (!validModel(model)) throw new TypeError('model is required and must be a short control-free string');
     assertModelAllowed({ baseUrl: parsed.href, model });
     if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
     if (apiKey !== undefined && typeof apiKey !== 'string') throw new TypeError('apiKey must be a string');
     if (!headers || typeof headers !== 'object' || Array.isArray(headers)) throw new TypeError('headers must be an object');
     if (reasoningEffort !== undefined && !REASONING_EFFORTS.has(reasoningEffort)) throw new TypeError('reasoningEffort is invalid');
-    this.baseUrl = `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}`;
+    this.baseUrl = normalizedBaseUrl;
     this.apiKey = apiKey;
     this.model = model;
     this.fetch = fetchImpl;
@@ -315,73 +294,19 @@ export class OpenAIResponsesProvider {
       throw error;
     }
   }
-  async #collect(payload, externalSignal, retryLimit = this.retries) {
-    if (externalSignal?.aborted) throw externalSignal.reason ?? new Error('Aborted');
-    let last;
-    for (let attempt = 0; attempt <= retryLimit; attempt++) {
-      const controller = new AbortController();
-      let attemptTimedOut = false;
-      const timer = setTimeout(() => {
-        attemptTimedOut = true;
-        controller.abort();
-      }, this.timeoutMs);
-      const abort = () => controller.abort(externalSignal.reason ?? new Error('Aborted'));
-      externalSignal?.addEventListener('abort', abort, { once: true });
-      try {
-        const endpoint = new URL('responses', `${this.baseUrl}/`).href;
-        const response = await fetchAbortable(this.fetch, endpoint, {
-          method: 'POST',
-          signal: controller.signal,
-          redirect: 'error',
-          headers: {
-            ...this.headers,
-            'content-type': 'application/json',
-            ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}),
-          },
-          body: JSON.stringify(payload),
-        });
-        // Provider response bodies may contain an echoed prompt, credentials,
-        // or other untrusted data.  Never put them in an error/log path.
-        if (!response.ok) {
-          if (isOpenAIEndpoint(this.baseUrl) && [400, 402, 429].includes(response.status)) {
-            if (await openAICreditExhausted(response, controller.signal))
-              throw new ProviderError('OpenAI API credit is exhausted', {
-                status: response.status,
-                kind: 'credit_exhausted',
-                retryable: false,
-              });
-          }
-          bestEffort(() => response.body?.cancel?.());
-          throw new ProviderError(`Chat request failed (HTTP ${response.status})`, {
-            status: response.status,
-            retryable: response.status === 429 || response.status >= 500,
-            kind: 'http',
-          });
-        }
-        return await this.#readJson(response.body, controller.signal);
-      } catch (error) {
-        if (externalSignal?.aborted) throw externalSignal.reason ?? error;
-        // Fetch errors can include arbitrary remote text too. Preserve only
-        // our own ProviderError; otherwise expose a generic safe error,
-        // without retaining an error cause that logs may inspect.
-        const providerError = attemptTimedOut
-          ? new ProviderError('Provider request timed out', { kind: 'attempt_timeout', retryable: true, timeoutMs: this.timeoutMs })
-          : error instanceof ProviderError
-            ? error
-            : new ProviderError(/redirect/i.test(String(error?.message)) ? 'Provider redirect rejected' : 'Chat request failed', {
-                kind: /redirect/i.test(String(error?.message)) ? 'redirect' : 'transport',
-                retryable: !/redirect/i.test(String(error?.message)),
-              });
-        providerError.attempts = attempt + 1;
-        if (!providerError.retryable || attempt === retryLimit) throw providerError;
-        last = providerError;
-      } finally {
-        clearTimeout(timer);
-        externalSignal?.removeEventListener('abort', abort);
-      }
-      await retryDelay(Math.min(4_000, 250 * 2 ** attempt) + Math.floor(Math.random() * 125), externalSignal);
-    }
-    throw last;
+  #collect(payload, externalSignal, retryLimit = this.retries) {
+    return collectAttempts({
+      fetchImpl: this.fetch,
+      baseUrl: this.baseUrl,
+      path: 'responses',
+      headers: this.headers,
+      apiKey: this.apiKey,
+      payload,
+      timeoutMs: this.timeoutMs,
+      retryLimit,
+      externalSignal,
+      readBody: (body, signal) => this.#readJson(body, signal),
+    });
   }
   async *chat({ messages, tools, signal, retryLimit, ...options } = {}) {
     if (!Array.isArray(messages) || !Array.isArray(tools)) throw new TypeError('messages and tools must be arrays');
@@ -426,13 +351,12 @@ export class OpenAIResponsesProvider {
       signal,
       retryLimit,
     );
-    if (!isPlainRecord(json)) throw invalidResponse('Invalid response body');
+    if (!plainObject(json)) throw invalidResponse('Invalid response body');
     if (!validModel(json.model)) throw invalidResponse('Invalid response model');
     // OpenAI may echo the dated snapshot of the requested alias; it is the
     // same priced model. Any other model is reported as echoed, so AgentLoop's
     // reservation check can refuse to execute its tool calls.
-    const responseModel =
-      json.model.startsWith(requestModel) && /^-\d{4}-\d{2}-\d{2}$/.test(json.model.slice(requestModel.length)) ? requestModel : json.model;
+    const responseModel = normalizeOpenAISnapshot(json.model, requestModel);
     // Usage is checked first: an unaccountable response must never hand
     // AgentLoop text or tool calls to act on.
     const usage = normalizeResponsesUsage(json.usage);
@@ -454,4 +378,3 @@ export class OpenAIResponsesProvider {
     yield { providerFinishReason: stop };
   }
 }
-export const createOpenAIResponsesProvider = (options) => new OpenAIResponsesProvider(options);

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -15,6 +15,7 @@ import {
   validateExplicitRepoPath,
   validateJobId,
   validateJobRequest,
+  validateListingOptions,
 } from './job-manager.mjs';
 import { probeVerifierTemp, sandboxAvailable, sandboxStatus } from './sandbox.mjs';
 import { healthIdentity, runtimeIdentity } from './identity.mjs';
@@ -59,7 +60,6 @@ import { OpenAIResponsesProvider } from './provider/openai-responses.mjs';
 import { AnthropicMessagesProvider, resolveLatestAnthropicSonnet, resolveLatestAnthropicOpus } from './provider/anthropic-messages.mjs';
 import { CreditFallbackProvider } from './provider/fallback.mjs';
 import { resolveLatestDeepSeekFlash, resolveLatestOpenAI } from './provider/model-discovery.mjs';
-export { resolveLatestDeepSeekFlash, resolveLatestOpenAI };
 import { PathPolicy } from './policy.mjs';
 import { LocalTools, availableToolDefinitions } from './agent/tools.mjs';
 import { AgentLoop } from './agent/loop.mjs';
@@ -75,16 +75,19 @@ import {
   OFFLOAD_OPENAI_LATEST_TERRA,
   OFFLOAD_OPENAI_LATEST_SOL,
   OFFLOAD_DEEPSEEK_LATEST_FLASH,
+  isSupportedProviderType,
 } from './model-policy.mjs';
 import { resolveModel, validatePricingTable } from './pricing.mjs';
-import { readRegularFileSync } from './regular-file.mjs';
+import { MAX_TEXT_FILE_BYTES, readUtf8FileSync } from './regular-file.mjs';
 import { matchesAny } from './glob.mjs';
+import { insidePath } from './path-containment.mjs';
+import { terminalStatuses } from './report.mjs';
 import { assertVerifierCommand } from './verifier-command.mjs';
 
 // Repository discovery must not pass provider credentials, ambient Git
 // redirects, filters, hooks, or fsmonitor helpers to a repository command.
 const command = (repo, args) => snapshotGit(repo, args).trim();
-const MAX_PRICING_BYTES = 1024 * 1024;
+const MAX_PRICING_BYTES = MAX_TEXT_FILE_BYTES;
 // The Offload checkout this server runs from: the one a maintainer prompt names.
 const PACKAGE_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 // The configured verifier duration thresholds a job records at start; undefined keeps the defaults.
@@ -103,12 +106,7 @@ const handoffIdentity = (job) => ({
   runnerPid: job?.runnerPid,
   runnerHeartbeatAt: job?.runnerHeartbeatAt,
 });
-export function insidePath(path, parent, { relativePath = relative, isAbsolutePath = isAbsolute, platform = process.platform } = {}) {
-  const part = relativePath(parent, path);
-  // On Windows, `path.relative` returns an absolute target when paths live on
-  // different drives or UNC shares. That is never containment.
-  return !isAbsolutePath(part) && (part === '' || (part !== '..' && !part.startsWith(`..${platform === 'win32' ? '\\' : '/'}`)));
-}
+export { insidePath };
 /**
  * What the loop guard may call each absolute prefix when it records a failing
  * call for the primary. Both the lexical and the resolved form are listed
@@ -179,11 +177,18 @@ function nativeWindowsIntegrityVault({ execFile } = {}) {
   };
 }
 function pricingFile(path) {
+  try {
+    return readPricingFile(path);
+  } catch (error) {
+    throw new Error(`unable to load pricing file ${path}: ${error.message || error}`);
+  }
+}
+function readPricingFile(path) {
   let text;
   try {
-    text = new TextDecoder('utf-8', { fatal: true }).decode(readRegularFileSync(path, MAX_PRICING_BYTES));
+    text = readUtf8FileSync(path, MAX_PRICING_BYTES);
   } catch {
-    throw new Error('pricing file is invalid or exceeds 1048576 bytes');
+    throw new Error(`pricing file is invalid or exceeds ${MAX_PRICING_BYTES} bytes`);
   }
   let table;
   try {
@@ -402,6 +407,11 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
     injectedStoreRoot ||= repoPath;
     return store;
   };
+  const loadRepoConfig = (repoPath) => config.loaded || loadConfig({ configPath: config.configPath, repoPath });
+  const rememberSecret = (state, value) => {
+    state.store.secrets ||= [];
+    if (!state.store.secrets.includes(value)) state.store.secrets.push(value);
+  };
   const configuredWorker = (state) =>
     worker || {
       async run(job, api) {
@@ -409,6 +419,9 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         // and compares the freshly resolved credential fingerprint before this
         // worker can construct a provider.
         if (state.integrity) job = await state.store.get(job.id);
+        // The authenticated refetch returns the stored full-scope record. Re-derive the assertion-repair
+        // narrowing so the named pass can only touch its literal assertion files.
+        if (job.assertionRepair?.round === (job.rounds || 0)) job = { ...job, ownedPaths: job.assertionRepair.paths, extraWritable: [] };
         if (job.cappedFinishRecovery !== undefined && !['queued', 'consumed', 'settled'].includes(job.cappedFinishRecovery))
           throw new Error('stored job has invalid capped implementation recovery state');
         if (job.budgetFinishRecovery !== undefined && !['queued', 'consumed'].includes(job.budgetFinishRecovery))
@@ -416,13 +429,13 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         const execution = job.executionProfile;
         // Accepted jobs contain their resolved execution and budget snapshot. A
         // detached child must not require a still-valid mutable config/repo file.
-        const loaded = execution ? null : config.loaded || loadConfig({ configPath: config.configPath, repoPath: job.repoPath });
+        const loaded = execution ? null : loadRepoConfig(job.repoPath);
         const profileName = job.profile || loaded?.config.default;
         const configured = execution ? null : loaded.config.profiles[profileName];
         if (!execution && !configured) throw new Error(`unknown profile: ${profileName}`);
         const profile = execution ? { model: execution.model, effort: execution.effort } : configured;
         const providerConfig = execution || loaded.config.providers[configured.provider];
-        if (!['openai-chat', 'anthropic-messages'].includes(providerConfig?.type))
+        if (!isSupportedProviderType(providerConfig?.type))
           throw new Error(`unsupported provider type: ${providerConfig?.type || 'missing'}`);
         // Execution profiles contain a concrete model snapshot. A direct
         // embedded worker without one remains limited to ordinary configured
@@ -435,8 +448,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         } catch {
           throw new Error('worker key is unavailable; run offload doctor or configure keyRef');
         }
-        state.store.secrets ||= [];
-        if (!state.store.secrets.includes(key)) state.store.secrets.push(key);
+        rememberSecret(state, key);
         let provider = providerInstance(providerConfig, key, profile.model, {
           reasoningEffort: (job.effort || profile.effort) === 'high' ? 'high' : undefined,
         });
@@ -451,7 +463,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
             } catch {
               throw new Error('fallback worker key is unavailable; run offload doctor or configure keyRef');
             }
-            if (!state.store.secrets.includes(fallbackKey)) state.store.secrets.push(fallbackKey);
+            rememberSecret(state, fallbackKey);
             routes.push({
               provider: providerInstance(fallbackConfig, fallbackKey, fallbackConfig.model, {
                 reasoningEffort: (job.effort || fallbackConfig.effort) === 'high' ? 'high' : undefined,
@@ -507,11 +519,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           const pricePath = execution
             ? providerConfig.pricingFile
             : resolveConfigRelativePath(providerConfig.pricingFile, loaded.configPath);
-          try {
-            pricing = pricingFile(pricePath);
-          } catch (error) {
-            throw new Error(`unable to load pricing file ${pricePath}: ${error.message || error}`);
-          }
+          pricing = pricingFile(pricePath);
         }
         // Retained jobs also need an exact fallback price before any request;
         // an older/static execution snapshot must not bypass the start gate.
@@ -558,6 +566,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
             budgetCap: remainingTurns < 1 ? 'turns' : 'usd',
           };
         if (remainingTimeoutMs < 1) return { status: 'TIMEOUT', turn: 0, costUsd: 0, usage: {}, error: 'Cumulative job timeout exhausted' };
+        const serverVerifierConfigured = job.mode !== 'report' && typeof job.testCommand === 'string' && job.testCommand.trim().length > 0;
         const loop = new AgentLoop({
           provider,
           tools,
@@ -576,7 +585,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           persistBudgetFinishRecovery: api.progress,
           cappedFinishRecovery: job.cappedFinishRecovery,
           budgetFinishRecovery: job.budgetFinishRecovery,
-          serverVerifierConfigured: job.mode !== 'report' && typeof job.testCommand === 'string' && job.testCommand.trim().length > 0,
+          serverVerifierConfigured,
           ...(job.mode === 'report'
             ? {}
             : {
@@ -606,8 +615,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
                     repoPath: executionPath,
                     allowCommand: !!runCommand,
                     remainingTurns,
-                    serverVerifierConfigured:
-                      job.mode !== 'report' && typeof job.testCommand === 'string' && job.testCommand.trim().length > 0,
+                    serverVerifierConfigured,
                   }),
                   task: job.assertionRepair?.round === (job.rounds || 0) ? repair : job.task,
                 },
@@ -629,10 +637,10 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
     };
   const workerHealth = (root) => {
     try {
-      const loaded = config.loaded || loadConfig({ configPath: config.configPath, repoPath: root });
+      const loaded = loadRepoConfig(root);
       const profile = loaded.config.profiles[loaded.config.default];
       const provider = profile && loaded.config.providers[profile.provider];
-      if (loaded.disabled || !['openai-chat', 'anthropic-messages'].includes(provider?.type)) return false;
+      if (loaded.disabled || !isSupportedProviderType(provider?.type)) return false;
       // Resolve only as a boolean preflight; never place the key or resolver
       // diagnostics in a health response.
       const key = (config.resolveKey || resolveKeyRef)(provider.keyRef);
@@ -645,7 +653,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
   // first; health names it so every client, not only the Claude banner, sees it.
   const legacyRouting = (root) => {
     try {
-      const loaded = config.loaded || loadConfig({ configPath: config.configPath, repoPath: root });
+      const loaded = loadRepoConfig(root);
       const status = legacyRoutingStatus({ profiles: loaded.config.profiles, configPath: loaded.configPath });
       return status ? { legacyClaudeFirst: status } : {};
     } catch {
@@ -658,7 +666,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
   // rather than claiming `not-applicable`.
   const interpreterAllowlist = (root) => {
     try {
-      const loaded = config.loaded || loadConfig({ configPath: config.configPath, repoPath: root });
+      const loaded = loadRepoConfig(root);
       return loaded.config.verifier?.interpreterRoots ?? [];
     } catch {
       return [];
@@ -725,28 +733,24 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       verifierTmp: await verifierTmpHealth(),
     };
   };
-  const repoHints = (hint) =>
-    [
-      hint,
-      mcpRepoHint,
-      config.repoPath,
-      process.env.CLAUDE_PROJECT_DIR,
-      process.env.CODEX_PROJECT_DIR,
-      process.env.CURSOR_PROJECT_DIR,
-      process.cwd(),
-    ].filter((value) => typeof value === 'string' && value);
+  // Ordered client/project hints. process.cwd() is deliberately not here: a
+  // user-level MCP process is often launched from the offload clone, not the
+  // client project, so a no-id list must not bind that incidental cwd.
+  const hintCandidates = () =>
+    [mcpRepoHint, config.repoPath, process.env.CLAUDE_PROJECT_DIR, process.env.CODEX_PROJECT_DIR, process.env.CURSOR_PROJECT_DIR].filter(
+      (value) => typeof value === 'string' && value,
+    );
   const canonicalRepo = (hint) => {
-    let lastError;
     // An explicit path is authoritative. Falling back to the server cwd here
     // can silently run or inspect the wrong checkout after a client typo.
-    for (const candidate of hint ? [hint] : repoHints()) {
+    for (const candidate of hint ? [hint] : [...hintCandidates(), process.cwd()]) {
       try {
         return realpathSync(resolve(command(candidate, ['rev-parse', '--show-toplevel'])));
-      } catch (error) {
-        lastError = error;
+      } catch {
+        // Not a git working tree here; try the next candidate.
       }
     }
-    throw new Error(`repoPath must be inside a git working tree${lastError ? '' : ''}`);
+    throw new Error('repoPath must be inside a git working tree');
   };
   const makeState = async (repoPath, { exceptRecoveryIds = [] } = {}) => {
     const root = canonicalRepo(repoPath);
@@ -878,15 +882,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
     await get(state);
     return state;
   };
-  // A user-level MCP process is often launched from the offload clone, not
-  // the client project. Do not bind that incidental cwd for a no-id list.
-  const contextualRepoHint = (opts) =>
-    opts.repoPath ||
-    mcpRepoHint ||
-    config.repoPath ||
-    process.env.CLAUDE_PROJECT_DIR ||
-    process.env.CODEX_PROJECT_DIR ||
-    process.env.CURSOR_PROJECT_DIR;
+  const contextualRepoHint = (opts) => opts.repoPath || hintCandidates()[0];
   let retrospectiveLog;
   const retrospectiveHistory = () =>
     (retrospectiveLog ||= config.retrospectiveLog || createRetrospectiveLog({ dir: config.retrospectiveLogDir }));
@@ -902,14 +898,8 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         return states.size > 1 ? { ...listing, jobs: listing.jobs.map((job) => ({ repo: state.repoPath, ...job })) } : listing;
       }),
     );
-    if (!listings.length) {
-      // Same validation as a bound repository, with nothing to list.
-      if (opts.all !== undefined && typeof opts.all !== 'boolean') throw new Error('all must be a boolean');
-      if (opts.maxJobs !== undefined && (!Number.isInteger(opts.maxJobs) || opts.maxJobs < 1 || opts.maxJobs > 100))
-        throw new Error('maxJobs must be an integer from 1 to 100');
-      if (opts.detail !== undefined && opts.detail !== 'compact' && opts.detail !== 'full')
-        throw new Error('detail must be compact or full');
-    }
+    // Same validation as a bound repository, even with nothing to list.
+    if (!listings.length) validateListingOptions(opts);
     const merged = mergeListings(listings, opts.maxJobs !== undefined ? { maxJobs: opts.maxJobs } : {});
     const scoped = opts.all !== true;
     return {
@@ -943,11 +933,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       let identifier = providerConfig.pricing;
       if (!table && providerConfig.pricingFile) {
         const pricePath = resolveConfigRelativePath(providerConfig.pricingFile, loaded.configPath);
-        try {
-          table = pricingFile(pricePath);
-        } catch (error) {
-          throw new Error(`unable to load pricing file ${pricePath}: ${error.message || error}`);
-        }
+        table = pricingFile(pricePath);
         identifier ||= `file:${pricePath}`;
       }
       if (table) validatePricingTable(table);
@@ -1029,14 +1015,14 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       const state = await makeState(input?.repoPath);
       if (closing) throw new Error('offload core is shutting down');
       startSignal.throwIfAborted();
-      const loaded = config.loaded || loadConfig({ configPath: config.configPath, repoPath: state.repoPath });
+      const loaded = loadRepoConfig(state.repoPath);
       if (loaded.disabled) throw new Error('offload is disabled for this repository');
       if (input.mode !== 'report') assertVerifierCommand(input.testCommand ?? loaded.repoConfig.testCommand);
       if (input?.profile && !Object.hasOwn(loaded.config.profiles, input.profile)) throw new Error(`unknown profile: ${input.profile}`);
       const profileName = input.profile || loaded.config.default;
       const profile = loaded.config.profiles[profileName];
       const providerConfig = loaded.config.providers[profile.provider];
-      if (!['openai-chat', 'anthropic-messages'].includes(providerConfig?.type))
+      if (!isSupportedProviderType(providerConfig?.type))
         throw new Error(`unsupported provider type: ${providerConfig?.type || 'missing'}`);
       // The whole chain is snapshotted: primary plus up to two fallbacks, each
       // taken only after the previous route's explicit credit exhaustion.
@@ -1049,7 +1035,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         seen.add(next);
         const fallbackProfile = loaded.config.profiles[next];
         const fallbackProviderConfig = fallbackProfile && loaded.config.providers[fallbackProfile.provider];
-        if (!['openai-chat', 'anthropic-messages'].includes(fallbackProviderConfig?.type))
+        if (!isSupportedProviderType(fallbackProviderConfig?.type))
           throw new Error(`unsupported fallback provider type: ${fallbackProviderConfig?.type || 'missing'}`);
         chain.push({ name: fallbackProfile.provider, profile: fallbackProfile, providerConfig: fallbackProviderConfig });
       }
@@ -1085,8 +1071,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         // Preserve the resolved value only in the in-memory redaction set.
         // A caller can otherwise put a non-heuristic literal credential in
         // initial task/criteria/test-command text before the worker runs.
-        state.store.secrets ||= [];
-        if (!state.store.secrets.includes(credential)) state.store.secrets.push(credential);
+        rememberSecret(state, credential);
       }
       const models = [];
       for (const [index, route] of chain.entries()) {
@@ -1388,12 +1373,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       for (;;) {
         await state.manager.running.get(id);
         const current = await state.store.get(id);
-        if (
-          ['DONE_VERIFIED', 'DONE_UNVERIFIED', 'VERIFY_FAILED', 'VERIFY_ENV_FAILED', 'FAILED', 'TIMEOUT', 'BUDGET', 'CANCELLED'].includes(
-            current.status,
-          )
-        )
-          return state.manager.job(id);
+        if (terminalStatuses.has(current.status)) return state.manager.job(id);
         // This process's round ended without publishing (a store write that kept
         // failing): finish it rather than poll a record no one will advance.
         if (!state.manager.running.has(id)) await state.manager.settleOrphan(id);

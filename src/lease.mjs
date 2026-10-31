@@ -2,7 +2,6 @@ import {
   mkdirSync,
   openSync,
   renameSync,
-  rmSync,
   closeSync,
   writeFileSync,
   readdirSync,
@@ -19,7 +18,9 @@ import { dirname, join, resolve, posix, win32 } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { normalizePath, pathsOverlap } from './glob.mjs';
-import { snapshotGitEnv } from './git-snapshot.mjs';
+import { atomicWrite, snapshotGitEnv } from './git-snapshot.mjs';
+import { pidAlive as defaultPidAlive } from './pid.mjs';
+import { sameFileIdentity as sameIdentity, sameStatFields } from './stat-identity.mjs';
 
 const MAX_LEASE_FILES = 512;
 const MAX_LOCK_BYTES = 64 * 1024;
@@ -134,7 +135,6 @@ export class LeaseManager {
       const record = this.#readRecord(jobId);
       const current = record?.value;
       if (!current) return false;
-      if (!validLease(current)) throw new LeaseError('Lease is invalid', 'E_LEASE_MISSING');
       this.#assertOwner(current, ownerNonce);
       // Although compliant writers hold .acquire, bind cleanup to the record
       // identity and owner nonce as well.  A replacement must never be
@@ -177,7 +177,7 @@ export class LeaseManager {
         const record = this.readLease(full, MAX_LOCK_BYTES, { platform: this.platform, record: true });
         const lease = record.value;
         if (!validLease(lease, this.platform)) {
-          if (reclaimStale) this.#retireInvalidLease(full);
+          if (reclaimStale) this.#retireIfStaleMalformed(full, this.staleMs);
           continue;
         }
         if (file !== `${lease.jobId}.json`) {
@@ -194,7 +194,7 @@ export class LeaseManager {
         // writer.  Never turn that safe failure into deletion of the writer's
         // replacement.  Static malformed records are reclaimed only after a
         // stale-age grace period.
-        if (reclaimStale && error?.code !== 'E_LEASE_CHANGED') this.#retireInvalidLease(full);
+        if (reclaimStale && error?.code !== 'E_LEASE_CHANGED') this.#retireIfStaleMalformed(full, this.staleMs);
       }
     }
     return leases;
@@ -207,17 +207,14 @@ export class LeaseManager {
       return null;
     }
   }
-  #read(jobId) {
-    return this.#readRecord(jobId)?.value || null;
-  }
   #mutate(jobId, mutator) {
     this.#ensureLockDir();
     const releaseMutex = this.#lockAcquire();
     try {
-      const current = this.#read(jobId);
-      if (!validLease(current)) throw new LeaseError('Lease not found', 'E_LEASE_MISSING');
+      const current = this.#readRecord(jobId)?.value;
+      if (!current) throw new LeaseError('Lease not found', 'E_LEASE_MISSING');
       const next = mutator(current);
-      atomicJson(this.#file(jobId), next);
+      atomicWrite(this.#file(jobId), JSON.stringify(next));
       return next;
     } finally {
       releaseMutex();
@@ -270,36 +267,27 @@ export class LeaseManager {
           // reclaimable.
           if (validMutex(holder)) {
             if (!this.pidAlive(holder.pid)) this.#retireMutex({ nonce: holder.nonce });
-          } else this.#retireInvalidMutex(mutex);
+          } else this.#retireIfStaleMalformed(mutex, this.mutexStaleMs);
         } catch (readError) {
           // A newly-created mutex can be observed before its JSON write has
           // completed.  Give malformed records an mtime-based grace period;
           // identity races are always left alone.
-          if (readError?.code !== 'E_LEASE_CHANGED') this.#retireInvalidMutex(mutex);
+          if (readError?.code !== 'E_LEASE_CHANGED') this.#retireIfStaleMalformed(mutex, this.mutexStaleMs);
         }
         sleep(5);
       }
     }
     throw new LeaseError('Timed out waiting to acquire lease lock', 'E_LEASE_BUSY');
   }
-  #retireInvalidLease(file) {
+  // Malformed records are reclaimed only once they are older than `graceMs`, so a record still being written is left alone.
+  #retireIfStaleMalformed(file, graceMs) {
     let details;
     try {
       details = lstatSync(file, BIGINT_STAT_OPTIONS);
     } catch {
       return false;
     }
-    if (!details.isFile() || details.isSymbolicLink() || BigInt(this.now()) - details.mtimeMs <= BigInt(this.staleMs)) return false;
-    return retireIfSame(file, identityFor(details));
-  }
-  #retireInvalidMutex(file) {
-    let details;
-    try {
-      details = lstatSync(file, BIGINT_STAT_OPTIONS);
-    } catch {
-      return false;
-    }
-    if (!details.isFile() || details.isSymbolicLink() || BigInt(this.now()) - details.mtimeMs <= BigInt(this.mutexStaleMs)) return false;
+    if (!details.isFile() || details.isSymbolicLink() || BigInt(this.now()) - details.mtimeMs <= BigInt(graceMs)) return false;
     return retireIfSame(file, identityFor(details));
   }
   #retireMutex({ nonce }) {
@@ -340,26 +328,6 @@ export function getGitDir(repoPath, { execFile = execFileSync, env = process.env
   // host's path implementation reinterpret a POSIX fixture on Windows.
   const paths = platform === 'win32' ? win32 : posix;
   return paths.resolve(repoPath, value);
-}
-function defaultPidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === 'EPERM';
-  }
-}
-function atomicJson(file, value) {
-  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    writeFileSync(temp, JSON.stringify(value), { mode: 0o600 });
-    renameSync(temp, file);
-  } finally {
-    try {
-      rmSync(temp, { force: true });
-    } catch {}
-  }
 }
 function currentUserOwns(details) {
   if (typeof process.getuid !== 'function') return true;
@@ -540,36 +508,10 @@ function checkedNow(value) {
   return value;
 }
 function sameLockMetadata(first, second) {
-  return (
-    ['dev', 'ino', 'size', 'mode'].every((name) => sameStatValue(first?.[name], second?.[name])) &&
-    sameTimestamp(first, second, 'mtime') &&
-    sameTimestamp(first, second, 'ctime')
-  );
-}
-function sameStatValue(first, second) {
-  if (first === second) return true;
-  if (typeof first === 'bigint' && Number.isSafeInteger(second)) return first === BigInt(second);
-  if (typeof second === 'bigint' && Number.isSafeInteger(first)) return BigInt(first) === second;
-  return false;
-}
-function sameTimestamp(first, second, name) {
-  const left = statTimestamp(first, name),
-    right = statTimestamp(second, name);
-  return left !== undefined && right !== undefined && sameStatValue(left, right);
-}
-function statTimestamp(details, name) {
-  const nanoseconds = details?.[`${name}Ns`];
-  if (typeof nanoseconds === 'bigint') return nanoseconds;
-  const milliseconds = details?.[`${name}Ms`];
-  if (typeof milliseconds === 'number' && Number.isFinite(milliseconds)) return milliseconds;
-  const date = details?.[name];
-  return date instanceof Date && Number.isFinite(date.getTime()) ? date.getTime() : undefined;
+  return sameStatFields(first, second, ['dev', 'ino', 'size', 'mode']);
 }
 function identityFor(details) {
   return { dev: details.dev, ino: details.ino };
-}
-function sameIdentity(details, identity) {
-  return sameStatValue(details?.dev, identity?.dev) && sameStatValue(details?.ino, identity?.ino);
 }
 /** Atomically quarantine only the exact pathname object we inspected.  If an
  * ABA replacement wins before rename, restore the captured replacement rather

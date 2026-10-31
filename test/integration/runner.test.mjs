@@ -6,7 +6,6 @@ import {
   runCommand,
   scrubEnv,
   macosProfile,
-  staticWritableRoot,
   sandboxAvailable,
   sandboxStatus,
   sandboxCanonicalPath,
@@ -21,7 +20,8 @@ import { mkdtemp, access, mkdir, readdir, readFile, realpath, rm, symlink, write
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, posix, win32 } from 'node:path';
-import { createIsolatedWorktree, snapshotPrimaryWorkingTree } from '../../src/worktree.mjs';
+import { createIsolatedWorktree } from '../../src/worktree.mjs';
+import { snapshotWorkingTree } from '../../src/git-snapshot.mjs';
 import { isolatedWorkspaceReadablePaths } from '../../src/core.mjs';
 import { cleanup as removeTree, git as runGit, makeRepo } from '../unit/helpers.mjs';
 
@@ -171,7 +171,6 @@ test('runner honors pre-abort and compiles globs to static sandbox roots', async
   const result = await runCommand('exit 99', { signal: controller.signal });
   assert.equal(result.cancelled, true);
   if (process.platform === 'win32') return;
-  assert.equal(staticWritableRoot('/repo/src/**', '/repo'), '/repo/src');
   for (const [value, cwd, sandboxCwd, expected] of [
     ['/var/private-worktree', '/var/private-worktree', '/private/var/private-worktree', '/private/var/private-worktree'],
     ['/var/private-worktree/src/**', '/var/private-worktree', '/private/var/private-worktree', '/private/var/private-worktree/src/**'],
@@ -603,7 +602,7 @@ test(
     await writeFile(join(repo, 'node_modules', 'dep-pkg', '.env'), 'TOKEN=should-not-be-readable\n');
     await mkdir(join(repo, 'node_modules', '.cache'), { recursive: true });
     await writeFile(join(repo, 'node_modules', '.cache', 'entry.json'), '{}\n');
-    const isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotPrimaryWorkingTree(repo) });
+    const isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotWorkingTree(repo) });
     // Cleanup needs the primary's object store, so the worktree goes first.
     t.after(() => {
       isolated.cleanup();

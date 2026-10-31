@@ -5,15 +5,12 @@
 // Anthropic thinking blocks: other adapters ignore it, and the Responses
 // adapter can rebuild its native input items without accepting arbitrary
 // provider objects.
+import { plainObject } from './plain-object.mjs';
+import { MAX_MESSAGE_CHARS } from './transcript-limits.mjs';
+
 export const MAX_OPENAI_REASONING_ITEMS = 32;
 
-const MAX_TEXT_CHARS = 1_000_000;
 const MAX_SUMMARY_PARTS = 64;
-const plainObject = (value) => {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-};
 const exactKeys = (value, keys) => {
   const actual = Object.keys(value);
   return actual.length === keys.length && actual.every((key) => keys.includes(key));
@@ -25,7 +22,7 @@ function validSummaryPart(value) {
     exactKeys(value, ['type', 'text']) &&
     value.type === 'summary_text' &&
     typeof value.text === 'string' &&
-    value.text.length <= MAX_TEXT_CHARS
+    value.text.length <= MAX_MESSAGE_CHARS
   );
 }
 
@@ -36,7 +33,7 @@ function validItem(value) {
     value.type === 'reasoning' &&
     typeof value.encrypted_content === 'string' &&
     value.encrypted_content.length > 0 &&
-    value.encrypted_content.length <= MAX_TEXT_CHARS &&
+    value.encrypted_content.length <= MAX_MESSAGE_CHARS &&
     !/[\0-\x1f\x7f]/.test(value.encrypted_content) &&
     Array.isArray(value.summary) &&
     value.summary.length <= MAX_SUMMARY_PARTS &&

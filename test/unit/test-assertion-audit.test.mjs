@@ -68,6 +68,7 @@ test('common test naming conventions and whole deleted test files are reviewed c
     'test_parse.py',
     'parse_test.go',
     'ParserTests.java',
+    'FooTest.cs',
     'tests.mjs',
   ]) {
     const result = auditTestAssertions(patch(path, '@@ -1 +0,0 @@\n-assertSomething();', { deleted: true }), [{ path, status: 'D' }]);
@@ -135,4 +136,16 @@ test('large removed-line streams keep the retained list bounded and count eviden
   assert.equal(audit.totalRemoved, total);
   assert.equal(audit.removed.length, 200);
   assert.deepEqual(audit.removed.at(-1), { path, line: 200, text: 'x' });
+});
+
+test('production and data files whose names merely end in "test" are not treated as test files', () => {
+  const paths = ['latest.json', 'src/contest.js', 'src/attest.go', 'docs/shortest.md', 'src/protest.py'];
+  const diff = paths.map((path) => patch(path, '@@ -1 +1 @@\n-old line\n+new line')).join('');
+  assert.deepEqual(
+    auditTestAssertions(
+      diff,
+      paths.map((path) => ({ path, status: 'M' })),
+    ),
+    { removed: [], totalRemoved: 0 },
+  );
 });

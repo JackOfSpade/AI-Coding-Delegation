@@ -14,19 +14,15 @@ import {
 } from '../../src/core.mjs';
 import { DEFAULT_CONFIG } from '../../src/config.mjs';
 import { validateJobRequest } from '../../src/job-manager.mjs';
-import { WINDOWS_INTEGRITY_ROOT_CREDENTIAL } from '../../src/integrity.mjs';
+import { WINDOWS_INTEGRITY_ROOT_CREDENTIAL } from '../../src/secrets.mjs';
 import { JobStore } from '../../src/store.mjs';
 import { getGitDir } from '../../src/lease.mjs';
-import {
-  cleanupIsolatedWorktree,
-  createIsolatedWorktree,
-  integrateRecordedTree,
-  openIsolatedWorktree,
-  snapshotPrimaryWorkingTree,
-} from '../../src/worktree.mjs';
+import { cleanupIsolatedWorktree, createIsolatedWorktree, integrateRecordedTree, openIsolatedWorktree } from '../../src/worktree.mjs';
+import { snapshotWorkingTree } from '../../src/git-snapshot.mjs';
 import { sandboxAvailable } from '../../src/sandbox.mjs';
 import { installedSkillHealth } from '../../src/skill-health.mjs';
 import { createMockOpenAIServer } from '../mock-openai-server.mjs';
+import { LOOPBACK_SKIP_MARKER } from '../run-suite.mjs';
 
 const OPENAI_BASE = 'https://api.openai.com/v1';
 const openaiModels = (ids) => new Response(JSON.stringify({ data: ids.map((id, index) => ({ id, created: 1_000 - index })) }));
@@ -446,7 +442,7 @@ test('Core grants an isolated worker command the linked primary node_modules as 
   await writeFile(join(path, '.gitignore'), 'node_modules/\n');
   await mkdir(join(path, 'node_modules', 'dep-pkg'), { recursive: true });
   await writeFile(join(path, 'node_modules', 'dep-pkg', 'index.js'), 'module.exports = 1;\n');
-  const isolated = createIsolatedWorktree({ repoPath: path, baselineTree: snapshotPrimaryWorkingTree(path) });
+  const isolated = createIsolatedWorktree({ repoPath: path, baselineTree: snapshotWorkingTree(path) });
   try {
     const job = { workspacePath: isolated.path, repoPath: path };
     const nodeModules = await realpath(join(path, 'node_modules'));
@@ -552,7 +548,7 @@ test('report worker external input transcript is ephemeral while its report rema
     ]);
   } catch (error) {
     if (error.code === 'EPERM') {
-      t.skip('loopback networking is unavailable in this sandbox');
+      t.skip(LOOPBACK_SKIP_MARKER);
       return;
     }
     throw error;
@@ -625,7 +621,7 @@ test('Core passes the current write-job turn allowance into the initial system p
     server = await createMockOpenAIServer([{ chunks: [finishChunk('guided', ['src/**']), usageChunk] }]);
   } catch (error) {
     if (error.code === 'EPERM') {
-      t.skip('loopback networking is unavailable in this sandbox');
+      t.skip(LOOPBACK_SKIP_MARKER);
       return;
     }
     throw error;
@@ -1837,7 +1833,7 @@ test('a raw-tampered sealed Core job never reaches the provider', async (t) => {
     server = await createMockOpenAIServer([{ chunks: [finishChunk(), usageChunk] }]);
   } catch (error) {
     if (error.code === 'EPERM') {
-      t.skip('loopback networking is unavailable in this sandbox');
+      t.skip(LOOPBACK_SKIP_MARKER);
       return;
     }
     throw error;
@@ -2201,7 +2197,7 @@ test('detached CLI worker inherits env keyRef without putting it in argv or outp
     ]);
   } catch (error) {
     if (error.code === 'EPERM') {
-      t.skip('loopback networking is unavailable in this sandbox');
+      t.skip(LOOPBACK_SKIP_MARKER);
       return;
     }
     throw error;
@@ -2278,7 +2274,7 @@ test('detached worker remains alive across automatic repair and publishes the re
     ]);
   } catch (error) {
     if (error.code === 'EPERM') {
-      t.skip('loopback networking is unavailable in this sandbox');
+      t.skip(LOOPBACK_SKIP_MARKER);
       return;
     }
     throw error;
@@ -2316,7 +2312,7 @@ test('cross-process cancel aborts a detached provider request and preserves the 
     ]);
   } catch (error) {
     if (error.code === 'EPERM') {
-      t.skip('loopback networking is unavailable in this sandbox');
+      t.skip(LOOPBACK_SKIP_MARKER);
       return;
     }
     throw error;
@@ -2349,7 +2345,7 @@ test('child uses its accepted execution, policy, and pricing snapshot after conf
     server = await createMockOpenAIServer([{ chunks: [finishChunk('snapshot', ['src/**', '.offload.json']), usageChunk] }]);
   } catch (error) {
     if (error.code === 'EPERM') {
-      t.skip('loopback networking is unavailable in this sandbox');
+      t.skip(LOOPBACK_SKIP_MARKER);
       return;
     }
     throw error;
@@ -2597,6 +2593,9 @@ test('assertion repair sends a fresh focused conversation through Core while pre
     const repairMessages = requests[2].messages;
     assert.equal(repairMessages[0].role, 'system');
     assert.match(repairMessages[1].content, /src\/a.js: expected 42/);
+    // The authenticated record refetch must not discard the narrowed write scope.
+    assert.match(repairMessages[0].content, /src\/a\.js/);
+    assert.doesNotMatch(repairMessages[0].content, /src\/\*\*/);
     assert.doesNotMatch(JSON.stringify(repairMessages), /ORIGINAL_IMPLEMENTATION_HISTORY|initial-write/);
     const audit = await core.manager.store.readMessages(started.jobId);
     assert.match(JSON.stringify(audit), /ORIGINAL_IMPLEMENTATION_HISTORY/);

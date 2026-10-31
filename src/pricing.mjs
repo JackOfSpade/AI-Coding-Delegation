@@ -56,14 +56,8 @@ export function validatePricingTable(table) {
   return table;
 }
 export function resolveModel(table, model) {
-  if (!table || typeof table !== 'object' || !table.models || typeof table.models !== 'object' || typeof model !== 'string')
-    return undefined;
-  if (Object.hasOwn(table.models, model)) return table.models[model];
-  // Fixture aliases can be explanatory prose rather than a canonical model
-  // identifier. Only honor aliases that resolve to an actual table entry.
-  const aliases = table.legacy_aliases;
-  const alias = aliases && typeof aliases === 'object' && Object.hasOwn(aliases, model) ? aliases[model] : undefined;
-  return typeof alias === 'string' && Object.hasOwn(table.models, alias) ? table.models[alias] : undefined;
+  const name = canonicalModelName(table, model);
+  return name === undefined ? undefined : table.models[name];
 }
 /** True only when two identifiers resolve to the exact same priced entry.
  * This permits declared aliases without treating merely similar rate tables as
@@ -77,6 +71,8 @@ function canonicalModelName(table, model) {
   if (!table || typeof table !== 'object' || !table.models || typeof table.models !== 'object' || typeof model !== 'string')
     return undefined;
   if (Object.hasOwn(table.models, model)) return model;
+  // Fixture aliases can be explanatory prose rather than a canonical model
+  // identifier. Only honor aliases that resolve to an actual table entry.
   const aliases = table.legacy_aliases;
   const alias = aliases && typeof aliases === 'object' && Object.hasOwn(aliases, model) ? aliases[model] : undefined;
   return typeof alias === 'string' && Object.hasOwn(table.models, alias) ? alias : undefined;

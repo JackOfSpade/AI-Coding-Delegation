@@ -5,13 +5,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   PosixIntegrityRoot,
-  WINDOWS_INTEGRITY_ROOT_CREDENTIAL,
   WindowsIntegrityRoot,
   credentialFingerprint,
   deriveJobMacKey,
   validCredentialFingerprint,
   validCredentialFingerprints,
 } from '../../src/integrity.mjs';
+import { WINDOWS_INTEGRITY_ROOT_CREDENTIAL } from '../../src/secrets.mjs';
 
 test(
   'POSIX integrity root is owner-private, non-symlinked, and malformed roots fail closed',

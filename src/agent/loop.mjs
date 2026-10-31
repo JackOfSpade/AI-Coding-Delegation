@@ -7,6 +7,8 @@ import { FAILURE_ERRORS, isWallTimeout, summarizeToolFailure, toolErrorHint } fr
 import { MAX_BATCH_COMMAND_SEC } from '../timing.mjs';
 import { anthropicContentMatchesAssistant, cloneAnthropicContent, validAnthropicContent } from '../anthropic-content.mjs';
 import { cloneOpenAIReasoning, validOpenAIReasoning } from '../openai-reasoning.mjs';
+import { plainObject } from '../plain-object.mjs';
+import { MAX_MESSAGE_CHARS, MAX_TOOL_ARGUMENT_CHARS, MAX_TOOL_CALLS, validToolIdentifier } from '../transcript-limits.mjs';
 
 // Progress is advisory and goes to the job store, whose write can wait on a busy
 // publication lock. It must never hold a round past its deadline or a cancel:
@@ -57,9 +59,6 @@ const finishArgs = (value) =>
   finishList(value.concerns) &&
   finishList(value.testsRun) &&
   validUntouchedPaths(value.untouchedPaths);
-const MAX_ASSISTANT_CHARS = 1_000_000;
-const MAX_TOOL_CALLS = 64;
-const MAX_TOOL_ARGUMENT_CHARS = 512_000;
 const BASE_PROMPT_TOKEN_OVERHEAD = 256;
 const MIN_REQUEST_OUTPUT_TOKENS = 16;
 const MAX_REQUEST_OUTPUT_TOKENS = 16_384;
@@ -157,8 +156,7 @@ const verifierCompletionCheckpoint = (remainingTurns) => {
   const prefix = `Completion checkpoint: ${remainingTurns} model turn${remainingTurns === 1 ? '' : 's'} remain.`;
   return `${prefix} A focused server verifier will run after finish. Do not continue exploring or rerun the verifier. If the required in-scope changes are complete, call finish now as the sole tool call. Use another tool only for an essential remaining edit or diagnosis.`;
 };
-const validMetadata = (value, max = 256) =>
-  typeof value === 'string' && value.length > 0 && value.length <= max && !/[\x00-\x1F\x7F]/.test(value);
+const validMetadata = (value, max = 256) => validToolIdentifier(value, max);
 const validProviderCall = (call) =>
   !!call &&
   typeof call === 'object' &&
@@ -166,16 +164,11 @@ const validProviderCall = (call) =>
   validMetadata(call.name, 128) &&
   typeof call.arguments === 'string' &&
   call.arguments.length <= MAX_TOOL_ARGUMENT_CHARS;
-const isPlainRecord = (value) => {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-};
 // Provider adapters are expected to normalize usage, but budget enforcement
 // is a capability boundary. Validate it again here so a custom or future
 // adapter cannot turn an absent usage record into a free, tool-authorized turn.
 const normalizedUsage = (usage) => {
-  if (!isPlainRecord(usage) || !Object.hasOwn(usage, 'inputTokens') || !Object.hasOwn(usage, 'outputTokens'))
+  if (!plainObject(usage) || !Object.hasOwn(usage, 'inputTokens') || !Object.hasOwn(usage, 'outputTokens'))
     throw new Error('Provider yielded invalid usage');
   const result = { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens };
   for (const name of ['inputTokens', 'outputTokens'])
@@ -406,7 +399,7 @@ export class AgentLoop {
       ? this.reservationModels.slice(stage)
       : this.reservationModels;
   }
-  async #execute(calls, signal, errors = [], timings = []) {
+  async #execute(calls, parsed, signal, errors = [], timings = []) {
     const result = new Array(calls.length);
     const one = async (call, i) => {
       // Reads overlap, so these are per-call figures (for the longest call), not
@@ -414,7 +407,7 @@ export class AgentLoop {
       const startedAt = this.now();
       try {
         if (signal?.aborted) throw signal.reason ?? new Error('Aborted');
-        result[i] = await this.tools.execute(call.name, safeJson(call.arguments), { signal });
+        result[i] = await this.tools.execute(call.name, parsed[i], { signal });
       } catch (error) {
         // An abort is control flow, not a worker-visible tool failure.  In
         // particular, swallowing it would leave a subprocess running until
@@ -539,10 +532,9 @@ export class AgentLoop {
     // early checkpoint a required-tool, non-thinking boundary. Generic finite
     // providers retain the gradual advisory cadence. Neither route narrows
     // the job's ordinary tool contract.
-    const earlyFocusedWriteCapable =
-      this.maxUsd !== Infinity &&
-      this.provider instanceof OpenAIChatProvider &&
-      this.provider.supportsForcedImplementationFocusFor?.(this.model) === true;
+    const forcedFocusCapable =
+      this.provider instanceof OpenAIChatProvider && this.provider.supportsForcedImplementationFocusFor?.(this.model) === true;
+    const earlyFocusedWriteCapable = this.maxUsd !== Infinity && forcedFocusCapable;
     const checkpointThreshold = earlyFocusedWriteCapable ? 2 : Math.max(2, Math.min(4, Math.floor(this.maxTurns / 3)));
     let completedNonWritingTurns = 0;
     let directWriteSucceeded = successfulDirectWriteInTranscript(initialTranscript);
@@ -584,21 +576,20 @@ export class AgentLoop {
         ...(providerFinishReason !== undefined ? { providerFinishReason } : {}),
       };
     };
+    const outcome = (status, turn, extra = {}) => ({ status, turn, usage: totalUsage, costUsd: this.meter.usd, ...extra, ...modelMeta() });
+    // responseModel is block-scoped to the turn loop, so it is passed in.
+    const responseOutcome = (status, turn, model, extra = {}) =>
+      outcome(status, turn, { pricingKnown: !this.meter.unknownPricing, model, ...extra });
     // A zero allowance cannot purchase even one token.  Likewise, a finite
     // cap with no exact model price cannot safely authorize a paid request.
     const pricedSpec = this.meter.table && resolveModel(this.meter.table, this.model);
     const pricingKnown = !!(pricedSpec && (!isAnthropicModel(this.model) || pricedSpec.usd_per_1m.input_cache_write));
     if (this.maxUsd !== Infinity && (this.maxUsd === 0 || !pricingKnown))
-      return {
-        status: 'BUDGET',
-        turn: 0,
-        usage: totalUsage,
-        costUsd: this.meter.usd,
+      return outcome('BUDGET', 0, {
         pricingKnown,
         error: this.maxUsd === 0 ? 'Budget is zero' : 'Pricing is unknown for a finite budget',
         budgetCap: 'other',
-        ...modelMeta(),
-      };
+      });
     const deadline = new AbortController();
     const onAbort = () => deadline.abort(this.signal.reason ?? new Error('Aborted'));
     this.signal?.addEventListener('abort', onAbort, { once: true });
@@ -612,9 +603,8 @@ export class AgentLoop {
       for (let turn = 1; turn <= this.maxTurns; turn++) {
         providerFinishReason = undefined;
         await this.context.flush();
-        if (this.signal?.aborted) return { status: stopped(), turn: turn - 1, usage: totalUsage, costUsd: this.meter.usd, ...modelMeta() };
-        if (this.now() - started > this.timeoutMs)
-          return { status: 'TIMEOUT', turn: turn - 1, usage: totalUsage, costUsd: this.meter.usd, ...modelMeta() };
+        if (this.signal?.aborted) return outcome(stopped(), turn - 1);
+        if (this.now() - started > this.timeoutMs) return outcome('TIMEOUT', turn - 1);
         let text = '',
           reasoning = '',
           calls = [],
@@ -634,15 +624,7 @@ export class AgentLoop {
         // report transcript is ephemeral, so a later continuation cannot
         // recover this reading. Spend the last logical turn on finish only.
         if (reportFinalizationUsed)
-          return {
-            status: 'BUDGET',
-            turn: turn - 1,
-            usage: totalUsage,
-            costUsd: this.meter.usd,
-            error: 'Report finalization did not finish',
-            budgetCap: 'reservation',
-            ...modelMeta(),
-          };
+          return outcome('BUDGET', turn - 1, { error: 'Report finalization did not finish', budgetCap: 'reservation' });
         const reportReadReservation =
           this.reportMode && this.maxUsd !== Infinity
             ? reserveRequestBudget(
@@ -677,8 +659,6 @@ export class AgentLoop {
         // It deliberately retains the ordinary/full tool contract: a first
         // file write does not prove that a multi-file implementation is done.
         const budgetFinishRecovery = budgetFinishRecoveryPending;
-        const forcedFocusCapable =
-          this.provider instanceof OpenAIChatProvider && this.provider.supportsForcedImplementationFocusFor?.(this.model) === true;
         const forcedImplementationFocus = implementationFocus && forcedFocusCapable;
         const forcedBudgetFinishRecovery = budgetFinishRecovery && forcedFocusCapable;
         const nonThinkingDeepSeekReplay = deepSeekNonThinkingReplay && forcedFocusCapable;
@@ -722,63 +702,41 @@ export class AgentLoop {
           const rejected = [];
           if (!reservation || reservation.maxTokens < MIN_REQUEST_OUTPUT_TOKENS)
             rejected.push({ reservation, projection: 'raw', elidedToolResults: 0 });
-          if (!budgetFinishRecovery && (!reservation || reservation.maxTokens < MIN_REQUEST_OUTPUT_TOKENS)) {
-            // Each candidate is a fresh provider-only clone.  Re-run the same
-            // worst-case reservation after every single old-result elision;
-            // neither the durable context nor its replayable transcript is
-            // mutated to make a finite-budget request fit.
-            const candidates = this.context.providerBudgetElisionSnapshots?.() ?? [];
+          const tryProjection = async (candidates, projection) => {
+            const models = this.#currentReservationModels();
+            const remainingBudgetUsd = this.maxUsd - this.meter.usd;
             for (const candidate of candidates) {
               const compactReservation = reserveRequestBudget(
                 this.meter.table,
-                this.#currentReservationModels(),
+                models,
                 candidate.messages,
                 activeToolDefinitions,
-                this.maxUsd - this.meter.usd,
+                remainingBudgetUsd,
                 focusRequestOptions,
               );
               if (!compactReservation || compactReservation.maxTokens < MIN_REQUEST_OUTPUT_TOKENS) {
-                rejected.push({
-                  reservation: compactReservation,
-                  projection: 'tool-elision',
-                  elidedToolResults: candidate.elidedToolResults ?? 0,
-                });
+                rejected.push({ reservation: compactReservation, projection, elidedToolResults: candidate.elidedToolResults ?? 0 });
                 continue;
               }
               messagesForTurn = candidate.messages;
               reservation = compactReservation;
               await this.progress?.({ turn, action: 'provider_context_budget_elided' });
-              break;
+              return;
             }
+          };
+          if (!budgetFinishRecovery && (!reservation || reservation.maxTokens < MIN_REQUEST_OUTPUT_TOKENS)) {
+            // Each candidate is a fresh provider-only clone.  Re-run the same
+            // worst-case reservation after every single old-result elision;
+            // neither the durable context nor its replayable transcript is
+            // mutated to make a finite-budget request fit.
+            await tryProjection(this.context.providerBudgetElisionSnapshots?.() ?? [], 'tool-elision');
           }
           if (!budgetFinishRecovery && (!reservation || reservation.maxTokens < MIN_REQUEST_OUTPUT_TOKENS)) {
             // The configured newest-result retention has already been tried in
             // full above.  As a last provider-only fallback, retain the newest
             // complete assistant transaction but progressively elide older
             // results.  The durable replay transcript remains unchanged.
-            const candidates = this.context.providerBudgetDeepElisionSnapshots?.() ?? [];
-            for (const candidate of candidates) {
-              const compactReservation = reserveRequestBudget(
-                this.meter.table,
-                this.#currentReservationModels(),
-                candidate.messages,
-                activeToolDefinitions,
-                this.maxUsd - this.meter.usd,
-                focusRequestOptions,
-              );
-              if (!compactReservation || compactReservation.maxTokens < MIN_REQUEST_OUTPUT_TOKENS) {
-                rejected.push({
-                  reservation: compactReservation,
-                  projection: 'deep-tool-elision',
-                  elidedToolResults: candidate.elidedToolResults ?? 0,
-                });
-                continue;
-              }
-              messagesForTurn = candidate.messages;
-              reservation = compactReservation;
-              await this.progress?.({ turn, action: 'provider_context_budget_elided' });
-              break;
-            }
+            await tryProjection(this.context.providerBudgetDeepElisionSnapshots?.() ?? [], 'deep-tool-elision');
           }
           if (!reservation || reservation.maxTokens < MIN_REQUEST_OUTPUT_TOKENS) {
             const remainingUsd = this.maxUsd - this.meter.usd;
@@ -796,8 +754,7 @@ export class AgentLoop {
               typeof this.persistBudgetFinishRecovery === 'function';
             if (terminalBudgetFinishRecovery) {
               const finishOnlyTools = this.toolDefinitions.filter((tool) => tool.function.name === 'finish');
-              const forcedBudgetFinishRecovery = forcedFocusCapable;
-              const finishOnlyOptions = forcedBudgetFinishRecovery
+              const finishOnlyOptions = forcedFocusCapable
                 ? {
                     thinking: { type: 'disabled' },
                     reasoning_effort: 'none',
@@ -840,17 +797,12 @@ export class AgentLoop {
                 .filter((candidate) => candidate.diagnostic)
                 .sort((left, right) => left.diagnostic.requiredUsd - right.diagnostic.requiredUsd)[0]?.diagnostic;
               if (cheapest) await this.progress?.({ turn, action: 'budget_reservation_exhausted', budgetReservation: cheapest });
-              return {
-                status: 'BUDGET',
-                turn: turn - 1,
-                usage: totalUsage,
-                costUsd: this.meter.usd,
+              return outcome('BUDGET', turn - 1, {
                 pricingKnown: true,
                 error: 'Remaining budget cannot cover a conservative prompt and minimum response reservation',
                 budgetCap: 'reservation',
                 ...(cheapest ? { budgetReservation: cheapest } : {}),
-                ...modelMeta(),
-              };
+              });
             }
           }
           maxTokens =
@@ -968,7 +920,7 @@ export class AgentLoop {
               if (openaiReasoningRecords > 1) throw new Error('Provider yielded multiple OpenAI reasoning records');
               openaiReasoning = cloneOpenAIReasoning(event.openaiReasoning);
             }
-            if (text.length + reasoning.length > MAX_ASSISTANT_CHARS) throw new Error('Provider response exceeds assistant size limit');
+            if (text.length + reasoning.length > MAX_MESSAGE_CHARS) throw new Error('Provider response exceeds assistant size limit');
             // Some compatible providers send model metadata only in an earlier
             // delta and omit it from their terminal usage event. Carry the last
             // validated model forward so usage is not silently priced as the
@@ -1017,110 +969,46 @@ export class AgentLoop {
             }
           }
         } catch (error) {
-          if (this.signal?.aborted)
-            return { status: stopped(), turn: turn - 1, usage: totalUsage, costUsd: this.meter.usd, ...modelMeta() };
-          if (deadline.signal.aborted)
-            return {
-              status: 'TIMEOUT',
-              turn: turn - 1,
-              usage: totalUsage,
-              costUsd: this.meter.usd,
-              error: 'Agent wall clock deadline exceeded',
-              ...modelMeta(),
-            };
+          if (this.signal?.aborted) return outcome(stopped(), turn - 1);
+          if (deadline.signal.aborted) return outcome('TIMEOUT', turn - 1, { error: 'Agent wall clock deadline exceeded' });
           if (error instanceof ProviderError) {
             const failure = providerFailure(error);
-            return {
-              status: failure?.kind === 'attempt_timeout' ? 'TIMEOUT' : 'FAILED',
-              turn: turn - 1,
-              usage: totalUsage,
-              costUsd: this.meter.usd,
+            return outcome(failure?.kind === 'attempt_timeout' ? 'TIMEOUT' : 'FAILED', turn - 1, {
               pricingKnown: !this.meter.unknownPricing,
               error: error.message,
               ...(failure ? { providerFailure: failure } : {}),
-              ...modelMeta(),
-            };
+            });
           }
           throw error;
         }
         if (toolCallRecords > 1)
-          return {
-            status: 'FAILED',
-            turn,
-            usage: totalUsage,
-            costUsd: this.meter.usd,
-            pricingKnown: !this.meter.unknownPricing,
-            model: responseModel,
-            error: 'Provider yielded multiple tool-call events in one turn',
-            ...modelMeta(),
-          };
+          return responseOutcome('FAILED', turn, responseModel, { error: 'Provider yielded multiple tool-call events in one turn' });
         // Duplicate usage is never coherent, even without a configured spend
         // cap. We still consume the whole stream first so any observed usage is
         // durably metered and an error cannot cause it to be retried as free.
         if (usageRecords > 1 || (this.maxUsd !== Infinity && usageRecords !== 1))
-          return {
-            status: 'FAILED',
-            turn,
-            usage: totalUsage,
-            costUsd: this.meter.usd,
-            pricingKnown: !this.meter.unknownPricing,
-            model: responseModel,
-            error: `Expected exactly one usage record, received ${usageRecords}`,
-            ...modelMeta(),
-          };
+          return responseOutcome('FAILED', turn, responseModel, { error: `Expected exactly one usage record, received ${usageRecords}` });
         if (modelConflict)
-          return {
-            status: 'FAILED',
-            turn,
-            usage: totalUsage,
-            costUsd: this.meter.usd,
-            pricingKnown: !this.meter.unknownPricing,
-            model: responseModel,
-            error: 'Provider response has conflicting model metadata',
-            ...modelMeta(),
-          };
+          return responseOutcome('FAILED', turn, responseModel, { error: 'Provider response has conflicting model metadata' });
         // Do not return as soon as a mismatched model appears: its terminal
         // usage record can arrive later in the same paid stream.  Consume and
         // account for the complete turn, then stop before any tool can execute.
         if (this.maxUsd !== Infinity && unauthorizedResponseModel)
-          return {
-            status: 'BUDGET',
-            turn,
-            usage: totalUsage,
-            costUsd: this.meter.usd,
-            pricingKnown: !this.meter.unknownPricing,
-            model: responseModel,
+          return responseOutcome('BUDGET', turn, responseModel, {
             error: 'Provider response model is not authorized for this finite budget',
             budgetCap: 'other',
-            ...modelMeta(),
-          };
+          });
         if (this.meter.usd > this.maxUsd || (this.meter.unknownPricing && this.maxUsd !== Infinity))
-          return {
-            status: 'BUDGET',
-            turn,
-            usage: totalUsage,
-            costUsd: this.meter.usd,
-            pricingKnown: !this.meter.unknownPricing,
-            model: responseModel,
+          return responseOutcome('BUDGET', turn, responseModel, {
             // A finite budget with an unpriced response trips here too; only a real overspend is the USD cap.
             budgetCap: this.meter.usd > this.maxUsd ? 'usd' : 'other',
-            ...modelMeta(),
-          };
+          });
         if (
           calls.length > MAX_TOOL_CALLS ||
           calls.some((call) => !validProviderCall(call)) ||
           calls.reduce((n, call) => n + call.arguments.length, 0) > MAX_TOOL_ARGUMENT_CHARS
         )
-          return {
-            status: 'FAILED',
-            turn,
-            usage: totalUsage,
-            costUsd: this.meter.usd,
-            pricingKnown: !this.meter.unknownPricing,
-            model: responseModel,
-            error: 'Provider tool calls exceed size limit',
-            ...modelMeta(),
-          };
+          return responseOutcome('FAILED', turn, responseModel, { error: 'Provider tool calls exceed size limit' });
         // Tool names are an authorization boundary, not merely prompt guidance.
         // A compromised/misconfigured provider must not reach capabilities that
         // were deliberately left out of this turn's advertised schema.
@@ -1133,12 +1021,14 @@ export class AgentLoop {
           // One bounded, execute-nothing correction. The response was already
           // metered above, nothing from it is replayed or run, and every
           // reservation/timeout check still applies to the next request. It
-          // is withheld from the finish-only and capped-continuation
-          // recoveries, which stay fail-closed.
+          // is withheld from the finish-only, capped-continuation and report
+          // finalization turns, which stay fail-closed: the turn after report
+          // finalization never makes a request, so a correction is undeliverable.
           const recoverUnadvertisedTool =
             !unadvertisedToolRecoveryUsed &&
             !budgetFinishRecovery &&
             !cappedFinishRecoveryUsed &&
+            !reportFinalizationUsed &&
             turn < this.maxTurns &&
             usageRecords === 1;
           if (recoverUnadvertisedTool) {
@@ -1149,16 +1039,7 @@ export class AgentLoop {
             continue;
           }
           await this.progress?.({ turn, action: `provider_unadvertised_tool:${hint}` });
-          return {
-            status: 'FAILED',
-            turn,
-            usage: totalUsage,
-            costUsd: this.meter.usd,
-            pricingKnown: !this.meter.unknownPricing,
-            model: responseModel,
-            error: 'Provider requested an unadvertised tool',
-            ...modelMeta(),
-          };
+          return responseOutcome('FAILED', turn, responseModel, { error: 'Provider requested an unadvertised tool' });
         }
         // DeepSeek requires exact reasoning_content replay when the provider
         // supplied it, including an explicit null or empty string from a
@@ -1272,50 +1153,22 @@ export class AgentLoop {
           this.context.add(assistant);
           await this.context.flush();
           await settleCappedImplementationRecovery();
-          return {
-            status: 'FAILED',
-            turn,
-            usage: totalUsage,
-            costUsd: this.meter.usd,
-            pricingKnown: !this.meter.unknownPricing,
-            model: responseModel,
+          return responseOutcome('FAILED', turn, responseModel, {
             // A closed, worker-side cause that offload_continue may resume. A
             // content-filter stop is the provider's, and would simply recur.
             ...(providerFinishReason === 'content_filter' ? {} : { failureKind: outputCapRecoveryExhausted ? 'output-cap' : 'no-finish' }),
             error: outputCapRecoveryExhausted ? FAILURE_ERRORS['output-cap'] : FAILURE_ERRORS['no-finish'],
             text,
-            ...modelMeta(),
-          };
+          });
         }
         let parsed;
         try {
-          parsed = calls.map((call) => {
-            if (!call?.id || !call.name) throw new Error('Tool call is missing id or name');
-            return safeJson(call.arguments);
-          });
+          parsed = calls.map((call) => safeJson(call.arguments));
         } catch (error) {
-          return {
-            status: 'FAILED',
-            turn,
-            usage: totalUsage,
-            costUsd: this.meter.usd,
-            pricingKnown: !this.meter.unknownPricing,
-            model: responseModel,
-            error: error.message,
-            ...modelMeta(),
-          };
+          return responseOutcome('FAILED', turn, responseModel, { error: error.message });
         }
         if (new Set(calls.map((call) => call.id)).size !== calls.length)
-          return {
-            status: 'FAILED',
-            turn,
-            usage: totalUsage,
-            costUsd: this.meter.usd,
-            pricingKnown: !this.meter.unknownPricing,
-            model: responseModel,
-            error: 'Duplicate tool call id',
-            ...modelMeta(),
-          };
+          return responseOutcome('FAILED', turn, responseModel, { error: 'Duplicate tool call id' });
         const finishIndex = calls.findIndex((call) => call.name === 'finish');
         const finishNotAlone = finishIndex !== -1 && calls.length !== 1;
         const finishInvalid = finishIndex !== -1 && !finishArgs(parsed[finishIndex]);
@@ -1324,8 +1177,9 @@ export class AgentLoop {
           // one above. The response was already metered, nothing in it runs, the
           // retry takes a normal turn (so it counts against maxTurns, and needs
           // one left) and keeps every reservation, timeout and accounting check.
-          // The finish-only budget recovery stays fail-closed.
-          const recoverFinishProtocol = !finishProtocolRecoveryUsed && !budgetFinishRecovery && turn < this.maxTurns;
+          // The finish-only budget recovery and report finalization stay fail-closed.
+          const recoverFinishProtocol =
+            !finishProtocolRecoveryUsed && !budgetFinishRecovery && !reportFinalizationUsed && turn < this.maxTurns;
           if (recoverFinishProtocol) {
             finishProtocolRecoveryUsed = true;
             const correction = finishNotAlone
@@ -1342,18 +1196,11 @@ export class AgentLoop {
             await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'finish_protocol_recover' });
             continue;
           }
-          return {
-            status: 'FAILED',
-            turn,
-            usage: totalUsage,
-            costUsd: this.meter.usd,
-            pricingKnown: !this.meter.unknownPricing,
-            model: responseModel,
+          return responseOutcome('FAILED', turn, responseModel, {
             // A worker-side cause offload_continue may resume (the work is in the workspace).
             failureKind: 'finish-protocol',
             error: FAILURE_ERRORS['finish-protocol'],
-            ...modelMeta(),
-          };
+          });
         }
         // Persist only a valid assistant tool-call turn.  This ensures a repair
         // never replays an OpenAI-invalid assistant message without matching
@@ -1408,30 +1255,14 @@ export class AgentLoop {
             ...(commandTimeoutSec ? { commandTimeoutSec } : {}),
           });
         try {
-          values = await this.#execute(calls, deadline.signal, toolErrors, toolTimings);
+          values = await this.#execute(calls, parsed, deadline.signal, toolErrors, toolTimings);
         } catch (error) {
-          if (this.signal?.aborted) return { status: stopped(), turn, usage: totalUsage, costUsd: this.meter.usd, ...modelMeta() };
-          if (deadline.signal.aborted)
-            return {
-              status: 'TIMEOUT',
-              turn,
-              usage: totalUsage,
-              costUsd: this.meter.usd,
-              error: 'Agent wall clock deadline exceeded',
-              ...modelMeta(),
-            };
+          if (this.signal?.aborted) return outcome(stopped(), turn);
+          if (deadline.signal.aborted) return outcome('TIMEOUT', turn, { error: 'Agent wall clock deadline exceeded' });
           throw error;
         }
-        if (this.signal?.aborted) return { status: stopped(), turn, usage: totalUsage, costUsd: this.meter.usd, ...modelMeta() };
-        if (deadline.signal.aborted)
-          return {
-            status: 'TIMEOUT',
-            turn,
-            usage: totalUsage,
-            costUsd: this.meter.usd,
-            error: 'Agent wall clock deadline exceeded',
-            ...modelMeta(),
-          };
+        if (this.signal?.aborted) return outcome(stopped(), turn);
+        if (deadline.signal.aborted) return outcome('TIMEOUT', turn, { error: 'Agent wall clock deadline exceeded' });
         await this.progress?.({
           turn,
           usage: totalUsage,
@@ -1446,13 +1277,7 @@ export class AgentLoop {
         if (failed) repeated.set(signatures, n);
         else repeated.delete(signatures);
         if (n >= 3)
-          return {
-            status: 'FAILED',
-            turn,
-            usage: totalUsage,
-            costUsd: this.meter.usd,
-            pricingKnown: !this.meter.unknownPricing,
-            model: responseModel,
+          return responseOutcome('FAILED', turn, responseModel, {
             failureKind: 'tool-loop',
             error: FAILURE_ERRORS['tool-loop'],
             toolFailure: summarizeToolFailure({
@@ -1465,8 +1290,7 @@ export class AgentLoop {
               pathAliases: this.pathAliases,
               secrets: this.secrets,
             }),
-            ...modelMeta(),
-          };
+          });
         for (let i = 0; i < calls.length; i++) {
           const value = values[i];
           if (calls[i].name === 'finish' && value && typeof value === 'object' && value.finish) {
@@ -1475,17 +1299,7 @@ export class AgentLoop {
             this.context.addToolResult(calls[i].id, JSON.stringify(value.finish), calls[i].name);
             await this.context.flush();
             await settleCappedImplementationRecovery();
-            return {
-              status: 'DONE',
-              turn,
-              usage: totalUsage,
-              costUsd: this.meter.usd,
-              pricingKnown: !this.meter.unknownPricing,
-              model: responseModel,
-              finish: value.finish,
-              text,
-              ...modelMeta(),
-            };
+            return responseOutcome('DONE', turn, responseModel, { finish: value.finish, text });
           }
           this.context.addToolResult(calls[i].id, value, calls[i].name);
           await this.context.flush();
@@ -1529,15 +1343,7 @@ export class AgentLoop {
           if (this.maxUsd !== Infinity) implementationFocusPending = true;
         }
       }
-      return {
-        status: 'BUDGET',
-        turn: this.maxTurns,
-        usage: totalUsage,
-        costUsd: this.meter.usd,
-        error: 'Maximum turns reached',
-        budgetCap: 'turns',
-        ...modelMeta(),
-      };
+      return outcome('BUDGET', this.maxTurns, { error: 'Maximum turns reached', budgetCap: 'turns' });
     } finally {
       clearTimeout(timer);
       this.signal?.removeEventListener('abort', onAbort);

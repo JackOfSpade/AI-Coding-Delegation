@@ -1,7 +1,9 @@
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, realpath, chmod, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
+import { insidePath } from './path-containment.mjs';
+import { readRegularFile } from './regular-file.mjs';
 
 export const MAX_REPORT_INPUT_FILES = 32;
 export const MAX_REPORT_INPUT_FILE_BYTES = 8 * 1024 * 1024;
@@ -9,15 +11,6 @@ export const MAX_REPORT_INPUT_TOTAL_BYTES = 32 * 1024 * 1024;
 export const REPORT_INPUT_DIRECTORY = '.offload-report-inputs';
 
 const BIGINT = Object.freeze({ bigint: true });
-
-function insidePath(path, root) {
-  const part = relative(root, path);
-  return part === '' || (!part.startsWith(`..${sep}`) && part !== '..' && !isAbsolute(part));
-}
-
-function sameFile(before, after) {
-  return ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].every((key) => before[key] === after[key]);
-}
 
 /** Candidate roots that are safe defaults for the process that owns this MCP
  * server. `/tmp` resolves to `/private/tmp` on macOS, but the latter is added
@@ -101,23 +94,15 @@ export async function copyReportInputs({ inputFiles = [], workspacePath, roots =
             .join(', ')}`,
         );
       }
-      const readFlags = process.platform === 'win32' ? 0 : (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0);
-      const handle = await open(requested, constants.O_RDONLY | readFlags);
       let bytes;
       try {
-        const opened = await handle.stat(BIGINT);
-        if (!opened.isFile() || !sameFile(before, opened)) throw new Error(`report input ${index + 1} changed while opening`);
-        bytes = Buffer.alloc(Number(opened.size));
-        let offset = 0;
-        while (offset < bytes.length) {
-          const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
-          if (!bytesRead) throw new Error(`report input ${index + 1} changed while reading`);
-          offset += bytesRead;
-        }
-        const after = await handle.stat(BIGINT);
-        if (!sameFile(opened, after)) throw new Error(`report input ${index + 1} changed while reading`);
-      } finally {
-        await handle.close();
+        bytes = await readRegularFile(requested, MAX_REPORT_INPUT_FILE_BYTES, { expected: before });
+      } catch (cause) {
+        // Keep errno failures (ENOENT, ELOOP, EACCES) raw; word identity failures per input.
+        if (cause?.code) throw cause;
+        throw new Error(`report input ${index + 1} changed while ${/while opening/.test(cause?.message ?? '') ? 'opening' : 'reading'}`, {
+          cause,
+        });
       }
       total += bytes.length;
       if (total > MAX_REPORT_INPUT_TOTAL_BYTES)

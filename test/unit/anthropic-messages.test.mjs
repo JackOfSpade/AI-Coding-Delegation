@@ -7,7 +7,7 @@ import {
 } from '../../src/provider/anthropic-messages.mjs';
 import { ProviderError, providerFailure } from '../../src/provider/openai-chat.mjs';
 import { CreditFallbackProvider } from '../../src/provider/fallback.mjs';
-import { resolveLatestDeepSeekFlash } from '../../src/core.mjs';
+import { resolveLatestDeepSeekFlash } from '../../src/provider/model-discovery.mjs';
 
 const sseResponse = (events) =>
   new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''), {
@@ -872,4 +872,93 @@ test('Anthropic aggregate output limits fail before exposing output and preserve
       { usage: { inputTokens: 10, outputTokens: 7, cacheHitTokens: 0, cacheMissTokens: 10, totalTokens: 17 }, model: 'claude-opus-5-5' },
     ]);
   }
+});
+
+const anthropicWith = (fetchImpl, extra = {}) =>
+  new AnthropicMessagesProvider({
+    baseUrl: 'https://api.anthropic.com',
+    apiKey: 'test-key',
+    model: 'claude-opus-5-5',
+    timeoutMs: 30_000,
+    retries: 1,
+    fetchImpl,
+    ...extra,
+  });
+const drainAnthropic = async (provider, request = {}) => {
+  for await (const _ of provider.chat({ messages: [], tools: [], ...request })) {
+    /* consume */
+  }
+};
+const flushLoop = async () => {
+  for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
+};
+const okEvents = () =>
+  sseResponse([
+    { type: 'message_start', message: { model: 'claude-opus-5-5', usage: { input_tokens: 1 } } },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } },
+    { type: 'message_stop' },
+  ]);
+
+test('Anthropic retries wait for a backoff delay instead of re-posting immediately', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let requests = 0;
+  const provider = anthropicWith(async () => (++requests === 1 ? new Response('{}', { status: 429 }) : okEvents()));
+  const pending = drainAnthropic(provider);
+  await flushLoop();
+  assert.equal(requests, 1);
+  t.mock.timers.tick(249);
+  await flushLoop();
+  assert.equal(requests, 1, 'still inside the minimum backoff');
+  t.mock.timers.tick(251);
+  await flushLoop();
+  await pending;
+  assert.equal(requests, 2);
+});
+
+test('cancelling during the Anthropic backoff rejects with the abort reason and posts once', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let requests = 0;
+  const controller = new AbortController();
+  const provider = anthropicWith(async () => {
+    requests++;
+    return new Response('{}', { status: 429 });
+  });
+  const reason = new Error('cancelled');
+  const outcome = drainAnthropic(provider, { signal: controller.signal }).catch((error) => error);
+  await flushLoop();
+  controller.abort(reason);
+  assert.equal(await outcome, reason);
+  assert.equal(requests, 1);
+});
+
+test('an oversized Anthropic SSE event is reported as sse_limit, not a generic transport failure', async () => {
+  const big = `data: ${'x'.repeat(1_100_000)}\n\n`;
+  const provider = anthropicWith(async () => new Response(big, { status: 200 }), { retries: 0 });
+  await assert.rejects(
+    () => drainAnthropic(provider),
+    (error) => error.kind === 'sse_limit' && error.retryable === true && error.message === 'Chat request failed',
+  );
+});
+
+test('a refused Anthropic redirect is not retried', async () => {
+  let requests = 0;
+  const provider = anthropicWith(
+    async () => {
+      requests++;
+      throw Object.assign(new TypeError('fetch failed'), { cause: new Error('unexpected redirect') });
+    },
+    { retries: 2 },
+  );
+  await assert.rejects(
+    () => drainAnthropic(provider),
+    (error) => error.kind === 'redirect' && error.retryable === false && error.attempts === 1,
+  );
+  assert.equal(requests, 1);
+});
+
+test('Anthropic base URL validation shares the OpenAI loopback rules', () => {
+  for (const baseUrl of ['http://127.0.0.2:9', 'http://LOCALHOST:9', 'http://[::1]:9'])
+    assert.ok(anthropicWith(async () => okEvents(), { baseUrl }));
+  assert.throws(() => anthropicWith(async () => okEvents(), { baseUrl: 'http://api.example.test' }), /HTTPS unless/);
+  assert.throws(() => anthropicWith(async () => okEvents(), { baseUrl: 'ftp://x' }), /http\(s\) URL/);
 });

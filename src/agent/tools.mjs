@@ -3,10 +3,11 @@ import { execFile } from 'node:child_process';
 import { constants, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { PathPolicy } from '../policy.mjs';
+import { PathPolicy, escapesRoot } from '../policy.mjs';
 import { RedactionProjector, redactText, stripTerminalControls } from '../redact.mjs';
 import { snapshotGitEnv } from '../git-snapshot.mjs';
-import { globToRegExp } from '../glob.mjs';
+import { globToRegExp, normalizePath } from '../glob.mjs';
+import { statTimestamp } from '../stat-identity.mjs';
 
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const MAX_READ_CAP = 256_000;
@@ -28,6 +29,12 @@ const MAX_EDIT_ARG_CAP = 64_000;
 const MAX_GREP_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_GREP_MATCHES = 300;
 const MAX_DIRECTORY_ENTRIES = 500;
+const MAX_DISCOVERED_FILES = 500;
+
+const assertRelativeRepoPath = (input) => {
+  if (typeof input !== 'string' || path.isAbsolute(input) || input.includes('\\') || /[\x00-\x1f\x7f]/.test(input))
+    throw new Error('Path must be a slash-normalized relative repository path');
+};
 const MAX_WALK_ENTRIES = 10_000;
 const MAX_WALK_DEPTH = 32;
 const GIT_TIMEOUT_MS = 2_000;
@@ -57,14 +64,6 @@ const capText = (value, cap) => {
 // terminal escapes/control injection and mask common accidental credentials.
 const sanitizeToolText = (value) => redactText(stripTerminalControls(value));
 const asText = (value) => (typeof value === 'string' ? value : JSON.stringify(value));
-const statTimestamp = (details, name) => {
-  const nanoseconds = details?.[`${name}Ns`];
-  if (typeof nanoseconds === 'bigint') return nanoseconds;
-  const milliseconds = details?.[`${name}Ms`];
-  if (typeof milliseconds === 'number' && Number.isFinite(milliseconds)) return milliseconds;
-  const date = details?.[name];
-  return date instanceof Date && Number.isFinite(date.getTime()) ? date.getTime() : undefined;
-};
 const safeStatSize = (value) => {
   if (typeof value === 'bigint') return value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : undefined;
   return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
@@ -302,6 +301,9 @@ export class LocalTools {
       ctime: statTimestamp(stat, 'ctime'),
     };
   }
+  #changedSinceRead(seen, raw, size, identity) {
+    return seen.size !== size || seen.hash !== hash(raw) || !seen.identity || !this.#sameIdentity(identity, seen.identity);
+  }
   #sameIdentity(left, right) {
     return (
       left.dev === right.dev &&
@@ -363,16 +365,14 @@ export class LocalTools {
     if (ignored.status !== 1) throw new Error('Refusing write: Git ignore safety check failed');
   }
   #readable(input, { directory = false } = {}) {
-    if (typeof input !== 'string' || path.isAbsolute(input) || input.includes('\\') || /[\x00-\x1f\x7f]/.test(input))
-      throw new Error('Path must be a slash-normalized relative repository path');
+    assertRelativeRepoPath(input);
     if (directory && (input === '.' || input === '')) return this.root; // root listing grants no child read
     const canonical = this.policy.assertReadable(input);
     if (directory) this.policy.assertReadable(path.posix.join(String(input), '.offload-directory-probe'));
     return canonical;
   }
   #writable(input) {
-    if (typeof input !== 'string' || path.isAbsolute(input) || input.includes('\\') || /[\x00-\x1f\x7f]/.test(input))
-      throw new Error('Path must be a slash-normalized relative repository path');
+    assertRelativeRepoPath(input);
     return this.policy.assertWritable(input);
   }
   async #openText(canonical, logical, { writable = false } = {}) {
@@ -411,7 +411,7 @@ export class LocalTools {
     // Walk each logical parent explicitly, resolving every existing component
     // before creating the next one.  Internal symlinks remain supported only
     // when their canonical target remains inside the repository.
-    const parentParts = logical.split('/').slice(0, -1);
+    const parentParts = normalizePath(logical).split('/').slice(0, -1);
     // Use the filesystem's spelling of the root for the whole walk. On
     // Windows, `realpath` may expand an 8.3 temp-directory alias while the
     // original caller path remains short; that is not a repository swap.
@@ -437,7 +437,7 @@ export class LocalTools {
         throw new Error('Refusing write parent changed while creating');
       }
       const rel = path.relative(root, resolved);
-      if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) throw new Error('Refusing write outside repository');
+      if (escapesRoot(rel)) throw new Error('Refusing write outside repository');
       const details = await this.fs.lstat(resolved);
       if (!details.isDirectory() || details.isSymbolicLink()) throw new Error('Refusing invalid write parent');
       cursor = resolved;
@@ -454,7 +454,7 @@ export class LocalTools {
     const parent = await this.fs.realpath(path.dirname(canonical));
     const root = await this.fs.realpath(this.root);
     const rel = path.relative(root, parent);
-    if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) throw new Error('Refusing write outside repository');
+    if (escapesRoot(rel)) throw new Error('Refusing write outside repository');
     const temp = path.join(parent, `.${path.basename(canonical)}.${process.pid}.${randomUUID()}.offload.tmp`);
     let handle;
     try {
@@ -771,7 +771,7 @@ export class LocalTools {
           }
           if (entry.isDirectory()) await walk(this.policy.resolve(child), child, depth + 1);
           else if (matches.test(child)) found.push(child);
-          if (found.length >= 500) {
+          if (found.length >= MAX_DISCOVERED_FILES) {
             truncated = true;
             return;
           }
@@ -798,7 +798,7 @@ export class LocalTools {
     const result = (discoveryTruncated = false) =>
       capText(
         sanitizeToolText(
-          `${lines.join('\n')}${matchesTruncated ? `\n[truncated after ${MAX_GREP_MATCHES} matches]` : ''}${discoveryTruncated ? '\n[file discovery truncated before all files were searched]' : ''}${skippedLarge ? '\n[files truncated at 8388608 bytes each]' : ''}`,
+          `${lines.join('\n')}${matchesTruncated ? `\n[truncated after ${MAX_GREP_MATCHES} matches]` : ''}${discoveryTruncated ? '\n[file discovery truncated before all files were searched]' : ''}${skippedLarge ? `\n[files truncated at ${MAX_GREP_FILE_BYTES} bytes each]` : ''}`,
         ),
         this.outputCap,
       );
@@ -934,7 +934,7 @@ export class LocalTools {
       if (size > MAX_EDITABLE_BYTES) throw new Error(`Refusing edit of file larger than ${MAX_EDITABLE_BYTES} bytes`);
       const raw = await this.#readAll(handle, size);
       before = this.#decode(raw);
-      if (seen.size !== size || seen.hash !== hash(raw) || !seen.identity || !this.#sameIdentity(identity, seen.identity))
+      if (this.#changedSinceRead(seen, raw, size, identity))
         throw new Error(`Refusing stale edit: ${this.#relative(canonical)} changed since read`);
     } finally {
       await handle.close();
@@ -945,7 +945,7 @@ export class LocalTools {
     if (!replace_all && hits !== 1) throw new Error(`old_string must match exactly once (matched ${hits})`);
     const eol = before.includes('\r\n') ? '\r\n' : '\n';
     const replacement = new_string.replace(/\r\n|\r|\n/g, eol);
-    const after = replace_all ? before.split(old_string).join(replacement) : before.replace(old_string, replacement);
+    const after = replace_all ? before.split(old_string).join(replacement) : before.replace(old_string, () => replacement);
     await this.#atomicWrite(file, canonical, after, { mode: mode & 0o777, expected: identity });
     this.readHashes.delete(canonical);
     return `Edited ${this.#relative(canonical)} (${replace_all ? hits : 1} replacement${hits === 1 ? '' : 's'}).`;
@@ -970,7 +970,7 @@ export class LocalTools {
           throw new Error(`Refusing overwrite of file larger than ${MAX_EDITABLE_BYTES} bytes`);
         const raw = await this.#readAll(opened.handle, opened.size);
         this.#decode(raw);
-        if (seen.size !== opened.size || seen.hash !== hash(raw) || !seen.identity || !this.#sameIdentity(opened.identity, seen.identity))
+        if (this.#changedSinceRead(seen, raw, opened.size, opened.identity))
           throw new Error(`Refusing stale write: ${this.#relative(canonical)} changed since read`);
         mode = opened.mode & 0o777;
         expected = opened.identity;

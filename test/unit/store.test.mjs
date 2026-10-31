@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as nodeFs from 'node:fs';
-import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { JobStore, atomicRename, readStoredBytes, readStoredFile, redact } from '../../src/store.mjs';
@@ -818,6 +819,58 @@ test('listing drops a record whose embedded id does not match its managed direct
     record.id = 'other-valid-job';
     writeFileSync(join(gitDir, 'offload', 'jobs', job.id, 'job.json'), JSON.stringify(record));
     assert.deepEqual(await store.listOperational({ limit: 20 }), []);
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
+test('listing keeps a job whose job.json is atomically replaced during the read', async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir });
+    const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
+    const file = join(gitDir, 'offload', 'jobs', job.id, 'job.json');
+    const bytes = readFileSync(file);
+    let running = true;
+    const replacer = (async () => {
+      for (let i = 0; running; i += 1) {
+        writeFileSync(`${file}.swap`, bytes, { mode: 0o600 });
+        renameSync(`${file}.swap`, file);
+        // Pace the replacements so one retry is enough while still racing the checked read's lstat/open window.
+        await sleep(4);
+      }
+    })();
+    try {
+      for (let i = 0; i < 400; i += 1) {
+        const listed = await store.listOperational({ limit: 20 });
+        assert.deepEqual(
+          listed.map((entry) => entry.id),
+          [job.id],
+          `list pass ${i} lost the job`,
+        );
+      }
+    } finally {
+      running = false;
+      await replacer;
+    }
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
+test('progress past the soft cap writes a single truncation marker and still accepts lifecycle events', async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir });
+    const job = await store.create({ task: 'x', ownedPaths: ['src/**'] });
+    const events = join(gitDir, 'offload', 'jobs', job.id, 'events.jsonl');
+    writeFileSync(events, `${'x'.repeat(1024 * 1024 + 10)}\n`, { mode: 0o600 });
+    for (let i = 0; i < 40; i += 1) await store.event(job.id, { type: 'progress', n: i });
+    await store.event(job.id, { type: 'status', state: 'done' });
+    const text = readFileSync(events, 'utf8');
+    assert.equal(text.split('progress-truncated').length - 1, 1);
+    assert.doesNotMatch(text, /"n":/);
+    assert.match(text, /"state":"done"/);
   } finally {
     cleanup(gitDir);
   }

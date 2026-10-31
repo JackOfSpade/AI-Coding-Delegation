@@ -18,18 +18,20 @@ import {
   OFFLOAD_OPENAI_LATEST_SOL,
   OFFLOAD_OPENAI_LATEST_TERRA,
   isOpenAIEndpoint,
+  isSupportedProviderType,
 } from './model-policy.mjs';
 import { loadPricing } from './pricing-registry.mjs';
 import { priceUsage, resolveModel, samePricedModel, validatePricingTable } from './pricing.mjs';
 import { snapshotGitEnv } from './git-snapshot.mjs';
-import { readRegularFileSync } from './regular-file.mjs';
+import { readUtf8FileSync } from './regular-file.mjs';
+import { plainObject } from './plain-object.mjs';
 import { skillCopyStatus, skillFileHash } from './skill-health.mjs';
 import { ECONOMY_SKILL, PREMIUM_SKILL, packagedSkillPath } from './command-skills.mjs';
 
-const MAX_PRICING_BYTES = 1024 * 1024;
+const utf8File = (file) => readUtf8FileSync(file);
 const read = (file) => {
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(readRegularFileSync(file, MAX_PRICING_BYTES));
+    return utf8File(file);
   } catch {
     return '';
   }
@@ -43,7 +45,7 @@ const parsed = (file) => {
 };
 const boundedRead = (file) => {
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(readRegularFileSync(file, MAX_PRICING_BYTES));
+    return utf8File(file);
   } catch {
     throw new Error('file exceeds live probe limit');
   }
@@ -60,11 +62,6 @@ const gitProbe = (args, { env = process.env, platform = process.platform, spawnP
     env: snapshotGitEnv(env),
   });
 };
-const plainRecord = (value) =>
-  value !== null &&
-  typeof value === 'object' &&
-  !Array.isArray(value) &&
-  (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 const exactArgs = (value, bin) => Array.isArray(value) && value.length === 2 && value[0] === bin && value[1] === 'mcp';
 
 // This is deliberately a narrow TOML reader, not a general TOML parser.  It
@@ -209,10 +206,10 @@ function registrations(home, root, platform, env) {
   const claudeRegistration = (file) => {
     const entry = parsed(file)?.mcpServers?.offload;
     const expectedEnvironment =
-      plainRecord(entry?.env) &&
+      plainObject(entry?.env) &&
       (Object.keys(entry.env).length === 0 || (Object.keys(entry.env).length === 1 && entry.env.OFFLOAD_MCP_APPROVAL_MODE === 'approve'));
     return (
-      plainRecord(entry) &&
+      plainObject(entry) &&
       entry.type === 'stdio' &&
       entry.command === process.execPath &&
       exactArgs(entry.args, bin) &&
@@ -221,7 +218,7 @@ function registrations(home, root, platform, env) {
   };
   const cursorRegistration = (file) => {
     const entry = parsed(file)?.mcpServers?.offload;
-    return plainRecord(entry) && entry.command === process.execPath && exactArgs(entry.args, bin);
+    return plainObject(entry) && entry.command === process.execPath && exactArgs(entry.args, bin);
   };
   const paths = resolveClientPaths({ home, env, platform });
   return {
@@ -483,7 +480,7 @@ export async function doctorLive({ probe, maxUsd, configPath, repoPath, env = pr
   const loaded = loadConfig({ configPath, repoPath, env });
   const profile = loaded.config.profiles[loaded.config.default];
   const providerConfig = loaded.config.providers[profile.provider];
-  if (!['openai-chat', 'anthropic-messages'].includes(providerConfig.type)) throw new Error('live probe provider type is unsupported');
+  if (!isSupportedProviderType(providerConfig.type)) throw new Error('live probe provider type is unsupported');
   let apiKey;
   try {
     apiKey = resolveKeyRef(providerConfig.keyRef, { env });

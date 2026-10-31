@@ -2,7 +2,9 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from '
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, posix, resolve, win32 } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { modelPolicyViolation } from './model-policy.mjs';
+import { isSupportedProviderType, modelPolicyViolation } from './model-policy.mjs';
+import { plainObject } from './plain-object.mjs';
+import { sameStatFields } from './stat-identity.mjs';
 
 export const DEFAULT_CONFIG = Object.freeze({
   providers: {
@@ -88,7 +90,7 @@ const LEGACY_COMMAND_PROFILES = {
 
 /** Command profile names whose chain is still a shipped Claude-first example. */
 export function legacyCommandProfiles(profiles) {
-  if (!isPlainObject(profiles)) return [];
+  if (!plainObject(profiles)) return [];
   return Object.entries(LEGACY_COMMAND_PROFILES)
     .filter(([name, { shapes }]) =>
       shapes.some(
@@ -159,11 +161,11 @@ export function defaultConfigPath(env = process.env, home = homedir(), platform 
 
 export function deepMerge(base, override) {
   if (override === undefined) return structuredClone(base);
-  if (!isPlainObject(base) || !isPlainObject(override)) return structuredClone(override);
+  if (!plainObject(base) || !plainObject(override)) return structuredClone(override);
   assertSafeKeys(override);
   const result = structuredClone(base);
   for (const [key, value] of Object.entries(override)) {
-    result[key] = isPlainObject(value) && isPlainObject(result[key]) ? deepMerge(result[key], value) : structuredClone(value);
+    result[key] = plainObject(value) && plainObject(result[key]) ? deepMerge(result[key], value) : structuredClone(value);
   }
   return result;
 }
@@ -228,17 +230,17 @@ export function parseJsonFile(filePath, label = 'config', { rejectSymlink = fals
 }
 
 export function validateConfig(config) {
-  if (!isPlainObject(config)) throw new ConfigError('Config must be a JSON object');
+  if (!plainObject(config)) throw new ConfigError('Config must be a JSON object');
   assertSafeKeys(config);
   assertAllowedKeys(config, ['providers', 'profiles', 'default', 'limits', 'verifier'], 'Config');
-  for (const key of ['providers', 'profiles']) if (!isPlainObject(config[key])) throw new ConfigError(`Config.${key} must be an object`);
+  for (const key of ['providers', 'profiles']) if (!plainObject(config[key])) throw new ConfigError(`Config.${key} must be an object`);
   assertSafeKeys(config.providers);
   assertSafeKeys(config.profiles);
   if (Object.keys(config.providers).length > MAX_PROVIDERS || Object.keys(config.profiles).length > MAX_PROFILES)
     throw new ConfigError('Config has too many providers or profiles', 'E_CONFIG_LIMIT');
   if (!boundedText(config.default, MAX_NAME)) throw new ConfigError('Config.default must be a non-empty profile name');
   if (!Object.hasOwn(config.profiles, config.default)) throw new ConfigError(`Default profile does not exist: ${config.default}`);
-  if (!isPlainObject(config.limits)) throw new ConfigError('Config.limits must be an object');
+  if (!plainObject(config.limits)) throw new ConfigError('Config.limits must be an object');
   assertSafeKeys(config.limits);
   assertAllowedKeys(config.limits, ['maxTurns', 'timeoutMinutes', 'maxUsd', 'creditCooldownMinutes'], 'Config.limits');
   numeric(config.limits.maxTurns, 'limits.maxTurns', 1, 1000, true);
@@ -248,7 +250,7 @@ export function validateConfig(config) {
   if (config.limits.creditCooldownMinutes !== undefined)
     numeric(config.limits.creditCooldownMinutes, 'limits.creditCooldownMinutes', 0, 1440);
   if (config.verifier !== undefined) {
-    if (!isPlainObject(config.verifier)) throw new ConfigError('Config.verifier must be an object');
+    if (!plainObject(config.verifier)) throw new ConfigError('Config.verifier must be an object');
     assertSafeKeys(config.verifier);
     assertAllowedKeys(config.verifier, ['interpreterRoots', 'minDurationFraction', 'expectedMsPerKiB'], 'Config.verifier');
     // A verifier run under this share of its expected duration is reported as
@@ -280,7 +282,7 @@ export function validateConfig(config) {
   for (const [name, provider] of Object.entries(config.providers)) {
     if (
       !boundedText(name, MAX_NAME) ||
-      !isPlainObject(provider) ||
+      !plainObject(provider) ||
       typeof provider.type !== 'string' ||
       typeof provider.baseUrl !== 'string' ||
       typeof provider.keyRef !== 'string'
@@ -289,11 +291,7 @@ export function validateConfig(config) {
     }
     assertSafeKeys(provider);
     assertAllowedKeys(provider, ['type', 'baseUrl', 'keyRef', 'pricing', 'pricingFile', 'attemptTimeoutMs'], `Provider ${name}`);
-    if (
-      !['openai-chat', 'anthropic-messages'].includes(provider.type) ||
-      !safeProviderUrl(provider.baseUrl) ||
-      !safeKeyRef(provider.keyRef)
-    )
+    if (!isSupportedProviderType(provider.type) || !safeProviderUrl(provider.baseUrl) || !safeKeyRef(provider.keyRef))
       throw new ConfigError(`Provider ${name} has invalid connection settings`, 'E_CONFIG_PROVIDER');
     if (provider.pricing !== undefined && !boundedText(provider.pricing, MAX_NAME))
       throw new ConfigError(`Provider ${name}.pricing must be a bounded string`, 'E_CONFIG_PROVIDER');
@@ -305,7 +303,7 @@ export function validateConfig(config) {
   for (const [name, profile] of Object.entries(config.profiles)) {
     if (
       !boundedText(name, MAX_NAME) ||
-      !isPlainObject(profile) ||
+      !plainObject(profile) ||
       !boundedText(profile.provider, MAX_NAME) ||
       !boundedText(profile.model, MAX_NAME)
     )
@@ -338,7 +336,7 @@ export function validateConfig(config) {
 }
 
 export function validateRepoConfig(config) {
-  if (!isPlainObject(config)) throw new ConfigError('Repository config must be a JSON object', 'E_REPO_CONFIG');
+  if (!plainObject(config)) throw new ConfigError('Repository config must be a JSON object', 'E_REPO_CONFIG');
   assertSafeKeys(config);
   const allowed = new Set(['testCommand', 'denyRead', 'disabled']);
   for (const key of Object.keys(config))
@@ -400,11 +398,6 @@ function numeric(value, name, minimum, maximum, integer = false) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < minimum || value > maximum || (integer && !Number.isInteger(value)))
     throw new ConfigError(`Config.${name} must be a finite ${integer ? 'integer' : 'number'} between ${minimum} and ${maximum}`);
 }
-function isPlainObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
 function boundedText(value, maximum) {
   return typeof value === 'string' && value.length > 0 && value.length <= maximum && !/[\0\r\n]/.test(value);
 }
@@ -446,30 +439,7 @@ function checkedConfigSize(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 function sameConfigMetadata(first, second) {
-  return (
-    ['dev', 'ino', 'size', 'mode'].every((name) => sameStatValue(first?.[name], second?.[name])) &&
-    sameTimestamp(first, second, 'mtime') &&
-    sameTimestamp(first, second, 'ctime')
-  );
-}
-function sameStatValue(first, second) {
-  if (first === second) return true;
-  if (typeof first === 'bigint' && Number.isSafeInteger(second)) return first === BigInt(second);
-  if (typeof second === 'bigint' && Number.isSafeInteger(first)) return BigInt(first) === second;
-  return false;
-}
-function sameTimestamp(first, second, name) {
-  const left = statTimestamp(first, name),
-    right = statTimestamp(second, name);
-  return left !== undefined && right !== undefined && sameStatValue(left, right);
-}
-function statTimestamp(details, name) {
-  const nanoseconds = details?.[`${name}Ns`];
-  if (typeof nanoseconds === 'bigint') return nanoseconds;
-  const milliseconds = details?.[`${name}Ms`];
-  if (typeof milliseconds === 'number' && Number.isFinite(milliseconds)) return milliseconds;
-  const date = details?.[name];
-  return date instanceof Date && Number.isFinite(date.getTime()) ? date.getTime() : undefined;
+  return sameStatFields(first, second, ['dev', 'ino', 'size', 'mode']);
 }
 
 const defaultFs = Object.freeze({ constants, lstatSync, openSync, fstatSync, readSync, closeSync });

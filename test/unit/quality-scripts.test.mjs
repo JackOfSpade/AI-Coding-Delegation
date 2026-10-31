@@ -9,11 +9,12 @@ import { checkSyntaxTargets, discoverSyntaxTargets } from '../../scripts/check-s
 import {
   collectPackageTargets,
   isForbiddenPackagePath,
-  npmPackCommand,
+  npmPackInvocation,
   npmPackEnvironment,
+  validateOffloadManifests,
   validateOffloadPluginArtifacts,
 } from '../../scripts/package-gate.mjs';
-import { analyzeStrictSkips, parseTapSkips } from '../run-suite.mjs';
+import { STRICT_SKIP_ALLOWLIST, analyzeStrictSkips, parseTapSkips } from '../run-suite.mjs';
 import { runCiTests } from '../../scripts/test-ci.mjs';
 import { cleanArtifacts } from '../../scripts/clean-artifacts.mjs';
 import { acquireArtifactLease, artifactLeaseRoot, formatArtifactLeaseMarker } from '../../scripts/artifact-lease.mjs';
@@ -85,8 +86,16 @@ test('package gate gives npm an isolated credential-free environment', () => {
 });
 
 test('package gate selects a runnable npm launcher on Windows', () => {
-  assert.equal(npmPackCommand('linux'), 'npm');
-  assert.equal(npmPackCommand('win32'), 'npm.cmd');
+  assert.deepEqual(npmPackInvocation(['pack', '--json'], 'linux'), { command: 'npm', args: ['pack', '--json'] });
+  assert.deepEqual(npmPackInvocation(['pack', '--json'], 'win32'), { command: 'cmd.exe', args: ['/d', '/s', '/c', 'npm.cmd pack --json'] });
+});
+
+test('strict skip allowlist has no duplicate (name, reason) pairs', () => {
+  const keys = STRICT_SKIP_ALLOWLIST.map((entry) => JSON.stringify([entry.name, entry.reason]));
+  assert.deepEqual(
+    keys.filter((key, index) => keys.indexOf(key) !== index),
+    [],
+  );
 });
 
 test('strict test runner parses TAP skips and rejects every skip outside the reviewed allowlist', () => {
@@ -787,6 +796,7 @@ test('package gate keeps the two plugin manifests semantically aligned and requi
   const codex = { ...marketplace, skills: './skills/' };
   const skill = '---\n{"name":"offload_economy","description":"delegate work"}\n---\n\n# Offload\n';
   assert.deepEqual(validateOffloadPluginArtifacts(marketplace, codex, skill), []);
+  assert.deepEqual(validateOffloadManifests(marketplace, { ...codex, version: '1.2.4' }), ['plugin manifest version differs']);
   assert.deepEqual(validateOffloadPluginArtifacts(marketplace, { ...codex, version: '1.2.4' }, skill), ['plugin manifest version differs']);
   assert.deepEqual(
     validateOffloadPluginArtifacts({ ...marketplace, author: {}, keywords: [] }, { ...codex, author: {}, keywords: [] }, skill),
@@ -889,6 +899,33 @@ test('package targets fail closed for unsafe paths and malformed export targets'
     targets: ['src/index.mjs'],
     invalid: [],
   });
+});
+
+test('client smoke reports output overflow instead of a spawn failure', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'offload-noisy-client-'));
+  const executable = join(directory, process.platform === 'win32' ? 'claude.cmd' : 'claude');
+  try {
+    await writeFile(join(directory, 'noisy.cjs'), 'process.stdout.write("x".repeat(70000));');
+    await writeFile(
+      executable,
+      process.platform === 'win32'
+        ? `@echo off\r\n"${process.execPath}" "%~dp0noisy.cjs"\r\n`
+        : `#!/bin/sh\nexec '${process.execPath.replaceAll("'", "'\"'\"'")}' '${join(directory, 'noisy.cjs')}'\n`,
+    );
+    if (process.platform !== 'win32') await chmod(executable, 0o755);
+    const env = { ...process.env, PATH: `${directory}${delimiter}${process.env.PATH || process.env.Path || ''}` };
+    const result = spawnSync(process.execPath, ['scripts/client-smoke.mjs', '--clients=claude'], {
+      cwd: root,
+      env,
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /produced more than 65536 bytes of output/);
+    assert.doesNotMatch(result.stderr, /could not start/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('client smoke validates a disposable registration lifecycle without touching the real home', async () => {

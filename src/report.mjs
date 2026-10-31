@@ -1,6 +1,7 @@
 import { continuationBlocker, promptCacheSummary } from './continuation.mjs';
 import { verifierPreflightLines } from './verifier-preflight.mjs';
-import { redactText } from './redact.mjs';
+import { redactText, stripTerminalControls } from './redact.mjs';
+import { TURN_SOURCES } from './budget-sizing.mjs';
 import {
   APPLY_ELIGIBLE_STATUSES,
   continuableFailure,
@@ -11,6 +12,124 @@ import {
 } from './failure.mjs';
 import { formatDuration, sanitizeTiming, timingTotals } from './timing.mjs';
 import { isVerifierEnvironmentKind, tsxIpcEnvironment } from './verify-env.mjs';
+
+/** The next-action advice, gated exactly as JobManager.repair()/offload_apply enforce. */
+function nextActionLines(job, { reportMode, violations, files, continuationReason, baseline, applyRunning, environmentFailure }) {
+  const nextActions = reportMode ? ['read reportResult'] : [`offload_job {jobId:${JSON.stringify(scalar(job.id))}, include:"diff"}`];
+  if (!reportMode && !violations.length && job.applied === true && !job.revertedAt && !job.revertUncertain && !applyRunning)
+    nextActions.push('revert');
+  const mutationSettled =
+    !job.integrationIntent &&
+    !job.revertIntent &&
+    !applyRunning &&
+    !job.integrationUncertain &&
+    !job.revertUncertain &&
+    job.applied !== true;
+  // The same gates JobManager.repair() enforces, so a report never advertises
+  // a next action the server will refuse.
+  const roundAvailable =
+    !continuationReason &&
+    job.workspaceRetained !== true &&
+    (job.rounds || 0) < (job.maxRepairRounds ?? 2) &&
+    job.budgetFinishRecovery === undefined &&
+    job.cappedFinishRecovery !== 'queued' &&
+    job.cappedFinishRecovery !== 'consumed' &&
+    // An inconclusive baseline comparison is a failure no repair round can address.
+    baseline?.status !== 'inconclusive' &&
+    (!job.verify || job.verify?.result?.sandbox === 'macos');
+  // The cumulative caps bind a repair (it is no way around a spent cap) but not
+  // a continuation, which raises them.
+  const budgetSpent =
+    (job.budget?.maxTurns != null && (job.turns || 0) >= job.budget.maxTurns) ||
+    (job.budget?.maxUsd != null && (job.costUsd || 0) >= job.budget.maxUsd);
+  if (
+    !reportMode &&
+    !violations.length &&
+    mutationSettled &&
+    job.status !== 'DONE_VERIFIED' &&
+    job.status !== 'DONE_UNVERIFIED' &&
+    job.status !== 'VERIFY_ENV_FAILED' &&
+    roundAvailable &&
+    !budgetSpent
+  )
+    nextActions.push('repair');
+  if (
+    !reportMode &&
+    mutationSettled &&
+    !violations.length &&
+    roundAvailable &&
+    !job.assertionRepair &&
+    job.applyVerify?.outcome === 'FAILED' &&
+    job.applyVerify?.reverted === true
+  )
+    nextActions.push(
+      'repair with assertionPaths [job-owned changed files] and defects [named assertions] ($0.50 fixed allowance, 6 turns; independent of prior maxUsd)',
+    );
+  // A cap stop is not a failure of the work: keep it and let the primary
+  // raise the cap. A FAILED round the worker itself ended (loop, no finish,
+  // output cap) is resumable too, by the same gate the server enforces.
+  // Offered only when there is in-scope work worth keeping.
+  const capStop = job.status === 'BUDGET' || job.status === 'TIMEOUT';
+  if (
+    !reportMode &&
+    !violations.length &&
+    mutationSettled &&
+    (capStop || continuableFailure(job)) &&
+    (files.length || retryableTranscriptFailure(job)) &&
+    roundAvailable
+  ) {
+    nextActions.push(!capStop && budgetSpent ? 'continue (extraTurns/extraUsd needed: the cumulative budget is spent)' : 'continue');
+  }
+  // A FAILED job only through the gate offload_apply enforces on its retained diff.
+  const appliable = APPLY_ELIGIBLE.has(job.status) || (job.status === 'FAILED' && !failedApplyRefusal(job));
+  const verifiedNoFinish =
+    !reportMode &&
+    job.status === 'FAILED' &&
+    job.failureKind === 'no-finish' &&
+    mutationSettled &&
+    appliable &&
+    files.length > 0 &&
+    typeof job.testCommand === 'string' &&
+    job.testCommand.trim() &&
+    job.verify?.command === job.testCommand &&
+    job.verify.verdict === 'PASS' &&
+    job.verify.result?.code === 0 &&
+    !job.verify.result.timedOut &&
+    !job.verify.result.cancelled &&
+    !isVerifierEnvironmentKind(environmentFailure?.kind);
+  if (verifiedNoFinish) nextActions.unshift('offload_apply with applyThenVerify (recommended after diff review)');
+  else if (!reportMode && !violations.length && mutationSettled && appliable && files.length)
+    nextActions.push('apply (after your own check)');
+  return { nextActions, verifiedNoFinish };
+}
+
+/** Advice for a verifier-environment failure, which is not a repair-able code failure. */
+function environmentLine(job, environmentFailure, { reportMode, primaryChecked, applyRunning }) {
+  return !reportMode && isVerifierEnvironmentKind(environmentFailure?.kind)
+    ? `verifier environment${primaryChecked ? ' (earlier sandbox run; primary verification recorded below)' : ''}: ${scalar(environmentFailure.detail || environmentFailure.kind)}. This is not a repair-able code failure; no repair round was spent and none will be started automatically.${
+        environmentFailure.kind === 'missing-package'
+          ? job.workspaceDependencies && job.workspaceDependencies !== 'linked'
+            ? ` The primary checkout's node_modules was not linked (${scalar(job.workspaceDependencies)}): install dependencies there.`
+            : ' Either it is not installed in the primary checkout, it lives in a nested/workspace package outside the linked root node_modules, or the worker imported a package that does not exist (check the diff).'
+          : environmentFailure.kind === 'temp-dir-denied'
+            ? ' Hard-coded /tmp is not writable in the verifier; tests must use os.tmpdir()/$TMPDIR and forward the environment to child processes. For a suite with such pre-existing failures, start with verifierMode "baseline-diff".'
+            : environmentFailure.kind === 'git-config-denied'
+              ? ' A temporary Git-fixture test could not read host Git configuration in the verifier sandbox. This is an environment limitation, not a product-test failure; run that integration suite in the primary checkout.'
+              : environmentFailure.kind === 'native-module-crash'
+                ? primaryChecked
+                  ? ' The earlier native import crash remains recorded separately from the primary check.'
+                  : ' Run the import in the primary checkout to determine whether the verifier sandbox caused the crash. An accepted interpreter declaration grants read and exec; it does not prove imports work.'
+                : environmentFailure.kind === 'sandbox-dominated'
+                  ? " Most of the suite's child-process/Git fixtures cannot run in the verifier sandbox, so the runs are no evidence about the change: run that suite in the primary checkout, and give the next job a testCommand without those files."
+                  : ''
+      }${
+        // An applyThenVerify run is already acting on this very advice.
+        applyRunning || job.applied === true
+          ? ''
+          : ' Review the diff, then use offload_apply to integrate it: applyThenVerify "<your check>" applies it, runs the check in the primary checkout and reverts it if the check fails (or pass verifiedBy for a check you ran yourself), or start a fresh job.'
+      }`
+    : '';
+}
 
 const terminal = new Set([
   'DONE_VERIFIED',
@@ -151,31 +270,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
   const environmentFailure =
     job.verifyEnvironment?.kind === 'permission-denied' ? (tsxIpcEnvironment(job.verify) ?? job.verifyEnvironment) : job.verifyEnvironment;
   const primaryChecked = job.applied === true && (job.applyVerify?.outcome === 'PASSED' || !!job.appliedUnverified?.verifiedBy);
-  const environment =
-    !reportMode && isVerifierEnvironmentKind(environmentFailure?.kind)
-      ? `verifier environment${primaryChecked ? ' (earlier sandbox run; primary verification recorded below)' : ''}: ${scalar(environmentFailure.detail || environmentFailure.kind)}. This is not a repair-able code failure; no repair round was spent and none will be started automatically.${
-          environmentFailure.kind === 'missing-package'
-            ? job.workspaceDependencies && job.workspaceDependencies !== 'linked'
-              ? ` The primary checkout's node_modules was not linked (${scalar(job.workspaceDependencies)}): install dependencies there.`
-              : ' Either it is not installed in the primary checkout, it lives in a nested/workspace package outside the linked root node_modules, or the worker imported a package that does not exist (check the diff).'
-            : environmentFailure.kind === 'temp-dir-denied'
-              ? ' Hard-coded /tmp is not writable in the verifier; tests must use os.tmpdir()/$TMPDIR and forward the environment to child processes. For a suite with such pre-existing failures, start with verifierMode "baseline-diff".'
-              : environmentFailure.kind === 'git-config-denied'
-                ? ' A temporary Git-fixture test could not read host Git configuration in the verifier sandbox. This is an environment limitation, not a product-test failure; run that integration suite in the primary checkout.'
-                : environmentFailure.kind === 'native-module-crash'
-                  ? primaryChecked
-                    ? ' The earlier native import crash remains recorded separately from the primary check.'
-                    : ' Run the import in the primary checkout to determine whether the verifier sandbox caused the crash. An accepted interpreter declaration grants read and exec; it does not prove imports work.'
-                  : environmentFailure.kind === 'sandbox-dominated'
-                    ? " Most of the suite's child-process/Git fixtures cannot run in the verifier sandbox, so the runs are no evidence about the change: run that suite in the primary checkout, and give the next job a testCommand without those files."
-                    : ''
-        }${
-          // An applyThenVerify run is already acting on this very advice.
-          applyRunning || job.applied === true
-            ? ''
-            : ' Review the diff, then use offload_apply to integrate it: applyThenVerify "<your check>" applies it, runs the check in the primary checkout and reverts it if the check fails (or pass verifiedBy for a check you ran yourself), or start a fresh job.'
-        }`
-      : '';
+  const environment = environmentLine(job, environmentFailure, { reportMode, primaryChecked, applyRunning });
   const appliedUnverified =
     job.appliedUnverified && typeof job.appliedUnverified === 'object'
       ? `applied WITHOUT server verification (was ${scalar(job.appliedUnverified.previousStatus || 'unknown')}${originalFailure(job.appliedUnverified.failure)}); primary's own check: ${scalar(job.appliedUnverified.verifiedBy || (job.appliedUnverified.applyThenVerify ? 'applyThenVerify (below)' : 'not recorded')).slice(0, 400)}`
@@ -225,91 +320,15 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
         : job.workspaceCleanupError
           ? `workspace cleanup: RETRYABLE ERROR — ${scalar(job.workspaceCleanupError)}`
           : '';
-  const nextActions = reportMode ? ['read reportResult'] : [`offload_job {jobId:${JSON.stringify(scalar(job.id))}, include:"diff"}`];
-  if (!reportMode && !violations.length && job.applied === true && !job.revertedAt && !job.revertUncertain && !applyRunning)
-    nextActions.push('revert');
-  const mutationSettled =
-    !job.integrationIntent &&
-    !job.revertIntent &&
-    !applyRunning &&
-    !job.integrationUncertain &&
-    !job.revertUncertain &&
-    job.applied !== true;
-  // The same gates JobManager.repair() enforces, so a report never advertises
-  // a next action the server will refuse.
-  const roundAvailable =
-    !continuationReason &&
-    job.workspaceRetained !== true &&
-    (job.rounds || 0) < (job.maxRepairRounds ?? 2) &&
-    job.budgetFinishRecovery === undefined &&
-    job.cappedFinishRecovery !== 'queued' &&
-    job.cappedFinishRecovery !== 'consumed' &&
-    // An inconclusive baseline comparison is a failure no repair round can address.
-    baseline?.status !== 'inconclusive' &&
-    (!job.verify || job.verify?.result?.sandbox === 'macos');
-  // The cumulative caps bind a repair (it is no way around a spent cap) but not
-  // a continuation, which raises them.
-  const budgetSpent =
-    (job.budget?.maxTurns != null && (job.turns || 0) >= job.budget.maxTurns) ||
-    (job.budget?.maxUsd != null && (job.costUsd || 0) >= job.budget.maxUsd);
-  if (
-    !reportMode &&
-    !violations.length &&
-    mutationSettled &&
-    job.status !== 'DONE_VERIFIED' &&
-    job.status !== 'DONE_UNVERIFIED' &&
-    job.status !== 'VERIFY_ENV_FAILED' &&
-    roundAvailable &&
-    !budgetSpent
-  )
-    nextActions.push('repair');
-  if (
-    !reportMode &&
-    mutationSettled &&
-    !violations.length &&
-    roundAvailable &&
-    !job.assertionRepair &&
-    job.applyVerify?.outcome === 'FAILED' &&
-    job.applyVerify?.reverted === true
-  )
-    nextActions.push(
-      'repair with assertionPaths [job-owned changed files] and defects [named assertions] ($0.50 fixed allowance, 6 turns; independent of prior maxUsd)',
-    );
-  // A cap stop is not a failure of the work: keep it and let the primary
-  // raise the cap. A FAILED round the worker itself ended (loop, no finish,
-  // output cap) is resumable too, by the same gate the server enforces.
-  // Offered only when there is in-scope work worth keeping.
-  const capStop = job.status === 'BUDGET' || job.status === 'TIMEOUT';
-  if (
-    !reportMode &&
-    !violations.length &&
-    mutationSettled &&
-    (capStop || continuableFailure(job)) &&
-    (files.length || retryableTranscriptFailure(job)) &&
-    roundAvailable
-  ) {
-    nextActions.push(!capStop && budgetSpent ? 'continue (extraTurns/extraUsd needed: the cumulative budget is spent)' : 'continue');
-  }
-  // A FAILED job only through the gate offload_apply enforces on its retained diff.
-  const appliable = APPLY_ELIGIBLE.has(job.status) || (job.status === 'FAILED' && !failedApplyRefusal(job));
-  const verifiedNoFinish =
-    !reportMode &&
-    job.status === 'FAILED' &&
-    job.failureKind === 'no-finish' &&
-    mutationSettled &&
-    appliable &&
-    files.length > 0 &&
-    typeof job.testCommand === 'string' &&
-    job.testCommand.trim() &&
-    job.verify?.command === job.testCommand &&
-    job.verify.verdict === 'PASS' &&
-    job.verify.result?.code === 0 &&
-    !job.verify.result.timedOut &&
-    !job.verify.result.cancelled &&
-    !isVerifierEnvironmentKind(environmentFailure?.kind);
-  if (verifiedNoFinish) nextActions.unshift('offload_apply with applyThenVerify (recommended after diff review)');
-  else if (!reportMode && !violations.length && mutationSettled && appliable && files.length)
-    nextActions.push('apply (after your own check)');
+  const { nextActions, verifiedNoFinish } = nextActionLines(job, {
+    reportMode,
+    violations,
+    files,
+    continuationReason,
+    baseline,
+    applyRunning,
+    environmentFailure,
+  });
   const raw = [
     line1,
     verifiedNoFinish &&
@@ -466,7 +485,7 @@ function stallLine(value) {
 function applyVerifyLines(record, lean) {
   if (!record || typeof record !== 'object' || Array.isArray(record)) return '';
   const command = `\`${scalar(record.command || '').slice(0, 300)}\``;
-  const seconds = Number.isFinite(record.durationMs) ? `${Math.round(record.durationMs / 100) / 10}s` : undefined;
+  const seconds = Number.isFinite(record.durationMs) ? tenths(record.durationMs) : undefined;
   const ran =
     [record.ranUnder ? `sandbox: ${scalar(record.ranUnder)}` : '', record.location === 'scratch' ? 'in a scratch copy of the primary' : '']
       .filter(Boolean)
@@ -537,19 +556,17 @@ const DURATION_SOURCES = {
 };
 /** One advisory line per verifier run that finished implausibly fast for this command. */
 function durationWarningLines(warnings) {
-  const seconds = (ms) => `${Math.round((Number.isFinite(ms) ? ms : 0) / 100) / 10}s`;
   return (Array.isArray(warnings) ? warnings : [])
     .filter((warning) => DURATION_SOURCES[warning?.source] && (warning.run === 'result' || warning.run === 'snapshot'))
     .slice(0, 2)
     .map(
       (warning) =>
-        `verify duration warning: the ${warning.run === 'result' ? 'result' : 'untouched-snapshot'} run took ${seconds(warning.durationMs)}, under ${scalar(Math.round((Number.isFinite(warning.minFraction) ? warning.minFraction : 0) * 100))}% of the ${seconds(warning.expectedMs)} expected from ${DURATION_SOURCES[warning.source]}; the suite may not have run, so check its output before trusting the verdict.`,
+        `verify duration warning: the ${warning.run === 'result' ? 'result' : 'untouched-snapshot'} run took ${tenths(warning.durationMs)}, under ${scalar(Math.round((Number.isFinite(warning.minFraction) ? warning.minFraction : 0) * 100))}% of the ${tenths(warning.expectedMs)} expected from ${DURATION_SOURCES[warning.source]}; the suite may not have run, so check its output before trusting the verdict.`,
     )
     .join('\n');
 }
 /** Nested, single-line names: a failing test's name is untrusted text and must not forge a report field. */
 function baselineLines(baseline, lean) {
-  const seconds = (ms) => `${Math.round((Number.isFinite(ms) ? ms : 0) / 100) / 10}s`;
   const names = Array.isArray(baseline.newFailures) ? baseline.newFailures.slice(0, 50) : [];
   const shown = names.slice(0, lean ? 8 : names.length).map((name) => `  | ${scalar(name)}`);
   const hidden = Math.max(0, (Number.isFinite(baseline.newFailureCount) ? baseline.newFailureCount : names.length) - shown.length);
@@ -561,11 +578,11 @@ function baselineLines(baseline, lean) {
     ].join('\n');
   if (baseline.status === 'compared')
     return [
-      `baseline-diff: ${scalar(baseline.result?.failures ?? 0)} failing now vs ${scalar(baseline.baseline?.failures ?? 0)} in the untouched snapshot · ${scalar(baseline.newFailureCount ?? 0)} new, ${scalar(baseline.preexisting ?? 0)} pre-existing, ${scalar(baseline.fixed ?? 0)} fixed · snapshot run ${seconds(baseline.baseline?.durationMs)}, result run ${seconds(baseline.result?.durationMs)}`,
+      `baseline-diff: ${scalar(baseline.result?.failures ?? 0)} failing now vs ${scalar(baseline.baseline?.failures ?? 0)} in the untouched snapshot · ${scalar(baseline.newFailureCount ?? 0)} new, ${scalar(baseline.preexisting ?? 0)} pre-existing, ${scalar(baseline.fixed ?? 0)} fixed · snapshot run ${tenths(baseline.baseline?.durationMs)}, result run ${tenths(baseline.result?.durationMs)}`,
       ...list,
     ].join('\n');
   if (baseline.status === 'inconclusive' && baseline.reason === 'environment-dominated')
-    return `baseline-diff: INCONCLUSIVE (environment-dominated) - ${scalar(baseline.result?.failures ?? 0)} failing now vs ${scalar(baseline.baseline?.failures ?? 0)} in the untouched snapshot, ${scalar(baseline.result?.passed ?? 0)} passing · sandbox denials in ${scalar(baseline.result?.deniedFailures ?? 0)} of ${scalar(baseline.result?.detailedFailures ?? 0)} failure detail(s) now, ${scalar(baseline.baseline?.deniedFailures ?? 0)} of ${scalar(baseline.baseline?.detailedFailures ?? 0)} in the snapshot · snapshot run ${seconds(baseline.baseline?.durationMs)}, result run ${seconds(baseline.result?.durationMs)}, expected at least ${seconds(baseline.expectedMs)} for the tested files - treated as an environment failure; no repair round was spent. ${BASELINE_HINTS['environment-dominated']}`;
+    return `baseline-diff: INCONCLUSIVE (environment-dominated) - ${scalar(baseline.result?.failures ?? 0)} failing now vs ${scalar(baseline.baseline?.failures ?? 0)} in the untouched snapshot, ${scalar(baseline.result?.passed ?? 0)} passing · sandbox denials in ${scalar(baseline.result?.deniedFailures ?? 0)} of ${scalar(baseline.result?.detailedFailures ?? 0)} failure detail(s) now, ${scalar(baseline.baseline?.deniedFailures ?? 0)} of ${scalar(baseline.baseline?.detailedFailures ?? 0)} in the snapshot · snapshot run ${tenths(baseline.baseline?.durationMs)}, result run ${tenths(baseline.result?.durationMs)}, expected at least ${tenths(baseline.expectedMs)} for the tested files - treated as an environment failure; no repair round was spent. ${BASELINE_HINTS['environment-dominated']}`;
   if (baseline.status === 'inconclusive')
     return `baseline-diff: INCONCLUSIVE (${scalar(baseline.reason || 'unknown')}) - treated as a failure; no repair round was spent. ${BASELINE_HINTS[baseline.reason] || ''}`.trimEnd();
   if (baseline.status === 'skipped' && baseline.reason === 'result-timed-out')
@@ -590,6 +607,8 @@ function providerFinishReasonLine(value) {
   return reasons.has(value) ? `provider finish reason: ${value}` : '';
 }
 const BUDGET_STOP_CAPS = new Set(['turns', 'usd', 'reservation', 'other']);
+const tenths = (ms) => `${Math.round((Number.isFinite(ms) ? ms : 0) / 100) / 10}s`;
+
 const money = (value) => (value === 0 || value >= 0.01 ? value.toFixed(2) : value.toFixed(4));
 /** Which cap ended a BUDGET round, with the spend against it, so the primary raises the right one. */
 function budgetStopLine(value) {
@@ -611,7 +630,6 @@ function budgetStopLine(value) {
       return `budget stop: ${used}, ${spent}.`;
   }
 }
-const TURN_SOURCES = new Set(['default', 'scaled', 'caller', 'raised']);
 /** Shown only when the server flagged the cap (it is below its own recommendation). */
 function budgetSizingLine(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !TURN_SOURCES.has(value.turnsSource)) return '';
@@ -669,42 +687,10 @@ function providerFailureLine(value) {
 function parseTimestamp(value) {
   return typeof value === 'string' || value instanceof Date ? Date.parse(value) : NaN;
 }
-function stripTerminalEscapes(value) {
-  const input = String(value);
-  let output = '';
-  for (let index = 0; index < input.length; index += 1) {
-    if (input.charCodeAt(index) !== 0x1b) {
-      output += input[index];
-      continue;
-    }
-    const kind = input.charCodeAt(index + 1);
-    if (kind === 0x5b) {
-      // CSI: consume through its final byte (0x40–0x7e).
-      index += 2;
-      while (index < input.length && (input.charCodeAt(index) < 0x40 || input.charCodeAt(index) > 0x7e)) index += 1;
-      continue;
-    }
-    if (kind === 0x5d) {
-      // OSC: terminate at BEL or ST (ESC \\). This bounded linear scan avoids
-      // a backtracking expression over untrusted verifier output.
-      index += 2;
-      while (index < input.length) {
-        if (input.charCodeAt(index) === 0x07) break;
-        if (input.charCodeAt(index) === 0x1b && input.charCodeAt(index + 1) === 0x5c) {
-          index += 1;
-          break;
-        }
-        index += 1;
-      }
-      continue;
-    }
-  }
-  return output;
-}
 function stripControls(value) {
-  return stripTerminalEscapes(value)
+  return stripTerminalControls(String(value))
     .replace(/\t/g, '↹')
-    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
+    .replace(/[\x7F-\x9F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
 }
 function providerTransitionLines(job) {
   const stage = Number.isSafeInteger(job.providerStage) && job.providerStage > 0 ? job.providerStage : job.creditFallback === true ? 1 : 0;

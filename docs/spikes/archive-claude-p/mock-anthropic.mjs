@@ -3,7 +3,7 @@
 //
 // Purpose: let the REAL `claude -p` binary (Claude Code 2.1.x) run end-to-end
 // against a local server with no real model, no real key and no outside network.
-// Node built-ins only. See ./README.md for the API, script examples and gotchas.
+// Node built-ins only. See mock-anthropic.test.mjs for API and script examples.
 //
 //   import { startMock, toolUse, text } from './mock-anthropic.mjs';
 //   const mock = await startMock({ script: [
@@ -46,9 +46,6 @@ export const thinking = (t, signature) =>
  * input_json_delta payload, which lets a script emit malformed / partial JSON.
  */
 export const toolUse = (name, input = {}, id) => ({ type: 'tool_use', id: id ?? nextId('toolu'), name, input });
-
-/** A turn made of the given blocks (array or single block) plus optional turn fields. */
-export const turn = (blocks, extra = {}) => ({ blocks: [].concat(blocks), ...extra });
 
 /** An error-injection turn: `errorTurn(529)`, `errorTurn(429, undefined, {'retry-after': '0'})`. */
 export const errorTurn = (status, body, headers) => ({ status, ...(body !== undefined ? { body } : {}), ...(headers ? { headers } : {}) });
@@ -207,7 +204,7 @@ function instanceFromSchema(schema, hint = 'Mock') {
 /**
  * Classify a POST /v1/messages request as 'main' | 'agent' | 'aux'.
  *
- * Observed with Claude Code 2.1.284 (see README "Request classification"):
+ * Observed with Claude Code 2.1.284 (see cc-2.1.284-anthropic-request-shape.json and docs/spikes/01-deepseek-facts.md):
  *  - main loop / sub-agent requests carry a non-empty `tools` array, `thinking`,
  *    `context_management`, and a `<system-reminder>` first user block or a
  *    mid-conversation `role:"system"` message. Sub-agent requests additionally carry
@@ -631,10 +628,7 @@ export async function startMock(options = {}) {
       if (isModels) {
         // DeepSeek's Anthropic surface has no /v1/models: 404 by default.
         rec.kind = 'models';
-        const mr = opts.modelsResponse ?? {
-          status: 404,
-          body: { type: 'error', error: { type: 'not_found_error', message: 'Not Found' } },
-        };
+        const mr = { status: 404, body: { type: 'error', error: { type: 'not_found_error', message: 'Not Found' } } };
         rec.response = { status: mr.status };
         return sendJson(res, mr.status, mr.body ?? {});
       }

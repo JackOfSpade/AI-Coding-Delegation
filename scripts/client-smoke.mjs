@@ -30,12 +30,13 @@ for (const name of ['ComSpec', 'PATHEXT', 'SystemRoot', 'TEMP', 'TMP']) if (proc
 // cmd.exe and Node, so its whole run needs more than any single step.
 const PROBE_TIMEOUT_MS = 10_000;
 const INSTALLER_TIMEOUT_MS = 120_000;
+const MAX_BUFFER = 64 * 1024;
 function run(command, args, label, timeout = PROBE_TIMEOUT_MS) {
   const result = spawnSync(command, args, {
     cwd: root,
     env: cleanEnv,
     encoding: 'utf8',
-    maxBuffer: 64 * 1024,
+    maxBuffer: MAX_BUFFER,
     timeout,
     // Only the fixed client --version probes need Windows batch lookup.
     // Invoke Node directly so spaces in its path never enter cmd.exe parsing.
@@ -43,6 +44,8 @@ function run(command, args, label, timeout = PROBE_TIMEOUT_MS) {
     windowsHide: true,
   });
   if (result.error?.code === 'ENOENT') throw new Error(`${label} is unavailable on this self-hosted runner`);
+  if (result.error?.code === 'ETIMEDOUT') throw new Error(`${label} timed out after ${timeout}ms`);
+  if (result.error?.code === 'ENOBUFS') throw new Error(`${label} produced more than ${MAX_BUFFER} bytes of output`);
   if (result.error) throw new Error(`${label} could not start: ${result.error.code || result.error.message}`);
   if (result.status !== 0) throw new Error(`${label} failed with exit ${result.status ?? 'unknown'}`);
   return result;

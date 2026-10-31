@@ -3687,11 +3687,10 @@ test('queued and consumed budget-finish recoveries are one-shot and fail closed 
     },
     { role: 'tool', tool_call_id: 'write-elided', name: 'write_file', content: 'written', elided: true },
   ];
-  // AgentContext's live elision metadata is normally created after startup;
-  // keep it in this recovery snapshot to prove the evidence boundary rejects
+  // Resume through the real constructor to prove the evidence boundary rejects
   // an already-elided durable result before it can buy a provider request.
-  const elidedWriteContext = new AgentContext();
-  elidedWriteContext.snapshot = () => structuredClone(elidedWriteTranscript);
+  const elidedWriteContext = new AgentContext(structuredClone(elidedWriteTranscript));
+  assert.equal(elidedWriteContext.snapshot()[1].elided, true, 'a resumed context keeps the durable elided flag');
   await cannotPostInvalidQueuedRecovery(elidedWriteTranscript, elidedWriteContext);
 
   let consumedPosts = 0;
@@ -4456,6 +4455,45 @@ test('report reserves a finish-only turn with gathered findings before reservati
   assert.ok(result.costUsd <= 0.2);
 });
 
+test('a finish-protocol or unadvertised-tool violation on the report finalization turn fails instead of promising a retry', async () => {
+  const rates = { peak: 1, off_peak: 1 };
+  const pricing = { models: { mock: { usd_per_1m: { input_cache_hit: rates, input_cache_miss: rates, output: rates } } } };
+  const findings = 'Evidence from the survey. '.repeat(4800);
+  const run = async (finalizingCalls) => {
+    const requests = [];
+    const progress = [];
+    const result = await new AgentLoop({
+      provider: {
+        async *chat(request) {
+          requests.push(request);
+          yield { model: 'mock', toolCalls: requests.length === 1 ? [call('read_file', '{"path":"survey.txt"}')] : finalizingCalls };
+          yield { usage: { inputTokens: 100, outputTokens: 20 } };
+        },
+      },
+      model: 'mock',
+      pricing,
+      maxUsd: 0.2,
+      maxTurns: 80,
+      reportMode: true,
+      progress: async (event) => {
+        if (event.action) progress.push(event.action);
+      },
+      toolDefinitions: availableToolDefinitions({ readOnly: true }),
+      tools: { execute: async (name, args) => (name === 'finish' ? { finish: args } : findings) },
+    }).run({ task: 'Survey the repository' });
+    return { result, requests, progress };
+  };
+  const invalid = await run([call('finish', '{"summary":""}')]);
+  assert.equal(invalid.result.status, 'FAILED');
+  assert.equal(invalid.result.failureKind, 'finish-protocol');
+  assert.equal(invalid.requests.length, 2, 'no retry request after the finalization turn');
+  assert.ok(!invalid.progress.includes('finish_protocol_recover'));
+  const unadvertised = await run([call('read_file', '{"path":"survey.txt"}', 'second')]);
+  assert.equal(unadvertised.result.status, 'FAILED');
+  assert.equal(unadvertised.result.error, 'Provider requested an unadvertised tool');
+  assert.equal(unadvertised.requests.length, 2);
+});
+
 test('report uses its last allowed turn to finish even with unlimited USD', async () => {
   const requests = [];
   const result = await new AgentLoop({
@@ -4677,4 +4715,27 @@ test('loop diagnostics redact configured opaque secrets before argument and erro
   assert.match(result.toolFailure.args, /\[REDACTED\]/);
   assert.match(result.toolFailure.error, /\[REDACTED\]/);
   assert.ok(!JSON.stringify(result.toolFailure).includes(secret.slice(0, 6)), 'a clipped secret prefix must never escape');
+});
+
+test('a resumed transcript keeps elided flags, so markers are not re-elided and yield no provider candidates', () => {
+  const marker = '[tool output elided: 70000 chars; request a narrower read if needed]';
+  const assistant = (id, name) => ({
+    role: 'assistant',
+    content: '',
+    tool_calls: [{ id, type: 'function', function: { name, arguments: '{}' } }],
+  });
+  const resumed = [
+    { role: 'system', content: 's' },
+    { role: 'user', content: 'u' },
+    assistant('w', 'write_file'),
+    { role: 'tool', tool_call_id: 'w', name: 'write_file', content: marker, elided: true },
+    assistant('r', 'read_file'),
+    { role: 'tool', tool_call_id: 'r', name: 'read_file', content: 'x'.repeat(5000) },
+  ];
+  const context = new AgentContext(resumed, { maxToolChars: 10, keepRecentToolResults: 0 });
+  const snapshot = context.snapshot();
+  assert.equal(snapshot[3].elided, true);
+  assert.equal(snapshot[3].content, marker, 'a resumed elision marker is not re-elided');
+  assert.deepEqual([...context.providerBudgetElisionSnapshots()], []);
+  assert.deepEqual([...context.providerBudgetDeepElisionSnapshots()], []);
 });

@@ -368,6 +368,3 @@ export function jobLogWindow(job, eventsText, { tail, limit } = LOG_DEFAULTS, se
     },
   };
 }
-
-/** The bounded default view; see jobLogWindow. */
-export const renderJobLog = (job, eventsText, window = LOG_DEFAULTS, secrets = []) => jobLogWindow(job, eventsText, window, secrets).text;

@@ -31,7 +31,7 @@ import { classifyVerifierEnvironment } from './verify-env.mjs';
 import { readRegularFileSync } from './regular-file.mjs';
 
 export const MAX_VERIFIER_INTERPRETERS = 4;
-export const MAX_VERIFIER_IMPORTS = 16;
+const MAX_VERIFIER_IMPORTS = 16;
 const MAX_ROOTS = 8;
 const MAX_PATH = 4096;
 const MAX_DETAIL = 200;

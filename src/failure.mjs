@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { redact, redactText, stripTerminalControls } from './redact.mjs';
+import { applyPathAliases, redact, redactText, stripTerminalControls } from './redact.mjs';
 
 /**
  * Why a worker round ended FAILED, in a form that is safe to persist, show a
@@ -44,22 +44,10 @@ const BODY_KEYS = new Set(['content', 'old_string', 'new_string', 'text', 'patch
 
 const clip = (text, limit) => (text.length > limit ? `${text.slice(0, limit - 1)}…` : text);
 
-/**
- * `[[absolutePrefix, label], ...]`, longest prefix first, so a worktree path
- * becomes `<worktree>/x` rather than leaking a temp directory or a home dir.
- */
-function applyAliases(text, aliases) {
-  let out = text;
-  for (const [prefix, label] of [...aliases].sort((a, b) => b[0].length - a[0].length))
-    // A prefix ends at a path boundary: /Users/jack must not rewrite /Users/jackson.
-    if (typeof prefix === 'string' && prefix.length > 1 && prefix !== '/')
-      out = out.replace(new RegExp(`${prefix.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&')}(?![A-Za-z0-9._-])`, 'g'), () => label);
-  return out;
-}
 // Redact before clipping so a secret is never cut into an unrecognizable prefix.
 const sanitize = (value, limit, aliases = [], secrets = []) =>
   clip(
-    redactText(applyAliases(redactText(stripTerminalControls(String(value)), secrets), aliases), secrets)
+    redactText(applyPathAliases(redactText(stripTerminalControls(String(value)), secrets), aliases), secrets)
       .replace(/[\r\n\t]+/g, ' ')
       .trim(),
     limit,
@@ -199,18 +187,18 @@ export function continuableFailure(job) {
   return !loopedAgain(job);
 }
 
-/**
- * Statuses whose diff is kept un-integrated and may be applied by the primary
- * with its own evidence. A FAILED job joins them only through
- * `failedApplyRefusal`, never by status alone; CANCELLED never does (the
- * primary stopped it on purpose).
- */
 const WALL_TIMEOUT_CODE = 'OFFLOAD_WALL_TIMEOUT';
 /** The abort reason JobManager's watchdog gives a round that outlived limits.timeoutMinutes. */
 export const wallTimeoutError = () =>
   Object.assign(new Error('job wall-clock limit (timeoutMinutes) exceeded'), { code: WALL_TIMEOUT_CODE });
 /** True when a job signal was aborted by the wall-clock watchdog rather than by a cancel. */
 export const isWallTimeout = (reason) => reason?.code === WALL_TIMEOUT_CODE;
+/**
+ * Statuses whose diff is kept un-integrated and may be applied by the primary
+ * with its own evidence. A FAILED job joins them only through
+ * `failedApplyRefusal`, never by status alone; CANCELLED never does (the
+ * primary stopped it on purpose).
+ */
 export const APPLY_ELIGIBLE_STATUSES = Object.freeze(['VERIFY_ENV_FAILED', 'VERIFY_FAILED', 'BUDGET', 'TIMEOUT']);
 
 const GIT_OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;

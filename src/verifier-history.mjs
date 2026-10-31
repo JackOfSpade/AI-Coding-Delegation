@@ -1,5 +1,5 @@
 import { posix } from 'node:path';
-import { normalizePath } from './glob.mjs';
+import { escapeRegExp, normalizePath } from './glob.mjs';
 import { isVerifierEnvironmentKind } from './verify-env.mjs';
 import { preflightVerifier } from './verifier-preflight.mjs';
 
@@ -46,8 +46,7 @@ export function verifierFailureFiles(verify, resolvedFiles = []) {
     }
     for (const file of all) {
       // Stack frames and runner paths, with a boundary before the whole path.
-      const escaped = file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      if (new RegExp(`(?:^|[\\s/("'])${escaped}(?=[:\\s)"']|$)`, 'm').test(block)) files.add(file);
+      if (new RegExp(`(?:^|[\\s/("'])${escapeRegExp(file)}(?=[:\\s)"']|$)`, 'm').test(block)) files.add(file);
     }
   }
   return verifierFiles([...files]);

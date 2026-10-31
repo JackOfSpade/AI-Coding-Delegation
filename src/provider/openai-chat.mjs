@@ -1,6 +1,8 @@
 import { sseJson } from './sse.mjs';
-import { abortableBody, bestEffort, fetchAbortable } from './abort.mjs';
+import { bestEffort, fetchAbortable, readJsonAbortable } from './abort.mjs';
 import { assertModelAllowed, isOpenAIEndpoint, modelPolicyViolation } from '../model-policy.mjs';
+import { plainObject } from '../plain-object.mjs';
+import { MAX_MESSAGE_CHARS, MAX_TOOL_ARGUMENT_CHARS, MAX_TOOL_CALLS, validToolIdentifier } from '../transcript-limits.mjs';
 
 export const DEFAULT_ATTEMPT_TIMEOUT_MS = 300_000;
 
@@ -90,7 +92,7 @@ export const retryDelay = (ms, signal) =>
     const timer = setTimeout(() => settle(resolve), ms);
     signal?.addEventListener('abort', abort, { once: true });
   });
-const positive = (value, name, fallback) => {
+export const positive = (value, name, fallback) => {
   value ??= fallback;
   if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${name} must be a non-negative integer`);
   return value;
@@ -113,11 +115,7 @@ const supportsForcedImplementationFocus = (parsed, model) =>
   parsed.port === '' &&
   parsed.pathname === '/' &&
   OFFICIAL_DEEPSEEK_FOCUS_MODELS.has(model);
-export const validToolIdentifier = (value, max) =>
-  typeof value === 'string' && value.length > 0 && value.length <= max && !/[\x00-\x1F\x7F]/.test(value);
-const MAX_TOOL_CALLS = 64;
-const MAX_TOOL_ARGUMENT_CHARS = 512_000;
-const MAX_MESSAGE_CHARS = 1_000_000;
+export { validToolIdentifier };
 export const PROVIDER_FINISH_REASONS = new Set(['stop', 'length', 'tool_calls', 'function_call', 'content_filter', 'other']);
 // Finish reasons are diagnostics only. Keep their persisted vocabulary closed
 // so provider-defined strings (which can be arbitrary text) never cross the
@@ -126,12 +124,37 @@ export function normalizeProviderFinishReason(value) {
   if (value === undefined || value === null || typeof value !== 'string') return undefined;
   return PROVIDER_FINISH_REASONS.has(value) ? value : 'other';
 }
-const streamFailureKind = (error) => {
+export const streamFailureKind = (error) => {
   const message = String(error?.message || '');
   if (/^SSE (?:event|attempt) exceeds configured size limit$/.test(message)) return 'sse_limit';
   if (/^(?:SSE response has no body|Invalid JSON in SSE data|SSE stream ended without \[DONE\])$/.test(message)) return 'sse_protocol';
   return undefined;
 };
+
+// Node's fetch reports a refused redirect as `TypeError: fetch failed` whose
+// cause says "unexpected redirect", so inspect both messages.
+export const isRedirectError = (error) => /redirect/i.test(String(error?.message)) || /redirect/i.test(String(error?.cause?.message));
+
+// OpenAI may echo the dated snapshot of the requested alias; it is the same priced model.
+export const normalizeOpenAISnapshot = (model, requestModel) =>
+  typeof model === 'string' && model.startsWith(requestModel) && /^-\d{4}-\d{2}-\d{2}$/.test(model.slice(requestModel.length))
+    ? requestModel
+    : model;
+
+export function checkedBaseUrl(baseUrl) {
+  let parsed;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    throw new TypeError('baseUrl must be an http(s) URL');
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw new TypeError('baseUrl must be an http(s) URL');
+  if (parsed.protocol === 'http:' && !isLoopbackHost(parsed.hostname))
+    throw new TypeError('baseUrl must use HTTPS unless its host is loopback');
+  if (parsed.username || parsed.password || parsed.search || parsed.hash)
+    throw new TypeError('baseUrl must not contain credentials, query, or fragment');
+  return { parsed, baseUrl: `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}` };
+}
 
 // Context may retain local metadata (for display or durability), but the
 // provider receives only fields in the Chat Completions wire schema. In
@@ -188,11 +211,6 @@ export function wireMessages(messages, { reasoning = true } = {}) {
   });
 }
 
-const isPlainRecord = (value) => {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-};
 // Wire providers have used both OpenAI's prompt/completion names and the
 // input/output spellings.  Accept either vocabulary, but never silently pick
 // one out of an ambiguous response: a finite budget needs one authoritative
@@ -221,10 +239,10 @@ const reconcileDuplicateCounter = (nested, direct, label) => {
 };
 
 export function normalizeUsage(usage) {
-  if (!isPlainRecord(usage)) throw new ProviderError('Invalid SSE usage');
+  if (!plainObject(usage)) throw new ProviderError('Invalid SSE usage');
   const detailValue = oneAlias(usage, ['prompt_tokens_details', 'input_tokens_details'], 'details');
   const details = detailValue === MISSING_USAGE_FIELD ? {} : detailValue;
-  if (!isPlainRecord(details)) throw new ProviderError('Invalid usage.details');
+  if (!plainObject(details)) throw new ProviderError('Invalid usage.details');
   const inputTokens = oneAlias(usage, ['prompt_tokens', 'input_tokens'], 'inputTokens', { required: true });
   const outputTokens = oneAlias(usage, ['completion_tokens', 'output_tokens'], 'outputTokens', { required: true });
   for (const [name, value] of Object.entries({ inputTokens, outputTokens }))
@@ -261,14 +279,7 @@ const OPENAI_CREDIT_CODES = new Set(['credit_balance_exhausted', 'insufficient_q
 // bound and is never retained or echoed.
 export async function openAICreditExhausted(response, signal) {
   try {
-    const chunks = [];
-    let bytes = 0;
-    for await (const chunk of abortableBody(response.body, signal)) {
-      bytes += chunk.byteLength;
-      if (bytes > 65_536) return false;
-      chunks.push(chunk);
-    }
-    const error = JSON.parse(Buffer.concat(chunks).toString('utf8'))?.error;
+    const error = (await readJsonAbortable(response.body, { signal, maxBytes: 65_536 }))?.error;
     return (
       Boolean(error) &&
       typeof error === 'object' &&
@@ -286,12 +297,7 @@ function billableChatUsage(chunks, { openai, requestModel }) {
   try {
     const models = chunks
       .filter((chunk) => validModel(chunk?.model))
-      .map((chunk) => {
-        const model = chunk.model;
-        return openai && model.startsWith(requestModel) && /^-\d{4}-\d{2}-\d{2}$/.test(model.slice(requestModel.length))
-          ? requestModel
-          : model;
-      });
+      .map((chunk) => (openai ? normalizeOpenAISnapshot(chunk.model, requestModel) : chunk.model));
     return {
       usage: normalizeUsage(records[0].usage),
       model: models[0] ?? requestModel,
@@ -314,13 +320,7 @@ function* chatResponseEvents(chunks, { openai, requestModel }) {
     if (!chunk || typeof chunk !== 'object' || Array.isArray(chunk)) throw new ProviderError('Invalid SSE response chunk');
     if (chunk?.model !== undefined && !validModel(chunk.model)) throw new ProviderError('Invalid response model');
     // OpenAI may echo the dated snapshot of the requested alias; it is the same priced model.
-    if (
-      openai &&
-      typeof chunk.model === 'string' &&
-      /^-\d{4}-\d{2}-\d{2}$/.test(chunk.model.slice(requestModel.length)) &&
-      chunk.model.startsWith(requestModel)
-    )
-      chunk.model = requestModel;
+    if (openai && chunk.model !== undefined) chunk.model = normalizeOpenAISnapshot(chunk.model, requestModel);
     if (chunk.choices !== undefined) {
       if (!Array.isArray(chunk.choices)) throw new ProviderError('Invalid SSE response choices');
       const choice = chunk.choices[0];
@@ -442,6 +442,101 @@ function* chatResponseEvents(chunks, { openai, requestModel }) {
   if (providerFinishReason !== undefined) yield { providerFinishReason };
 }
 
+/**
+ * Shared retry/abort state machine for the OpenAI-compatible adapters: one
+ * POST per attempt with a per-attempt deadline, bounded retries with backoff,
+ * and safe (body-free) error mapping. `readBody` consumes a successful body.
+ */
+export async function collectAttempts({
+  fetchImpl,
+  baseUrl,
+  path,
+  headers,
+  apiKey,
+  payload,
+  timeoutMs,
+  retryLimit,
+  externalSignal,
+  readBody,
+}) {
+  if (externalSignal?.aborted) throw externalSignal.reason ?? new Error('Aborted');
+  let last;
+  for (let attempt = 0; attempt <= retryLimit; attempt++) {
+    const controller = new AbortController();
+    let attemptTimedOut = false;
+    const timer = setTimeout(() => {
+      attemptTimedOut = true;
+      controller.abort();
+    }, timeoutMs);
+    const abort = () => controller.abort(externalSignal.reason ?? new Error('Aborted'));
+    externalSignal?.addEventListener('abort', abort, { once: true });
+    try {
+      // `baseUrl` is the provider's API base, not its origin. DeepSeek's
+      // documented base is the origin while OpenAI-compatible deployments
+      // commonly supply a path ending in `/v1`; append only the operation.
+      const endpoint = new URL(path, `${baseUrl}/`).href;
+      const response = await fetchAbortable(fetchImpl, endpoint, {
+        method: 'POST',
+        signal: controller.signal,
+        redirect: 'error',
+        headers: {
+          ...headers,
+          'content-type': 'application/json',
+          ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+        },
+        body: JSON.stringify(payload),
+      });
+      // Provider response bodies may contain an echoed prompt, credentials,
+      // or other untrusted data.  Never put them in an error/log path.
+      if (!response.ok) {
+        if (isOpenAIEndpoint(baseUrl) && [400, 402, 429].includes(response.status)) {
+          if (await openAICreditExhausted(response, controller.signal))
+            throw new ProviderError('OpenAI API credit is exhausted', {
+              status: response.status,
+              kind: 'credit_exhausted',
+              retryable: false,
+            });
+        }
+        bestEffort(() => response.body?.cancel?.());
+        throw new ProviderError(`Chat request failed (HTTP ${response.status})`, {
+          status: response.status,
+          retryable: response.status === 429 || response.status >= 500,
+          kind: 'http',
+        });
+      }
+      return await readBody(response.body, controller.signal);
+    } catch (error) {
+      if (externalSignal?.aborted) throw externalSignal.reason ?? error;
+      // This controller belongs solely to the per-attempt timeout.  Keep it
+      // distinct from a caller cancellation or AgentLoop wall deadline,
+      // both of which arrive through externalSignal above.
+      // Fetch/SSE errors can include arbitrary remote text too.  Preserve
+      // only our status-bearing ProviderError; otherwise expose a generic
+      // safe error, without retaining an error cause that logs may inspect.
+      const redirect = isRedirectError(error);
+      const providerError = attemptTimedOut
+        ? // A provider-owned attempt deadline is the one ambiguous failure
+          // we may retry for uncapped callers. Finite-budget AgentLoops pass
+          // retryLimit: 0, so they still make exactly one POST attempt.
+          new ProviderError('Provider request timed out', { kind: 'attempt_timeout', retryable: true, timeoutMs })
+        : error instanceof ProviderError
+          ? error
+          : new ProviderError(redirect ? 'Provider redirect rejected' : 'Chat request failed', {
+              kind: redirect ? 'redirect' : streamFailureKind(error) || 'transport',
+              retryable: !redirect,
+            });
+      providerError.attempts = attempt + 1;
+      if (!providerError.retryable || attempt === retryLimit) throw providerError;
+      last = providerError;
+    } finally {
+      clearTimeout(timer);
+      externalSignal?.removeEventListener('abort', abort);
+    }
+    await retryDelay(Math.min(4_000, 250 * 2 ** attempt) + Math.floor(Math.random() * 125), externalSignal);
+  }
+  throw last;
+}
+
 /** OpenAI chat-completions adapter. A whole successful attempt is buffered
  * before yielding: retrying a broken stream can therefore never duplicate a
  * previously emitted delta. The request timeout stays live through body EOF. */
@@ -459,23 +554,13 @@ export class OpenAIChatProvider {
     maxSseEventBytes = 1_000_000,
     maxSseAttemptBytes = 8_000_000,
   } = {}) {
-    let parsed;
-    try {
-      parsed = new URL(baseUrl);
-    } catch {
-      throw new TypeError('baseUrl must be an http(s) URL');
-    }
-    if (!['http:', 'https:'].includes(parsed.protocol)) throw new TypeError('baseUrl must be an http(s) URL');
-    if (parsed.protocol === 'http:' && !isLoopbackHost(parsed.hostname))
-      throw new TypeError('baseUrl must use HTTPS unless its host is loopback');
-    if (parsed.username || parsed.password || parsed.search || parsed.hash)
-      throw new TypeError('baseUrl must not contain credentials, query, or fragment');
+    const { parsed, baseUrl: normalizedBaseUrl } = checkedBaseUrl(baseUrl);
     if (!validModel(model)) throw new TypeError('model is required and must be a short control-free string');
     assertModelAllowed({ baseUrl: parsed.href, model });
     if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
     if (apiKey !== undefined && typeof apiKey !== 'string') throw new TypeError('apiKey must be a string');
     if (!headers || typeof headers !== 'object' || Array.isArray(headers)) throw new TypeError('headers must be an object');
-    this.baseUrl = `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}`;
+    this.baseUrl = normalizedBaseUrl;
     this.apiKey = apiKey;
     this.model = model;
     this.fetch = fetchImpl;
@@ -495,89 +580,24 @@ export class OpenAIChatProvider {
     this.maxSseAttemptBytes = positive(maxSseAttemptBytes, 'maxSseAttemptBytes', 8_000_000);
     if (!this.maxSseEventBytes || !this.maxSseAttemptBytes) throw new TypeError('SSE limits must be positive');
   }
-  async #collect(payload, externalSignal, retryLimit = this.retries) {
-    if (externalSignal?.aborted) throw externalSignal.reason ?? new Error('Aborted');
-    let last;
-    for (let attempt = 0; attempt <= retryLimit; attempt++) {
-      const controller = new AbortController();
-      let attemptTimedOut = false;
-      const timer = setTimeout(() => {
-        attemptTimedOut = true;
-        controller.abort();
-      }, this.timeoutMs);
-      const abort = () => controller.abort(externalSignal.reason ?? new Error('Aborted'));
-      externalSignal?.addEventListener('abort', abort, { once: true });
-      try {
-        // `baseUrl` is the provider's API base, not its origin. DeepSeek's
-        // documented base is the origin while OpenAI-compatible deployments
-        // commonly supply a path ending in `/v1`; append only the operation.
-        const endpoint = new URL('chat/completions', `${this.baseUrl}/`).href;
-        const response = await fetchAbortable(this.fetch, endpoint, {
-          method: 'POST',
-          signal: controller.signal,
-          redirect: 'error',
-          headers: {
-            ...this.headers,
-            'content-type': 'application/json',
-            ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}),
-          },
-          body: JSON.stringify(payload),
-        });
-        // Provider response bodies may contain an echoed prompt, credentials,
-        // or other untrusted data.  Never put them in an error/log path.
-        if (!response.ok) {
-          if (isOpenAIEndpoint(this.baseUrl) && [400, 402, 429].includes(response.status)) {
-            if (await openAICreditExhausted(response, controller.signal))
-              throw new ProviderError('OpenAI API credit is exhausted', {
-                status: response.status,
-                kind: 'credit_exhausted',
-                retryable: false,
-              });
-          }
-          bestEffort(() => response.body?.cancel?.());
-          throw new ProviderError(`Chat request failed (HTTP ${response.status})`, {
-            status: response.status,
-            retryable: response.status === 429 || response.status >= 500,
-            kind: 'http',
-          });
-        }
+  #collect(payload, externalSignal, retryLimit = this.retries) {
+    return collectAttempts({
+      fetchImpl: this.fetch,
+      baseUrl: this.baseUrl,
+      path: 'chat/completions',
+      headers: this.headers,
+      apiKey: this.apiKey,
+      payload,
+      timeoutMs: this.timeoutMs,
+      retryLimit,
+      externalSignal,
+      readBody: async (body, signal) => {
         const chunks = [];
-        for await (const chunk of sseJson(response.body, {
-          signal: controller.signal,
-          maxEventBytes: this.maxSseEventBytes,
-          maxAttemptBytes: this.maxSseAttemptBytes,
-        }))
+        for await (const chunk of sseJson(body, { signal, maxEventBytes: this.maxSseEventBytes, maxAttemptBytes: this.maxSseAttemptBytes }))
           chunks.push(chunk);
         return chunks;
-      } catch (error) {
-        if (externalSignal?.aborted) throw externalSignal.reason ?? error;
-        // This controller belongs solely to the per-attempt timeout.  Keep it
-        // distinct from a caller cancellation or AgentLoop wall deadline,
-        // both of which arrive through externalSignal above.
-        // Fetch/SSE errors can include arbitrary remote text too.  Preserve
-        // only our status-bearing ProviderError; otherwise expose a generic
-        // safe error, without retaining an error cause that logs may inspect.
-        const providerError = attemptTimedOut
-          ? // A provider-owned attempt deadline is the one ambiguous failure
-            // we may retry for uncapped callers. Finite-budget AgentLoops pass
-            // retryLimit: 0, so they still make exactly one POST attempt.
-            new ProviderError('Provider request timed out', { kind: 'attempt_timeout', retryable: true, timeoutMs: this.timeoutMs })
-          : error instanceof ProviderError
-            ? error
-            : new ProviderError(/redirect/i.test(String(error?.message)) ? 'Provider redirect rejected' : 'Chat request failed', {
-                kind: /redirect/i.test(String(error?.message)) ? 'redirect' : streamFailureKind(error) || 'transport',
-                retryable: !/redirect/i.test(String(error?.message)),
-              });
-        providerError.attempts = attempt + 1;
-        if (!providerError.retryable || attempt === retryLimit) throw providerError;
-        last = providerError;
-      } finally {
-        clearTimeout(timer);
-        externalSignal?.removeEventListener('abort', abort);
-      }
-      await retryDelay(Math.min(4_000, 250 * 2 ** attempt) + Math.floor(Math.random() * 125), externalSignal);
-    }
-    throw last;
+      },
+    });
   }
   async *chat({ messages, tools, signal, retryLimit, ...options } = {}) {
     if (!Array.isArray(messages) || !Array.isArray(tools)) throw new TypeError('messages and tools must be arrays');

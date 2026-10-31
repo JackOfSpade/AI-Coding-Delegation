@@ -102,8 +102,6 @@ export function loadPricing(name) {
   return typeof name === 'string' ? TABLES[name] : undefined;
 }
 
-export const pricingNames = () => Object.keys(TABLES);
-
 function deepFreeze(value) {
   if (value && typeof value === 'object' && !Object.isFrozen(value)) {
     for (const child of Object.values(value)) deepFreeze(child);

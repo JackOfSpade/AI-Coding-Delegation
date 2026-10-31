@@ -1,3 +1,5 @@
+import { escapeRegExp } from './glob.mjs';
+
 // `token` is ambiguous in structured telemetry: inputTokens/outputTokens and
 // cache token counts are accounting data, not credentials.  Keep the
 // credential rule precise so persistence does not silently destroy metering.
@@ -342,7 +344,6 @@ export class RedactionProjector {
   }
 }
 
-/** Redact known literal secrets and common credential-bearing text forms. */
 /**
  * Bare token-shaped strings (sk-..., rk-..., key..., bearer...) that the
  * durable store redacts before the key/assignment rules of `redactText` run.
@@ -356,6 +357,8 @@ export function redactTokenShapes(value) {
   // removed independently, regardless of their shape.
   return String(value).replace(/\b(?:sk|rk|key|bearer)[-_][-_A-Za-z0-9]{11,}\b/gi, '[REDACTED]');
 }
+
+/** Redact known literal secrets and common credential-bearing text forms. */
 export function redactText(value, secrets = []) {
   let text = String(value);
   for (const secret of secrets) if (typeof secret === 'string' && secret.length > 0) text = text.split(secret).join('[REDACTED]');
@@ -373,16 +376,24 @@ export function safeErrorText(value) {
 // A home directory is somebody's account name; `/Users/<name>`, `/home/<name>` and `C:\Users\<name>` read `~`.
 const HOME_PATH = /(?:\/(?:Users|home)\/[^/\s'"`)\]]+|[A-Za-z]:\\Users\\[^\\\s'"`)\]]+)/g;
 /**
+ * Rewrite each `[absolutePrefix, label]` alias, longest prefix first, so a
+ * worktree path becomes `<worktree>/x` rather than leaking a temp directory.
+ * A prefix ends at a path boundary: /Users/jack must not rewrite /Users/jackson.
+ */
+export function applyPathAliases(text, aliases = []) {
+  let out = text;
+  for (const [prefix, label] of aliases.filter(Array.isArray).sort((a, b) => String(b?.[0]).length - String(a?.[0]).length))
+    if (typeof prefix === 'string' && prefix.length > 1 && prefix !== '/')
+      out = out.replace(new RegExp(`${escapeRegExp(prefix)}(?![A-Za-z0-9._-])`, 'g'), () => label);
+  return out;
+}
+/**
  * `aliases` are `[absolutePrefix, label]` pairs (longest first, ending at a
  * path boundary) for a known directory such as a checkout; any other home
  * directory is shortened to `~`.
  */
 export function relativizePaths(value, aliases = []) {
-  let text = String(value);
-  for (const [prefix, label] of [...aliases].sort((a, b) => String(b?.[0]).length - String(a?.[0]).length))
-    if (typeof prefix === 'string' && prefix.length > 1 && prefix !== '/')
-      text = text.replace(new RegExp(`${prefix.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&')}(?![A-Za-z0-9._-])`, 'g'), () => label);
-  return text.replace(HOME_PATH, '~');
+  return applyPathAliases(String(value), aliases).replace(HOME_PATH, '~');
 }
 
 /**

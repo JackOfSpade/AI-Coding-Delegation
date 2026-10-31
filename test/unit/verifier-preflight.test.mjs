@@ -268,6 +268,16 @@ test('a hard-coded system temp write blocks and names the test file that imports
   assert.doesNotMatch(message, /\n/, 'MCP error text drops control characters');
 });
 
+test('shell-expanded mkdir operands are not treated as repo-relative paths', (t) => {
+  const { root } = fixture(t);
+  for (const testCommand of ['mkdir -p $TMPDIR/foo && node --test', 'mkdir -p "${TMPDIR}/x"', 'mkdir -p "$(mktemp -d)/x"', 'mkdir ~/x'])
+    assert.equal(preflightVerifier({ repoPath: root, testCommand, writeScope: [] }).blocking, undefined, testCommand);
+  assert.equal(preflightVerifier({ repoPath: root, testCommand: 'mkdir -p out', writeScope: [] }).blocking?.[0]?.target, 'out');
+
+  // An absolute operand keeps its literal system-temp prefix even when it also contains an expansion.
+  for (const testCommand of ['mkdir -p /tmp/$USER-x', 'mkdir /private/tmp/$RANDOM', 'mktemp /tmp/foo.$$'])
+    assert.ok(preflightVerifier({ repoPath: root, testCommand, writeScope: [] }).blocking?.length, testCommand);
+});
 test('Python tempfile dir= and shell mkdir targets are resolved too', (t) => {
   const { root, write } = fixture(t);
   write(

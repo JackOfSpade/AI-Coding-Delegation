@@ -1,6 +1,19 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { access, constants, cp, link, mkdtemp, mkdir, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  access,
+  chmod,
+  constants,
+  cp,
+  link,
+  mkdtemp as createTempDirectory,
+  mkdir,
+  readFile,
+  readlink,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -18,6 +31,16 @@ import {
 } from '../../install.mjs';
 import { EventEmitter } from 'node:events';
 import { doctor } from '../../src/doctor.mjs';
+// Every temp home and product directory is removed once this file's tests finish.
+const createdDirectories = [];
+const mkdtemp = async (prefix) => {
+  const directory = await createTempDirectory(prefix);
+  createdDirectories.push(directory);
+  return directory;
+};
+after(async () => {
+  await Promise.all(createdDirectories.map((directory) => rm(directory, { recursive: true, force: true }).catch(() => {})));
+});
 // Ambient Codex installations are deliberately not part of generic installer
 // tests; dedicated plugin cases inject an executable and command runner.
 const install = (options) =>
@@ -693,6 +716,56 @@ test('installer approval mode can opt only Offload tools into unattended Claude 
   const restoredCodex = await readFile(join(home, '.codex', 'config.toml'), 'utf8');
   assert.match(restoredCodex, /default_tools_approval_mode = "writes"/);
 });
+test('installer keeps ownership of still-installed mutating Claude rules across an approve rewrite', async () => {
+  const home = await mkdtemp(`${tmpdir()}/offload-approval-home-`);
+  const configHome = join(home, 'config');
+  const executable = join(home, 'bin', 'claude');
+  const statePath = join(home, '.claude.json');
+  const calls = [];
+  const options = {
+    root: process.cwd(),
+    home,
+    configHome,
+    clients: ['claude'],
+    approvalMode: 'approve',
+    env: { PATH: dirname(executable) },
+    commandExists: async (path) => path === executable,
+    runCommand: fakeClaudeCli({ statePath, calls }),
+  };
+  const mutating = ['start', 'repair', 'continue', 'apply', 'revert', 'cancel'].map((name) => `mcp__offload__offload_${name}`);
+  const settingsPath = join(home, '.claude', 'settings.json');
+  const manifestPath = join(configHome, 'offload', 'installer-state.json');
+  await install(options);
+  const settings = JSON.parse(await readFile(settingsPath, 'utf8'));
+  settings.permissions.allow = settings.permissions.allow.filter((rule) => rule !== 'mcp__offload__offload_cancel');
+  await writeFile(settingsPath, JSON.stringify(settings));
+  await install(options);
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  for (const rule of mutating) assert.ok(manifest.claudeSettings.rules.includes(rule), rule);
+  await install({ ...options, approvalMode: 'prompt' });
+  const restored = JSON.parse(await readFile(settingsPath, 'utf8'));
+  for (const rule of mutating) assert.ok(!restored.permissions.allow.includes(rule), rule);
+});
+test(
+  'installer reports filesystem failures instead of mislabelling them as invalid Cursor JSON',
+  { skip: (process.platform === 'win32' || process.getuid?.() === 0) && 'requires POSIX permissions and a non-root user' },
+  async () => {
+    const home = await mkdtemp(`${tmpdir()}/offload-home-`);
+    const configHome = join(home, 'config');
+    const cursorDir = join(home, '.cursor');
+    await mkdir(cursorDir, { recursive: true });
+    await writeFile(join(cursorDir, 'mcp.json'), '{"mcpServers":{}}\n');
+    await chmod(cursorDir, 0o555);
+    try {
+      await assert.rejects(
+        install({ root: process.cwd(), home, configHome, clients: ['cursor'] }),
+        (error) => !/invalid Cursor MCP JSON/.test(error.message) && /EACCES|EPERM/.test(String(error.code || error.message)),
+      );
+    } finally {
+      await chmod(cursorDir, 0o755);
+    }
+  },
+);
 test('installer never rewrites opaque Claude auth-shaped state when registering through the CLI', async () => {
   const home = await mkdtemp(`${tmpdir()}/offload-home-`);
   const configHome = join(home, 'config');

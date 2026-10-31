@@ -35,7 +35,7 @@ const GIT_SYSTEM_CONFIG_DENIED =
 // The two places a hard-coded temp path lands on macOS and Linux. The verifier
 // grants only its per-run TMPDIR, so a command that spells one of these out (or
 // spawns a child that dropped TMPDIR) is denied by design.
-const SYSTEM_TEMP = /^(?:\/private)?\/(?:tmp|var\/folders)(?:\/|$)/;
+export const SYSTEM_TEMP_PATH = /^(?:\/private)?\/(?:tmp|var\/folders)(?:\/|$)/;
 // The verifier's own per-run TMPDIR lives under the system temp root; a denial
 // on a file a test made inside it is not a hard-coded system-temp path.
 const OWN_TEMP = /\/offload-sandbox-[A-Za-z0-9]+(?:\/|$)/;
@@ -246,7 +246,7 @@ export function classifyVerifierEnvironment(verify, { workspacePath, writeScope 
     // command that wants more than the package may grant.
     // The private worktree itself lives under the OS temp root, so a denial
     // inside it is never a system-temp denial.
-    if (!ownedByWorker && !insideWorkspace && SYSTEM_TEMP.test(path) && !OWN_TEMP.test(path))
+    if (!ownedByWorker && !insideWorkspace && SYSTEM_TEMP_PATH.test(path) && !OWN_TEMP.test(path))
       return {
         kind: 'temp-dir-denied',
         detail: `a command used the system temp directory ${clip(path)}; the verifier grants only its per-run TMPDIR (use os.tmpdir() and pass process.env to child processes)`,

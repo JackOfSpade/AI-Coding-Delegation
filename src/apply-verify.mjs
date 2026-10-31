@@ -7,21 +7,21 @@ import { redactText, stripTerminalControls } from './redact.mjs';
  * stateful parts (journal, lease, revert, recovery) live in JobManager; nothing
  * here touches a repository, a store, or a process.
  */
-export const APPLY_VERIFY_DEFAULT_TIMEOUT_SEC = 300;
-export const APPLY_VERIFY_MIN_TIMEOUT_SEC = 5;
-export const APPLY_VERIFY_MAX_TIMEOUT_SEC = 900;
+const APPLY_VERIFY_DEFAULT_TIMEOUT_SEC = 300;
+const APPLY_VERIFY_MIN_TIMEOUT_SEC = 5;
+const APPLY_VERIFY_MAX_TIMEOUT_SEC = 900;
 export const MAX_APPLY_VERIFY_COMMAND = 8_192;
 // The journaled (display) form of the command; the run itself uses the full text.
 export const APPLY_VERIFY_RECORD_COMMAND = 500;
-export const MAX_APPLY_VERIFY_TAIL_CHARS = 8_000;
-export const MAX_APPLY_VERIFY_TAIL_LINES = 40;
+const MAX_APPLY_VERIFY_TAIL_CHARS = 8_000;
+const MAX_APPLY_VERIFY_TAIL_LINES = 40;
 // Keep tail extraction bounded even for a custom runner's unusually large output.
 const TAIL_SCAN_CHARS = 64 * 1024;
 export const APPLY_VERIFY_PHASES = new Set(['applying', 'verifying', 'reverting']);
-export const APPLY_VERIFY_OUTCOMES = new Set(['PASSED', 'FAILED', 'TIMED_OUT', 'CANCELLED', 'NOT_RUN', 'PRIMARY_CHANGED', 'INTERRUPTED']);
+const APPLY_VERIFY_OUTCOMES = new Set(['PASSED', 'FAILED', 'TIMED_OUT', 'CANCELLED', 'NOT_RUN', 'PRIMARY_CHANGED', 'INTERRUPTED']);
 // Where the command runs: the read-only primary checkout, or a disposable,
 // writable private worktree of the just-applied primary.
-export const APPLY_VERIFY_LOCATIONS = new Set(['primary', 'scratch']);
+const APPLY_VERIFY_LOCATIONS = new Set(['primary', 'scratch']);
 
 /**
  * Validate the apply-time options together. Returns `null` when no command was
@@ -132,7 +132,7 @@ const names = (value) =>
 export function publicApplyVerify(record) {
   if (!record || typeof record !== 'object' || Array.isArray(record)) return undefined;
   const out = {};
-  if (typeof record.command === 'string') out.command = text(record.command, 500);
+  if (typeof record.command === 'string') out.command = text(record.command, APPLY_VERIFY_RECORD_COMMAND);
   for (const key of ['outcome', 'commandOutcome']) if (APPLY_VERIFY_OUTCOMES.has(record[key])) out[key] = record[key];
   if (APPLY_VERIFY_PHASES.has(record.phase)) out.phase = record.phase;
   if (record.location === 'scratch') out.location = 'scratch';

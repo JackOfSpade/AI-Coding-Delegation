@@ -14,6 +14,7 @@ import {
   symlinkSync,
   utimesSync,
 } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import {
@@ -26,9 +27,9 @@ import {
   pinJobTrees,
   releaseJobTrees,
   sameWorktreePath,
-  snapshotPrimaryWorkingTree,
   workingTreeStatus,
 } from '../../src/worktree.mjs';
+import { snapshotWorkingTree } from '../../src/git-snapshot.mjs';
 import { runCommand, sandboxAvailable } from '../../src/sandbox.mjs';
 import { cleanup, git, makeRepo, tempDir, write } from './helpers.mjs';
 
@@ -83,7 +84,7 @@ test('isolated worktree is seeded from dirty and untracked baseline without touc
     write(join(repo, 'tracked.txt'), 'dirty primary\n');
     write(join(repo, 'new.txt'), 'untracked primary\n');
     const metadata = primaryMetadata(repo);
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
     assert.equal(readFileSync(join(isolated.path, 'tracked.txt'), 'utf8'), 'dirty primary\n');
     assert.equal(readFileSync(join(isolated.path, 'new.txt'), 'utf8'), 'untracked primary\n');
@@ -120,7 +121,7 @@ process.stdout.write(fs.readFileSync(0));
     );
     git(repo, ['config', 'filter.offload-test.smudge', nodeFilterCommand(script)]);
     process.env.OFFLOAD_PROVIDER_SECRET = 'must-not-reach-git-child';
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
     assert.equal(readFileSync(join(isolated.path, 'payload.txt'), 'utf8'), 'safe payload\n');
     assert.equal(existsSync(marker), false);
@@ -141,7 +142,7 @@ test('integration applies only worker-touched paths, preserves unrelated primary
   let isolated;
   try {
     const metadata = primaryMetadata(repo);
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
     write(join(isolated.path, 'tracked.txt'), 'worker result\n');
     write(join(isolated.path, 'worker.bin'), Buffer.from([0, 1, 2, 255, 0]));
@@ -165,7 +166,7 @@ test('integration preserves a non-NUL invalid UTF-8 text patch byte-for-byte', (
   const repo = makeRepo();
   let isolated;
   try {
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
     const expected = Buffer.from([0x74, 0x65, 0x78, 0x74, 0x2d, 0xff, 0x0a]);
     write(join(isolated.path, 'tracked.txt'), expected);
@@ -185,7 +186,7 @@ test('primary edits on an exact worker-touched path block integration', () => {
   const repo = makeRepo();
   let isolated;
   try {
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
     write(join(isolated.path, 'tracked.txt'), 'worker result\n');
     const after = isolated.snapshot();
@@ -212,7 +213,7 @@ test('path-filtered integration applies only its explicit changed-file subset an
     write(join(repo, 'extra.txt'), 'base extra\n');
     git(repo, ['add', 'extra.txt']);
     git(repo, ['commit', '-m', 'add extra']);
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
     write(join(isolated.path, 'tracked.txt'), 'owned result\n');
     write(join(isolated.path, 'extra.txt'), 'ephemeral result\n');
@@ -238,7 +239,7 @@ test('path-filtered integration applies only its explicit changed-file subset an
       (error) => error.code === 'E_WORKTREE_PATH',
     );
 
-    const nextBaseline = snapshotPrimaryWorkingTree(repo);
+    const nextBaseline = snapshotWorkingTree(repo);
     conflicting = createIsolatedWorktree({ repoPath: repo, baselineTree: nextBaseline });
     write(join(conflicting.path, 'tracked.txt'), 'conflicting worker result\n');
     write(join(conflicting.path, 'extra.txt'), 'never integrate this\n');
@@ -263,7 +264,7 @@ test('ignored workspace output is audited and cleanup removes its Git worktree a
   let isolated;
   try {
     write(join(repo, '.gitignore'), 'generated/\nignored.log\n');
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
     write(join(isolated.path, 'generated', 'output.txt'), 'generated\n');
     write(join(isolated.path, 'ignored.log'), 'log\n');
@@ -287,7 +288,7 @@ test('active worktree tree pins survive aggressive Git GC and are released with 
   let isolated;
   try {
     write(join(repo, 'tracked.txt'), 'uncommitted baseline\n');
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
     assert.equal(git(repo, ['rev-parse', '--verify', `${treePinRef(isolated.path, 'baseline')}^{tree}`]), baseline);
     assert.equal(git(repo, ['rev-parse', '--verify', `${treePinRef(isolated.path, 'seed')}^{tree}`]), baseline);
@@ -311,7 +312,7 @@ test('a vanished proven private root releases active pins after stale registrati
   const repo = makeRepo();
   let isolated;
   try {
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
     const workspace = isolated.path;
     const pin = treePinRef(workspace, 'baseline');
@@ -332,7 +333,7 @@ test('a mid-release pin failure leaves every pin visible and cleanup retryable',
   let isolated;
   let lock;
   try {
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
     const after = isolated.snapshot();
     const baselinePin = treePinRef(isolated.path, 'baseline');
@@ -361,13 +362,44 @@ test('a mid-release pin failure leaves every pin visible and cleanup retryable',
   }
 });
 
+test('a creation failure is not masked by a pin-release failure during cleanup', () => {
+  const repo = makeRepo();
+  const root = realpathSync(tempDir());
+  const name = 'offload-worktree-lockedcreate';
+  const lock = join(repo, '.git', `${treePinRef(join(root, name, 'workspace'), 'after')}.lock`);
+  try {
+    const baseline = snapshotWorkingTree(repo);
+    mkdirSync(dirname(lock), { recursive: true });
+    write(lock, 'lock\n');
+    // A tree naming a blob that does not exist passes the tree-object check but makes `read-tree` fail.
+    const brokenSeed = execFileSync('git', ['mktree', '--missing'], {
+      cwd: repo,
+      input: `100644 blob ${'1'.repeat(40)}\tmissing.txt\n`,
+      encoding: 'utf8',
+    }).trim();
+    const mkdtemp = () => {
+      const dir = join(root, name);
+      mkdirSync(dir, { mode: 0o700 });
+      return dir;
+    };
+    assert.throws(
+      () => createIsolatedWorktree({ repoPath: repo, baselineTree: baseline, seedTree: brokenSeed, tempRoot: root, mkdtemp }),
+      (error) => error.code === 'E_WORKTREE_SEED',
+    );
+  } finally {
+    rmSync(lock, { force: true });
+    cleanup(repo);
+    cleanup(root);
+  }
+});
+
 test('durable job tree pins survive GC, are transactional, and cannot affect another job namespace', () => {
   const repo = makeRepo();
   try {
     write(join(repo, 'tracked.txt'), 'durable before\n');
-    const before = snapshotPrimaryWorkingTree(repo);
+    const before = snapshotWorkingTree(repo);
     write(join(repo, 'tracked.txt'), 'durable after\n');
-    const workspaceAfter = snapshotPrimaryWorkingTree(repo);
+    const workspaceAfter = snapshotWorkingTree(repo);
     const first = pinJobTrees({ repoPath: repo, jobId: 'job_A-1', trees: { before, workspaceAfter } });
     pinJobTrees({ repoPath: repo, jobId: 'job_B-2', trees: { before } });
     assert.equal(git(repo, ['rev-parse', '--verify', `${first.before.ref}^{tree}`]), before);
@@ -400,7 +432,7 @@ test('a failed cleanup remains retryable and never removes a still-registered lo
   const repo = makeRepo();
   let isolated;
   try {
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
     git(repo, ['worktree', 'lock', '--reason', 'test lock', isolated.path]);
     assert.throws(
@@ -426,7 +458,7 @@ test('cleanup retains a private-root replacement instead of recursively removing
   let originalRoot;
   let replacementRoot;
   try {
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
     originalRoot = dirname(isolated.path);
     replacementRoot = `${originalRoot}-saved`;
@@ -461,7 +493,7 @@ test('worktree creation rejects non-tree baselines before creating a workspace',
       () => createIsolatedWorktree({ repoPath: repo, baselineTree: '0'.repeat(40) }),
       (error) => error.code === 'E_WORKTREE_BASELINE',
     );
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     assert.throws(
       () => createIsolatedWorktree({ repoPath: repo, baselineTree: baseline, seedTree: '--bad' }),
       (error) => error.code === 'E_WORKTREE_TREE',
@@ -481,9 +513,9 @@ test('a distinct seed tree populates the workspace while comparisons and integra
   let reopened;
   try {
     write(join(repo, 'tracked.txt'), 'original baseline\n');
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     write(join(repo, 'tracked.txt'), 'manual repair seed\n');
-    const seed = snapshotPrimaryWorkingTree(repo);
+    const seed = snapshotWorkingTree(repo);
     isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline, seedTree: seed });
     assert.equal(isolated.seedTree, seed);
     assert.equal(readFileSync(join(isolated.path, 'tracked.txt'), 'utf8'), 'manual repair seed\n');
@@ -515,7 +547,7 @@ test('a persisted isolated worktree can be reopened and integrated through a fre
   let created;
   let reopened;
   try {
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     created = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
     write(join(created.path, 'tracked.txt'), 'reopened worker result\n');
     const after = created.snapshot();
@@ -538,7 +570,7 @@ test('reopen rejects outside and unregistered paths, while recovery cleanup is p
   let isolated;
   let unregistered;
   try {
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     assert.throws(
       () => openIsolatedWorktree({ repoPath: repo, workspacePath: repo, baselineTree: baseline }),
       (error) => error.code === 'E_WORKTREE_RECOVERY',
@@ -578,7 +610,7 @@ test('allocator and recovery cleanup never follow arbitrary paths, but remove a 
   let isolated;
   let target;
   try {
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     target = mkdtempSync(join(tmpdir(), 'offload-unrelated-target-'));
     write(join(target, 'keep.txt'), 'must survive\n');
     assert.throws(
@@ -626,7 +658,7 @@ test('an exactly gitignored dependency symlink does not break isolated snapshots
   let isolated;
   try {
     write(join(repo, '.gitignore'), 'node_modules\n');
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
     assert.equal(isolated.dependencies.nodeModules, 'linked');
     write(join(isolated.path, 'tracked.txt'), 'worker result\n');
@@ -644,7 +676,7 @@ test('snapshot errors preserve underlying Git stderr and capture can precede a f
   let isolated;
   let lock;
   try {
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
     isolated.snapshot();
     lock = join(repo, '.git', `${treePinRef(isolated.path, 'after')}.lock`);
@@ -671,7 +703,7 @@ test('a private worktree resolves primary dependencies through parent and local 
   const repo = repoWithDependency();
   let isolated;
   try {
-    const baseline = snapshotPrimaryWorkingTree(repo);
+    const baseline = snapshotWorkingTree(repo);
     isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
     assert.equal(isolated.dependencies.nodeModules, 'linked');
     const link = join(dirname(isolated.path), 'node_modules');
@@ -700,7 +732,7 @@ test('a private worktree resolves primary dependencies through parent and local 
 test('cleanup removes the dependency link without touching the primary node_modules', () => {
   const repo = repoWithDependency();
   try {
-    const isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotPrimaryWorkingTree(repo) });
+    const isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotWorkingTree(repo) });
     const privateRoot = dirname(isolated.path);
     isolated.cleanup();
     assert.equal(existsSync(privateRoot), false);
@@ -734,7 +766,7 @@ test('no dependency link is made for an absent, symlinked, or tracked node_modul
     let isolated;
     try {
       setup(repo, outside);
-      isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotPrimaryWorkingTree(repo) });
+      isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotWorkingTree(repo) });
       assert.equal(isolated.dependencies.nodeModules, expected);
       assert.equal(
         existsSync(join(dirname(isolated.path), 'node_modules')) &&
@@ -755,7 +787,7 @@ test('a retargeted or replaced dependency link grants no read path', () => {
   const outside = tempDir('offload-outside-');
   let isolated;
   try {
-    isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotPrimaryWorkingTree(repo) });
+    isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotWorkingTree(repo) });
     const link = join(dirname(isolated.path), 'node_modules');
     assert.equal(isolatedDependencyReadPaths(isolated.path, repo).length, 1);
     rmSync(link);
@@ -783,7 +815,7 @@ test('a retargeted workspace dependency link remains visible to the scope audit'
   const outside = tempDir('offload-outside-');
   let isolated;
   try {
-    isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotPrimaryWorkingTree(repo) });
+    isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotWorkingTree(repo) });
     const local = join(isolated.path, 'node_modules');
     rmSync(local);
     symlinkSync(outside, local, 'dir');
@@ -824,7 +856,7 @@ test(
       write(join(repo, 'probe.cjs'), 'process.stdout.write(require("dep-pkg"));\n');
       git(repo, ['add', 'probe.cjs']);
       git(repo, ['commit', '-m', 'probe']);
-      isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotPrimaryWorkingTree(repo) });
+      isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: snapshotWorkingTree(repo) });
       const readablePaths = [dirname(isolated.path), ...isolatedDependencyReadPaths(isolated.path, repo)];
       const options = {
         cwd: isolated.path,
@@ -922,7 +954,7 @@ test('integrateRecordedTree applies a recorded result to the primary with the in
     write(join(repo, 'src', 'a.txt'), 'one\n');
     git(repo, ['add', '.']);
     git(repo, ['commit', '-m', 'src']);
-    const baselineTree = snapshotPrimaryWorkingTree(repo);
+    const baselineTree = snapshotWorkingTree(repo);
     const isolated = createIsolatedWorktree({ repoPath: repo, baselineTree });
     let afterTree;
     try {
@@ -969,7 +1001,7 @@ test('integrateRecordedTree applies a recorded result to the primary with the in
 test('integrateRecordedTree refuses malformed input before touching the primary', () => {
   const repo = makeRepo();
   try {
-    const tree = snapshotPrimaryWorkingTree(repo);
+    const tree = snapshotWorkingTree(repo);
     for (const input of [
       { repoPath: repo, baselineTree: tree, afterTree: tree },
       { repoPath: repo, baselineTree: tree, afterTree: tree, paths: [] },

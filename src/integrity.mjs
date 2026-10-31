@@ -3,6 +3,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { constants, existsSync, lstatSync, realpathSync } from 'node:fs';
 import { chmod, lstat, mkdir, open, writeFile } from 'node:fs/promises';
 import { WINDOWS_INTEGRITY_ROOT_CREDENTIAL } from './secrets.mjs';
+import { sameStatFields, sameStatValue } from './stat-identity.mjs';
 
 const ROOT_FILE = 'integrity-root-v1';
 const ROOT_RE = /^[A-Za-z0-9_-]{43}$/;
@@ -105,31 +106,8 @@ async function readRootFile(path, fs = defaultRootFileSystem) {
   return text.slice(0, -1);
 }
 
-function sameStatValue(first, second) {
-  if (first === second) return true;
-  if (typeof first === 'bigint' && Number.isSafeInteger(second)) return first === BigInt(second);
-  if (typeof second === 'bigint' && Number.isSafeInteger(first)) return BigInt(first) === second;
-  return false;
-}
-function statTimestamp(details, name) {
-  const nanoseconds = details?.[`${name}Ns`];
-  if (typeof nanoseconds === 'bigint') return nanoseconds;
-  const milliseconds = details?.[`${name}Ms`];
-  if (typeof milliseconds === 'number' && Number.isFinite(milliseconds)) return milliseconds;
-  const date = details?.[name];
-  return date instanceof Date && Number.isFinite(date.getTime()) ? date.getTime() : undefined;
-}
 function sameRootMetadata(first, second) {
-  return (
-    ['dev', 'ino', 'uid', 'size', 'mode'].every((name) => sameStatValue(first?.[name], second?.[name])) &&
-    sameTimestamp(first, second, 'mtime') &&
-    sameTimestamp(first, second, 'ctime')
-  );
-}
-function sameTimestamp(first, second, name) {
-  const left = statTimestamp(first, name),
-    right = statTimestamp(second, name);
-  return left !== undefined && right !== undefined && sameStatValue(left, right);
+  return sameStatFields(first, second, ['dev', 'ino', 'uid', 'size', 'mode']);
 }
 function modeIsPrivate(mode) {
   return typeof mode === 'bigint' ? (mode & 0o077n) === 0n : (mode & 0o077) === 0;
@@ -173,7 +151,6 @@ export class PosixIntegrityRoot {
   }
 }
 
-export { WINDOWS_INTEGRITY_ROOT_CREDENTIAL } from './secrets.mjs';
 /** A fixed raw Credential Locker item. It deliberately has no repository/job
  * data and is not addressable by the generic keychain:service mapping. */
 export class WindowsIntegrityRoot {

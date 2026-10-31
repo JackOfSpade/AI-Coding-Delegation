@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { safeErrorText as safeText } from './redact.mjs';
 import { readRegularFile } from './regular-file.mjs';
+import { plainObject } from './plain-object.mjs';
 import { runtimeIdentity } from './identity.mjs';
 import { validateJobRequest } from './job-manager.mjs';
 import { COMMAND_SKILL_NAMES as SKILL_NAMES } from './command-skills.mjs';
@@ -433,7 +434,14 @@ async function loadSkillCatalog() {
 }
 export function createMcpServer(
   core,
-  { input = process.stdin, output = process.stdout, maxFrameBytes = 1_000_000, maxPendingRequests = 64, log = { record() {} } } = {},
+  {
+    input = process.stdin,
+    output = process.stdout,
+    maxFrameBytes = 1_000_000,
+    maxPendingRequests = 64,
+    log = { record() {} },
+    loadCatalog = loadSkillCatalog,
+  } = {},
 ) {
   if (!Number.isSafeInteger(maxFrameBytes) || maxFrameBytes < 1024 || maxFrameBytes > 16_000_000)
     throw new TypeError('maxFrameBytes must be an integer between 1024 and 16000000');
@@ -525,6 +533,12 @@ export function createMcpServer(
     // The direct-write path is still an output-stream queue. A single frame
     // must not bypass our cap just because no earlier write has backpressured.
     if (bytes > maxQueuedOutputBytes) {
+      // An oversized answer to a request is a per-request failure: reply with a small id-bearing
+      // error instead of tearing down the transport. Notifications and errors still fail closed.
+      if (value?.id !== undefined && value.result !== undefined) {
+        send({ jsonrpc: '2.0', id: value.id, error: { code: -32603, message: 'response too large' } });
+        return;
+      }
       failOutput();
       return;
     }
@@ -548,13 +562,19 @@ export function createMcpServer(
   const onOutputError = () => failOutput();
   output.on?.('drain', flushOutput);
   output.on?.('error', onOutputError);
-  const plainObject = (value) =>
-    value !== null &&
-    typeof value === 'object' &&
-    !Array.isArray(value) &&
-    (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
   let skillCatalog;
-  const skills = () => (skillCatalog ||= loadSkillCatalog());
+  // Concurrent callers share one in-flight load; a failed load is evicted so
+  // the next request retries instead of replaying the failure for the server's life.
+  const skills = () => {
+    if (!skillCatalog) {
+      const attempt = loadCatalog();
+      skillCatalog = attempt;
+      attempt.catch(() => {
+        if (skillCatalog === attempt) skillCatalog = undefined;
+      });
+    }
+    return skillCatalog;
+  };
   const exactParams = (value, required, optional = []) =>
     plainObject(value) &&
     Object.keys(value).every((key) => [...required, ...optional].includes(key)) &&

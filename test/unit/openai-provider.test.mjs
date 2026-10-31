@@ -201,7 +201,7 @@ test('fallback: the last route and partial streams never switch', async () => {
   assert.equal(transitions, 0);
 });
 
-test('continuation resumes at persisted stage and legacy signature maps to routes', async () => {
+test('continuation resumes at persisted stage', async () => {
   const seen = [];
   const mk = (name) => ({
     async *chat(request) {
@@ -219,15 +219,15 @@ test('continuation resumes at persisted stage and legacy signature maps to route
   });
   await collect(resumed);
   assert.deepEqual(seen, ['c:mc']);
-  const legacy = new CreditFallbackProvider({
-    primary: mk('p'),
-    fallback: mk('f'),
-    primaryModel: 'mp',
-    fallbackModel: 'mf',
-    fallbackUsed: true,
+  const staged = new CreditFallbackProvider({
+    routes: [
+      { provider: mk('p'), model: 'mp' },
+      { provider: mk('f'), model: 'mf' },
+    ],
+    stage: 1,
   });
-  assert.equal(legacy.stage, 1);
-  await collect(legacy);
+  assert.equal(staged.stage, 1);
+  await collect(staged);
   assert.equal(seen.at(-1), 'f:mf');
   assert.throws(() => new CreditFallbackProvider({ routes: [{ provider: mk('a'), model: 'ma' }] }), TypeError);
   assert.throws(
@@ -261,4 +261,20 @@ test('OpenAI dated snapshot echoes normalize to the requested alias; other model
     fetchImpl: dated('deepseek-flash-2026-10-26'),
   });
   assert.ok((await drain(deepseek)).some((event) => event.model === 'deepseek-flash-2026-10-26'));
+});
+
+test("Chat adapter classifies Node's real refused-redirect error as a single non-retryable attempt", async () => {
+  let calls = 0;
+  const provider = openai(
+    async () => {
+      calls++;
+      throw Object.assign(new TypeError('fetch failed'), { cause: new Error('unexpected redirect') });
+    },
+    { retries: 3 },
+  );
+  await assert.rejects(
+    () => drain(provider),
+    (error) => error.kind === 'redirect' && error.retryable === false && error.attempts === 1,
+  );
+  assert.equal(calls, 1);
 });

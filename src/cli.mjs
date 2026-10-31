@@ -126,7 +126,6 @@ const decode = (value, fallback) => {
 const bool = (value) => value === true || value === 'true';
 // One path, or a JSON array of up to four.
 const interpreterFlag = (value) => (String(value).trimStart().startsWith('[') ? decode(value) : [value]);
-const validId = validJobId;
 const finiteNumber = (value, key, { integer = false, minimum, maximum, exclusiveMinimum = false } = {}) => {
   if (!decimalText(value)) throw new Error(`option --${key} must be a decimal number`);
   const number = Number(value);
@@ -144,39 +143,15 @@ const MAX_REPAIR_ITEMS = 32,
   MAX_REPAIR_ITEM = 4_000,
   MAX_REPAIR_CHARS = 16_000;
 const cleanText = (value, maximum) => typeof value === 'string' && value.length > 0 && value.length <= maximum && !/[\0\r]/.test(value);
-function decodedFlag(flags, key, fallback) {
-  return decode(flags[key], fallback);
-}
-/** Validate caller-decodable values before Core is constructed. Core setup can
- * create durable job/integrity state, so malformed CLI input must not defer
- * rejection to JobManager after those side effects have happened. */
-function validateDecodedInvocation(command, flags, positionals) {
-  validateExplicitRepoPath(flags.repoPath);
-  if (command === 'worker' && flags.repoPath === undefined) throw new Error('worker --repoPath is required');
-  if (['worker', 'wait', 'repair', 'revert', 'cancel'].includes(command) && !validId(positionals[0]))
-    throw new Error('valid job id is required');
-  if (command === 'job' && positionals[0] != null && !validId(positionals[0])) throw new Error('invalid job id');
-  if (command === 'job' && flags.include !== undefined && !['summary', 'diff', 'files', 'log'].includes(flags.include))
-    throw new Error('job --include must be summary, diff, files, or log');
-  if (command === 'repair') {
-    const defects = decodedFlag(flags, 'defects', []);
-    if (
-      !Array.isArray(defects) ||
-      !defects.length ||
-      defects.length > MAX_REPAIR_ITEMS ||
-      !defects.every((value) => cleanText(value, MAX_REPAIR_ITEM)) ||
-      defects.reduce((total, value) => total + value.length, 0) > MAX_REPAIR_CHARS
-    )
-      throw new Error('repair --defects must be 1-32 non-empty bounded strings');
-  }
-  if (command !== 'start') return;
-  validateJobRequest({
+/** The job request a `start` invocation describes; one builder serves pre-core validation and the real call. */
+function startRequest(flags, positionals) {
+  return {
     task: flags.task ?? positionals.join(' '),
     mode: flags.mode,
-    ownedPaths: decodedFlag(flags, 'ownedPaths', undefined),
-    inputFiles: decodedFlag(flags, 'inputFiles', undefined),
-    acceptanceCriteria: decodedFlag(flags, 'acceptanceCriteria', []),
-    relevantPaths: decodedFlag(flags, 'relevantPaths', []),
+    ownedPaths: decode(flags.ownedPaths, undefined),
+    inputFiles: decode(flags.inputFiles, undefined),
+    acceptanceCriteria: decode(flags.acceptanceCriteria, []),
+    relevantPaths: decode(flags.relevantPaths, []),
     testCommand: flags.testCommand,
     ...(flags.verifierMode !== undefined ? { verifierMode: flags.verifierMode } : {}),
     ...(flags.verifierTimeoutSec !== undefined ? { verifierTimeoutSec: Number(flags.verifierTimeoutSec) } : {}),
@@ -184,9 +159,8 @@ function validateDecodedInvocation(command, flags, positionals) {
     profile: flags.profile,
     effort: flags.effort,
     maxRepairRounds: flags.maxRepairRounds == null ? undefined : Number(flags.maxRepairRounds),
-    budget: decodedFlag(
-      flags,
-      'budget',
+    budget: decode(
+      flags.budget,
       flags.maxUsd != null || flags.maxTurns != null || flags.timeoutMinutes != null || flags.turnPolicy != null
         ? {
             ...(flags.maxUsd != null ? { maxUsd: Number(flags.maxUsd) } : {}),
@@ -199,14 +173,39 @@ function validateDecodedInvocation(command, flags, positionals) {
     ...(flags.allowNetwork !== undefined ? { allowNetwork: bool(flags.allowNetwork) } : {}),
     ...(flags['unsafe-policy-only-verifier'] !== undefined ? { unsafePolicyOnlyVerifier: bool(flags['unsafe-policy-only-verifier']) } : {}),
     ...(flags['accept-verifier-blockers'] !== undefined ? { acceptVerifierBlockers: bool(flags['accept-verifier-blockers']) } : {}),
-    ...(flags.extraWritable !== undefined ? { extraWritable: decodedFlag(flags, 'extraWritable', []) } : {}),
+    ...(flags.extraWritable !== undefined ? { extraWritable: decode(flags.extraWritable, []) } : {}),
     repoPath: flags.repoPath,
-  });
+  };
+}
+/** Validate caller-decodable values before Core is constructed. Core setup can
+ * create durable job/integrity state, so malformed CLI input must not defer
+ * rejection to JobManager after those side effects have happened. */
+function validateDecodedInvocation(command, flags, positionals) {
+  validateExplicitRepoPath(flags.repoPath);
+  if (command === 'worker' && flags.repoPath === undefined) throw new Error('worker --repoPath is required');
+  if (['worker', 'wait', 'repair', 'revert', 'cancel'].includes(command) && !validJobId(positionals[0]))
+    throw new Error('valid job id is required');
+  if (command === 'job' && positionals[0] != null && !validJobId(positionals[0])) throw new Error('invalid job id');
+  if (command === 'job' && flags.include !== undefined && !['summary', 'diff', 'files', 'log'].includes(flags.include))
+    throw new Error('job --include must be summary, diff, files, or log');
+  if (command === 'repair') {
+    const defects = decode(flags.defects, []);
+    if (
+      !Array.isArray(defects) ||
+      !defects.length ||
+      defects.length > MAX_REPAIR_ITEMS ||
+      !defects.every((value) => cleanText(value, MAX_REPAIR_ITEM)) ||
+      defects.reduce((total, value) => total + value.length, 0) > MAX_REPAIR_CHARS
+    )
+      throw new Error('repair --defects must be 1-32 non-empty bounded strings');
+  }
+  if (command !== 'start') return;
+  validateJobRequest(startRequest(flags, positionals));
 }
 /** `--jobs a,b` as 1-16 distinct valid job ids. */
 function retrospectiveJobIds(value) {
   const ids = String(value).split(',');
-  if (ids.length > MAX_RETROSPECTIVE_JOBS || new Set(ids).size !== ids.length || !ids.every(validId))
+  if (ids.length > MAX_RETROSPECTIVE_JOBS || new Set(ids).size !== ids.length || !ids.every(validJobId))
     throw new Error(`retrospective --jobs must be 1-${MAX_RETROSPECTIVE_JOBS} distinct valid job ids separated by commas`);
   return ids;
 }
@@ -274,7 +273,7 @@ function validateInvocation(command, flags, positionals) {
   if (command === 'job' && flags.verifierImports !== undefined) {
     if (positionals.length === 1) throw new Error('job --verifierImports applies only to the health call (no job id)');
     if (flags.verifierInterpreter === undefined) throw new Error('job --verifierImports requires --verifierInterpreter');
-    normalizeVerifierImports(decodedFlag(flags, 'verifierImports', undefined));
+    normalizeVerifierImports(decode(flags.verifierImports, undefined));
   }
   if (command === 'job' && (flags.tail !== undefined || flags.limit !== undefined)) {
     if (flags.include !== 'log') throw new Error('job --tail/--limit require --include log');
@@ -288,7 +287,7 @@ function detachedEnvironment(env = process.env) {
   return { ...env };
 }
 export function spawnDetachedWorker({ jobId, repoPath, spawnProcess = spawn, env = process.env } = {}) {
-  if (!validId(jobId) || typeof repoPath !== 'string' || !repoPath) throw new Error('job id and repo path are required to start worker');
+  if (!validJobId(jobId) || typeof repoPath !== 'string' || !repoPath) throw new Error('job id and repo path are required to start worker');
   const child = spawnProcess(process.execPath, [binPath, 'worker', jobId, '--repoPath', repoPath], {
     detached: true,
     stdio: 'ignore',
@@ -324,6 +323,15 @@ export function spawnDetachedWorker({ jobId, repoPath, spawnProcess = spawn, env
     child.once('error', failed);
     child.once('spawn', ready);
   });
+}
+async function launchDetached(core, spawnWorker, result) {
+  try {
+    const child = await spawnWorker({ jobId: result.jobId, repoPath: result.repo });
+    await core.assignWorkerPid(result.jobId, child.pid, result.repo);
+  } catch (error) {
+    await core.failDetached?.(result.jobId, result.repo, error);
+    throw error;
+  }
 }
 export async function runCli(argv = process.argv.slice(2), options = {}) {
   const stdout = options.stdout || process.stdout;
@@ -364,13 +372,13 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
       // truthiness check would incorrectly treat `--live=false` as enabled.
       if (bool(flags.live)) {
         const maxUsd = Number(flags.maxUsd);
-        if (!Number.isFinite(maxUsd)) throw new Error('doctor --live requires a finite --maxUsd cap');
         const result = await runLiveDoctor({ maxUsd, repoPath: flags.repoPath });
         stdout.write(`${JSON.stringify(result, null, 2)}\n`);
         return 0;
       }
       const diagnostic = doctor({ root: fileURLToPath(new URL('..', import.meta.url)), repoPath: flags.repoPath });
-      const health = (await core.job()).health;
+      // Health for the named repository only; without --repoPath (the session hook) doctor must not bind or initialise the cwd.
+      const health = (await core.job(undefined, flags.repoPath === undefined ? {} : { repoPath: flags.repoPath })).health;
       const result = { ...diagnostic, worker: health?.worker, coreSandbox: health?.sandbox, verifierTmp: health?.verifierTmp };
       if (bool(flags.hook)) {
         stdout.write(
@@ -384,7 +392,7 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
       stderr.write(`offload: ${safeText(error.message || error)}\n`);
       return 2;
     } finally {
-      // `doctor` asks the core only for local health.  Close a core created by
+      // `doctor` asks the core only for local or named-repository health.  Close a core created by
       // this command so an embedding's managers/timers cannot outlive it; an
       // injected core belongs to its caller and is deliberately untouched.
       if (!injectedCore) await Promise.resolve(core.shutdown?.({ timeoutMs: 5_000 })).catch(() => {});
@@ -393,7 +401,6 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
   try {
     let result;
     if (command === 'worker') {
-      if (!validId(positionals[0])) throw new Error('valid job id is required');
       let stopping = false;
       const stop = () => {
         if (stopping) return;
@@ -408,52 +415,13 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
         for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.removeListener(signal, stop);
       }
     } else if (command === 'start') {
-      const input = {
-        task: flags.task || positionals.join(' '),
-        mode: flags.mode,
-        ownedPaths: decode(flags.ownedPaths, undefined),
-        inputFiles: decode(flags.inputFiles, undefined),
-        acceptanceCriteria: decode(flags.acceptanceCriteria, []),
-        relevantPaths: decode(flags.relevantPaths, []),
-        testCommand: flags.testCommand,
-        ...(flags.verifierMode !== undefined ? { verifierMode: flags.verifierMode } : {}),
-        ...(flags.verifierTimeoutSec !== undefined ? { verifierTimeoutSec: Number(flags.verifierTimeoutSec) } : {}),
-        ...(flags.verifierInterpreter !== undefined ? { verifierInterpreter: interpreterFlag(flags.verifierInterpreter) } : {}),
-        profile: flags.profile,
-        effort: flags.effort,
-        maxRepairRounds: flags.maxRepairRounds == null ? undefined : Number(flags.maxRepairRounds),
-        budget: decode(
-          flags.budget,
-          flags.maxUsd != null || flags.maxTurns != null || flags.timeoutMinutes != null || flags.turnPolicy != null
-            ? {
-                ...(flags.maxUsd != null ? { maxUsd: Number(flags.maxUsd) } : {}),
-                ...(flags.maxTurns != null ? { maxTurns: Number(flags.maxTurns) } : {}),
-                ...(flags.turnPolicy != null ? { turnPolicy: flags.turnPolicy } : {}),
-                ...(flags.timeoutMinutes != null ? { timeoutMinutes: Number(flags.timeoutMinutes) } : {}),
-              }
-            : undefined,
-        ),
-        ...(flags.allowNetwork !== undefined ? { allowNetwork: bool(flags.allowNetwork) } : {}),
-        ...(flags['unsafe-policy-only-verifier'] !== undefined
-          ? { unsafePolicyOnlyVerifier: bool(flags['unsafe-policy-only-verifier']) }
-          : {}),
-        ...(flags['accept-verifier-blockers'] !== undefined ? { acceptVerifierBlockers: bool(flags['accept-verifier-blockers']) } : {}),
-        ...(flags.extraWritable !== undefined ? { extraWritable: decode(flags.extraWritable, []) } : {}),
-        repoPath: flags.repoPath,
-      };
+      const input = startRequest(flags, positionals);
       if (injectedCore || bool(flags.foreground)) result = await core.start(input);
       else {
         result = await core.start(input, { launch: false });
-        try {
-          const child = await spawnWorker({ jobId: result.jobId, repoPath: result.repo });
-          await core.assignWorkerPid(result.jobId, child.pid, result.repo);
-        } catch (error) {
-          await core.failDetached?.(result.jobId, result.repo, error);
-          throw error;
-        }
+        await launchDetached(core, spawnWorker, result);
       }
     } else if (command === 'wait') {
-      if (!validId(positionals[0])) throw new Error('valid job id is required');
       result = await core.wait(positionals[0], {
         timeoutSec: flags.timeoutSec == null ? undefined : Number(flags.timeoutSec),
         repoPath: flags.repoPath,
@@ -462,7 +430,6 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
         detail: flags.detail ?? 'full',
       });
     } else if (command === 'job') {
-      if (positionals[0] != null && !validId(positionals[0])) throw new Error('invalid job id');
       result = await core.job(positionals[0], {
         include: flags.include,
         ...logWindowFlags(flags),
@@ -491,28 +458,19 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
         result = `${JSON.stringify(digest, null, 2)}\n\n--- maintainer prompt skeleton (edit before pasting) ---\n${maintainerPromptSkeleton}`;
       }
     } else if (command === 'repair') {
-      if (!validId(positionals[0])) throw new Error('valid job id is required');
       const defects = decode(flags.defects, []);
       const assertionOptions = flags.assertionPaths === undefined ? {} : { assertionPaths: decode(flags.assertionPaths, []) };
       if (injectedCore || bool(flags.foreground))
         result = await core.repair(positionals[0], defects, { repoPath: flags.repoPath, ...assertionOptions });
       else {
         result = await core.repair(positionals[0], defects, { repoPath: flags.repoPath, ...assertionOptions, launch: false });
-        try {
-          const child = await spawnWorker({ jobId: result.jobId, repoPath: result.repo });
-          await core.assignWorkerPid(result.jobId, child.pid, result.repo);
-        } catch (error) {
-          await core.failDetached?.(result.jobId, result.repo, error);
-          throw error;
-        }
+        await launchDetached(core, spawnWorker, result);
       }
     } else if (command === 'cancel') {
-      if (!validId(positionals[0])) throw new Error('valid job id is required');
       result = await core.cancel(positionals[0], { repoPath: flags.repoPath });
     } else if (command === 'revert') {
-      if (!validId(positionals[0])) throw new Error('valid job id is required');
       result = await core.revert(positionals[0], { apply: bool(flags.apply), repoPath: flags.repoPath });
-    } else throw new Error('usage: offload <start|wait|job|repair|revert|cancel|retrospective|doctor|mcp>');
+    }
     stdout.write(`${typeof result === 'string' ? result : JSON.stringify(result, null, 2)}\n`);
     return 0;
   } catch (error) {

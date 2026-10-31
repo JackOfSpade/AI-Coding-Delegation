@@ -1660,3 +1660,76 @@ test('the skill names exactly the capabilities, tools, parameters and CLI flags 
   assert.ok(text.includes('--detail compact'));
   assert.equal((await run(['wait', 'oj-1', '--detail', 'compact'])).code, 0);
 });
+test('MCP answers an oversized tool result with a small error and keeps serving', async () => {
+  const input = new PassThrough(),
+    output = new PassThrough();
+  let wire = '';
+  output.on('data', (value) => {
+    wire += value;
+  });
+  let shutdowns = 0;
+  const server = createMcpServer(
+    {
+      job: async () => ({ diff: 'x'.repeat(1_200_000) }),
+      shutdown: async () => {
+        shutdowns += 1;
+      },
+    },
+    { input, output },
+  );
+  input.write('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}\n');
+  input.write(
+    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"offload_job","arguments":{"jobId":"j","include":"diff"}}}\n',
+  );
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  input.write('{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n');
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const frames = wire
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line));
+  const tooLarge = frames.find((frame) => frame.id === 1);
+  assert.equal(tooLarge.error.code, -32603);
+  assert.equal(tooLarge.error.message, 'response too large');
+  assert.equal(shutdowns, 0);
+  assert.equal(output.destroyed, false);
+  assert.ok(frames.find((frame) => frame.id === 2)?.result?.tools, 'server keeps answering after the oversized result');
+  await server.close();
+});
+test('MCP retries a failed skill-catalog load instead of caching the failure', async () => {
+  const input = new PassThrough(),
+    output = new PassThrough();
+  let wire = '';
+  output.on('data', (value) => {
+    wire += value;
+  });
+  let loads = 0;
+  const catalog = { entries: [], resources: new Map() };
+  const server = createMcpServer(
+    {},
+    {
+      input,
+      output,
+      loadCatalog: async () => {
+        loads += 1;
+        if (loads === 1) throw new Error('transient');
+        return catalog;
+      },
+    },
+  );
+  const frameFor = async (id) => {
+    input.write(`${JSON.stringify({ jsonrpc: '2.0', id, method: 'skills/list', params: {} })}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return wire
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .find((frame) => frame.id === id);
+  };
+  input.write('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}\n');
+  assert.equal((await frameFor(1)).error.code, -32603);
+  const second = await frameFor(2);
+  assert.equal(second.error, undefined, JSON.stringify(second));
+  assert.equal(loads, 2);
+  await server.close();
+});

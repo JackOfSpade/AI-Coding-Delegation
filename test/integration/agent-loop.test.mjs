@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { OpenAIChatProvider } from '../../src/provider/openai-chat.mjs';
 import { createMockOpenAIServer } from '../mock-openai-server.mjs';
+import { LOOPBACK_SKIP_MARKER } from '../run-suite.mjs';
 import { LocalTools } from '../../src/agent/tools.mjs';
 import { AgentLoop } from '../../src/agent/loop.mjs';
 
@@ -20,7 +21,7 @@ async function mockOrSkip(t, scripts) {
     return await createMockOpenAIServer(scripts);
   } catch (error) {
     if (error?.code === 'EPERM') {
-      t.skip('loopback networking is unavailable in this sandbox');
+      t.skip(LOOPBACK_SKIP_MARKER);
       return null;
     }
     throw error;

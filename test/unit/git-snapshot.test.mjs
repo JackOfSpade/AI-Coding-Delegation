@@ -1,12 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import {
-  createPatch,
+  atomicWrite,
   diffTreeFiles,
-  diffTreePaths,
   diffTrees,
   git as snapshotGit,
   parseNulNameStatus,
@@ -87,24 +86,6 @@ test('temporary-index snapshots include untracked files, exclude ignored files, 
     assert.deepEqual(readFileSync(join(repo, '.git', 'index')), indexBefore);
     assert.deepEqual(readFileSync(join(repo, '.git', 'HEAD')), headFileBefore);
     assert.equal(git(repo, ['status', '--porcelain']), 'M tracked.txt\n?? .gitignore\n?? new.txt');
-  } finally {
-    cleanup(repo);
-  }
-});
-test('patch publication removes its private temporary file when the final rename fails', () => {
-  const repo = makeRepo();
-  try {
-    const before = snapshotWorkingTree(repo);
-    write(join(repo, 'tracked.txt'), 'changed\n');
-    const after = snapshotWorkingTree(repo);
-    const parent = join(repo, '.git');
-    const target = join(parent, 'patch-target');
-    mkdirSync(target);
-    assert.throws(() => createPatch(repo, before, after, target));
-    assert.equal(
-      readdirSync(parent).some((name) => name.startsWith('patch-target.')),
-      false,
-    );
   } finally {
     cleanup(repo);
   }
@@ -235,7 +216,8 @@ test('snapshot patch carries binary blobs, executable modes and symlinks when su
     symlinkSync('tracked.txt', join(repo, 'linked.txt'));
     const after = snapshotWorkingTree(repo);
     const patch = join(repo, '.git', 'binary.patch');
-    const contents = createPatch(repo, before, after, patch);
+    const contents = diffTrees(repo, before, after);
+    writeFileSync(patch, contents);
     assert.ok(Buffer.isBuffer(contents));
     assert.match(contents.toString('utf8'), /GIT binary patch/);
     assert.match(contents.toString('utf8'), /new file mode 100755/);
@@ -256,12 +238,8 @@ test('text-classified invalid UTF-8 changes remain raw bytes in generated patche
     write(join(repo, 'tracked.txt'), expected);
     const after = snapshotWorkingTree(repo);
     const patch = diffTrees(repo, before, after);
-    const patchPath = join(repo, '.git', 'raw-text.patch');
-    const written = createPatch(repo, before, after, patchPath);
     assert.ok(Buffer.isBuffer(patch));
     assert.ok(patch.includes(Buffer.from([0xff])), 'Git emitted the non-NUL invalid UTF-8 byte in a text diff');
-    assert.deepEqual(written, patch);
-    assert.deepEqual(readFileSync(patchPath), patch, 'atomic patch persistence must not round-trip through UTF-8');
   } finally {
     cleanup(repo);
   }
@@ -273,7 +251,7 @@ test('patch reversion dry-runs by default and refuses conflicts', () => {
     write(join(repo, 'tracked.txt'), 'worker change\n');
     const after = snapshotWorkingTree(repo);
     const patch = join(repo, '.git', 'patch.diff');
-    createPatch(repo, before, after, patch);
+    writeFileSync(patch, diffTrees(repo, before, after));
     assert.deepEqual(revertPatch(repo, patch), { dryRun: true, applied: false });
     assert.equal(readFileSync(join(repo, 'tracked.txt'), 'utf8'), 'worker change\n');
     assert.deepEqual(revertPatch(repo, patch, { apply: true }), { dryRun: false, applied: true });
@@ -294,7 +272,8 @@ test('revert checks and applies one checked patch buffer despite a path swap', (
     write(join(repo, 'tracked.txt'), 'worker change\n');
     const after = snapshotWorkingTree(repo);
     const patchPath = join(repo, '.git', 'patch.diff');
-    const original = createPatch(repo, before, after, patchPath);
+    const original = diffTrees(repo, before, after);
+    writeFileSync(patchPath, original);
     const calls = [];
     const result = revertPatch(repo, patchPath, {
       apply: true,
@@ -325,7 +304,7 @@ test('snapshot APIs require tree object ids and an explicit boolean revert apply
       (error) => error.code === 'E_GIT_TREE',
     );
     const patch = join(repo, '.git', 'patch.diff');
-    createPatch(repo, tree, tree, patch);
+    writeFileSync(patch, diffTrees(repo, tree, tree));
     assert.throws(
       () => revertPatch(repo, patch, { apply: 'true' }),
       (error) => error.code === 'E_REVERT_APPLY',
@@ -341,19 +320,16 @@ test('path-filtered tree diffs use safe top-level glob pathspecs', () => {
     write(join(repo, 'src', 'worker.mjs'), 'export const x = 1\n');
     write(join(repo, 'test', 'worker.test.mjs'), 'test\n');
     const after = snapshotWorkingTree(repo);
-    const scoped = diffTreePaths(repo, before, after, ['src/**']);
+    const scoped = diffTrees(repo, before, after, { paths: ['src/**'] });
     assert.ok(Buffer.isBuffer(scoped));
     assert.match(scoped.toString('utf8'), /src\/worker\.mjs/);
     assert.doesNotMatch(scoped.toString('utf8'), /test\/worker\.test\.mjs/);
-    const patchPath = join(repo, '.git', 'scoped.patch');
-    createPatch(repo, before, after, patchPath, { paths: ['src/**'] });
-    assert.match(readFileSync(patchPath, 'utf8'), /src\/worker\.mjs/);
     assert.throws(
-      () => diffTreePaths(repo, before, after, ['../outside']),
+      () => diffTrees(repo, before, after, { paths: ['../outside'] }),
       (error) => error.code === 'E_GIT_PATHSPEC',
     );
     assert.throws(
-      () => diffTreePaths(repo, before, after, [':(glob)**']),
+      () => diffTrees(repo, before, after, { paths: [':(glob)**'] }),
       (error) => error.code === 'E_GIT_PATHSPEC',
     );
   } finally {
@@ -401,3 +377,23 @@ test(
     }
   },
 );
+
+test('atomicWrite replaces the target and leaves no private temporary file, even when the rename fails', () => {
+  const repo = makeRepo();
+  try {
+    const target = join(repo, 'out.json');
+    atomicWrite(target, 'one');
+    atomicWrite(target, 'two');
+    assert.equal(readFileSync(target, 'utf8'), 'two');
+    const bad = join(repo, 'missing-dir', 'x');
+    assert.throws(() => atomicWrite(bad, 'x'));
+    mkdirSync(join(repo, 'dir-target'));
+    assert.throws(() => atomicWrite(join(repo, 'dir-target'), 'x'));
+    assert.deepEqual(
+      readdirSync(repo).filter((name) => name.endsWith('.tmp')),
+      [],
+    );
+  } finally {
+    cleanup(repo);
+  }
+});

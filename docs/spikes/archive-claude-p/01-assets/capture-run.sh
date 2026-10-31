@@ -37,7 +37,7 @@ env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" HOME="$OUT/home" T
   ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" ANTHROPIC_AUTH_TOKEN="sk-dummy-local-mock" \
   HTTPS_PROXY="http://127.0.0.1:9" HTTP_PROXY="http://127.0.0.1:9" NO_PROXY="127.0.0.1,localhost" \
   DISABLE_AUTOUPDATER=1 \
-  "${ENVS[@]}" \
+  ${ENVS[@]+"${ENVS[@]}"} \
   "$CLAUDE_BIN" -p "$PROMPT" --output-format json "$@" < /dev/null > "$OUT/stdout.json" 2> "$OUT/stderr.txt"
 echo "exit=$?" > "$OUT/exit.txt"
 cleanup; trap - EXIT

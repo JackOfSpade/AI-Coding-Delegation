@@ -12,6 +12,7 @@ import { createIsolatedWorktree, openIsolatedWorktree, cleanupIsolatedWorktree }
 import { cleanup, git, makeRepo, write } from '../unit/helpers.mjs';
 import { OpenAIChatProvider } from '../../src/provider/openai-chat.mjs';
 import { createMockOpenAIServer } from '../mock-openai-server.mjs';
+import { LOOPBACK_SKIP_MARKER } from '../run-suite.mjs';
 
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 const gitId = 'a'.repeat(40),
@@ -841,6 +842,12 @@ test('isolated lifecycle keeps primary unchanged until verified integration and 
     assert.deepEqual(await m.revert(started.jobId), { dryRun: true, applied: false });
     assert.deepEqual(await m.revert(started.jobId, { apply: true }), { dryRun: false, applied: true });
     assert.equal(existsSync(join(repo, 'src', 'owned.txt')), false);
+    for (const options of [undefined, { apply: true }]) {
+      await assert.rejects(
+        () => m.revert(started.jobId, options),
+        (error) => /already been reverted/.test(error.message) && !/stale/.test(error.message),
+      );
+    }
   } finally {
     cleanup(repo);
   }
@@ -2201,6 +2208,74 @@ test('shutdown cancellation suppresses an automatic repair queued at the schedul
   assert.equal(runs, 1, 'shutdown must not install a replacement lifecycle after the old task was snapshotted');
   assert.equal(m.running.has(started.jobId), false);
 });
+test('an in-flight lease heartbeat cannot strand an automatic repair re-queue', async () => {
+  let runs = 0;
+  const m = await manager({ run: async () => ({ status: 'DONE', summary: `run ${++runs}` }) }, 'fail');
+  m.leases.heartbeatIntervalMs = 15;
+  const get = m.store.get.bind(m.store);
+  const update = m.store.update.bind(m.store);
+  let scheduled = false;
+  m.store.update = async (id, changes) => {
+    if (changes.autoRepairScheduled === true) scheduled = true;
+    if (changes.status === 'QUEUED') scheduled = false;
+    return update(id, changes);
+  };
+  m.store.get = async (id) => {
+    const record = await get(id);
+    // Hold a stale read open so a running heartbeat would change the recovery identity.
+    if (scheduled) await new Promise((resolve) => setTimeout(resolve, 60));
+    return record;
+  };
+  const started = await m.start({
+    task: 'heartbeat race',
+    ownedPaths: ['src/**'],
+    repoPath: process.cwd(),
+    testCommand: 'fail',
+    maxRepairRounds: 1,
+    sandboxMode: 'macos',
+  });
+  const done = await m.wait(started.jobId, { timeoutSec: terminalWaitSec(5) });
+  assert.equal(runs, 2, 'the authorized repair round must still start');
+  assert.notEqual(done.status, 'REPAIR_QUEUED');
+  const stored = await get(started.jobId);
+  assert.equal(stored.rounds, 1);
+});
+test('a long report-mode worker error is truncated and redacted, not replaced by the generic message', async () => {
+  for (const error of [
+    'x'.repeat(3000),
+    `API_KEY=sk-secret-value-123456 ${'y'.repeat(3000)}`,
+    `${'z'.repeat(1492)} API_KEY=sk-secret-value-123456`,
+  ]) {
+    const repo = makeRepo(),
+      gitDir = await mkdtemp(`${tmpdir()}/offload-report-error-`);
+    try {
+      const m = new JobManager({
+        store: new JobStore({ gitDir }),
+        snapshots: gitSnapshots(),
+        worker: {
+          run: async () => {
+            throw new Error(error);
+          },
+        },
+        config: {
+          repoPath: repo,
+          git: { branch: async (path) => git(path, ['branch', '--show-current']), head: async (path) => git(path, ['rev-parse', 'HEAD']) },
+          applyPatch: gitPatchApplier,
+          isolation: { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree },
+        },
+      });
+      const started = await m.start({ task: 'inspect', mode: 'report', repoPath: repo });
+      await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC });
+      const stored = await m.store.get(started.jobId);
+      assert.equal(stored.status, 'FAILED');
+      assert.ok(stored.error.length <= 1500);
+      assert.notEqual(stored.error, 'report worker failed');
+      assert.doesNotMatch(stored.error, /sk-secre/);
+    } finally {
+      cleanup(repo);
+    }
+  }
+});
 test('shutdown retains worker ownership through blocked terminal report publication', async () => {
   const gitDir = await mkdtemp(`${tmpdir()}/offload-shutdown-publication-`);
   const store = new JobStore({ gitDir });
@@ -2324,6 +2399,9 @@ test('revert permits unrelated changes but rejects a change to an owned patch pa
   await assert.rejects(() => m.revert(job.id, { apply: 'false' }), /apply must be boolean/);
   await assert.rejects(() => m.revert(job.id, { apply: 1 }), /apply must be boolean/);
   assert.equal(applied, 2, 'truthy non-booleans must not reach an applying patch adapter');
+  // Once reverted, the job says so rather than reporting a stale tree.
+  await assert.rejects(() => m.revert(job.id), /already been reverted/);
+  await store.update(job.id, { revertedAt: undefined });
   changed = [{ path: 'src/a.mjs', status: 'M' }];
   await assert.rejects(() => m.revert(job.id), /job-owned file/);
 });
@@ -3307,7 +3385,7 @@ test('offload_cancel interrupts an in-flight provider request whose body hangs, 
       { chunks: [{ choices: [{ delta: { content: 'partial' } }] }, { choices: [{ delta: {} }] }], hangAfterChunks: 1 },
     ]);
   } catch (error) {
-    if (error?.code === 'EPERM') return t.skip('loopback networking is unavailable in this sandbox');
+    if (error?.code === 'EPERM') return t.skip(LOOPBACK_SKIP_MARKER);
     throw error;
   }
   try {

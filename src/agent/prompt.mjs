@@ -1,11 +1,10 @@
-import { constants } from 'node:fs';
-import { lstat, open, realpath } from 'node:fs/promises';
+import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { PAGE_PAYLOAD, splitRelevantPath } from '../budget-sizing.mjs';
+import { readRegularFile } from '../regular-file.mjs';
 import { DEFAULT_OUTPUT_CAP, DEFAULT_READ_CAP } from './tools.mjs';
 
 const MAX_CONVENTIONS_BYTES = 128 * 1024;
-const BIGINT_STAT_OPTIONS = Object.freeze({ bigint: true });
 const MAX_RELEVANT_PATHS = 50;
 // An entry as the prompt lists it: a ":START-END" suffix, with or without the
 // annotation annotateRelevantPaths appends.
@@ -39,30 +38,12 @@ export async function repoConventions(repoPath, maxChars = 12_000) {
   for (const name of ['AGENTS.md', 'CLAUDE.md']) {
     try {
       const candidate = path.join(root, name);
-      const stat = await lstat(candidate, BIGINT_STAT_OPTIONS);
-      // Do not turn a repository-controlled symlink into a host-file read.
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > BigInt(MAX_CONVENTIONS_BYTES)) continue;
+      // Do not turn a repository-controlled symlink into a host-file read:
+      // readRegularFile rejects a symlink, a non-regular or oversized file, and
+      // a file that changes while it is read.
       const canonical = await realpath(candidate);
       if (!canonical.startsWith(`${root}${path.sep}`)) continue;
-      const noFollow = process.platform === 'win32' ? 0 : constants.O_NOFOLLOW || 0;
-      const nonBlock = process.platform === 'win32' ? 0 : constants.O_NONBLOCK || 0;
-      const handle = await open(canonical, constants.O_RDONLY | noFollow | nonBlock);
-      let bytes;
-      try {
-        const opened = await handle.stat(BIGINT_STAT_OPTIONS);
-        if (!opened.isFile() || !sameMetadata(stat, opened)) continue;
-        bytes = Buffer.allocUnsafe(Number(opened.size));
-        let offset = 0;
-        while (offset < bytes.length) {
-          const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
-          if (!bytesRead) throw new Error('convention changed while reading');
-          offset += bytesRead;
-        }
-        const after = await handle.stat(BIGINT_STAT_OPTIONS);
-        if (!after.isFile() || !sameMetadata(opened, after)) continue;
-      } finally {
-        await handle.close().catch(() => {});
-      }
+      const bytes = await readRegularFile(candidate, MAX_CONVENTIONS_BYTES);
       if (bytes.includes(0)) continue;
       let content;
       try {
@@ -78,26 +59,6 @@ export async function repoConventions(repoPath, maxChars = 12_000) {
   return '';
 }
 
-function sameMetadata(first, second) {
-  return (
-    ['dev', 'ino', 'size', 'mode'].every((name) => first?.[name] === second?.[name]) &&
-    sameTimestamp(first, second, 'mtime') &&
-    sameTimestamp(first, second, 'ctime')
-  );
-}
-function sameTimestamp(first, second, name) {
-  const left = statTimestamp(first, name),
-    right = statTimestamp(second, name);
-  return left !== undefined && right !== undefined && left === right;
-}
-function statTimestamp(details, name) {
-  const nanoseconds = details?.[`${name}Ns`];
-  if (typeof nanoseconds === 'bigint') return nanoseconds;
-  const milliseconds = details?.[`${name}Ms`];
-  if (typeof milliseconds === 'number' && Number.isFinite(milliseconds)) return milliseconds;
-  const date = details?.[name];
-  return date instanceof Date && Number.isFinite(date.getTime()) ? date.getTime() : undefined;
-}
 /**
  * Turn "path:START-END" entries into a read_file starting offset. read_file is
  * byte-addressed, so a bare line range would still make the worker scan from

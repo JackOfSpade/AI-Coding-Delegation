@@ -137,7 +137,6 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
     ['macOS Homebrew Node runs a dependency-free npm test inside the sandbox', 'requires a Homebrew Node on macOS'],
     ['macOS Homebrew Node runs a dependency-free npm test inside the sandbox', 'requires an available macOS sandbox'],
     ['macOS sandbox denies protected files through case-folded and Unicode-normalized root aliases', 'requires an available macOS sandbox'],
-    ['macOS sandbox denies exact host configuration roots after toolchain allowances', 'requires an available macOS sandbox'],
     ['no protected host configuration subtree exists on this host', 'no protected host configuration subtree exists on this host'],
     [
       'Windows PowerShell can construct a SID-scoped Global mutex with a current-user-only ACL',

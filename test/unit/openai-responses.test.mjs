@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { OpenAIResponsesProvider, createOpenAIResponsesProvider } from '../../src/provider/openai-responses.mjs';
+import { OpenAIResponsesProvider } from '../../src/provider/openai-responses.mjs';
 import { ProviderError, providerFailure } from '../../src/provider/openai-chat.mjs';
 
 const MODEL = 'gpt-6.1-terra';
@@ -168,8 +168,7 @@ test('unknown, stream and invalid options are rejected before any request', asyn
 
 test('constructor validation matches the Chat adapter', () => {
   const ok = { baseUrl: 'https://api.openai.com/v1', apiKey: 'k', model: MODEL, fetchImpl: async () => json({}) };
-  assert.ok(createOpenAIResponsesProvider(ok) instanceof OpenAIResponsesProvider);
-  assert.equal(createOpenAIResponsesProvider(ok).supportsForcedImplementationFocusFor(MODEL), false);
+  assert.equal(new OpenAIResponsesProvider(ok).supportsForcedImplementationFocusFor(MODEL), false);
   assert.ok(new OpenAIResponsesProvider({ ...ok, baseUrl: 'http://127.0.0.1:9/v1', model: 'local' }));
   for (const bad of [
     { baseUrl: 'http://api.openai.com/v1' },
@@ -481,6 +480,19 @@ test('5xx and transport failures retry; redirects do not', async () => {
         }),
       ),
     (error) => error.kind === 'redirect' && error.retryable === false,
+  );
+  assert.equal(calls, 1);
+  // Node's real fetch reports a refused redirect as a generic TypeError whose cause names it.
+  calls = 0;
+  await assert.rejects(
+    () =>
+      drain(
+        provider(async () => {
+          calls++;
+          throw Object.assign(new TypeError('fetch failed'), { cause: new Error('unexpected redirect') });
+        }),
+      ),
+    (error) => error.kind === 'redirect' && error.retryable === false && error.attempts === 1,
   );
   assert.equal(calls, 1);
   await assert.rejects(

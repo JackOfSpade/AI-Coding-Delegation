@@ -1,8 +1,9 @@
 import { existsSync, readdirSync } from 'node:fs';
 import { dirname, join, posix } from 'node:path';
-import { matchesAny } from './glob.mjs';
+import { escapeRegExp, matchesAny } from './glob.mjs';
 import { PathPolicy } from './policy.mjs';
 import { readRegularFileSync } from './regular-file.mjs';
+import { SYSTEM_TEMP_PATH } from './verify-env.mjs';
 
 const SOURCE = /\.(?:[cm]?[jt]sx?|py|sh|json)$/;
 const TEST_CODE = /\.(?:[cm]?[jt]sx?|py)$/;
@@ -166,7 +167,6 @@ function localReferences(text, argv = []) {
   return { found, incomplete };
 }
 
-const SYSTEM_TEMP_PATH = /^\/(?:private\/)?(?:tmp|var\/folders)(?:\/|$)/;
 const MAX_FINDINGS = 24;
 // Findings a compact response or refusal names before counting the rest.
 const COMPACT_FINDINGS = 3;
@@ -427,6 +427,9 @@ function writeFindings(text, file, { repoPath, writeScope }) {
       for (const word of words.slice(1)) {
         const value = word.replace(/^--tmpdir=/, '');
         if (value.startsWith('-')) continue;
+        // Shell expansion ($VAR, $(..), backticks, ~) is not resolved statically, so a relative operand is not a repo-relative
+        // literal. An absolute operand keeps its literal prefix (/tmp/$USER-x is still a system-temp write).
+        if (!value.startsWith('/') && /[$`]|^~/.test(value)) continue;
         const target = resolvePathExpression(JSON.stringify(value), { file, text });
         // A relative mktemp operand is a template, often TMPDIR-based (-t).
         if (name === 'mkdir' || target?.kind === 'system') add(name, text.indexOf(word), target, false);
@@ -812,7 +815,7 @@ function segmentRunner(words) {
 const exclusion = {
   pytest: (file) => `--ignore=${shellWord(file)}`,
   vitest: (file) => `--exclude ${shellWord(file)}`,
-  jest: (file) => `--testPathIgnorePatterns ${shellWord(file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))}`,
+  jest: (file) => `--testPathIgnorePatterns ${shellWord(escapeRegExp(file))}`,
 };
 
 /** Rewrite one command text so it no longer runs `drop` (named test files). */
@@ -939,7 +942,7 @@ const BLOCKING_ADVICE = {
     'the verifier can write only ownedPaths, extraWritable and its per-run TMPDIR; create it under os.tmpdir(), or declare it in extraWritable (never integrated)',
 };
 /** One line per blocking finding: file:line, the resolved target and the fix. */
-export function verifierBlockingLines(value, { limit = MAX_FINDINGS } = {}) {
+function verifierBlockingLines(value, { limit = MAX_FINDINGS } = {}) {
   if (!Array.isArray(value?.blocking)) return [];
   const shown = value.blocking.filter((finding) => BLOCKING_ADVICE[finding?.code] && typeof finding.path === 'string');
   const lines = shown

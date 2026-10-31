@@ -3,9 +3,10 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { compactReport, terminalStatuses } from './report.mjs';
 import { auditTestAssertions } from './test-assertion-audit.mjs';
-import { matchesAny, normalizePath, pathsOverlap } from './glob.mjs';
+import { escapeRegExp, matchesAny, normalizePath, pathsOverlap } from './glob.mjs';
+import { pidAlive } from './pid.mjs';
 import { parseKeyRef } from './secrets.mjs';
-import { isDeepSeekEndpoint, isOpenAIEndpoint, modelPolicyViolation } from './model-policy.mjs';
+import { isDeepSeekEndpoint, isOpenAIEndpoint, isSupportedProviderType, modelPolicyViolation } from './model-policy.mjs';
 import { safeProviderFailureReason } from './provider/openai-chat.mjs';
 import { diffTreeFiles, diffTrees, git as snapshotGit } from './git-snapshot.mjs';
 import { copyReportInputs, prepareReportInputsForCleanup, reportInputRoots, validateReportInputFiles } from './report-inputs.mjs';
@@ -28,7 +29,7 @@ import {
   safeToolFailure,
   wallTimeoutError,
 } from './failure.mjs';
-import { isolatedDependencyReadPaths } from './worktree.mjs';
+import { isolatedDependencyReadPaths, sameWorktreePath } from './worktree.mjs';
 import { classifyVerifierEnvironment, isVerifierEnvironmentKind } from './verify-env.mjs';
 import { continuationBlocker, promptCacheSummary } from './continuation.mjs';
 import { compactVerifierPreflight, narrowTestCommand, preflightVerifier, verifierBlockingMessage } from './verifier-preflight.mjs';
@@ -107,9 +108,19 @@ const MAX_PATHS = 128,
   MAX_REPAIR_ITEMS = 32,
   MAX_REPAIR_ITEM = 4_000,
   MAX_REPAIR_CHARS = 16_000;
+const INTEGRATION_UNCERTAIN = 'integration outcome is uncertain; inspect primary changes manually';
+const APPLY_VERIFY_UNRECOVERED =
+  'an interrupted applyThenVerify run has not been recovered yet; restart the offload server (recovery runs at startup) before retrying';
 const assertDetail = (detail) => {
   if (detail !== 'compact' && detail !== 'full') throw new Error('detail must be compact or full');
 };
+/** Validates job-listing options; omitted options take the listing defaults. */
+export function validateListingOptions({ all = false, maxJobs = DEFAULT_LIST_JOBS, detail = 'compact' } = {}) {
+  if (typeof all !== 'boolean') throw new Error('all must be a boolean');
+  assertDetail(detail);
+  if (!Number.isInteger(maxJobs) || maxJobs < 1 || maxJobs > MAX_LIST_JOBS)
+    throw new Error(`maxJobs must be an integer from 1 to ${MAX_LIST_JOBS}`);
+}
 const PRE_MUTATION_ERRORS = new Set([
   'E_WORKTREE_CONFLICT',
   'E_WORKTREE_APPLY_CHECK',
@@ -196,7 +207,6 @@ const MAX_RESULT_TURNS = 1000,
 const USAGE_KEYS = ['inputTokens', 'outputTokens', 'cacheHitTokens', 'cacheMissTokens', 'cacheWriteTokens'];
 const finiteCount = (value) => Number.isSafeInteger(value) && value >= 0 && value <= MAX_USAGE;
 const filenameTokenCharacter = '[\\p{L}\\p{N}._-]';
-const escapeRegExp = (value) => value.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&');
 const validGitObjectId = (value) => typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value);
 const validBranchName = (value) => typeof value === 'string' && value.length <= 1024 && !/[\x00-\x1f\x7f]/.test(value);
 /** Durable records, leases, CLI and MCP all share this identifier boundary. */
@@ -254,6 +264,25 @@ const validUsage = (value) =>
   USAGE_KEYS.every((key) => value[key] === undefined || finiteCount(value[key])) &&
   (value.cacheWriteTokens ?? 0) <= (value.cacheMissTokens ?? 0) &&
   (value.inputTokens === undefined || (value.cacheHitTokens ?? 0) + (value.cacheMissTokens ?? 0) === value.inputTokens);
+const accumulateUsage = (prior, delta) =>
+  Object.fromEntries(
+    USAGE_KEYS.filter((key) => key !== 'cacheWriteTokens' || prior?.[key] !== undefined || delta?.[key] !== undefined).map((key) => [
+      key,
+      (prior?.[key] || 0) + (delta?.[key] || 0),
+    ]),
+  );
+const usageConsistent = (usage) =>
+  Object.values(usage).every(finiteCount) && usage.cacheHitTokens + usage.cacheMissTokens === usage.inputTokens;
+// Provider-protocol fields a replayed assistant message must carry intact; keep in sync with the message-shape allowlist in src/store.mjs.
+const PROVIDER_PROTOCOL_KEYS = ['reasoning_content', 'anthropic_content', 'openai_reasoning'];
+const hasProviderProtocolState = (messages) =>
+  Array.isArray(messages) &&
+  messages.some((message) => message?.role === 'assistant' && PROVIDER_PROTOCOL_KEYS.some((key) => Object.hasOwn(message, key)));
+const boundedActions = (list) =>
+  list
+    .filter((value) => typeof value === 'string')
+    .slice(-8)
+    .map((value) => value.slice(0, 300));
 const boundedString = (value, cap) => (typeof value === 'string' && value.length <= cap ? value : undefined);
 /** Take a UTF-8 byte prefix without turning a supplementary-plane character
  * into an unpaired surrogate. Redaction can enlarge short credential values,
@@ -279,8 +308,13 @@ function safeReportString(value, maxChars = MAX_REPORT_TEXT) {
   return bounded || undefined;
 }
 const safeReportText = (value) => safeReportString(value);
-const safeReportError = (value) =>
-  safeReportString(typeof value === 'string' ? value : String(value || ''), 1500) || 'report worker failed';
+// Redact the whole (bounded) message before cutting it to 1,500 bytes, so a
+// credential straddling the cut cannot survive as an unrecognizable prefix.
+const safeReportError = (value) => {
+  const text = truncateUtf8(typeof value === 'string' ? value : String(value || ''), MAX_REPORT_TEXT);
+  const redacted = safeReportString(text, MAX_REPORT_TEXT);
+  return (redacted && truncateUtf8(redacted, 1500)) || 'report worker failed';
+};
 const PROVIDER_FAILURE_KINDS = new Set([
   'request',
   'response',
@@ -386,6 +420,10 @@ const safeFinalizationError = (error) =>
   error && /^E_(?:WORKTREE|GIT)_[A-Z_]+$/.test(error.code || '')
     ? { code: error.code, message: redactText(stripTerminalControls(String(error.message || ''))).slice(0, 2500) }
     : undefined;
+const finalizationErrorChange = (error) => {
+  const finalizationError = safeFinalizationError(error);
+  return finalizationError ? { finalizationError } : {};
+};
 const safeProviderFailure = (value) => {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !PROVIDER_FAILURE_KINDS.has(value.kind)) return undefined;
   const failure = { kind: value.kind };
@@ -481,6 +519,8 @@ export function executionFallbacks(execution) {
   if (Array.isArray(execution?.fallbacks)) return execution.fallbacks;
   return execution?.fallback ? [execution.fallback] : [];
 }
+/** The full route chain: the primary route first, then its fallbacks. */
+const executionRoutes = (execution) => [execution, ...executionFallbacks(execution)];
 // The snapshotted credit-fallback chain as callers may see it: provider
 // family and concrete model per route, never endpoints or key references.
 function publicRoutes(job) {
@@ -495,7 +535,7 @@ function publicRoutes(job) {
         : type === 'anthropic-messages'
           ? 'anthropic'
           : 'openai-compatible';
-  return [execution, ...executionFallbacks(execution)].map((route, index) => ({
+  return executionRoutes(execution).map((route, index) => ({
     provider: provider(route),
     model: route.model,
     ...(index === stage ? { active: true } : {}),
@@ -542,7 +582,7 @@ const creditRouteKey = (route) =>
 export function creditExhaustions(jobs, { nowMs, windowMs }) {
   const newest = new Map();
   for (const job of jobs) {
-    const chain = [job?.executionProfile, ...executionFallbacks(job?.executionProfile)];
+    const chain = executionRoutes(job?.executionProfile);
     for (const transition of Array.isArray(job?.providerTransitions) ? job.providerTransitions : []) {
       const at = Date.parse(transition?.at ?? '');
       const key = Number.isSafeInteger(transition?.from) ? creditRouteKey(chain[transition.from]) : undefined;
@@ -574,7 +614,7 @@ function validExecutionProfile(value) {
       typeof profile !== 'object' ||
       Array.isArray(profile) ||
       Object.keys(profile).some((key) => !permitted.has(key) || (nested && (key === 'fallback' || key === 'fallbacks'))) ||
-      !['openai-chat', 'anthropic-messages'].includes(profile.type) ||
+      !isSupportedProviderType(profile.type) ||
       !cleanProviderText(profile.baseUrl, 2048) ||
       !cleanText(profile.model, 128) ||
       modelPolicyViolation(profile) ||
@@ -610,9 +650,6 @@ function validExecutionProfile(value) {
   }
   return value.fallback === undefined || one(value.fallback, true);
 }
-// `writePaths` is a convenience snapshot written alongside a job, never an
-// authority. Derive the operative scope from fields validated at every
-// persisted-job boundary so a modified record cannot widen a lease or sandbox.
 // Bounded diagnostic only: why a verifier can or cannot import the primary's
 // installed dependencies. Never an authority; reads come from the live link.
 const DEPENDENCY_STATES = new Set([
@@ -734,6 +771,9 @@ const workspaceDependencyState = (workspace) => ({
     ? { workspaceVerifierDeps: safeVerifierDeps(workspace.dependencies.verifierDeps) }
     : {}),
 });
+// `writePaths` is a convenience snapshot written alongside a job, never an
+// authority. Derive the operative scope from fields validated at every
+// persisted-job boundary so a modified record cannot widen a lease or sandbox.
 const writeScope = (job) => [...(job.ownedPaths || []), ...(job.extraWritable || [])];
 const JOB_INPUT_KEYS = [
   'task',
@@ -790,16 +830,6 @@ function changedFiles(patch) {
     else if (line.startsWith('deleted file mode ') && files.at(-1)) files.at(-1).status = 'D';
   }
   return files;
-}
-function pidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // EPERM proves that a process exists even when this user cannot signal it.
-    return error?.code === 'EPERM';
-  }
 }
 
 /** Validate an untrusted caller request without touching a repository, store,
@@ -865,8 +895,8 @@ export function validateJobRequest(input) {
     throw new Error('maxRepairRounds must be an integer from 0 to 4');
   if (input.relevantPaths != null && !canonicalRelevantPaths(input.relevantPaths))
     throw new Error('relevantPaths must be relative paths/globs, optionally suffixed :START-END (1-based lines, START <= END)');
-  if (input.extraWritable != null && !validPaths(input.extraWritable, false)) throw new Error('extraWritable must be relative paths/globs');
   const extraWritable = input.extraWritable == null ? [] : canonicalPaths(input.extraWritable, false);
+  if (!extraWritable) throw new Error('extraWritable must be relative paths/globs');
   // Extra-writable paths are intentionally discarded at finalization while
   // owned paths can be integrated and reverted. Any possible intersection
   // makes the authority ambiguous (and owned-first classification would
@@ -958,32 +988,6 @@ const primaryIndexChanged = (repoPath, before, paths) => {
     return true;
   }
 };
-
-/**
- * Repository roots are an authority boundary, but their textual spelling is
- * not stable on Windows: Git, Node, and the filesystem can disagree about
- * slash direction, drive-letter case, and the extended-path prefix. Compare
- * canonical filesystem identities instead of the serialization used by one
- * particular tool.
- */
-export function sameRepositoryPath(left, right, { platform = process.platform } = {}) {
-  if (typeof left !== 'string' || typeof right !== 'string' || !left || !right) return false;
-  const canonical = (value) => {
-    try {
-      return (realpathSync.native || realpathSync)(resolve(value));
-    } catch {
-      return resolve(value);
-    }
-  };
-  const normalizeWindows = (value) =>
-    value
-      .replaceAll('\\', '/')
-      .replace(/^\/\/?\?\//, '')
-      .toLowerCase();
-  const a = canonical(left),
-    b = canonical(right);
-  return platform === 'win32' ? normalizeWindows(a) === normalizeWindows(b) : a === b;
-}
 
 // Cleanup helpers may resolve while retaining a private root for a later retry.
 // An explicit failure must keep the durable path; legacy void helpers still succeed.
@@ -1122,12 +1126,7 @@ export class JobManager {
     }
     await this.cleanupWorkspace(job.id);
     if (stageError) throw stageError;
-    return this.store.update(job.id, {
-      status,
-      activity: undefined,
-      finishedAt: this.now().toISOString(),
-      finalizedAt: this.now().toISOString(),
-    });
+    return this.store.update(job.id, { ...this.#terminalStamp(status), activity: undefined });
   }
   /**
    * Consume a parent/child handoff outcome while holding the handoff lease.
@@ -1163,20 +1162,63 @@ export class JobManager {
     if (!this.isolated || typeof this.config.isolation.pin !== 'function') return;
     await this.config.isolation.pin({ repoPath: job.repoPath, jobId: job.id, trees });
   }
+  /**
+   * Conditionally update a job only while its durable ownership tuple still matches
+   * `observed`. JobStore provides a same-lock CAS; small injected test/adaptor stores
+   * get a guarded read-compare-write fallback (the CAS branch never reads first).
+   */
+  async #updateIfCurrent(observed, changes, { get = (id) => this.store.get(id), update = (id, next) => this.store.update(id, next) } = {}) {
+    if (typeof this.store.updateOperationalIf === 'function')
+      return this.store.updateOperationalIf(observed.id, this.#recoveryIdentity(observed), changes);
+    const current = await get(observed.id);
+    return this.#sameRecoveryIdentity(observed, current) ? update(observed.id, changes) : null;
+  }
+  /** Publication stamps for a FINALIZING-to-terminal transition, sharing one clock reading. */
+  #terminalStamp(finalStatus) {
+    const at = this.now().toISOString();
+    return { status: finalStatus || 'FAILED', finishedAt: at, finalizedAt: at };
+  }
+  async #pinIntegrated(record, primaryAfter) {
+    await this.#pinTrees(record, {
+      before: record.before,
+      ...(record.workerAfter ? { workerAfter: record.workerAfter } : {}),
+      workspaceAfter: record.workspaceAfter,
+      primaryAfter,
+    });
+  }
+  /** Acquire through either lease-adapter shape: the built-in (jobId, paths, options) or a lightweight single descriptor object. */
+  async #acquireLease(jobId, repoPath, paths, { pid, ownerNonce, legacyNonce = false } = {}) {
+    if (this.leases.acquire.length >= 2) return this.leases.acquire(jobId, paths, { ...(pid !== undefined && { pid }), ownerNonce });
+    return this.leases.acquire({
+      jobId,
+      repoPath,
+      ownedPaths: paths,
+      ...(pid !== undefined && { pid }),
+      ...(legacyNonce && { ownerNonce }),
+    });
+  }
+  /** The git directory a verifier run is sandboxed against; the configured resolver wins over asking git. */
+  async #gitDir(cwd) {
+    return this.config.gitDir ? this.config.gitDir(cwd) : resolve(cwd, git(cwd, ['rev-parse', '--git-dir']));
+  }
+  async #branch(repoPath) {
+    return this.config.git ? this.config.git.branch(repoPath) : git(repoPath, ['branch', '--show-current']);
+  }
+  async #head(repoPath) {
+    return this.config.git ? this.config.git.head(repoPath) : git(repoPath, ['rev-parse', 'HEAD']);
+  }
   async #primaryState(job, paths) {
     if (!this.snapshots.create || !safeRevertPaths(paths)) throw new Error('primary state cannot be safely reconciled');
     const primaryTree = await this.snapshots.create(job.repoPath);
-    const branch = this.config.git ? await this.config.git.branch(job.repoPath) : git(job.repoPath, ['branch', '--show-current']);
-    const head = this.config.git ? await this.config.git.head(job.repoPath) : git(job.repoPath, ['rev-parse', 'HEAD']);
-    return {
-      primaryTree,
-      branch,
-      head,
-      // `git apply` deliberately leaves the primary index alone. A selected
-      // index drift therefore makes a crash result ambiguous even where the
-      // worktree bytes happen to look like one side of the patch.
-      indexUnchanged: !primaryIndexChanged(job.repoPath, job.primaryIndexBefore, paths),
-    };
+    const branch = await this.#branch(job.repoPath);
+    const head = await this.#head(job.repoPath);
+    const branchChanged = branch !== job.branch || head !== job.head;
+    // `git apply` deliberately leaves the primary index alone. A selected
+    // index drift therefore makes a crash result ambiguous even where the
+    // worktree bytes happen to look like one side of the patch.
+    const indexUnchanged = !primaryIndexChanged(job.repoPath, job.primaryIndexBefore, paths);
+    // `stable` is the single definition of "primary unchanged since the job".
+    return { primaryTree, branch, head, branchChanged, indexUnchanged, stable: !branchChanged && indexUnchanged };
   }
   #sameSelectedTreePaths(repoPath, left, right, paths) {
     if (!validGitObjectId(left) || !validGitObjectId(right) || !safeRevertPaths(paths)) return false;
@@ -1200,7 +1242,7 @@ export class JobManager {
     }
     try {
       const state = await this.#primaryState(job, paths);
-      const stable = state.branch === job.branch && state.head === job.head && state.indexUnchanged;
+      const { stable } = state;
       const applied = this.#sameSelectedTreePaths(job.repoPath, job.workspaceAfter, state.primaryTree, paths);
       const absent = this.#sameSelectedTreePaths(job.repoPath, job.before, state.primaryTree, paths);
       if (stable && applied && !absent) {
@@ -1227,9 +1269,7 @@ export class JobManager {
         integrationOutcome: 'uncertain',
         integrationUncertain: true,
         primaryAfter: state.primaryTree,
-        ...(state.branch !== job.branch || state.head !== job.head
-          ? { branchChanged: true, currentBranch: state.branch, currentHead: state.head }
-          : {}),
+        ...(state.branchChanged ? { branchChanged: true, currentBranch: state.branch, currentHead: state.head } : {}),
       };
     } catch {
       return { integrationIntent: false, integrationOutcome: 'uncertain', integrationUncertain: true };
@@ -1243,7 +1283,7 @@ export class JobManager {
     }
     try {
       const state = await this.#primaryState(job, paths);
-      const stable = state.branch === job.branch && state.head === job.head && state.indexUnchanged;
+      const { stable } = state;
       const reverted = this.#sameSelectedTreePaths(job.repoPath, job.before, state.primaryTree, paths);
       const stillApplied = this.#sameSelectedTreePaths(job.repoPath, expectedAppliedTree, state.primaryTree, paths);
       if (stable && reverted && !stillApplied) {
@@ -1262,9 +1302,7 @@ export class JobManager {
         revertIntent: false,
         revertOutcome: 'uncertain',
         revertUncertain: true,
-        ...(state.branch !== job.branch || state.head !== job.head
-          ? { branchChangedAfterIntegration: true, currentBranch: state.branch, currentHead: state.head }
-          : {}),
+        ...(state.branchChanged ? { branchChangedAfterIntegration: true, currentBranch: state.branch, currentHead: state.head } : {}),
       };
     } catch {
       return { revertIntent: false, revertOutcome: 'uncertain', revertUncertain: true };
@@ -1281,12 +1319,12 @@ export class JobManager {
         return false;
       }
     };
-    const owned = all.filter((file) => inScope(file?.path, job.ownedPaths || []));
-    const ephemeralChanges = all.filter(
-      (file) => !inScope(file?.path, job.ownedPaths || []) && inScope(file?.path, job.extraWritable || []),
-    );
+    const owns = (path) => inScope(path, job.ownedPaths || []);
+    const extra = (path) => inScope(path, job.extraWritable || []);
+    const owned = all.filter((file) => owns(file?.path));
+    const ephemeralChanges = all.filter((file) => !owns(file?.path) && extra(file?.path));
     const ignored = workspace.ignoredPaths();
-    const discardedIgnored = ignored.filter((path) => !inScope(path, job.ownedPaths || []) && inScope(path, job.extraWritable || []));
+    const discardedIgnored = ignored.filter((path) => !owns(path) && extra(path));
     const invalidIgnored = ignored.filter((path) => !discardedIgnored.includes(path));
     const ownedPaths = owned.map((file) => file.path);
     const revertPaths = ownedPaths.filter(safeRevertPath);
@@ -1305,7 +1343,7 @@ export class JobManager {
         try {
           verifierMutations = diffTreeFiles(job.repoPath, job.workerAfter, workspaceAfter)
             .map((file) => file.path)
-            .filter((path) => inScope(path, job.ownedPaths || []));
+            .filter((path) => owns(path));
         } catch {
           verifierMutations = ['<could not compare verifier result>'];
         }
@@ -1313,9 +1351,7 @@ export class JobManager {
     }
     const violations = [
       ...new Set([
-        ...all
-          .filter((file) => !inScope(file?.path, job.ownedPaths || []) && !inScope(file?.path, job.extraWritable || []))
-          .map((file) => file.path),
+        ...all.filter((file) => !owns(file?.path) && !extra(file?.path)).map((file) => file.path),
         ...(job.assertionRepair?.round === (job.rounds || 0) && job.workspaceSeed
           ? diffTreeFiles(job.repoPath, job.workspaceSeed, workspaceAfter)
               .map((file) => file.path)
@@ -1344,8 +1380,7 @@ export class JobManager {
     };
   }
   async cleanupWorkspace(id) {
-    const get = this.store.getOperational?.bind(this.store) || this.store.get?.bind(this.store);
-    const update = this.store.updateOperational?.bind(this.store) || this.store.update.bind(this.store);
+    const { get, update } = this.#operational();
     const job = await get(id);
     const cleaned = await this.#cleanupWorkspace(job);
     try {
@@ -1405,8 +1440,7 @@ export class JobManager {
       // not permission to publish a terminal result or clean a workspace.
       if (typeof this.leases.acquire !== 'function') return false;
       try {
-        if (this.leases.acquire.length >= 2) await this.leases.acquire(job.id, scope, { pid: process.pid, ownerNonce });
-        else await this.leases.acquire({ jobId: job.id, repoPath: job.repoPath, ownedPaths: scope, pid: process.pid, ownerNonce });
+        await this.#acquireLease(job.id, job.repoPath, scope, { pid: process.pid, ownerNonce, legacyNonce: true });
         acquired = true;
       } catch {
         return false;
@@ -1422,12 +1456,7 @@ export class JobManager {
         runnerPid: process.pid,
         runnerHeartbeatAt: this.now().toISOString(),
       };
-      if (typeof this.store.updateOperationalIf === 'function')
-        claimed = await this.store.updateOperationalIf(job.id, this.#recoveryIdentity(job), changes);
-      else {
-        const current = await get(job.id);
-        claimed = this.#sameRecoveryIdentity(job, current) ? await this.store.update(job.id, changes) : null;
-      }
+      claimed = await this.#updateIfCurrent(job, changes, { get });
     } catch {
       claimed = null;
     }
@@ -1456,9 +1485,32 @@ export class JobManager {
       runnerHeartbeatAt: job.runnerHeartbeatAt,
     };
   }
+  /** The store's MAC-verified operational view of each accessor, falling back to the plain one; bound, or undefined when absent. */
+  #operational() {
+    const store = this.store;
+    const pick = (operational, plain) => (typeof store[operational] === 'function' ? store[operational] : store[plain])?.bind(store);
+    return {
+      get: pick('getOperational', 'get'),
+      list: pick('listOperational', 'list'),
+      update: pick('updateOperational', 'update'),
+      writeArtifact: pick('writeArtifactOperational', 'writeArtifact'),
+    };
+  }
   #sameRecoveryIdentity(left, right) {
     const expected = this.#recoveryIdentity(left);
     return Object.entries(expected).every(([key, value]) => Object.is(right?.[key], value));
+  }
+  /** Fresh proof that no lease names this job and its durable ownership tuple is unchanged. Any failure means "not proven". */
+  async #provedNoLease(job, get) {
+    if (typeof this.leases.list !== 'function') return false;
+    try {
+      const current = await get(job.id);
+      if (!this.#sameRecoveryIdentity(job, current)) return false;
+      const leases = await this.leases.list({ reclaimStale: false });
+      return Array.isArray(leases) && !leases.some((lease) => lease?.jobId === job.id);
+    } catch {
+      return false;
+    }
   }
   /**
    * Recovery is not the live worker. It may clean an isolated workspace only
@@ -1474,17 +1526,7 @@ export class JobManager {
     // A terminal status can outlive a CLI/MCP server process which no longer
     // owns a lease. Retrying that recorded cleanup is safe only after a fresh
     // no-lease proof; never call ordinary release against a live PID.
-    if (ownerAlive) {
-      if (!allowLiveNoLease || typeof this.leases.list !== 'function') return false;
-      try {
-        const current = await get(job.id);
-        if (!this.#sameRecoveryIdentity(job, current)) return false;
-        const leases = await this.leases.list({ reclaimStale: false });
-        return Array.isArray(leases) && !leases.some((lease) => lease?.jobId === job.id);
-      } catch {
-        return false;
-      }
-    }
+    if (ownerAlive) return allowLiveNoLease ? this.#provedNoLease(job, get) : false;
     // The preflight leaves a dead owner's lease intact until the durable
     // terminal reservation succeeds. It only rejects an immediately unsafe
     // live-owner case; the post-CAS call below performs exact release.
@@ -1497,15 +1539,7 @@ export class JobManager {
       // A nonce mismatch is the normal indication that a live handoff won.
       // Fall through only to the explicit no-lease proof below.
     }
-    if (typeof this.leases.list !== 'function') return false;
-    try {
-      const current = await get(job.id);
-      if (!this.#sameRecoveryIdentity(job, current)) return false;
-      const leases = await this.leases.list({ reclaimStale: false });
-      return Array.isArray(leases) && !leases.some((lease) => lease?.jobId === job.id);
-    } catch {
-      return false;
-    }
+    return this.#provedNoLease(job, get);
   }
   validate(input) {
     return validateJobRequest(input);
@@ -1543,7 +1577,7 @@ export class JobManager {
     } catch {
       repoPath = undefined;
     }
-    if (!this.repoPath || !sameRepositoryPath(repoPath, this.repoPath))
+    if (!this.repoPath || !repoPath || !sameWorktreePath(repoPath, this.repoPath))
       throw new Error('stored job repository does not match this manager');
     if (
       !validBranchName(job.branch) ||
@@ -1606,11 +1640,11 @@ export class JobManager {
    * it starts on the first route not cooling down (the last route at worst),
    * so it does not pay a refused first request. Undefined: start on route 0.
    */
-  async #creditCooldownStart(execution, windowMs) {
-    const chain = [execution, ...executionFallbacks(execution)];
+  async #creditCooldownStart(execution, windowMs, listStored) {
+    const chain = executionRoutes(execution);
     if (chain.length < 2 || !Number.isFinite(windowMs) || windowMs <= 0) return undefined;
     const nowMs = this.#nowMs();
-    const exhausted = creditExhaustions(await this.store.list({ limit: Number.MAX_SAFE_INTEGER }), { nowMs, windowMs });
+    const exhausted = creditExhaustions(await listStored(), { nowMs, windowMs });
     let stage = 0;
     while (stage < chain.length - 1 && exhausted.has(creditRouteKey(chain[stage]))) stage++;
     if (!stage) return undefined;
@@ -1665,7 +1699,7 @@ export class JobManager {
       throw new Error('repoPath must be inside a git working tree');
     }
     signal?.throwIfAborted();
-    if (this.repoPath && !sameRepositoryPath(repoPath, this.repoPath)) throw new Error('repoPath does not match this manager');
+    if (this.repoPath && !sameWorktreePath(repoPath, this.repoPath)) throw new Error('repoPath does not match this manager');
     this.repoPath ||= repoPath;
     if (this.config.disabled) throw new Error('offload is disabled for this repository');
     if (input.mode === 'report' && !this.isolated) throw new Error('report jobs require an isolated private worktree');
@@ -1681,8 +1715,12 @@ export class JobManager {
       denyRead: input.denyRead,
       writeScope: [...input.ownedPaths, ...(input.extraWritable || [])],
     });
+    // One lazily memoized scan of the store serves every consumer within this call.
+    let storedJobs;
+    const listStored = async () =>
+      (storedJobs ??= typeof this.store.list === 'function' ? await this.store.list({ limit: Number.MAX_SAFE_INTEGER }) : []);
     if (input.mode !== 'report') {
-      const previousFailures = await this.verifierEnvironmentFailures();
+      const previousFailures = await this.verifierEnvironmentFailures(await listStored());
       signal?.throwIfAborted();
       if (previousFailures.length) {
         verifierPreflight ||= { scannedFiles: 0, resolvedFiles: [], limited: true, warnings: [] };
@@ -1719,11 +1757,11 @@ export class JobManager {
         verifierPreflight.blockersAccepted = true;
       }
     }
-    const cooldown = await this.#creditCooldownStart(input.executionProfile, creditCooldownMs);
+    const cooldown = await this.#creditCooldownStart(input.executionProfile, creditCooldownMs, listStored);
     signal?.throwIfAborted();
-    const branch = this.config.git ? await this.config.git.branch(repoPath) : git(repoPath, ['branch', '--show-current']);
+    const branch = await this.#branch(repoPath);
     signal?.throwIfAborted();
-    const head = this.config.git ? await this.config.git.head(repoPath) : git(repoPath, ['rev-parse', 'HEAD']);
+    const head = await this.#head(repoPath);
     signal?.throwIfAborted();
     // The built-in LeaseManager takes (jobId, paths); lightweight test/custom
     // managers may instead accept one descriptive object.
@@ -1819,8 +1857,7 @@ export class JobManager {
       if (workspace && input.mode !== 'report') await this.#pinTrees(job, { before });
       signal?.throwIfAborted();
       if (writePaths.length && this.leases.acquire) {
-        if (this.leases.acquire.length >= 2) await this.leases.acquire(job.id, writePaths, { ownerNonce: leaseOwnerNonce });
-        else await this.leases.acquire({ jobId: job.id, repoPath, ownedPaths: writePaths });
+        await this.#acquireLease(job.id, repoPath, writePaths, { ownerNonce: leaseOwnerNonce });
       }
       signal?.throwIfAborted();
       if (this.leases.bind) await this.leases.bind(job.id);
@@ -1903,8 +1940,7 @@ export class JobManager {
       // launch. Fallback acquisition supports custom/older lease adapters.
       if (writeScope(job).length && !this.leases.transfer && this.leases.acquire) {
         if (this.leases.release) await this.leases.release(id, { ownerNonce: job.leaseOwnerNonce });
-        if (this.leases.acquire.length >= 2) await this.leases.acquire(id, writeScope(job), { ownerNonce: job.leaseOwnerNonce });
-        else await this.leases.acquire({ jobId: id, repoPath: job.repoPath, ownedPaths: writeScope(job) });
+        await this.#acquireLease(id, job.repoPath, writeScope(job), { ownerNonce: job.leaseOwnerNonce });
       }
       await this.store.event(id, { type: 'worker-claimed', pid: process.pid });
       this._launch(id, job.pendingDefects ? 'repair' : 'start', job.pendingDefects, job);
@@ -1943,6 +1979,7 @@ export class JobManager {
     const abortStatus = () => (isWallTimeout(controller.signal.reason) ? 'TIMEOUT' : 'CANCELLED');
     task = (async () => {
       let heartbeat, cancellationWatch, leaseLost, watchdog;
+      const beats = new Set();
       let job, ownerNonce, workspace, launchClaimed, clock;
       try {
         // A detached resume can read a queued handoff, then be delayed before
@@ -1969,12 +2006,7 @@ export class JobManager {
           // What the round is doing, for a poller's stall check; cleared at the terminal write.
           activity: { phase: 'startup', since: new Date(claimedAtMs).toISOString(), lastEventAt: new Date(claimedAtMs).toISOString() },
         };
-        if (typeof this.store.updateOperationalIf === 'function')
-          job = await this.store.updateOperationalIf(id, this.#recoveryIdentity(observed), launchChanges);
-        else {
-          const current = await this.store.get(id);
-          job = this.#sameRecoveryIdentity(observed, current) ? await this.store.update(id, launchChanges) : null;
-        }
+        job = await this.#updateIfCurrent(observed, launchChanges);
         // Lost claims are expected under cross-process recovery. This task no
         // longer owns the lease/workspace, so it must not enter the ordinary
         // error finalizer (which releases, cleans, or publishes another
@@ -2026,13 +2058,17 @@ export class JobManager {
         }
         if (writeScope(job).length) {
           const every = Number.isFinite(this.leases.heartbeatIntervalMs) ? this.leases.heartbeatIntervalMs : 30_000;
-          const beat = () =>
-            Promise.resolve(this.leases.heartbeat?.(id, { ownerNonce }))
+          const beat = () => {
+            const pending = Promise.resolve(this.leases.heartbeat?.(id, { ownerNonce }))
               .then(() => this.store.update(id, { runnerHeartbeatAt: this.now().toISOString() }))
               .catch((error) => {
                 leaseLost = error?.message || 'lease heartbeat failed';
                 controller.abort(new Error(`lease lost: ${leaseLost}`));
-              });
+              })
+              .finally(() => beats.delete(pending));
+            beats.add(pending);
+            return pending;
+          };
           heartbeat = setInterval(beat, Math.max(1, every));
           heartbeat.unref?.();
         }
@@ -2061,16 +2097,7 @@ export class JobManager {
           // provider protocol state to replay.
           if (job.mode !== 'report') {
             const transcript = await this.store.readMessages?.(id);
-            const hasProviderProtocolState = Array.isArray(transcript)
-              ? transcript.some(
-                  (message) =>
-                    message?.role === 'assistant' &&
-                    (Object.hasOwn(message, 'reasoning_content') ||
-                      Object.hasOwn(message, 'anthropic_content') ||
-                      Object.hasOwn(message, 'openai_reasoning')),
-                )
-              : false;
-            if (job.transcriptReplayable === false || (job.transcriptReplayable !== true && hasProviderProtocolState))
+            if (job.transcriptReplayable === false || (job.transcriptReplayable !== true && hasProviderProtocolState(transcript)))
               throw new Error('durable transcript reasoning is unavailable for safe provider replay; start a fresh job');
           }
           // Keep lifecycle transitions in this worker claim rather than
@@ -2109,7 +2136,7 @@ export class JobManager {
               if (event?.action === 'provider_credit_fallback') {
                 // Monotonic and bounded by the sealed route chain: a worker can
                 // only ever advance to a route this job snapshotted at start.
-                const routeCount = 1 + executionFallbacks(job.executionProfile).length;
+                const routeCount = executionRoutes(job.executionProfile).length;
                 const requested = event.providerStage ?? (event.creditFallback === true ? 1 : undefined);
                 if (Number.isSafeInteger(requested) && requested >= 1 && requested < routeCount && requested > providerStageState) {
                   // When each route was refused, so later starts can skip it for the cool-down.
@@ -2151,16 +2178,8 @@ export class JobManager {
               )
                 progress.turns = (job.turns || 0) + event.turn;
               if (validUsage(event?.usage)) {
-                const nextUsage = Object.fromEntries(
-                  USAGE_KEYS.filter(
-                    (key) => key !== 'cacheWriteTokens' || job.usage?.[key] !== undefined || event.usage[key] !== undefined,
-                  ).map((key) => [key, (job.usage?.[key] || 0) + (event.usage[key] || 0)]),
-                );
-                if (
-                  Object.values(nextUsage).every(finiteCount) &&
-                  nextUsage.cacheHitTokens + nextUsage.cacheMissTokens === nextUsage.inputTokens
-                )
-                  progress.usage = nextUsage;
+                const nextUsage = accumulateUsage(job.usage, event.usage);
+                if (usageConsistent(nextUsage)) progress.usage = nextUsage;
               }
               if (
                 Number.isFinite(event?.costUsd) &&
@@ -2182,17 +2201,14 @@ export class JobManager {
               else if (providerFinishReason !== undefined) progress.providerFinishReason = providerFinishReason;
               const budgetReservation = safeBudgetReservation(event?.budgetReservation);
               if (budgetReservation) progress.budgetReservation = budgetReservation;
-              if (Array.isArray(event?.recentActions))
-                progress.recentActions = event.recentActions
-                  .filter((value) => typeof value === 'string')
-                  .slice(-8)
-                  .map((value) => value.slice(0, 300));
-              else if (Array.isArray(event?.actions))
-                progress.recentActions = event.actions
-                  .filter((value) => typeof value === 'string')
-                  .slice(-8)
-                  .map((value) => value.slice(0, 300));
-              else if (typeof event?.action === 'string') progress.recentActions = [event.action.slice(0, 300)];
+              const actions = Array.isArray(event?.recentActions)
+                ? event.recentActions
+                : Array.isArray(event?.actions)
+                  ? event.actions
+                  : typeof event?.action === 'string'
+                    ? [event.action]
+                    : undefined;
+              if (actions) progress.recentActions = boundedActions(actions);
               // Wall-clock accounting. Every event refreshes the activity marker
               // (a poller's proof of life); only a phase change or per-call tool
               // timings rewrite the round's record. The event's phase fields are
@@ -2266,18 +2282,13 @@ export class JobManager {
           // the caller's outer control signal rather than provider ownership.
           if (providerFailure && workerStatus === 'WORKER_DONE')
             workerStatus = providerFailure.kind === 'attempt_timeout' ? 'TIMEOUT' : 'FAILED';
-          const candidateUsage = Object.fromEntries(
-            USAGE_KEYS.filter((key) => key !== 'cacheWriteTokens' || job.usage?.[key] !== undefined || safeUsage[key] !== undefined).map(
-              (key) => [key, (job.usage?.[key] || 0) + (safeUsage[key] || 0)],
-            ),
-          );
+          const candidateUsage = accumulateUsage(job.usage, safeUsage);
           const badAccounting =
             badResult ||
             !finiteCount((job.turns || 0) + resultTurns) ||
             !Number.isFinite((job.costUsd || 0) + (result?.costUsd || 0)) ||
             (job.costUsd || 0) + (result?.costUsd || 0) > MAX_RESULT_COST ||
-            !Object.values(candidateUsage).every(finiteCount) ||
-            candidateUsage.cacheHitTokens + candidateUsage.cacheMissTokens !== candidateUsage.inputTokens;
+            !usageConsistent(candidateUsage);
           // The worker enforces its remaining allowance before each request,
           // but the durable manager is the final accounting authority. This
           // keeps a buggy/custom worker from turning an over-budget result into
@@ -2395,7 +2406,7 @@ export class JobManager {
           const aborted = controller.signal.aborted;
           const providerFailure = safeProviderFailure(error);
           job = await this.store.update(id, {
-            ...(safeFinalizationError(error) ? { finalizationError: safeFinalizationError(error) } : {}),
+            ...finalizationErrorChange(error),
             status: 'FINALIZING',
             finalStatus: leaseLost
               ? 'FAILED'
@@ -2486,10 +2497,8 @@ export class JobManager {
               // isolation boundary.  The worktree helper preserves unrelated
               // primary edits and rejects an exact same-path race.
               if (!audited.violations.length && ['DONE_VERIFIED', 'DONE_UNVERIFIED'].includes(job.finalStatus)) {
-                const currentBranch = this.config.git
-                  ? await this.config.git.branch(job.repoPath)
-                  : git(job.repoPath, ['branch', '--show-current']);
-                const currentHead = this.config.git ? await this.config.git.head(job.repoPath) : git(job.repoPath, ['rev-parse', 'HEAD']);
+                const currentBranch = await this.#branch(job.repoPath);
+                const currentHead = await this.#head(job.repoPath);
                 if (currentBranch !== job.branch || currentHead !== job.head)
                   job = await this.store.update(id, {
                     status: 'FINALIZING',
@@ -2544,12 +2553,7 @@ export class JobManager {
                       // worktree pin. Retain it before publishing a durable field
                       // that depends on that otherwise-unreachable tree.
                       if (reconciliation.integrationOutcome === 'applied') {
-                        await this.#pinTrees(pending, {
-                          before: pending.before,
-                          ...(pending.workerAfter ? { workerAfter: pending.workerAfter } : {}),
-                          workspaceAfter: pending.workspaceAfter,
-                          primaryAfter: reconciliation.primaryAfter,
-                        });
+                        await this.#pinIntegrated(pending, reconciliation.primaryAfter);
                       }
                       job = await this.store.update(id, { ...reconciliation, integrationFiles: integrated.files || [] });
                       if (reconciliation.integrationOutcome !== 'applied') {
@@ -2576,12 +2580,7 @@ export class JobManager {
                           integrationUncertain: current.applied !== true,
                         };
                     if (reconciliation.integrationOutcome === 'applied' && reconciliation.primaryAfter) {
-                      await this.#pinTrees(current, {
-                        before: current.before,
-                        ...(current.workerAfter ? { workerAfter: current.workerAfter } : {}),
-                        workspaceAfter: current.workspaceAfter,
-                        primaryAfter: reconciliation.primaryAfter,
-                      });
+                      await this.#pinIntegrated(current, reconciliation.primaryAfter);
                     }
                     job = await this.store.update(id, reconciliation);
                     const conflict = error?.code === 'E_WORKTREE_CONFLICT' || reconciliation.integrationOutcome === 'not-applied';
@@ -2661,10 +2660,8 @@ export class JobManager {
             }
             if (job.scopeViolations?.length) job = await this.store.update(id, { status: 'FINALIZING', finalStatus: 'FAILED' });
             job = this.validatePersisted(job);
-            const currentBranch = this.config.git
-              ? await this.config.git.branch(job.repoPath)
-              : git(job.repoPath, ['branch', '--show-current']);
-            const currentHead = this.config.git ? await this.config.git.head(job.repoPath) : git(job.repoPath, ['rev-parse', 'HEAD']);
+            const currentBranch = await this.#branch(job.repoPath);
+            const currentHead = await this.#head(job.repoPath);
             if (currentBranch !== job.branch || currentHead !== job.head) {
               // A branch switch after a proven primary application is important
               // diagnostic metadata, but it cannot retroactively make the
@@ -2693,7 +2690,7 @@ export class JobManager {
               !/patch containing configured secret/.test(String(snapshotError.message || snapshotError))
                 ? { workspaceRetained: true }
                 : {}),
-              ...(safeFinalizationError(snapshotError) ? { finalizationError: safeFinalizationError(snapshotError) } : {}),
+              ...finalizationErrorChange(snapshotError),
               status: 'FINALIZING',
               finalStatus: failed.finalStatus === 'CANCELLED' ? 'CANCELLED' : 'FAILED',
               error: `${leaseLost ? `lease lost: ${leaseLost}; ` : ''}${String(snapshotError.message || snapshotError)}`,
@@ -2704,15 +2701,7 @@ export class JobManager {
           let terminalCleanupComplete = false;
           try {
             const prePublish = await this.store.get(id);
-            done =
-              prePublish.status === 'FINALIZING'
-                ? {
-                    ...prePublish,
-                    status: prePublish.finalStatus || 'FAILED',
-                    finishedAt: this.now().toISOString(),
-                    finalizedAt: this.now().toISOString(),
-                  }
-                : prePublish;
+            done = prePublish.status === 'FINALIZING' ? { ...prePublish, ...this.#terminalStamp(prePublish.finalStatus) } : prePublish;
             // A durable terminal status is the public completion barrier.
             // Complete the final round's lease/workspace ownership work while
             // still FINALIZING, then re-read its cleanup metadata before the
@@ -2761,13 +2750,7 @@ export class JobManager {
             const error = `finalization publication failed: ${publicationError.message || publicationError}`;
             try {
               if (terminalCleanupComplete) {
-                await this.store.update(id, {
-                  status: 'FAILED',
-                  finalStatus: 'FAILED',
-                  error,
-                  finishedAt: this.now().toISOString(),
-                  finalizedAt: this.now().toISOString(),
-                });
+                await this.store.update(id, { ...this.#terminalStamp('FAILED'), finalStatus: 'FAILED', error });
               } else {
                 await this.#finishOwnedTerminal(await this.store.get(id), 'FAILED', { error });
                 terminalCleanupComplete = true;
@@ -2789,6 +2772,12 @@ export class JobManager {
                   await this.#finishOwnedTerminal(await this.store.get(id), 'CANCELLED');
                   return;
                 }
+                // The retained lease stays valid across the repair and the next round
+                // installs its own heartbeat. Stop this round's beat and drain any
+                // in-flight write: runnerHeartbeatAt is part of the recovery identity,
+                // so it must not change between the read and the conditional re-queue.
+                if (heartbeat) clearInterval(heartbeat);
+                await Promise.allSettled([...beats]);
                 const current = await this.store.get(id);
                 const cancelledBeforeQueue = await this.store.cancelRequested?.(id);
                 if (controller.signal.aborted || cancelledBeforeQueue) {
@@ -2808,38 +2797,21 @@ export class JobManager {
                 // This marker suppresses duplicate scheduling for the completed
                 // round only. Clear it before the next round so another failed
                 // verifier can consume the remaining authorized repair budget.
-                const queued =
-                  typeof this.store.updateOperationalIf === 'function'
-                    ? await this.store.updateOperationalIf(id, this.#recoveryIdentity(current), {
-                        status: 'QUEUED',
-                        rounds: (current.rounds || 0) + 1,
-                        finishedAt: undefined,
-                        leaseOwnerNonce,
-                        handoffState: 'LOCAL',
-                        autoRepairScheduled: false,
-                        providerFinishReason: undefined,
-                        budgetReservation: undefined,
-                        roundQueue: this.#roundQueue(this.#nowMs()),
-                        activity: undefined,
-                        ...ROUND_SCOPED_VERIFIER_STATE,
-                        ...ROUND_SCOPED_ERROR_STATE,
-                      })
-                    : this.#sameRecoveryIdentity(current, await this.store.get(id))
-                      ? await this.store.update(id, {
-                          status: 'QUEUED',
-                          rounds: (current.rounds || 0) + 1,
-                          finishedAt: undefined,
-                          leaseOwnerNonce,
-                          handoffState: 'LOCAL',
-                          autoRepairScheduled: false,
-                          providerFinishReason: undefined,
-                          budgetReservation: undefined,
-                          roundQueue: this.#roundQueue(this.#nowMs()),
-                          activity: undefined,
-                          ...ROUND_SCOPED_VERIFIER_STATE,
-                          ...ROUND_SCOPED_ERROR_STATE,
-                        })
-                      : null;
+                const requeue = {
+                  status: 'QUEUED',
+                  rounds: (current.rounds || 0) + 1,
+                  finishedAt: undefined,
+                  leaseOwnerNonce,
+                  handoffState: 'LOCAL',
+                  autoRepairScheduled: false,
+                  providerFinishReason: undefined,
+                  budgetReservation: undefined,
+                  roundQueue: this.#roundQueue(this.#nowMs()),
+                  activity: undefined,
+                  ...ROUND_SCOPED_VERIFIER_STATE,
+                  ...ROUND_SCOPED_ERROR_STATE,
+                };
+                const queued = await this.#updateIfCurrent(current, requeue);
                 if (!queued) return;
                 const cancelledAfterQueue = await this.store.cancelRequested?.(id);
                 if (controller.signal.aborted || cancelledAfterQueue) {
@@ -2916,12 +2888,7 @@ export class JobManager {
         if (job?.id) await this.cleanupWorkspace(job.id);
         try {
           const pending = await this.store.get(id);
-          if (pending.status === 'FINALIZING')
-            await this.store.update(id, {
-              status: pending.finalStatus || 'FAILED',
-              finishedAt: this.now().toISOString(),
-              finalizedAt: this.now().toISOString(),
-            });
+          if (pending.status === 'FINALIZING') await this.store.update(id, this.#terminalStamp(pending.finalStatus));
         } catch {}
         unregister();
       }
@@ -2935,9 +2902,7 @@ export class JobManager {
   async #verifierOptions(job, executionPath) {
     return {
       cwd: executionPath,
-      gitDir: this.config.gitDir
-        ? await this.config.gitDir(executionPath)
-        : resolve(executionPath, git(executionPath, ['rev-parse', '--git-dir'])),
+      gitDir: await this.#gitDir(executionPath),
       signal: this.controllers.get(job.id)?.signal,
       allowNetwork: !!job.allowNetwork,
       denyRead: job.denyRead || [],
@@ -3064,8 +3029,8 @@ export class JobManager {
     const expectations = snapshotRan ? [{ source: 'snapshot', ms: baselineRun.durationMs }] : [];
     try {
       // Advisory only, so the unauthenticated operational listing is enough.
-      const list = this.store.listOperational || this.store.list;
-      const jobs = typeof list === 'function' ? await list.call(this.store, { limit: Number.MAX_SAFE_INTEGER }) : [];
+      const { list } = this.#operational();
+      const jobs = typeof list === 'function' ? await list({ limit: Number.MAX_SAFE_INTEGER }) : [];
       const history = expectedVerifierMs(jobs, { repoPath: job.repoPath, testCommand: job.testCommand, excludeId: job.id });
       if (history) expectations.push({ source: 'history', ms: history });
     } catch {}
@@ -3505,10 +3470,7 @@ export class JobManager {
    * once; jobs cut by maxJobs or scope are in `storeCostUsd` only).
    */
   async listing({ all = false, maxJobs = DEFAULT_LIST_JOBS, detail = 'compact' } = {}) {
-    if (typeof all !== 'boolean') throw new Error('all must be a boolean');
-    assertDetail(detail);
-    if (!Number.isInteger(maxJobs) || maxJobs < 1 || maxJobs > MAX_LIST_JOBS)
-      throw new Error(`maxJobs must be an integer from 1 to ${MAX_LIST_JOBS}`);
+    validateListingOptions({ all, maxJobs, detail });
     const stored = await this.store.list({ limit: Number.MAX_SAFE_INTEGER });
     const sessionMs = this.#sessionStartMs();
     const scoped = all || sessionMs === undefined ? stored : stored.filter((job) => !final(job.status) || this.#inSession(job, sessionMs));
@@ -3600,11 +3562,11 @@ export class JobManager {
    * returned to a caller as it is.
    */
   async retrospectiveSource({ ids, last, limit = MAX_RETROSPECTIVE_JOBS } = {}) {
-    const get = (this.store.getOperational || this.store.get).bind(this.store);
+    const { get } = this.#operational();
     let jobs;
     if (ids) jobs = await Promise.all(ids.map((id) => get(id)));
     else {
-      const list = (this.store.listOperational || this.store.list).bind(this.store);
+      const { list } = this.#operational();
       const stored = await list({ limit: Number.MAX_SAFE_INTEGER });
       const sessionMs = this.#sessionStartMs();
       jobs = last !== undefined || sessionMs === undefined ? stored : stored.filter((job) => this.#inSession(job, sessionMs));
@@ -3647,7 +3609,7 @@ export class JobManager {
     const sessionMs = this.#sessionStartMs();
     if (sessionMs === undefined) return undefined;
     try {
-      const list = (this.store.listOperational || this.store.list).bind(this.store);
+      const { list } = this.#operational();
       const jobs = (await list({ limit: Number.MAX_SAFE_INTEGER })).filter((job) => this.#inSession(job, sessionMs));
       return { jobs: jobs.length, costUsd: sumCost(jobs), unknown: jobs.filter((job) => costOf(job) === null).length };
     } catch {
@@ -3658,9 +3620,9 @@ export class JobManager {
     const spend = detail === 'compact' ? await this.#sessionSpend() : undefined;
     return this.report(job, { detail, ...rest, ...(spend ? { spend } : {}) });
   }
-  async verifierEnvironmentFailures() {
+  async verifierEnvironmentFailures(jobs) {
     if (typeof this.store.list !== 'function') return [];
-    return sessionVerifierFailures(await this.store.list({ limit: Number.MAX_SAFE_INTEGER }), {
+    return sessionVerifierFailures(jobs ?? (await this.store.list({ limit: Number.MAX_SAFE_INTEGER })), {
       sessionStartedAt: this.config.sessionStartedAt,
       repoPath: this.repoPath || this.config.repoPath,
     });
@@ -3719,7 +3681,7 @@ export class JobManager {
     // cancellation marker after its provider credential was rotated.  This
     // uses the store's MAC-verified operational view only; it never resumes,
     // verifies, repairs, or otherwise consumes an execution profile.
-    const get = this.store.getOperational?.bind(this.store) || this.store.get?.bind(this.store);
+    const { get } = this.#operational();
     const before = await get(id);
     // A terminal job whose applyThenVerify command is running is still being
     // acted on: its owner (possibly another process) polls this marker.
@@ -3749,12 +3711,11 @@ export class JobManager {
     // The run may have ended between the read above and the marker: nothing is
     // left to consume it, and a stale marker would refuse the next apply.
     if (applyRunning && job.applyVerifyIntent !== true && !this.controllers.has(id)) await this.store.clearCancel?.(id).catch(() => {});
-    // Without a local controller this process is not the worker owner. Keep
-    // only the durable cancellation marker written above; a queued detached
-    // child may still be between handoff checks, and deleting its workspace
-    // here would race its authenticated owner. Resume/assign/recovery consume
-    // the marker and perform the owned terminal cleanup.
-    if (!final(job.status) && !controller && ['QUEUED', 'REPAIR_QUEUED'].includes(job.status)) job = await get(id);
+    // Without a local controller this process is not the worker owner, so it
+    // leaves only the durable cancellation marker written above; a queued
+    // detached child may still be between handoff checks, and deleting its
+    // workspace here would race its authenticated owner. Resume/assign/recovery
+    // consume the marker and perform the owned terminal cleanup.
     const cancel = await this.#cancelState(job);
     // The same compact view start and wait return: the full report is one offload_job detail "full" away.
     return { ...this.public(job), ...(cancel || {}), report: this.report(job, { detail: 'compact' }) };
@@ -3792,112 +3753,7 @@ export class JobManager {
       job = this.validatePersisted(await this.store.get(id));
     }
     if (!final(job.status) || this.running.has(id)) throw new Error('job is still running');
-    if (continuation) {
-      // Continuation exists so a worker that ran out of turns/cost/time keeps
-      // its work. A verifier failure is a different problem with a different
-      // tool (offload_repair names the defects), and a job with nothing in
-      // scope has nothing worth keeping. A FAILED round is resumable only for
-      // the worker-side causes the loop names (default-deny, see failure.mjs):
-      // specific transcript corruption is also recoverable; every other
-      // provider, protocol, scope or integrity failure stays default-deny.
-      if (job.status === 'FAILED' && loopedAgain(job))
-        throw new Error(
-          'the same tool call looped again after an earlier round; use offload_repair with a concrete change of approach, or start a fresh job',
-        );
-      if (!['BUDGET', 'TIMEOUT'].includes(job.status) && !continuableFailure(job))
-        throw new Error(
-          `only a job that stopped on BUDGET or TIMEOUT, or that FAILED on transcript corruption or in a continuable worker-side way (${FAILURE_KINDS.join(', ')}), can be continued (this one is ${job.status}); use offload_repair for defects`,
-        );
-      if ((!Array.isArray(job.files) || !job.files.length) && !retryableTranscriptFailure(job))
-        throw new Error('job has no in-scope changes to continue from; start a fresh job');
-      // A cap stop can happen below the nominal cap (a request reservation the
-      // remaining budget cannot cover), so "not yet exhausted" is not proof
-      // that another round would get further.
-      if (job.status === 'BUDGET' && continuation.extraTurns === undefined && continuation.extraUsd === undefined)
-        throw new Error('a BUDGET stop needs extraTurns and/or extraUsd for the cap that stopped the job');
-    }
-    // A queued recovery has an intentionally constrained transcript and a
-    // consumed recovery may already have issued a billable provider POST.
-    // Never append a repair task to either ambiguity boundary.
-    if (continuationBlocker(job)) throw new Error(continuationBlocker(job));
-    // Legacy records without a replayability marker need inspection before
-    // accepting raised caps, consuming a repair round or recreating a workspace.
-    if (job.transcriptReplayable !== true) {
-      const messages = await this.store.readMessages?.(id);
-      if (
-        messages?.some(
-          (message) =>
-            message.role === 'assistant' &&
-            (Object.hasOwn(message, 'reasoning_content') ||
-              Object.hasOwn(message, 'anthropic_content') ||
-              Object.hasOwn(message, 'openai_reasoning')),
-        )
-      )
-        throw new Error('durable transcript reasoning is unavailable for safe provider replay; start a fresh job');
-    }
-    if (job.applied === true) throw new Error('an applied job cannot be repaired; start a new job from the current primary tree');
-    if (job.workspaceRetained === true)
-      throw new Error('capture the retained worker work with offload_apply (dry run) before repairing or continuing');
-    if (job.integrationIntent === true || job.revertIntent === true || job.integrationUncertain === true || job.revertUncertain === true)
-      throw new Error('a job with an unresolved primary mutation outcome cannot be repaired; inspect the primary tree and start a new job');
-    if (job.scopeViolations?.length || job.verifierMutations?.length)
-      throw new Error('a job with scope or verifier-authorship violations cannot be repaired; start a fresh job');
-    if (job.verify && !verifierUsedMacosSandbox(job.verify))
-      throw new Error('jobs with a policy-only or unknown verifier result require a fresh start');
-    if (await this.store.cancelRequested?.(id)) throw new Error('job was cancelled');
-    if ((job.rounds || 0) >= (job.maxRepairRounds ?? 2)) throw new Error('maximum repair rounds reached');
-    // A continuation raises the cumulative caps by an explicit, bounded amount
-    // and is otherwise subject to every limit a repair is: it consumes one of
-    // the job's rounds, and turns/cost stay cumulative across the whole job.
-    let assertionRepair;
-    if (assertionPaths !== undefined) {
-      if (continuation || !this.isolated || job.applyVerify?.outcome !== 'FAILED' || job.applyVerify?.reverted !== true)
-        throw new Error('assertionPaths requires a failed, automatically reverted applyThenVerify check');
-      if (
-        !Array.isArray(assertionPaths) ||
-        !assertionPaths.length ||
-        assertionPaths.length > 8 ||
-        new Set(assertionPaths).size !== assertionPaths.length ||
-        !assertionPaths.every(
-          (path) =>
-            typeof path === 'string' &&
-            safeRevertPath(path) &&
-            !/[?*\[\]{}!]/.test(path) &&
-            matchesAny(path, job.ownedPaths || []) &&
-            job.files?.some((file) => file.path === path),
-        )
-      )
-        throw new Error('assertionPaths must name 1-8 distinct literal files changed and owned by this job');
-      if (job.assertionRepair) throw new Error('the fixed assertion repair allowance has already been used');
-      assertionRepair = {
-        paths: assertionPaths,
-        allowanceUsd: 0.5,
-        maxTurns: 6,
-        round: (job.rounds || 0) + 1,
-        transcriptStart: ((await this.store.readMessages?.(id)) || []).length,
-      };
-    }
-    const budget = assertionRepair
-      ? {
-          ...job.budget,
-          maxUsd: Math.min(10_000, (job.costUsd || 0) + assertionRepair.allowanceUsd),
-          maxTurns: Math.min(1000, (job.turns || 0) + assertionRepair.maxTurns),
-        }
-      : continuation
-        ? this.#raisedBudget(job, continuation)
-        : job.budget;
-    if (
-      (budget?.maxTurns != null && (job.turns || 0) >= budget.maxTurns) ||
-      (budget?.maxUsd != null && (job.costUsd || 0) >= budget.maxUsd)
-    )
-      throw new Error(
-        continuation
-          ? 'cumulative job budget still exhausted after the requested increase; pass extraTurns and/or extraUsd for the cap that stopped the job'
-          : 'cumulative job budget exhausted',
-      );
-    // A worker-side FAILED continuation tells the worker what actually went
-    // wrong (the loop guard's failing call); the primary's note is kept.
-    const effective = continuation && job.status === 'FAILED' ? [failureContinueDefect(job), ...defects.slice(1)] : defects;
+    const { assertionRepair, budget, effective } = await this.#repairPlan(id, job, defects, { continuation, assertionPaths });
     const previousStatus = job.status;
     const leaseOwnerNonce = randomUUID();
     let workspace, reservation;
@@ -3916,12 +3772,7 @@ export class JobManager {
         // check measures it from here. The QUEUED write below clears it.
         activity: { phase: 'setup', since: new Date(repairEnteredMs).toISOString(), lastEventAt: new Date(repairEnteredMs).toISOString() },
       };
-      reservation =
-        typeof this.store.updateOperationalIf === 'function'
-          ? await this.store.updateOperationalIf(id, this.#recoveryIdentity(job), reservationChanges)
-          : this.#sameRecoveryIdentity(job, await this.store.get(id))
-            ? await this.store.update(id, reservationChanges)
-            : null;
+      reservation = await this.#updateIfCurrent(job, reservationChanges);
       if (!reservation) throw new Error('job lifecycle ownership changed during repair setup');
       job = this.validatePersisted(reservation);
       if (continuation && job.error === LOCAL_TRANSCRIPT_CORRUPTION && !job.providerFailure) {
@@ -3940,8 +3791,7 @@ export class JobManager {
         if (!workspace?.path || typeof workspace.path !== 'string') throw new Error('could not recreate isolated workspace for repair');
       }
       if (this.leases.acquire) {
-        if (this.leases.acquire.length >= 2) await this.leases.acquire(job.id, writeScope(job), { ownerNonce: leaseOwnerNonce });
-        else await this.leases.acquire({ jobId: job.id, repoPath: job.repoPath, ownedPaths: writeScope(job) });
+        await this.#acquireLease(job.id, job.repoPath, writeScope(job), { ownerNonce: leaseOwnerNonce });
       }
       const repairChanges = {
         status: 'QUEUED',
@@ -3988,12 +3838,7 @@ export class JobManager {
             }
           : {}),
       };
-      const next =
-        typeof this.store.updateOperationalIf === 'function'
-          ? await this.store.updateOperationalIf(id, this.#recoveryIdentity(job), repairChanges)
-          : this.#sameRecoveryIdentity(job, await this.store.get(id))
-            ? await this.store.update(id, repairChanges)
-            : null;
+      const next = await this.#updateIfCurrent(job, repairChanges);
       if (!next) throw new Error('job lifecycle ownership changed during repair setup');
       // Record acceptance before launching asynchronously. A worker that
       // returns without model/tool progress is still distinguishable from a
@@ -4165,19 +4010,14 @@ export class JobManager {
     // Checked before the integration journal below: reconciling that journal
     // would rewrite the record of a run another process is still executing.
     if (job.applyVerifyIntent === true)
-      throw new Error(
-        this.#applyInFlight(job)
-          ? 'an applyThenVerify run is already in progress for this job'
-          : 'an interrupted applyThenVerify run has not been recovered yet; restart the offload server (recovery runs at startup) before retrying',
-      );
+      throw new Error(this.#applyInFlight(job) ? 'an applyThenVerify run is already in progress for this job' : APPLY_VERIFY_UNRECOVERED);
     if (job.revertIntent === true || job.revertUncertain === true || job.integrationUncertain === true)
       throw new Error('a job with an unresolved primary mutation outcome cannot be applied; inspect the primary tree');
     if (job.integrationIntent === true) {
       const reconciliation = await this.#reconcileIntegration(job);
       job = this.validatePersisted(await this.store.update(id, reconciliation));
       if (reconciliation.integrationOutcome === 'applied') return { dryRun: false, applied: true, alreadyApplied: true };
-      if (reconciliation.integrationOutcome === 'uncertain')
-        throw new Error('integration outcome is uncertain; inspect primary changes manually');
+      if (reconciliation.integrationOutcome === 'uncertain') throw new Error(INTEGRATION_UNCERTAIN);
     }
     if (job.applied === true) throw new Error('job is already applied (use offload_revert to undo it)');
     if (job.status === 'FAILED' && job.workspaceRetained === true) {
@@ -4216,8 +4056,8 @@ export class JobManager {
     // is the one whose worker did not end cleanly.
     const failure = job.status === 'FAILED' ? this.#failureOrigin(job) : undefined;
     if (job.status === 'FAILED') await this.#assertRetainedPatch(job, paths);
-    const currentBranch = this.config.git ? await this.config.git.branch(job.repoPath) : git(job.repoPath, ['branch', '--show-current']);
-    const currentHead = this.config.git ? await this.config.git.head(job.repoPath) : git(job.repoPath, ['rev-parse', 'HEAD']);
+    const currentBranch = await this.#branch(job.repoPath);
+    const currentHead = await this.#head(job.repoPath);
     if (currentBranch !== job.branch || currentHead !== job.head)
       throw new Error('job patch is stale; primary branch or HEAD changed since the job started');
     if (primaryIndexChanged(job.repoPath, job.primaryIndexBefore, paths))
@@ -4260,8 +4100,7 @@ export class JobManager {
     // command and any revert: nothing else may claim this scope meanwhile.
     const leaseOwnerNonce = randomUUID();
     if (this.leases.acquire) {
-      if (this.leases.acquire.length >= 2) await this.leases.acquire(job.id, writeScope(job), { ownerNonce: leaseOwnerNonce });
-      else await this.leases.acquire({ jobId: job.id, repoPath: job.repoPath, ownedPaths: writeScope(job) });
+      await this.#acquireLease(job.id, job.repoPath, writeScope(job), { ownerNonce: leaseOwnerNonce });
     }
     // Registered like a worker's controller so offload_cancel, a client's
     // request cancellation and server shutdown all stop the command (and so
@@ -4320,12 +4159,7 @@ export class JobManager {
         runnerHeartbeatAt: this.now().toISOString(),
         leaseOwnerNonce,
       };
-      const claimed =
-        typeof this.store.updateOperationalIf === 'function'
-          ? await this.store.updateOperationalIf(id, this.#recoveryIdentity(job), intent)
-          : this.#sameRecoveryIdentity(job, await this.store.get(id))
-            ? await this.store.update(id, intent)
-            : null;
+      const claimed = await this.#updateIfCurrent(job, intent);
       if (!claimed) throw new Error('job lifecycle ownership changed during apply');
       let integrated;
       try {
@@ -4350,9 +4184,9 @@ export class JobManager {
         else if (reconciliation.integrationOutcome === 'uncertain') {
           await this.store.update(id, {
             integrationConflict: false,
-            error: 'integration outcome is uncertain; inspect primary changes manually',
+            error: INTEGRATION_UNCERTAIN,
           });
-          throw new Error('integration outcome is uncertain; inspect primary changes manually');
+          throw new Error(INTEGRATION_UNCERTAIN);
         } else throw mapConflict(error);
       }
       // From here the primary may hold the diff. An exception nobody planned
@@ -4363,12 +4197,7 @@ export class JobManager {
         const pending = await this.store.get(id);
         reconciliation = await this.#reconcileIntegration(pending);
         if (reconciliation.integrationOutcome === 'applied') {
-          await this.#pinTrees(pending, {
-            before: pending.before,
-            ...(pending.workerAfter ? { workerAfter: pending.workerAfter } : {}),
-            workspaceAfter: pending.workspaceAfter,
-            primaryAfter: reconciliation.primaryAfter,
-          });
+          await this.#pinIntegrated(pending, reconciliation.primaryAfter);
         }
       } catch (error) {
         if (!plan) throw error;
@@ -4376,11 +4205,7 @@ export class JobManager {
       }
       if (reconciliation.integrationOutcome !== 'applied') {
         await this.store.update(id, { ...reconciliation, ...clearApplyVerify });
-        throw new Error(
-          reconciliation.integrationOutcome === 'uncertain'
-            ? 'integration outcome is uncertain; inspect primary changes manually'
-            : 'the diff was not applied',
-        );
+        throw new Error(reconciliation.integrationOutcome === 'uncertain' ? INTEGRATION_UNCERTAIN : 'the diff was not applied');
       }
       if (plan) {
         // The diff is in the primary but no status is published: it stays what
@@ -4455,9 +4280,7 @@ export class JobManager {
           if (plan.location === 'scratch')
             run = await this.#scratchApplyVerify(job, { plan, reconciliation, signal: controller.signal, requireSandbox });
           else {
-            const gitDir = this.config.gitDir
-              ? await this.config.gitDir(job.repoPath)
-              : resolve(job.repoPath, git(job.repoPath, ['rev-parse', '--git-dir']));
+            const gitDir = await this.#gitDir(job.repoPath);
             run = await this.runner.verify(plan.command, {
               cwd: job.repoPath,
               gitDir,
@@ -4503,7 +4326,7 @@ export class JobManager {
       try {
         const state = await this.#primaryState(job, paths);
         const intact = this.#sameSelectedTreePaths(job.repoPath, reconciliation.primaryAfter, state.primaryTree, paths);
-        const stable = state.branch === job.branch && state.head === job.head && state.indexUnchanged;
+        const { stable } = state;
         let changed = [];
         if (this.snapshots.files) {
           try {
@@ -4639,7 +4462,7 @@ export class JobManager {
       const cwd = workspace.path;
       return await this.runner.verify(plan.command, {
         cwd,
-        gitDir: this.config.gitDir ? await this.config.gitDir(cwd) : resolve(cwd, git(cwd, ['rev-parse', '--git-dir'])),
+        gitDir: await this.#gitDir(cwd),
         signal,
         allowNetwork: false,
         denyRead: job.denyRead || [],
@@ -4803,6 +4626,112 @@ export class JobManager {
       },
     };
   }
+  /**
+   * Every precondition of a repair or continuation (these throw, and otherwise
+   * only produce the plan): the fixed assertion allowance, the cumulative
+   * budget, and the defects the worker will actually see.
+   */
+  async #repairPlan(id, job, defects, { continuation, assertionPaths }) {
+    if (continuation) {
+      // Continuation exists so a worker that ran out of turns/cost/time keeps
+      // its work. A verifier failure is a different problem with a different
+      // tool (offload_repair names the defects), and a job with nothing in
+      // scope has nothing worth keeping. A FAILED round is resumable only for
+      // the worker-side causes the loop names (default-deny, see failure.mjs):
+      // specific transcript corruption is also recoverable; every other
+      // provider, protocol, scope or integrity failure stays default-deny.
+      if (job.status === 'FAILED' && loopedAgain(job))
+        throw new Error(
+          'the same tool call looped again after an earlier round; use offload_repair with a concrete change of approach, or start a fresh job',
+        );
+      if (!['BUDGET', 'TIMEOUT'].includes(job.status) && !continuableFailure(job))
+        throw new Error(
+          `only a job that stopped on BUDGET or TIMEOUT, or that FAILED on transcript corruption or in a continuable worker-side way (${FAILURE_KINDS.join(', ')}), can be continued (this one is ${job.status}); use offload_repair for defects`,
+        );
+      if ((!Array.isArray(job.files) || !job.files.length) && !retryableTranscriptFailure(job))
+        throw new Error('job has no in-scope changes to continue from; start a fresh job');
+      // A cap stop can happen below the nominal cap (a request reservation the
+      // remaining budget cannot cover), so "not yet exhausted" is not proof
+      // that another round would get further.
+      if (job.status === 'BUDGET' && continuation.extraTurns === undefined && continuation.extraUsd === undefined)
+        throw new Error('a BUDGET stop needs extraTurns and/or extraUsd for the cap that stopped the job');
+    }
+    // A queued recovery has an intentionally constrained transcript and a
+    // consumed recovery may already have issued a billable provider POST.
+    // Never append a repair task to either ambiguity boundary.
+    if (continuationBlocker(job)) throw new Error(continuationBlocker(job));
+    // Legacy records without a replayability marker need inspection before
+    // accepting raised caps, consuming a repair round or recreating a workspace.
+    if (job.transcriptReplayable !== true) {
+      const messages = await this.store.readMessages?.(id);
+      if (hasProviderProtocolState(messages))
+        throw new Error('durable transcript reasoning is unavailable for safe provider replay; start a fresh job');
+    }
+    if (job.applied === true) throw new Error('an applied job cannot be repaired; start a new job from the current primary tree');
+    if (job.workspaceRetained === true)
+      throw new Error('capture the retained worker work with offload_apply (dry run) before repairing or continuing');
+    if (job.integrationIntent === true || job.revertIntent === true || job.integrationUncertain === true || job.revertUncertain === true)
+      throw new Error('a job with an unresolved primary mutation outcome cannot be repaired; inspect the primary tree and start a new job');
+    if (job.scopeViolations?.length || job.verifierMutations?.length)
+      throw new Error('a job with scope or verifier-authorship violations cannot be repaired; start a fresh job');
+    if (job.verify && !verifierUsedMacosSandbox(job.verify))
+      throw new Error('jobs with a policy-only or unknown verifier result require a fresh start');
+    if (await this.store.cancelRequested?.(id)) throw new Error('job was cancelled');
+    if ((job.rounds || 0) >= (job.maxRepairRounds ?? 2)) throw new Error('maximum repair rounds reached');
+    // A continuation raises the cumulative caps by an explicit, bounded amount
+    // and is otherwise subject to every limit a repair is: it consumes one of
+    // the job's rounds, and turns/cost stay cumulative across the whole job.
+    let assertionRepair;
+    if (assertionPaths !== undefined) {
+      if (continuation || !this.isolated || job.applyVerify?.outcome !== 'FAILED' || job.applyVerify?.reverted !== true)
+        throw new Error('assertionPaths requires a failed, automatically reverted applyThenVerify check');
+      if (
+        !Array.isArray(assertionPaths) ||
+        !assertionPaths.length ||
+        assertionPaths.length > 8 ||
+        new Set(assertionPaths).size !== assertionPaths.length ||
+        !assertionPaths.every(
+          (path) =>
+            typeof path === 'string' &&
+            safeRevertPath(path) &&
+            !/[?*\[\]{}!]/.test(path) &&
+            matchesAny(path, job.ownedPaths || []) &&
+            job.files?.some((file) => file.path === path),
+        )
+      )
+        throw new Error('assertionPaths must name 1-8 distinct literal files changed and owned by this job');
+      if (job.assertionRepair) throw new Error('the fixed assertion repair allowance has already been used');
+      assertionRepair = {
+        paths: assertionPaths,
+        allowanceUsd: 0.5,
+        maxTurns: 6,
+        round: (job.rounds || 0) + 1,
+        transcriptStart: ((await this.store.readMessages?.(id)) || []).length,
+      };
+    }
+    const budget = assertionRepair
+      ? {
+          ...job.budget,
+          maxUsd: Math.min(10_000, (job.costUsd || 0) + assertionRepair.allowanceUsd),
+          maxTurns: Math.min(1000, (job.turns || 0) + assertionRepair.maxTurns),
+        }
+      : continuation
+        ? this.#raisedBudget(job, continuation)
+        : job.budget;
+    if (
+      (budget?.maxTurns != null && (job.turns || 0) >= budget.maxTurns) ||
+      (budget?.maxUsd != null && (job.costUsd || 0) >= budget.maxUsd)
+    )
+      throw new Error(
+        continuation
+          ? 'cumulative job budget still exhausted after the requested increase; pass extraTurns and/or extraUsd for the cap that stopped the job'
+          : 'cumulative job budget exhausted',
+      );
+    // A worker-side FAILED continuation tells the worker what actually went
+    // wrong (the loop guard's failing call); the primary's note is kept.
+    const effective = continuation && job.status === 'FAILED' ? [failureContinueDefect(job), ...defects.slice(1)] : defects;
+    return { assertionRepair, budget, effective };
+  }
   #raisedBudget(job, { extraTurns, extraUsd }) {
     const budget = { ...(job.budget || {}) };
     if (extraTurns !== undefined && budget.maxTurns != null) budget.maxTurns += extraTurns;
@@ -4854,9 +4783,7 @@ export class JobManager {
     if (!auto) job = await this.#settleOrphanedApplyVerify(job);
     if (!auto && job.applyVerifyIntent === true)
       throw new Error(
-        this.#applyInFlight(job)
-          ? 'an applyThenVerify run is in progress for this job; wait for it to finish'
-          : 'an interrupted applyThenVerify run has not been recovered yet; restart the offload server (recovery runs at startup) before retrying',
+        this.#applyInFlight(job) ? 'an applyThenVerify run is in progress for this job; wait for it to finish' : APPLY_VERIFY_UNRECOVERED,
       );
     // A manual revert is the primary acting on an earlier applyThenVerify
     // outcome (typically "STILL APPLIED"); it is superseded in the same write
@@ -4884,14 +4811,15 @@ export class JobManager {
     // unsafe, including a dry run.
     if (Array.isArray(job.scopeViolations) && job.scopeViolations.length) throw new Error('cannot revert a job with scope violations');
     if (job.applied !== true) throw new Error('cannot revert a job that was not applied to the primary working tree');
+    if (job.revertedAt) throw new Error('job patch has already been reverted');
     if (job.revertUncertain === true) throw new Error('cannot revert a job whose prior reverse-application outcome is uncertain');
     const revertPaths = job.revertFiles || job.files?.map((file) => file.path) || [];
     if (!safeRevertPaths(revertPaths)) throw new Error('job has no safe owned patch to revert');
     if (job.workspacePath && primaryIndexChanged(job.repoPath, job.primaryIndexBefore, revertPaths))
       throw new Error('job patch is stale; primary index changed on a job-owned file');
     if (job.workspacePath) {
-      const currentBranch = this.config.git ? await this.config.git.branch(job.repoPath) : git(job.repoPath, ['branch', '--show-current']);
-      const currentHead = this.config.git ? await this.config.git.head(job.repoPath) : git(job.repoPath, ['rev-parse', 'HEAD']);
+      const currentBranch = await this.#branch(job.repoPath);
+      const currentHead = await this.#head(job.repoPath);
       if (currentBranch !== job.branch || currentHead !== job.head)
         throw new Error('job patch is stale; primary branch or HEAD changed since job started');
     }
@@ -4905,7 +4833,6 @@ export class JobManager {
           throw new Error('job patch is stale; a job-owned file changed since completion');
       }
     }
-    if (job.revertedAt) throw new Error('job patch has already been reverted');
     const patch = this.store.readArtifactBytes
       ? await this.store.readArtifactBytes(id, 'revert.diff')
       : await this.store.readArtifact(id, 'revert.diff');
@@ -4958,79 +4885,278 @@ export class JobManager {
       throw error;
     }
   }
-  async recover(options = {}) {
-    // Recovery finalizes an already authenticated durable lifecycle; it must
-    // not be blocked by a rotated provider credential, and it must never pass
-    // the record's execution profile to a resolver or worker.
-    const list = this.store.listOperational?.bind(this.store) || this.store.list.bind(this.store);
-    const get = this.store.getOperational?.bind(this.store) || this.store.get?.bind(this.store);
-    const update = this.store.updateOperational?.bind(this.store) || this.store.update.bind(this.store);
-    const writeArtifact = this.store.writeArtifactOperational?.bind(this.store) || this.store.writeArtifact.bind(this.store);
-    const updateRecoveredIfCurrent = async (job, changes) => {
-      // JobStore provides a same-lock CAS. Keep a guarded fallback for small
-      // injected test/adaptor stores, which have no cross-process authority.
-      if (typeof this.store.updateOperationalIf === 'function')
-        return this.store.updateOperationalIf(job.id, this.#recoveryIdentity(job), changes);
-      const current = await get(job.id);
-      if (!this.#sameRecoveryIdentity(job, current)) return null;
-      return update(job.id, changes);
+  async #stageRecoveredTerminal(ops, job, status, changes) {
+    return this.#updateIfCurrent(job, { ...changes, status: 'FINALIZING', finalStatus: status }, ops);
+  }
+  async #publishRecoveredTerminal(ops, job, status, changes, event) {
+    const { get, update, writeArtifact } = ops;
+    const staged = await this.#stageRecoveredTerminal(ops, job, status, changes);
+    if (!staged) return null;
+    if (!(await this.#recoveryMayClean(staged, get, { orphan: this.#orphanedApplyVerify(job) || this.#orphanedWorker(job) }))) return null;
+    await this.cleanupWorkspace(job.id);
+    const cleaned = await get(job.id);
+    const done = {
+      ...cleaned,
+      status,
+      finishedAt: cleaned.finishedAt || this.now().toISOString(),
+      finalizedAt: cleaned.finalizedAt || this.now().toISOString(),
     };
-    const stageRecoveredTerminal = async (job, status, changes) => {
-      return updateRecoveredIfCurrent(job, { ...changes, status: 'FINALIZING', finalStatus: status });
-    };
-    const publishRecoveredTerminal = async (job, status, changes, event) => {
-      const staged = await stageRecoveredTerminal(job, status, changes);
-      if (!staged) return null;
-      if (!(await this.#recoveryMayClean(staged, get, { orphan: this.#orphanedApplyVerify(job) || this.#orphanedWorker(job) })))
-        return null;
+    await writeArtifact(job.id, 'report.md', this.report(done));
+    await this.store.event(job.id, event);
+    return update(job.id, { status, finishedAt: done.finishedAt, finalizedAt: done.finalizedAt });
+  }
+  async #settleTerminalCleanupReservation(ops, job, event = { type: 'recovered-cleanup', status: job.recoveryTerminalStatus }) {
+    const { get, writeArtifact } = ops;
+    const terminalStatus = job.recoveryTerminalStatus;
+    if (!final(terminalStatus)) return false;
+    if (await this.#recoveryMayClean(job, get, { allowLiveNoLease: true })) {
       await this.cleanupWorkspace(job.id);
       const cleaned = await get(job.id);
       const done = {
         ...cleaned,
-        status,
+        status: terminalStatus,
         finishedAt: cleaned.finishedAt || this.now().toISOString(),
         finalizedAt: cleaned.finalizedAt || this.now().toISOString(),
       };
+      // Keep the report aligned with the cleanup metadata that recovery just
+      // persisted. If either publication fails, retain the FINALIZING
+      // reservation so a later recovery retries rather than publishing a
+      // terminal record with a permanently stale report artifact.
       await writeArtifact(job.id, 'report.md', this.report(done));
       await this.store.event(job.id, event);
-      return update(job.id, { status, finishedAt: done.finishedAt, finalizedAt: done.finalizedAt });
-    };
-    const settleTerminalCleanupReservation = async (job, event = { type: 'recovered-cleanup', status: job.recoveryTerminalStatus }) => {
-      const terminalStatus = job.recoveryTerminalStatus;
-      if (!final(terminalStatus)) return false;
-      if (await this.#recoveryMayClean(job, get, { allowLiveNoLease: true })) {
-        await this.cleanupWorkspace(job.id);
-        const cleaned = await get(job.id);
-        const done = {
-          ...cleaned,
-          status: terminalStatus,
-          finishedAt: cleaned.finishedAt || this.now().toISOString(),
-          finalizedAt: cleaned.finalizedAt || this.now().toISOString(),
-        };
-        // Keep the report aligned with the cleanup metadata that recovery just
-        // persisted. If either publication fails, retain the FINALIZING
-        // reservation so a later recovery retries rather than publishing a
-        // terminal record with a permanently stale report artifact.
-        await writeArtifact(job.id, 'report.md', this.report(done));
-        await this.store.event(job.id, event);
-        return !!(await updateRecoveredIfCurrent(job, {
+      return !!(await this.#updateIfCurrent(
+        job,
+        {
           status: terminalStatus,
           finalStatus: terminalStatus,
           finishedAt: done.finishedAt,
           finalizedAt: done.finalizedAt,
           recoveryTerminalStatus: undefined,
-        }));
+        },
+        ops,
+      ));
+    }
+    // Do not strand a terminal record merely because a lease reappeared
+    // while this recovery pass was reserving cleanup. The exact-CAS restore
+    // leaves its new owner untouched and permits a later safe retry.
+    await this.#updateIfCurrent(job, { status: terminalStatus, finalStatus: terminalStatus, recoveryTerminalStatus: undefined }, ops);
+    return false;
+  }
+  /** A dead applyThenVerify run is settled from the live tree, never as a pass. Returns whether a terminal record was published. */
+  async #recoverApplyVerifyJournal(ops, job) {
+    try {
+      // A cancel aimed at the dead run has nothing left to consume it.
+      await this.store.clearCancel?.(job.id).catch(() => {});
+      const reconciliation = await this.#reconcileIntegration(job);
+      if (reconciliation.integrationOutcome === 'applied' && reconciliation.primaryAfter) {
+        await this.#pinIntegrated(job, reconciliation.primaryAfter);
       }
-      // Do not strand a terminal record merely because a lease reappeared
-      // while this recovery pass was reserving cleanup. The exact-CAS restore
-      // leaves its new owner untouched and permits a later safe retry.
-      await updateRecoveredIfCurrent(job, {
-        status: terminalStatus,
-        finalStatus: terminalStatus,
-        recoveryTerminalStatus: undefined,
+      const settled = this.#applyVerifySettlement(job, reconciliation);
+      const published = await this.#publishRecoveredTerminal(ops, job, settled.finalStatus, settled.changes, {
+        type: 'recovered-integration',
+        outcome: reconciliation.integrationOutcome,
+        applyThenVerify: 'INTERRUPTED',
       });
-      return false;
+      return !!published;
+    } catch (error) {
+      try {
+        await this.#publishRecoveredTerminal(
+          ops,
+          job,
+          'FAILED',
+          {
+            integrationUncertain: true,
+            applyVerifyIntent: false,
+            revertIntent: false,
+            error: `applyThenVerify recovery could not prove primary state: ${error.message || error}`,
+          },
+          { type: 'recovered-integration', outcome: 'uncertain', applyThenVerify: 'INTERRUPTED' },
+        );
+      } catch {}
+    }
+    return false;
+  }
+  /** Resolve an integration journal against the live primary tree. Returns whether a terminal record was published. */
+  async #recoverIntegrationJournal(ops, job) {
+    try {
+      const reconciliation = await this.#reconcileIntegration(job);
+      if (reconciliation.integrationOutcome === 'applied' && reconciliation.primaryAfter) {
+        await this.#pinIntegrated(job, reconciliation.primaryAfter);
+      }
+      const applied = reconciliation.integrationOutcome === 'applied';
+      // A late apply of an already-final job must fall back to the status
+      // it had, not to a generic FAILED, when the patch never landed.
+      const finalStatus = applied ? job.integrationFinalStatus : final(job.applyPreviousStatus) ? job.applyPreviousStatus : 'FAILED';
+      const published = await this.#publishRecoveredTerminal(
+        ops,
+        job,
+        finalStatus,
+        {
+          ...reconciliation,
+          ...(applied && final(job.applyPreviousStatus)
+            ? {
+                appliedUnverified: {
+                  at: this.now().toISOString(),
+                  previousStatus: job.applyPreviousStatus,
+                  verifiedBy: typeof job.applyVerifiedBy === 'string' ? job.applyVerifiedBy.slice(0, MAX_VERIFIED_BY) : '',
+                },
+              }
+            : {}),
+          ...(applied
+            ? {}
+            : {
+                integrationConflict: reconciliation.integrationOutcome === 'not-applied',
+                error:
+                  reconciliation.integrationOutcome === 'uncertain'
+                    ? 'isolated integration outcome is uncertain; inspect primary changes manually'
+                    : 'isolated changes were not applied',
+              }),
+        },
+        { type: 'recovered-integration', outcome: reconciliation.integrationOutcome },
+      );
+      return !!published;
+    } catch (error) {
+      // Keep a failed/uncertain marker, but deliberately leave the intent
+      // untouched when persistence itself failed so later recovery will
+      // not mistake an unproven primary mutation for a clean failure.
+      try {
+        await this.#publishRecoveredTerminal(
+          ops,
+          job,
+          'FAILED',
+          {
+            integrationUncertain: true,
+            error: `integration recovery could not prove primary state: ${error.message || error}`,
+          },
+          { type: 'recovered-integration', outcome: 'uncertain' },
+        );
+      } catch {}
+    }
+    return false;
+  }
+  /** Resolve a revert journal against the live primary tree. Returns whether a terminal record was published. */
+  async #recoverRevertJournal(ops, job) {
+    try {
+      const reconciliation = await this.#reconcileRevert(job);
+      // Reconciliation alone leaves a terminal record repairable.  Fence
+      // it before proving/releasing its old lease: a repair which wins in
+      // the release-to-cleanup gap can otherwise publish a replacement
+      // workspace that cleanupWorkspace() would re-read and delete.
+      const terminalStatus = final(job.finalStatus) ? job.finalStatus : final(job.status) ? job.status : 'FAILED';
+      const staged = await this.#stageRecoveredTerminal(ops, job, terminalStatus, {
+        ...reconciliation,
+        recoveryTerminalStatus: terminalStatus,
+      });
+      if (!staged) return false;
+      return await this.#settleTerminalCleanupReservation(ops, staged, { type: 'recovered-revert', outcome: reconciliation.revertOutcome });
+    } catch {
+      // Retain the intent if its durable reconciliation cannot be stored.
+    }
+    return false;
+  }
+  /** Finalize a round whose owner is gone, auditing whatever its workspace or the primary tree holds. Returns whether a terminal record was published. */
+  async #recoverCrashedRound(ops, job, { ownOrphan }) {
+    const { writeArtifact } = ops;
+    // This process's own abandoned round was not interrupted by a restart; a
+    // cancel aimed at it is honoured as one.
+    const orphanCancelled = ownOrphan && (await this.store.cancelRequested?.(job.id).catch(() => false)) === true;
+    const recoveredError = ownOrphan ? 'the worker round ended without publishing a terminal status' : 'server restarted';
+    const finalJob = {
+      ...job,
+      error: orphanCancelled ? undefined : recoveredError,
     };
+    // An orphaned round's own task may already have removed its worktree.
+    const workspaceGone = ownOrphan && !!job.workspacePath && !existsSync(job.workspacePath);
+    try {
+      if (job.workspacePath && this.isolated && job.mode !== 'report' && !workspaceGone) {
+        const workspace = this.#workspace(job);
+        const workspaceAfter = workspace.snapshot({ pin: false });
+        const audited = await this.#classifyIsolatedWorkspace(job, workspace, workspaceAfter);
+        await writeArtifact(job.id, 'patch.diff', audited.allPatch);
+        await writeArtifact(job.id, 'revert.diff', audited.revertPatch);
+        finalJob.workspaceAfter = workspaceAfter;
+        finalJob.after = workspaceAfter;
+        finalJob.patchRound = job.rounds || 0;
+        finalJob.files = audited.owned;
+        finalJob.allFiles = audited.all;
+        finalJob.testAssertionChanges = auditTestAssertions(audited.allPatch, audited.all);
+        finalJob.revertFiles = audited.revertPaths;
+        finalJob.scopeViolations = audited.violations;
+        finalJob.discardedEphemeralOutputs = audited.discardedEphemeralOutputs;
+        finalJob.verifierMutations = audited.verifierMutations;
+        await this.#pinTrees(job, { before: job.before, ...(job.workerAfter ? { workerAfter: job.workerAfter } : {}), workspaceAfter });
+      } else if (job.mode !== 'report' && this.snapshots.create && this.snapshots.diff && job.before) {
+        const after = await this.snapshots.create(job.repoPath);
+        const patch = await this.snapshots.diff(job.repoPath, job.before, after);
+        // Recovery has no trustworthy live-worker attribution. Preserve the
+        // complete review diff, and permit a reverse patch only for files
+        // plainly inside this job's declared write scope.
+        const all = this.snapshots.files ? await this.snapshots.files(job.repoPath, job.before, after) : changedFiles(patch);
+        const inScope = (file) => {
+          if (typeof file?.path !== 'string' || file.path.includes('\\')) return false;
+          try {
+            return matchesAny(file.path, writeScope(job));
+          } catch {
+            return false;
+          }
+        };
+        const owned = all.filter(inScope);
+        const violations = all.filter((file) => !inScope(file)).map((file) => file.path);
+        const revertFiles = owned.map((file) => file.path).filter(safeRevertPath);
+        const revertPatch = revertFiles.length
+          ? await this.snapshots.diff(job.repoPath, job.before, after, { paths: revertFiles, literalPaths: true })
+          : Buffer.alloc(0);
+        await writeArtifact(job.id, 'patch.diff', patch);
+        await writeArtifact(job.id, 'revert.diff', revertPatch);
+        finalJob.after = after;
+        // Real Git snapshots use NUL-delimited paths; parsing diff headers is
+        // only a compatibility fallback for injected test adapters.
+        finalJob.files = owned;
+        finalJob.allFiles = all;
+        finalJob.testAssertionChanges = auditTestAssertions(revertPatch, owned);
+        finalJob.scopeViolations = violations;
+        finalJob.revertFiles = revertFiles;
+      }
+      return !!(await this.#publishRecoveredTerminal(ops, job, orphanCancelled ? 'CANCELLED' : 'FAILED', finalJob, {
+        type: 'recovered',
+        message: orphanCancelled ? 'cancelled after its worker round ended' : recoveredError,
+      }));
+    } catch (error) {
+      try {
+        const published = await this.#publishRecoveredTerminal(
+          ops,
+          job,
+          orphanCancelled ? 'CANCELLED' : 'FAILED',
+          {
+            ...finalJob,
+            ...(job.workspacePath &&
+            this.isolated &&
+            job.mode !== 'report' &&
+            !workspaceGone &&
+            existsSync(job.workspacePath) &&
+            !/patch containing configured secret/.test(String(error.message || error))
+              ? { workspaceRetained: true }
+              : {}),
+            ...finalizationErrorChange(error),
+            error: `recovery finalization failed: ${error.message || error}`,
+          },
+          {
+            type: 'recovered',
+            message: recoveredError,
+            ...finalizationErrorChange(error),
+          },
+        );
+        return !!published;
+      } catch {}
+      return false;
+    }
+  }
+  async recover(options = {}) {
+    // Recovery finalizes an already authenticated durable lifecycle; it must
+    // not be blocked by a rotated provider credential, and it must never pass
+    // the record's execution profile to a resolver or worker.
+    const { list, get, update, writeArtifact } = this.#operational();
+    const ops = { list, get, update, writeArtifact };
     // An applyThenVerify run in this process is registered by its controller.
     // `ownerIds` are jobs whose running entry is the caller's own call.
     const except = new Set([
@@ -5072,13 +5198,11 @@ export class JobManager {
         // recovery. Automated cleanup is impossible, but record that bounded
         // manual-cleanup decision explicitly instead of retrying forever.
         await update(job.id, {
-          status: 'FAILED',
+          ...this.#terminalStamp('FAILED'),
           finalStatus: 'FAILED',
           error: 'stored job failed validation',
           workspaceCleanupError: 'stored job validation failed; manual workspace cleanup is required',
           workspaceCleanupRequired: true,
-          finishedAt: this.now().toISOString(),
-          finalizedAt: this.now().toISOString(),
         });
         recovered += 1;
         continue;
@@ -5122,125 +5246,15 @@ export class JobManager {
       // also covers a crash after the integration journal cleared (while the
       // command ran) and one in the middle of its automatic revert.
       if (job.applyVerifyIntent === true) {
-        try {
-          // A cancel aimed at the dead run has nothing left to consume it.
-          await this.store.clearCancel?.(job.id).catch(() => {});
-          const reconciliation = await this.#reconcileIntegration(job);
-          if (reconciliation.integrationOutcome === 'applied' && reconciliation.primaryAfter) {
-            await this.#pinTrees(job, {
-              before: job.before,
-              ...(job.workerAfter ? { workerAfter: job.workerAfter } : {}),
-              workspaceAfter: job.workspaceAfter,
-              primaryAfter: reconciliation.primaryAfter,
-            });
-          }
-          const settled = this.#applyVerifySettlement(job, reconciliation);
-          const published = await publishRecoveredTerminal(job, settled.finalStatus, settled.changes, {
-            type: 'recovered-integration',
-            outcome: reconciliation.integrationOutcome,
-            applyThenVerify: 'INTERRUPTED',
-          });
-          if (published) recovered += 1;
-        } catch (error) {
-          try {
-            await publishRecoveredTerminal(
-              job,
-              'FAILED',
-              {
-                integrationUncertain: true,
-                applyVerifyIntent: false,
-                revertIntent: false,
-                error: `applyThenVerify recovery could not prove primary state: ${error.message || error}`,
-              },
-              { type: 'recovered-integration', outcome: 'uncertain', applyThenVerify: 'INTERRUPTED' },
-            );
-          } catch {}
-        }
+        if (await this.#recoverApplyVerifyJournal(ops, job)) recovered += 1;
         continue;
       }
       if (job.integrationIntent === true) {
-        try {
-          const reconciliation = await this.#reconcileIntegration(job);
-          if (reconciliation.integrationOutcome === 'applied' && reconciliation.primaryAfter) {
-            await this.#pinTrees(job, {
-              before: job.before,
-              ...(job.workerAfter ? { workerAfter: job.workerAfter } : {}),
-              workspaceAfter: job.workspaceAfter,
-              primaryAfter: reconciliation.primaryAfter,
-            });
-          }
-          const applied = reconciliation.integrationOutcome === 'applied';
-          // A late apply of an already-final job must fall back to the status
-          // it had, not to a generic FAILED, when the patch never landed.
-          const finalStatus = applied ? job.integrationFinalStatus : final(job.applyPreviousStatus) ? job.applyPreviousStatus : 'FAILED';
-          const published = await publishRecoveredTerminal(
-            job,
-            finalStatus,
-            {
-              ...reconciliation,
-              ...(applied && final(job.applyPreviousStatus)
-                ? {
-                    appliedUnverified: {
-                      at: this.now().toISOString(),
-                      previousStatus: job.applyPreviousStatus,
-                      verifiedBy: typeof job.applyVerifiedBy === 'string' ? job.applyVerifiedBy.slice(0, MAX_VERIFIED_BY) : '',
-                    },
-                  }
-                : {}),
-              ...(applied
-                ? {}
-                : {
-                    integrationConflict: reconciliation.integrationOutcome === 'not-applied',
-                    error:
-                      reconciliation.integrationOutcome === 'uncertain'
-                        ? 'isolated integration outcome is uncertain; inspect primary changes manually'
-                        : 'isolated changes were not applied',
-                  }),
-            },
-            { type: 'recovered-integration', outcome: reconciliation.integrationOutcome },
-          );
-          if (published) recovered += 1;
-        } catch (error) {
-          // Keep a failed/uncertain marker, but deliberately leave the intent
-          // untouched when persistence itself failed so later recovery will
-          // not mistake an unproven primary mutation for a clean failure.
-          try {
-            await publishRecoveredTerminal(
-              job,
-              'FAILED',
-              {
-                integrationUncertain: true,
-                error: `integration recovery could not prove primary state: ${error.message || error}`,
-              },
-              { type: 'recovered-integration', outcome: 'uncertain' },
-            );
-          } catch {}
-        }
+        if (await this.#recoverIntegrationJournal(ops, job)) recovered += 1;
         continue;
       }
       if (job.revertIntent === true) {
-        try {
-          const reconciliation = await this.#reconcileRevert(job);
-          // Reconciliation alone leaves a terminal record repairable.  Fence
-          // it before proving/releasing its old lease: a repair which wins in
-          // the release-to-cleanup gap can otherwise publish a replacement
-          // workspace that cleanupWorkspace() would re-read and delete.
-          const terminalStatus = final(job.finalStatus) ? job.finalStatus : final(job.status) ? job.status : 'FAILED';
-          const staged = await stageRecoveredTerminal(job, terminalStatus, {
-            ...reconciliation,
-            recoveryTerminalStatus: terminalStatus,
-          });
-          if (!staged) continue;
-          if (
-            await settleTerminalCleanupReservation(staged, {
-              type: 'recovered-revert',
-              outcome: reconciliation.revertOutcome,
-            })
-          )
-            recovered += 1;
-        } catch {
-          // Retain the intent if its durable reconciliation cannot be stored.
-        }
+        if (await this.#recoverRevertJournal(ops, job)) recovered += 1;
         continue;
       }
       // Resume a recovery-owned terminal cleanup reservation without feeding
@@ -5248,7 +5262,7 @@ export class JobManager {
       // status into FAILED). This is also the only live-PID path permitted to
       // retry cleanup, and it still requires an explicit no-lease proof.
       if (terminalCleanupReservation) {
-        if (await settleTerminalCleanupReservation(job)) recovered += 1;
+        if (await this.#settleTerminalCleanupReservation(ops, job)) recovered += 1;
         continue;
       }
       // The primary integration was already proven and durably recorded, but
@@ -5261,7 +5275,7 @@ export class JobManager {
         !job.integrationUncertain &&
         ['DONE_VERIFIED', 'DONE_UNVERIFIED'].includes(job.finalStatus)
       ) {
-        if (await publishRecoveredTerminal(job, job.finalStatus, {}, { type: 'recovered-publication', status: job.finalStatus }))
+        if (await this.#publishRecoveredTerminal(ops, job, job.finalStatus, {}, { type: 'recovered-publication', status: job.finalStatus }))
           recovered += 1;
         continue;
       }
@@ -5276,105 +5290,12 @@ export class JobManager {
         // delete that replacement instead of this terminal workspace.
         const terminalStatus = final(job.finalStatus) ? job.finalStatus : job.status;
         if (!(await this.#recoveryMayClean(job, get, { allowLiveNoLease: true, preflight: true }))) continue;
-        const staged = await stageRecoveredTerminal(job, terminalStatus, { recoveryTerminalStatus: terminalStatus });
+        const staged = await this.#stageRecoveredTerminal(ops, job, terminalStatus, { recoveryTerminalStatus: terminalStatus });
         if (!staged) continue;
-        if (await settleTerminalCleanupReservation(staged)) recovered += 1;
+        if (await this.#settleTerminalCleanupReservation(ops, staged)) recovered += 1;
         continue;
       }
-      // This process's own abandoned round was not interrupted by a restart; a
-      // cancel aimed at it is honoured as one.
-      const orphanCancelled = ownOrphan && (await this.store.cancelRequested?.(job.id).catch(() => false)) === true;
-      const recoveredError = ownOrphan ? 'the worker round ended without publishing a terminal status' : 'server restarted';
-      const finalJob = {
-        ...job,
-        error: orphanCancelled ? undefined : recoveredError,
-      };
-      // An orphaned round's own task may already have removed its worktree.
-      const workspaceGone = ownOrphan && !!job.workspacePath && !existsSync(job.workspacePath);
-      try {
-        if (job.workspacePath && this.isolated && job.mode !== 'report' && !workspaceGone) {
-          const workspace = this.#workspace(job);
-          const workspaceAfter = workspace.snapshot({ pin: false });
-          const audited = await this.#classifyIsolatedWorkspace(job, workspace, workspaceAfter);
-          await writeArtifact(job.id, 'patch.diff', audited.allPatch);
-          await writeArtifact(job.id, 'revert.diff', audited.revertPatch);
-          finalJob.workspaceAfter = workspaceAfter;
-          finalJob.after = workspaceAfter;
-          finalJob.patchRound = job.rounds || 0;
-          finalJob.files = audited.owned;
-          finalJob.allFiles = audited.all;
-          finalJob.testAssertionChanges = auditTestAssertions(audited.allPatch, audited.all);
-          finalJob.revertFiles = audited.revertPaths;
-          finalJob.scopeViolations = audited.violations;
-          finalJob.discardedEphemeralOutputs = audited.discardedEphemeralOutputs;
-          finalJob.verifierMutations = audited.verifierMutations;
-          await this.#pinTrees(job, { before: job.before, ...(job.workerAfter ? { workerAfter: job.workerAfter } : {}), workspaceAfter });
-        } else if (job.mode !== 'report' && this.snapshots.create && this.snapshots.diff && job.before) {
-          const after = await this.snapshots.create(job.repoPath);
-          const patch = await this.snapshots.diff(job.repoPath, job.before, after);
-          // Recovery has no trustworthy live-worker attribution. Preserve the
-          // complete review diff, and permit a reverse patch only for files
-          // plainly inside this job's declared write scope.
-          const all = this.snapshots.files ? await this.snapshots.files(job.repoPath, job.before, after) : changedFiles(patch);
-          const inScope = (file) => {
-            if (typeof file?.path !== 'string' || file.path.includes('\\')) return false;
-            try {
-              return matchesAny(file.path, writeScope(job));
-            } catch {
-              return false;
-            }
-          };
-          const owned = all.filter(inScope);
-          const violations = all.filter((file) => !inScope(file)).map((file) => file.path);
-          const revertFiles = owned.map((file) => file.path).filter(safeRevertPath);
-          const revertPatch = revertFiles.length
-            ? await this.snapshots.diff(job.repoPath, job.before, after, { paths: revertFiles, literalPaths: true })
-            : Buffer.alloc(0);
-          await writeArtifact(job.id, 'patch.diff', patch);
-          await writeArtifact(job.id, 'revert.diff', revertPatch);
-          finalJob.after = after;
-          // Real Git snapshots use NUL-delimited paths; parsing diff headers is
-          // only a compatibility fallback for injected test adapters.
-          finalJob.files = owned;
-          finalJob.allFiles = all;
-          finalJob.testAssertionChanges = auditTestAssertions(revertPatch, owned);
-          finalJob.scopeViolations = violations;
-          finalJob.revertFiles = revertFiles;
-        }
-        if (
-          await publishRecoveredTerminal(job, orphanCancelled ? 'CANCELLED' : 'FAILED', finalJob, {
-            type: 'recovered',
-            message: orphanCancelled ? 'cancelled after its worker round ended' : recoveredError,
-          })
-        )
-          recovered += 1;
-      } catch (error) {
-        try {
-          const published = await publishRecoveredTerminal(
-            job,
-            orphanCancelled ? 'CANCELLED' : 'FAILED',
-            {
-              ...finalJob,
-              ...(job.workspacePath &&
-              this.isolated &&
-              job.mode !== 'report' &&
-              !workspaceGone &&
-              existsSync(job.workspacePath) &&
-              !/patch containing configured secret/.test(String(error.message || error))
-                ? { workspaceRetained: true }
-                : {}),
-              ...(safeFinalizationError(error) ? { finalizationError: safeFinalizationError(error) } : {}),
-              error: `recovery finalization failed: ${error.message || error}`,
-            },
-            {
-              type: 'recovered',
-              message: recoveredError,
-              ...(safeFinalizationError(error) ? { finalizationError: safeFinalizationError(error) } : {}),
-            },
-          );
-          if (published) recovered += 1;
-        } catch {}
-      }
+      if (await this.#recoverCrashedRound(ops, job, { ownOrphan })) recovered += 1;
     }
     return recovered;
   }

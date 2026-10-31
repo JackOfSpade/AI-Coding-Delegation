@@ -4,18 +4,9 @@ import { ProviderError } from './openai-chat.mjs';
  * Walk an ordered route chain, advancing only after an uncharged, explicit
  * credit-exhaustion refusal from the active route. `onTransition(toStage)` must
  * make the new stage durable before the next route is spent on.
- * The legacy {primary, fallback, primaryModel, fallbackModel, fallbackUsed}
- * signature maps to two routes.
  */
 export class CreditFallbackProvider {
-  constructor({ routes, stage = 0, onTransition, primary, fallback, primaryModel, fallbackModel, fallbackUsed = false } = {}) {
-    if (!routes) {
-      routes = [
-        { provider: primary, model: primaryModel },
-        { provider: fallback, model: fallbackModel },
-      ];
-      stage = fallbackUsed ? 1 : 0;
-    }
+  constructor({ routes, stage = 0, onTransition } = {}) {
     if (
       !Array.isArray(routes) ||
       routes.length < 2 ||

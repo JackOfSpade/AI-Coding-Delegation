@@ -1,32 +1,28 @@
 import { sseEvents } from './sse.mjs';
 import { bestEffort, fetchAbortable, readJsonAbortable } from './abort.mjs';
-import { DEFAULT_ATTEMPT_TIMEOUT_MS, ProviderError } from './openai-chat.mjs';
+import {
+  DEFAULT_ATTEMPT_TIMEOUT_MS,
+  ProviderError,
+  checkedBaseUrl as checkedHttpBaseUrl,
+  isRedirectError,
+  retryDelay,
+  streamFailureKind,
+} from './openai-chat.mjs';
 import { assertModelAllowed, isAnthropicModel, modelPolicyViolation } from '../model-policy.mjs';
-import { anthropicContentMatchesAssistant, cloneAnthropicContent, validAnthropicContent } from '../anthropic-content.mjs';
+import {
+  MAX_TEXT_CHARS,
+  anthropicContentMatchesAssistant,
+  cloneAnthropicContent,
+  validAnthropicContent,
+  validText,
+} from '../anthropic-content.mjs';
+import { MAX_TOOL_ARGUMENT_CHARS, MAX_TOOL_CALLS, validToolIdentifier } from '../transcript-limits.mjs';
 
 export const DEFAULT_ANTHROPIC_VERSION = '2023-06-01';
 const MAX_SSE_EVENT_BYTES = 1_000_000;
 const MAX_SSE_ATTEMPT_BYTES = 8_000_000;
-const MAX_TOOL_CALLS = 64;
-const MAX_TOOL_ARGUMENT_CHARS = 512_000;
 
-const validText = (value, limit = 1_000_000) => typeof value === 'string' && value.length <= limit && !/[\0\x0b\x0c\x7f]/.test(value);
-const validId = (value, limit) => typeof value === 'string' && value.length > 0 && value.length <= limit && !/[\0-\x1f\x7f]/.test(value);
-const loopback = (host) => ['localhost', '127.0.0.1', '[::1]'].includes(host);
-
-function checkedBaseUrl(baseUrl) {
-  let parsed;
-  try {
-    parsed = new URL(baseUrl);
-  } catch {
-    throw new TypeError('baseUrl must be an http(s) URL');
-  }
-  if (!['http:', 'https:'].includes(parsed.protocol) || (parsed.protocol === 'http:' && !loopback(parsed.hostname)))
-    throw new TypeError('baseUrl must use HTTPS unless its host is loopback');
-  if (parsed.username || parsed.password || parsed.search || parsed.hash)
-    throw new TypeError('baseUrl must not contain credentials, query, or fragment');
-  return `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}`;
-}
+const checkedBaseUrl = (baseUrl) => checkedHttpBaseUrl(baseUrl).baseUrl;
 
 function normalizedUsage(input, output) {
   const count = (value) => Number.isSafeInteger(value) && value >= 0;
@@ -51,7 +47,12 @@ function normalizedUsage(input, output) {
 function wireTools(tools) {
   return tools.map((tool) => {
     const functionTool = tool?.function;
-    if (!functionTool || !validId(functionTool.name, 128) || !validText(functionTool.description ?? '', 8_000) || !functionTool.parameters)
+    if (
+      !functionTool ||
+      !validToolIdentifier(functionTool.name, 128) ||
+      !validText(functionTool.description ?? '', 8_000) ||
+      !functionTool.parameters
+    )
       throw new ProviderError('Invalid tool definition');
     return { name: functionTool.name, description: functionTool.description, input_schema: functionTool.parameters };
   });
@@ -59,8 +60,8 @@ function wireTools(tools) {
 
 function wireToolChoice(value) {
   if (value === undefined) return undefined;
-  if (value?.type === 'tool' && validId(value.name, 128)) return { type: 'tool', name: value.name };
-  if (value?.type === 'function' && validId(value.function?.name, 128)) return { type: 'tool', name: value.function.name };
+  if (value?.type === 'tool' && validToolIdentifier(value.name, 128)) return { type: 'tool', name: value.name };
+  if (value?.type === 'function' && validToolIdentifier(value.function?.name, 128)) return { type: 'tool', name: value.function.name };
   throw new ProviderError('Invalid Anthropic tool choice');
 }
 
@@ -97,7 +98,11 @@ function wireMessages(messages) {
     if (!message || typeof message !== 'object' || !['system', 'user', 'assistant', 'tool'].includes(message.role))
       throw new ProviderError('Invalid transcript message');
     if (message.role === 'tool') {
-      if (!validId(message.tool_call_id, 512) || !validText(message.content) || (message.name !== undefined && !validId(message.name, 128)))
+      if (
+        !validToolIdentifier(message.tool_call_id, 512) ||
+        !validText(message.content) ||
+        (message.name !== undefined && !validToolIdentifier(message.name, 128))
+      )
         throw new ProviderError('Invalid tool result');
       toolResults.push({ type: 'tool_result', tool_use_id: message.tool_call_id, content: message.content });
       continue;
@@ -120,8 +125,8 @@ function wireMessages(messages) {
           throw new ProviderError('Invalid assistant tool calls');
         for (const call of message.tool_calls) {
           if (
-            !validId(call?.id, 512) ||
-            !validId(call?.function?.name, 128) ||
+            !validToolIdentifier(call?.id, 512) ||
+            !validToolIdentifier(call?.function?.name, 128) ||
             !validText(call?.function?.arguments ?? '', MAX_TOOL_ARGUMENT_CHARS)
           )
             throw new ProviderError('Invalid assistant tool call');
@@ -282,7 +287,9 @@ export class AnthropicMessagesProvider {
           ? new ProviderError('Provider request timed out', { kind: 'attempt_timeout', retryable: true, timeoutMs: this.timeoutMs })
           : error instanceof ProviderError
             ? error
-            : new ProviderError('Chat request failed', { kind: 'transport', retryable: true });
+            : isRedirectError(error)
+              ? new ProviderError('Provider redirect rejected', { kind: 'redirect', retryable: false })
+              : new ProviderError('Chat request failed', { kind: streamFailureKind(error) || 'transport', retryable: true });
         providerError.attempts = attempt + 1;
         if (!providerError.retryable || attempt === retryLimit) throw providerError;
         last = providerError;
@@ -290,6 +297,7 @@ export class AnthropicMessagesProvider {
         clearTimeout(timeout);
         signal?.removeEventListener('abort', abort);
       }
+      await retryDelay(Math.min(4_000, 250 * 2 ** attempt) + Math.floor(Math.random() * 125), signal);
     }
     throw last;
   }
@@ -355,7 +363,7 @@ export class AnthropicMessagesProvider {
             throw new ProviderError('Invalid Anthropic content block', { kind: 'response' });
           const block = event.content_block;
           if (block?.type === 'text' && validText(block.text ?? '')) blocks.set(index, { type: 'text', text: block.text ?? '' });
-          else if (block?.type === 'tool_use' && validId(block.id, 512) && validId(block.name, 128))
+          else if (block?.type === 'tool_use' && validToolIdentifier(block.id, 512) && validToolIdentifier(block.name, 128))
             blocks.set(index, { type: 'tool_use', id: block.id, name: block.name, input: '' });
           else if (block?.type === 'thinking' && validText(block.thinking ?? '') && validText(block.signature ?? ''))
             blocks.set(index, { type: 'thinking', thinking: block.thinking ?? '', signature: block.signature ?? '' });
@@ -426,7 +434,7 @@ export class AnthropicMessagesProvider {
           anthropicContent.push({ type: 'redacted_thinking', data: block.data });
         }
       }
-      if (text.length > 1_000_000) throw new ProviderError('Anthropic text exceeds size limit', { kind: 'response' });
+      if (text.length > MAX_TEXT_CHARS) throw new ProviderError('Anthropic text exceeds size limit', { kind: 'response' });
       if (toolCalls.length > MAX_TOOL_CALLS || new Set(toolCalls.map((call) => call.id)).size !== toolCalls.length)
         throw new ProviderError('Invalid Anthropic tool calls', { kind: 'response' });
       if (toolCalls.reduce((total, call) => total + call.arguments.length, 0) > MAX_TOOL_ARGUMENT_CHARS)
@@ -516,7 +524,8 @@ async function discoverAnthropicModel({ baseUrl, apiKey, fetchImpl = globalThis.
     );
     if (model) return model.id;
     if (body.has_more !== true) break;
-    if (!validId(body.last_id, 256) || seenCursors.has(body.last_id)) throw new ProviderError('Invalid Anthropic Models pagination');
+    if (!validToolIdentifier(body.last_id, 256) || seenCursors.has(body.last_id))
+      throw new ProviderError('Invalid Anthropic Models pagination');
     seenCursors.add(body.last_id);
     afterId = body.last_id;
     page += 1;

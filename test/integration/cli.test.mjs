@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Writable } from 'node:stream';
 import { EventEmitter } from 'node:events';
+import { tmpdir } from 'node:os';
 import { parseArgs, runCli, spawnDetachedWorker } from '../../src/cli.mjs';
 function sink() {
   let text = '';
@@ -461,6 +462,18 @@ test('doctor output carries the verifier temp probe from core health', async () 
   });
   assert.equal(status, 0);
   assert.deepEqual(JSON.parse(out.get()).verifierTmp, verifierTmp);
+});
+test('doctor binds core health to --repoPath and never to the cwd', async () => {
+  const seen = [];
+  const core = { job: async (id, opts) => (seen.push({ id, opts }), { health: { worker: true, sandbox: 'macos' } }) };
+  const out = sink();
+  assert.equal(await runCli(['doctor'], { core, stdout: out.stream, stderr: sink().stream }), 0);
+  assert.equal(seen[0].id, undefined);
+  assert.equal(seen[0].opts.repoPath, undefined, 'the session hook must not bind or initialise the current directory');
+  assert.equal(JSON.parse(out.get()).worker, true);
+  const other = tmpdir();
+  assert.equal(await runCli(['doctor', '--repoPath', other], { core, stdout: sink().stream, stderr: sink().stream }), 0);
+  assert.equal(seen[1].opts.repoPath, other);
 });
 test('CLI rejects invalid verifier options before any core call', async () => {
   const cases = [

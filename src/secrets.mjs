@@ -1,6 +1,7 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { sameFileIdentity, sameStatFields, sameStatValue } from './stat-identity.mjs';
 
 const MAX_SECRET_BYTES = 16 * 1024;
 const MAX_SERVICE_LENGTH = 256;
@@ -24,6 +25,11 @@ export class SecretError extends Error {
     this.name = 'SecretError';
     this.code = code;
   }
+}
+
+function assertValidSecret(value) {
+  if (typeof value !== 'string' || !value.trim() || Buffer.byteLength(value) > MAX_SECRET_BYTES || /[\0-\x1f\x7f]/.test(value))
+    throw new SecretError('Secret has invalid size or characters', 'E_SECRET_INVALID');
 }
 
 export function parseKeyRef(ref) {
@@ -73,7 +79,6 @@ export function resolveKeyRef(ref, options = {}) {
   const { kind, value } = parseKeyRef(ref);
   let secret;
   if (kind === 'env') {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) throw new SecretError('Invalid environment variable name', 'E_SECRET_REF');
     secret = (options.env || process.env)[value];
   } else if (kind === 'file') {
     secret = readSecretFile(value, options);
@@ -88,12 +93,11 @@ export function resolveKeyRef(ref, options = {}) {
   let end = secret.length;
   while (end && (secret.charCodeAt(end - 1) === 0x0a || secret.charCodeAt(end - 1) === 0x0d)) end -= 1;
   const normalized = secret.slice(0, end);
-  if (!normalized || Buffer.byteLength(normalized) > MAX_SECRET_BYTES || /[\0-\x1f\x7f]/.test(normalized))
-    throw new SecretError('Secret has invalid size or characters', 'E_SECRET_INVALID');
+  assertValidSecret(normalized);
   return normalized;
 }
 
-const MAX_SECRET_FILE_BYTES = 16 * 1024;
+const MAX_SECRET_FILE_BYTES = MAX_SECRET_BYTES;
 const BIGINT_STAT_OPTIONS = Object.freeze({ bigint: true });
 const bigintStat = (path) => statSync(path, BIGINT_STAT_OPTIONS);
 const bigintLstat = (path) => lstatSync(path, BIGINT_STAT_OPTIONS);
@@ -177,18 +181,8 @@ export function readSecretFile(
   }
 }
 
-function sameFileIdentity(first, second) {
-  return sameStatValue(first?.dev, second?.dev) && sameStatValue(first?.ino, second?.ino);
-}
 function sameSecretMetadata(first, second) {
-  return (
-    sameFileIdentity(first, second) &&
-    sameStatValue(first?.uid, second?.uid) &&
-    sameStatValue(first?.size, second?.size) &&
-    sameStatValue(first?.mode, second?.mode) &&
-    sameTimestamp(first, second, 'mtime') &&
-    sameTimestamp(first, second, 'ctime')
-  );
+  return sameFileIdentity(first, second) && sameStatFields(first, second, ['uid', 'size', 'mode']);
 }
 function validateSecretMetadata(details, uid) {
   if (!details?.isFile?.()) throw new SecretError('Secret path is not a regular file', 'E_SECRET_FILE');
@@ -206,25 +200,6 @@ function secretFileByteLength(size) {
   if (!Number.isSafeInteger(size) || size < 1 || size > MAX_SECRET_FILE_BYTES)
     throw new SecretError('Secret file size is invalid', 'E_SECRET_FILE');
   return size;
-}
-function sameStatValue(first, second) {
-  if (first === second) return true;
-  if (typeof first === 'bigint' && Number.isSafeInteger(second)) return first === BigInt(second);
-  if (typeof second === 'bigint' && Number.isSafeInteger(first)) return BigInt(first) === second;
-  return false;
-}
-function sameTimestamp(first, second, name) {
-  const firstValue = statTimestamp(first, name),
-    secondValue = statTimestamp(second, name);
-  return firstValue !== undefined && secondValue !== undefined && sameStatValue(firstValue, secondValue);
-}
-function statTimestamp(details, name) {
-  const nanoseconds = details?.[`${name}Ns`];
-  if (typeof nanoseconds === 'bigint') return nanoseconds;
-  const milliseconds = details?.[`${name}Ms`];
-  if (typeof milliseconds === 'number' && Number.isFinite(milliseconds)) return milliseconds;
-  const date = details?.[name];
-  return date instanceof Date && Number.isFinite(date.getTime()) ? date.getTime() : undefined;
 }
 
 /** Read an unvalidated value from the platform credential store. API-key
@@ -312,6 +287,12 @@ export function storeKeychainSecret(
   if (platform === 'darwin' && typeof secret === 'string') {
     if (!/^[A-Za-z0-9._~+/=-]+$/.test(secret) || Buffer.byteLength(secret) > MAX_SECRET_BYTES)
       throw new SecretError('Secret has invalid size or characters', 'E_SECRET_INVALID');
+    // `security -i` tokenizes the line shell-style, so the service must not need quoting.
+    if (!/^[A-Za-z0-9._:@+-]+$/.test(service))
+      throw new SecretError(
+        'macOS keychain service contains characters unsupported by non-interactive storage',
+        'E_SECRET_STORE_INTERACTIVE',
+      );
     let result;
     try {
       result = execFile('security', ['-i'], {
@@ -349,8 +330,7 @@ export function storeKeychainSecret(
     if (result?.status !== undefined && result.status !== 0) throw new SecretError('macOS keychain storage failed', 'E_SECRET_STORE');
     return { stored: true, service };
   }
-  if (typeof secret !== 'string' || !secret.trim() || Buffer.byteLength(secret) > MAX_SECRET_BYTES || /[\0-\x1f\x7f]/.test(secret))
-    throw new SecretError('Secret has invalid size or characters', 'E_SECRET_INVALID');
+  assertValidSecret(secret);
   const options = { input: secret, encoding: 'utf8', timeout: 5_000, stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true };
   let result;
   if (platform === 'linux') result = execFile('secret-tool', ['store', '--label=offload', 'service', service], options);

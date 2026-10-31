@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { TOOL_CACHE } from './verify-env.mjs';
 import { stripTerminalControls } from './redact.mjs';
+import { escapeRegExp } from './glob.mjs';
+import { OUTPUT_TRUNCATED_PREFIX } from './sandbox.mjs';
 
 /**
  * Pure helpers for the baseline-diff verifier: extract failing test identities
@@ -34,7 +36,6 @@ const SANDBOX_DIR = /offload-sandbox-[A-Za-z0-9]+/g;
 const DURATION = / ?\(\d+(?:\.\d+)? ?m?s\)$/;
 // node-tap and friends append `# time=12.3ms`; like DURATION it differs on every run.
 const TAP_DIRECTIVES = /(?: # [A-Za-z_]+=\S*)+$/;
-const TRUNCATION_MARKER = '… output truncated (';
 // What the verifier sandbox prints when it refuses a test's fixture: a child
 // process it may not spawn, a path it may not touch, Git metadata it hides. The
 // worktree's .git is unreadable in the verifier, so git reports `error reading
@@ -77,7 +78,6 @@ const STOP_FLAG = /(?:^|\s)(?:-{1,2}(?:test\.)?failfast|--bail)(?:=(?!false\b|0\
 export const commandStopsEarly = (command) => typeof command === 'string' && STOP_FLAG.test(command);
 
 const stripText = (value) => stripTerminalControls(value).replace(CONTROLS, '');
-const escapeRegExp = (value) => value.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&');
 
 // Replace each `<anything>/offload-worktree-<id>/workspace` token with `<ws>`.
 // Walking back from each match keeps this linear: a lazy `\S*?` prefix is
@@ -722,4 +722,4 @@ export function repairDefectText(verify, limit = 3968) {
 }
 
 /** True when retained verifier text was cut by the runner's head+tail capture. */
-export const outputWasTruncated = (text) => typeof text === 'string' && text.includes(TRUNCATION_MARKER);
+export const outputWasTruncated = (text) => typeof text === 'string' && text.includes(OUTPUT_TRUNCATED_PREFIX);

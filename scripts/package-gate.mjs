@@ -59,7 +59,7 @@ function isPlainObject(value) {
  * separate plugin schema. The skill frontmatter is JSON (not YAML) because it
  * is also consumed directly by the MCP catalog.
  */
-export function validateOffloadPluginArtifacts(marketplace, codex, skill) {
+export function validateOffloadManifests(marketplace, codex) {
   const errors = [];
   if (!isPlainObject(marketplace)) errors.push('marketplace plugin manifest must be a JSON object');
   if (!isPlainObject(codex)) errors.push('Codex plugin manifest must be a JSON object');
@@ -85,6 +85,12 @@ export function validateOffloadPluginArtifacts(marketplace, codex, skill) {
       errors.push('plugin manifest keywords must be the same bounded non-empty string array');
     if (codex.skills !== './skills/') errors.push('Codex plugin manifest must declare ./skills/');
   }
+  return errors;
+}
+
+/** Validate one skill's JSON frontmatter against the plugin manifest (null skips the name cross-check). */
+export function validateOffloadSkillFrontmatter(skill, marketplace) {
+  const errors = [];
   const frontmatter = typeof skill === 'string' && /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(skill);
   if (!frontmatter) errors.push('plugin SKILL.md must start with JSON frontmatter');
   else {
@@ -105,6 +111,10 @@ export function validateOffloadPluginArtifacts(marketplace, codex, skill) {
     }
   }
   return errors;
+}
+
+export function validateOffloadPluginArtifacts(marketplace, codex, skill) {
+  return [...validateOffloadManifests(marketplace, codex), ...validateOffloadSkillFrontmatter(skill, marketplace)];
 }
 
 export function npmPackEnvironment(baseEnv, isolatedHome, cache, platform = process.platform) {
@@ -131,11 +141,7 @@ export function npmPackEnvironment(baseEnv, isolatedHome, cache, platform = proc
 }
 
 /** Windows command files require cmd.exe; POSIX can execute npm directly. */
-export function npmPackCommand(platform = process.platform) {
-  return platform === 'win32' ? 'npm.cmd' : 'npm';
-}
-
-function npmPackInvocation(args, platform = process.platform) {
+export function npmPackInvocation(args, platform = process.platform) {
   if (platform !== 'win32') return { command: 'npm', args };
   // Node 24 cannot reliably exec a .cmd file directly. All command tokens
   // here are package-gate literals, and cmd.exe itself is fixed rather than
@@ -201,7 +207,7 @@ export async function packageGate(
     result = spawnSync(invocation.command, invocation.args, {
       cwd: root,
       encoding: 'utf8',
-      env: npmPackEnvironment(process.env, cache, cache),
+      env: npmPackEnvironment(environment, cache, cache),
       windowsHide: true,
     });
   } finally {
@@ -245,15 +251,13 @@ export async function packageGate(
   let pluginArtifacts = [];
   if (manifest.name === 'offload' && !missing.some((file) => offloadPluginFiles.includes(file))) {
     try {
-      const [marketplace, codex, skill, opus] = await Promise.all([
-        readFile(join(root, offloadPluginFiles[0]), 'utf8').then(JSON.parse),
-        readFile(join(root, offloadPluginFiles[1]), 'utf8').then(JSON.parse),
-        readFile(join(root, offloadPluginFiles[2]), 'utf8'),
-        readFile(join(root, offloadPluginFiles[3]), 'utf8'),
-      ]);
+      // PLUGIN_FILES lists the two JSON manifests first, then the skills.
+      const [marketplace, codex, ...skills] = await Promise.all(
+        offloadPluginFiles.map((path, index) => readFile(join(root, path), 'utf8').then((text) => (index < 2 ? JSON.parse(text) : text))),
+      );
       pluginArtifacts = [
-        ...validateOffloadPluginArtifacts(marketplace, codex, skill),
-        ...validateOffloadPluginArtifacts(marketplace, codex, opus),
+        ...validateOffloadManifests(marketplace, codex),
+        ...skills.flatMap((skill) => validateOffloadSkillFrontmatter(skill, marketplace)),
       ];
     } catch {
       pluginArtifacts = ['plugin artifacts must contain valid JSON manifests'];

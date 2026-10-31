@@ -3,10 +3,13 @@ import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve, sep, relative, isAbsolute, posix } from 'node:path';
+import { dirname, join, resolve, relative, isAbsolute, posix } from 'node:path';
 import { normalizePath } from './glob.mjs';
-import { DEFAULT_DENY_READ, DEFAULT_DENY_WRITE } from './policy.mjs';
+import { DEFAULT_DENY_READ, DEFAULT_DENY_WRITE, escapesRoot } from './policy.mjs';
 import { stripTerminalControls } from './redact.mjs';
+
+/** Prefix of the marker the sandbox inserts where captured output was elided. */
+export const OUTPUT_TRUNCATED_PREFIX = '… output truncated (';
 
 const SECRET =
   /(?:^|_)(?:api[_-]?key|access[_-]?key(?:[_-]?id)?|token|secret|password|authorization|credential(?:s)?|private[_-]?key)(?:$|_)/i;
@@ -147,15 +150,6 @@ const q = (value) => JSON.stringify(String(value));
 function seatbeltPath(value) {
   if (typeof value !== 'string' || /[\0-\x1f\x7f]/.test(value)) throw new TypeError('sandbox paths must not contain control characters');
   return value;
-}
-/** Turn a glob into the ancestor it can safely need; sandbox-exec receives no glob syntax. */
-export function staticWritableRoot(value, repoPath) {
-  const base = resolve(repoPath || process.cwd());
-  const absolute = isAbsolute(value) ? resolve(value) : resolve(base, value);
-  const parts = absolute.split(sep);
-  const magic = parts.findIndex((part) => /[*?\[]/.test(part));
-  const root = magic < 0 ? absolute : parts.slice(0, magic).join(sep) || sep;
-  return root === sep && repoPath ? base : root;
 }
 const seatbeltString = (value) => String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
 const asciiPair = (character) =>
@@ -474,7 +468,7 @@ export function sandboxCanonicalPath(value, cwd, sandboxCwd) {
   if (typeof value !== 'string' || !isAbsolute(value)) return value;
   const rel = relative(cwd, resolve(value));
   if (!rel) return sandboxCwd;
-  return rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel) ? value : join(sandboxCwd, rel);
+  return escapesRoot(rel) ? value : join(sandboxCwd, rel);
 }
 /** Best-effort descendant termination on Windows; Windows has no POSIX process groups. */
 export function terminateWindowsTree(pid, taskkill = spawnSync) {
@@ -535,7 +529,7 @@ function capture(limit) {
     },
     value() {
       return omitted
-        ? `${safeUtf8(head, 'end')}\n… output truncated (${omitted} bytes omitted) …\n${safeUtf8(tail, 'start')}`
+        ? `${safeUtf8(head, 'end')}\n${OUTPUT_TRUNCATED_PREFIX}${omitted} bytes omitted) …\n${safeUtf8(tail, 'start')}`
         : new TextDecoder().decode(Buffer.concat([head, tail]));
     },
   };
@@ -615,7 +609,7 @@ export async function runCommand(command, options = {}) {
   // physical worktree spelling. Relative globs remain relative so their
   // existing scope validation is unchanged.
   const sandboxPath = (value) => (canSandbox ? sandboxCanonicalPath(value, cwd, sandboxCwd) : value);
-  const sandboxWritablePaths = (options.writablePaths || []).map(sandboxPath);
+  const sandboxWritablePaths = profileInput.writablePaths.map(sandboxPath);
   // Canonicalize explicit external read roots too. In particular, macOS
   // renders a lexical `/var/...` worktree under `/private/var/...`; handing
   // Seatbelt the former makes an otherwise authorized cwd fail at runtime.
@@ -623,24 +617,24 @@ export async function runCommand(command, options = {}) {
   // best-effort read grant.
   const sandboxReadablePaths = canSandbox
     ? await Promise.all(
-        (options.readablePaths || []).map(async (value) => {
+        profileInput.readablePaths.map(async (value) => {
           const path = sandboxPath(value);
           if (typeof path !== 'string' || !isAbsolute(path)) throw new TypeError('sandbox readable paths must be absolute');
           return realpath(path);
         }),
       )
-    : options.readablePaths || [];
+    : profileInput.readablePaths;
   // Declared interpreter roots are canonicalized like the read roots above, and
   // a root that vanished fails before execution instead of granting nothing.
   const sandboxInterpreterPaths = canSandbox
     ? await Promise.all(
-        (options.interpreterPaths || []).map(async (value) => {
+        profileInput.interpreterPaths.map(async (value) => {
           if (typeof value !== 'string' || !isAbsolute(value)) throw new TypeError('sandbox interpreter paths must be absolute');
           return realpath(value);
         }),
       )
-    : options.interpreterPaths || [];
-  const sandboxCachePaths = (options.cachePaths || []).map(sandboxPath);
+    : profileInput.interpreterPaths;
+  const sandboxCachePaths = profileInput.cachePaths.map(sandboxPath);
   const sandboxGitDir = sandboxPath(options.gitDir);
   if (canSandbox) {
     // Validate before creating a temp directory so a rejection has no residue.
@@ -689,20 +683,17 @@ export async function runCommand(command, options = {}) {
     const sandboxProfile =
       sandbox === 'macos'
         ? compileSandboxProfile({
+            ...profileInput,
             repoPath: sandboxCwd,
             gitDir: sandboxGitDir,
             writablePaths: sandboxWritablePaths,
             readablePaths: sandboxReadablePaths,
-            denyRead: options.denyRead || [],
-            denyWrite: options.denyWrite || DEFAULT_DENY_WRITE,
             // The private script directory must be readable by the sandboxed
             // interpreter. A separately requested temporary directory remains
             // an explicit cache capability rather than replacing that root.
             tempPath: sandboxTempPath,
             cachePaths: [...sandboxCachePaths, ...(options.tempPath ? [sandboxPath(options.tempPath)] : [])],
             interpreterPaths: sandboxInterpreterPaths,
-            interpreterMetadataPaths: options.interpreterMetadataPaths || [],
-            allowNetwork: options.allowNetwork === true,
             allowTempSockets: true,
           })
         : undefined;
@@ -796,12 +787,6 @@ export async function runCommand(command, options = {}) {
   } finally {
     if (dir) await rm(dir, { recursive: true, force: true });
   }
-}
-export async function assertWithin(path, root) {
-  const [target, base] = await Promise.all([realpath(path), realpath(root)]);
-  const rel = relative(base, target);
-  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error(`path escapes repository: ${path}`);
-  return target;
 }
 
 const TEMP_PROBE_SCRIPT = [

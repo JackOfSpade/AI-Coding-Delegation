@@ -1,11 +1,12 @@
 import { mkdir, open as openFile, opendir, rename, rm, rmdir, writeFile, chmod, lstat, realpath, link, unlink } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { redact as foundationRedact, redactText, redactTokenShapes, safeTokenAccountingValue } from './redact.mjs';
 import { validJobId } from './job-manager.mjs';
+import { pidAlive as defaultPidAlive } from './pid.mjs';
+import { getGitDir } from './lease.mjs';
 import { anthropicContentMatchesAssistant, validAnthropicContent } from './anthropic-content.mjs';
 import { validOpenAIReasoning } from './openai-reasoning.mjs';
 
@@ -26,6 +27,7 @@ const MAX_JOB_DIRS = 2_000;
 const INTEGRITY_VERSION = 1;
 const INTEGRITY_DOMAIN = 'offload job integrity v1\0';
 const PUBLICATION_ARTIFACTS = new Set(['patch.diff', 'revert.diff', 'report.md']);
+const PATCH_ARTIFACTS = new Set(['patch.diff', 'revert.diff']);
 const LOCK_STALE_MS = 120_000;
 const LOCK_WAIT_MS = 25;
 const LOCK_TIMEOUT_MS = 120_000;
@@ -99,8 +101,7 @@ function validEnvelope(value) {
     !Array.isArray(value) &&
     value.version === INTEGRITY_VERSION &&
     value.algorithm === 'hmac-sha256' &&
-    typeof value.mac === 'string' &&
-    /^[0-9a-f]{64}$/i.test(value.mac) &&
+    validDigest(value.mac) &&
     Object.keys(value).every((key) => ['version', 'algorithm', 'mac'].includes(key))
   );
 }
@@ -287,6 +288,8 @@ async function json(path, fallback = null) {
 }
 
 export class JobStore {
+  // Jobs whose progress log already carries its single truncation marker (the lock/serial queue makes check-and-add race free).
+  #truncationMarked = new Set();
   constructor({ gitDir, repoPath, now = () => new Date(), id = () => randomUUID().replaceAll('-', ''), secrets = [], integrity } = {}) {
     this.gitDir = gitDir && resolve(gitDir);
     this.repoPath = repoPath;
@@ -342,17 +345,7 @@ export class JobStore {
     return job;
   }
   async init(repoPath = this.repoPath) {
-    if (!this.gitDir) {
-      const env = { ...process.env };
-      for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
-      const gd = execFileSync('git', ['-C', resolve(repoPath || process.cwd()), 'rev-parse', '--git-dir'], {
-        encoding: 'utf8',
-        env,
-        timeout: 30_000,
-        maxBuffer: 1024 * 1024,
-      }).trim();
-      this.gitDir = resolve(repoPath || process.cwd(), gd);
-    }
+    if (!this.gitDir) this.gitDir = getGitDir(resolve(repoPath || process.cwd()));
     // Canonicalize before checking ancestry: macOS exposes /tmp through a
     // system link, but no repository-controlled link may survive this point.
     this.gitDir = await realpath(this.gitDir);
@@ -463,22 +456,22 @@ export class JobStore {
   async getOperational(id) {
     return this.#readJob(id, { authenticate: false });
   }
-  async #readJob(id, { authenticate }) {
-    await this.init();
-    const path = join(await this.#assertJobDirectory(id), 'job.json');
-    let job;
-    // A normal writer publishes with same-directory rename. Retry one checked
-    // read if that benign replacement races our descriptor identity check;
-    // a persistent link/corruption still fails closed.
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+  // A normal writer publishes with same-directory rename. Retry one checked read if that benign replacement races our
+  // descriptor identity check; a persistent link/corruption still fails closed.
+  async #readJobFile(path) {
+    for (let attempt = 0; ; attempt += 1) {
       try {
-        job = await json(path);
-        break;
+        return await json(path);
       } catch (error) {
         if (attempt === 0 && /^stored file .*changed/.test(error.message || '')) continue;
         throw error;
       }
     }
+  }
+  async #readJob(id, { authenticate }) {
+    await this.init();
+    const path = join(await this.#assertJobDirectory(id), 'job.json');
+    const job = await this.#readJobFile(path);
     if (!job) throw new Error(`job not found: ${id}`);
     if (job.id !== id) throw new Error('stored job id does not match its directory');
     if (this.integrityRequired(job) && !this.verifyJob(job)) throw new Error('stored job integrity check failed');
@@ -579,7 +572,8 @@ export class JobStore {
         if (event?.type === 'progress') {
           const size = (await lstat(path).catch(() => null))?.size || 0;
           if (size > MAX_PROGRESS_LOG_BYTES) {
-            if (size > MAX_PROGRESS_LOG_BYTES + 1024) return;
+            if (size > MAX_PROGRESS_LOG_BYTES + 1024 || this.#truncationMarked.has(id)) return;
+            this.#truncationMarked.add(id);
             return this.#appendBounded(path, JSON.stringify({ type: 'progress-truncated', at: this.now().toISOString() }) + '\n');
           }
         }
@@ -713,11 +707,7 @@ export class JobStore {
     const directory = await this.#assertJobDirectory(id);
     const job = await this.get(id);
     const bytes = await readStoredBytes(join(directory, name), MAX_ARTIFACT_BYTES, Buffer.alloc(0));
-    if (
-      this.integrityRequired(job) &&
-      ['patch.diff', 'revert.diff', 'report.md'].includes(name) &&
-      (bytes.length > 0 || job.artifactDigests?.[name])
-    ) {
+    if (this.integrityRequired(job) && PUBLICATION_ARTIFACTS.has(name) && (bytes.length > 0 || job.artifactDigests?.[name])) {
       const actual = digest(bytes),
         committed = job.artifactDigests?.[name],
         pending = job.artifactPendingDigests?.[name];
@@ -728,7 +718,7 @@ export class JobStore {
   }
   async readArtifact(id, name) {
     const bytes = await this.readArtifactBytes(id, name);
-    if (['patch.diff', 'revert.diff'].includes(name)) return safePatchDisplay(bytes);
+    if (PATCH_ARTIFACTS.has(name)) return safePatchDisplay(bytes);
     return decodeStoredUtf8(bytes, 'stored artifact');
   }
   /** Resolve a sealed publication intent after a process crash.  This is
@@ -784,11 +774,11 @@ export class JobStore {
   }
   async #writeArtifact(id, name, content, { authenticate }) {
     await this.init();
-    if (!['patch.diff', 'revert.diff', 'report.md'].includes(name)) throw new Error('invalid artifact');
+    if (!PUBLICATION_ARTIFACTS.has(name)) throw new Error('invalid artifact');
     if (!Buffer.isBuffer(content) && typeof content !== 'string') throw new TypeError('artifact content must be a string or Buffer');
     const raw = Buffer.isBuffer(content) ? Buffer.from(content) : Buffer.from(content, 'utf8');
     if (raw.length > MAX_ARTIFACT_BYTES) throw new Error('artifact exceeds size limit');
-    const patchArtifact = ['patch.diff', 'revert.diff'].includes(name);
+    const patchArtifact = PATCH_ARTIFACTS.has(name);
     if (patchArtifact && this.secrets.some((secret) => raw.includes(Buffer.from(secret, 'utf8'))))
       throw new Error('refusing to persist patch containing configured secret');
     const path = join(await this.#assertJobDirectory(id), name);
@@ -844,7 +834,7 @@ export class JobStore {
         ...(await Promise.all(
           ids.slice(start, start + 16).map(async (id) => {
             const directory = await this.#assertJobDirectory(id).catch(() => null);
-            const job = directory && (await json(join(directory, 'job.json')).catch(() => null));
+            const job = directory && (await this.#readJobFile(join(directory, 'job.json')).catch(() => null));
             // Listing is also an authority boundary: callers feed these records to
             // lifecycle recovery. A plain/injected store must not surface a record
             // whose embedded id points at another directory (or an invalid path),
@@ -1058,7 +1048,7 @@ export class JobStore {
     for (;;) {
       if (await this.#publicationTombstonePending(directory)) {
         if (Date.now() >= deadline) throw new Error('job publication lock is busy');
-        await new Promise((resolve) => setTimeout(resolve, LOCK_WAIT_MS));
+        await sleep(LOCK_WAIT_MS);
         continue;
       }
       let handle, createdIdentity;
@@ -1121,7 +1111,7 @@ export class JobStore {
           continue;
         }
         if (Date.now() >= deadline) throw new Error('job publication lock is busy');
-        await new Promise((resolve) => setTimeout(resolve, LOCK_WAIT_MS));
+        await sleep(LOCK_WAIT_MS);
       }
     }
     try {
@@ -1264,7 +1254,7 @@ export class JobStore {
     }
     if (!this.integrityRequired(job)) return text;
     const committed = job.transcriptDigest;
-    if (typeof committed !== 'string' || !/^[0-9a-f]{64}$/i.test(committed)) throw new Error('stored transcript integrity check failed');
+    if (!validDigest(committed)) throw new Error('stored transcript integrity check failed');
     const actual = digest(text),
       bytes = Buffer.byteLength(text);
     const committedBytes = job.transcriptBytes;
@@ -1279,13 +1269,7 @@ export class JobStore {
     const pendingBytes = job.transcriptPendingBytes;
     // Both possibilities are a deterministic consequence of a crash between
     // the sealed intent, same-directory rename, and final sealed commit.
-    if (
-      typeof pending !== 'string' ||
-      !/^[0-9a-f]{64}$/i.test(pending) ||
-      !Number.isSafeInteger(pendingBytes) ||
-      pendingBytes < 0 ||
-      pendingBytes > MAX_TRANSCRIPT_BYTES
-    )
+    if (!validDigest(pending) || !Number.isSafeInteger(pendingBytes) || pendingBytes < 0 || pendingBytes > MAX_TRANSCRIPT_BYTES)
       throw new Error('stored transcript integrity check failed');
     if (committedMatches || (actual === pending && bytes === pendingBytes)) return text;
     throw new Error('stored transcript integrity check failed');
@@ -1440,14 +1424,4 @@ function validStoredJob(value) {
     typeof value.createdAt === 'string' &&
     validPublicationState(value)
   );
-}
-
-function defaultPidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === 'EPERM';
-  }
 }

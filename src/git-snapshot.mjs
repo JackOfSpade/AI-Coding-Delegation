@@ -1,4 +1,4 @@
-import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync, renameSync } from 'node:fs';
+import { closeSync, mkdirSync, mkdtempSync, openSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -78,18 +78,6 @@ export function diffTreeFiles(repoPath, before, after) {
     { output: 'buffer' },
   );
   return parseNulNameStatus(raw);
-}
-
-/** Return a binary-safe tree diff constrained to validated repo-relative glob paths. */
-export function diffTreePaths(repoPath, before, after, paths) {
-  return diffTrees(repoPath, before, after, { paths });
-}
-
-/** Persist a generated patch atomically and return its content. */
-export function createPatch(repoPath, before, after, patchPath, { paths } = {}) {
-  const patch = diffTrees(repoPath, before, after, { paths });
-  if (patchPath) atomicWrite(patchPath, patch);
-  return patch;
 }
 
 /** Check a reverse patch by default; apply only when apply:true is explicitly supplied. */
@@ -222,7 +210,7 @@ export function parseNulNameStatus(raw) {
   }
   return files;
 }
-function atomicWrite(file, contents) {
+export function atomicWrite(file, contents) {
   const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
   let fd,
     created = false;

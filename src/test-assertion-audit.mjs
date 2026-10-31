@@ -6,7 +6,9 @@ const MAX_LINE_LENGTH = 1000;
 // leave room for all the existing lifecycle metadata, not just entry counts.
 const MAX_AUDIT_BYTES = 128 * 1024;
 const TEST_PATH =
-  /(?:^|\/)(?:tests?|__tests__|specs?)(?:\/|\.[^/]+$)|(?:^|\/)(?:test_[^/]+|[^/]+_test\.[^/]+|[^/]+\.(?:test|spec)\.[^/]+|[^/]*Tests?\.[^/]+)$/i;
+  /(?:^|\/)(?:tests?|__tests__|specs?)(?:\/|\.[^/]+$)|(?:^|\/)(?:test_[^/]+|[^/]+_test\.[^/]+|[^/]+\.(?:test|spec)\.[^/]+)$/i;
+// CamelCase conventions (ParserTests.java, FooTest.cs) need a case-sensitive match so latest.json is not a test file.
+const CAMEL_TEST_PATH = /(?:^|\/)(?:[^/]*[a-z0-9])?Tests?\.[^/]+$/;
 
 /** Decode Git's C-quoted paths, including octal-escaped UTF-8 bytes. */
 function oldPath(header) {
@@ -64,7 +66,9 @@ function* patchLines(patch) {
 export function auditTestAssertions(patch, files) {
   const paths = new Set(
     (Array.isArray(files) ? files : [])
-      .filter((file) => typeof file?.path === 'string' && file.status !== 'A' && TEST_PATH.test(file.path))
+      .filter(
+        (file) => typeof file?.path === 'string' && file.status !== 'A' && (TEST_PATH.test(file.path) || CAMEL_TEST_PATH.test(file.path)),
+      )
       .map((file) => file.path),
   );
   const removed = [];

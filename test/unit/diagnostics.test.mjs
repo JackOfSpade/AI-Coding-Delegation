@@ -10,7 +10,6 @@ import {
   defaultLogDir,
   jobLogWindow,
   LOG_DEFAULTS,
-  renderJobLog,
   resolveLogWindow,
 } from '../../src/diagnostics.mjs';
 import { redactText } from '../../src/redact.mjs';
@@ -97,8 +96,8 @@ test('OFFLOAD_LOG=off disables and OFFLOAD_LOG_DIR overrides the location', () =
 
 test('a successfully completed job is not marked as needing failure diagnosis', () => {
   for (const status of ['DONE', 'DONE_VERIFIED', 'DONE_UNVERIFIED'])
-    assert.doesNotMatch(renderJobLog({ id: 'successful', status }, ''), /needsDiagnosis/);
-  assert.match(renderJobLog({ id: 'failed', status: 'FAILED' }, ''), /"needsDiagnosis": true/);
+    assert.doesNotMatch(jobLogWindow({ id: 'successful', status }, '').text, /needsDiagnosis/);
+  assert.match(jobLogWindow({ id: 'failed', status: 'FAILED' }, '').text, /"needsDiagnosis": true/);
 });
 
 test('job log digest leads with header, error, and non-progress tail', () => {
@@ -109,7 +108,7 @@ test('job log digest leads with header, error, and non-progress tail', () => {
   ]
     .map((event) => JSON.stringify(event))
     .join('\n');
-  const text = renderJobLog({ id: 'oj-1', status: 'FAILED', error: 'provider down' }, `${events}\n`);
+  const text = jobLogWindow({ id: 'oj-1', status: 'FAILED', error: 'provider down' }, `${events}\n`).text;
   assert.ok(text.startsWith(DEBUG_HEADER));
   assert.match(text, /"needsDiagnosis": true/);
   assert.match(text, /provider down/);
@@ -178,7 +177,6 @@ test('a window that holds every event keeps the plain header and the verbatim ev
   assert.equal(rawSection(text).header, 'EVENTS (raw, oldest first)');
   assert.ok(text.endsWith(`${events}\n`));
   assert.equal(info.truncated, false);
-  assert.equal(renderJobLog({ id: 'oj-1', status: 'DONE' }, `${events}\n`), text);
 });
 
 test('the digest carries the failure kind and the last failing call, and an oversized digest is clipped, not the events', () => {
@@ -338,7 +336,6 @@ test('redaction is applied before the window is measured, so a short secret cann
   assert.ok(text.length <= 2_000, `${text.length}`);
   assert.doesNotMatch(text, /abcd1234/);
   assert.ok(info.shown > 0 && info.truncated);
-  assert.equal(renderJobLog(job, secretLines, window, ['abcd1234']), text);
   // Token-shaped text is shortened or lengthened by redaction the same way.
   const assignments = Array.from({ length: 200 }, () => JSON.stringify({ type: 'x', m: 'KEY=a' })).join('\n');
   const shaped = jobLogWindow(job, assignments, window, []);

@@ -3,6 +3,7 @@ import { readdir } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
+import { processExit } from './process-exit.mjs';
 
 const IGNORED_DIRECTORIES = new Set(['.git', 'artifacts', 'coverage', 'node_modules']);
 const JAVASCRIPT_EXTENSIONS = new Set(['.cjs', '.js', '.mjs']);
@@ -26,18 +27,9 @@ export async function discoverSyntaxTargets(projectRoot = process.cwd()) {
   return (await discover(root)).sort();
 }
 
-function checkOneSyntaxTarget(target, stdio) {
-  return new Promise((resolveCheck, rejectCheck) => {
-    const child = spawn(process.execPath, ['--check', target], {
-      stdio,
-      windowsHide: true,
-    });
-    child.once('error', rejectCheck);
-    child.once('exit', (code) => {
-      if (code === 0) resolveCheck();
-      else rejectCheck(new Error(`syntax check failed for ${target}`));
-    });
-  });
+async function checkOneSyntaxTarget(target, stdio) {
+  const code = await processExit(spawn(process.execPath, ['--check', target], { stdio, windowsHide: true }));
+  if (code !== 0) throw new Error(`syntax check failed for ${target}`);
 }
 
 export async function checkSyntaxTargets(targets, { concurrency = 8, stdio = 'inherit' } = {}) {

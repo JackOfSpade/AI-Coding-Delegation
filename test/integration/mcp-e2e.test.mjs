@@ -8,6 +8,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { sandboxAvailable } from '../../src/sandbox.mjs';
 import { createMockOpenAIServer } from '../mock-openai-server.mjs';
+import { LOOPBACK_SKIP_MARKER } from '../run-suite.mjs';
 
 // Every scenario here drives the real server entry point (`offload mcp`, a
 // stdio JSON-RPC peer) against the mock provider, a real private worktree and,
@@ -195,7 +196,7 @@ async function withServer(t, { repo, limits, scripts = [] }, body) {
     server = await createMockOpenAIServer(scripts);
   } catch (error) {
     if (error.code === 'EPERM') {
-      t.skip('loopback networking is unavailable in this sandbox');
+      t.skip(LOOPBACK_SKIP_MARKER);
       return;
     }
     throw error;

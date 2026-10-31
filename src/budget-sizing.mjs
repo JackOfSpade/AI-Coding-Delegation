@@ -39,7 +39,8 @@ const MAX_SAFE_BYTES = 64 * MAX_SIZED_BYTES;
 const MAX_ECHOED_FILES = 8;
 const MAX_ECHOED_WARNINGS = 4;
 const MAX_WARNING_CHARS = 400;
-const TURN_SOURCES = new Set(['default', 'scaled', 'caller', 'raised']);
+/** Closed vocabulary of `turnsSource` provenance values; the single source of truth. */
+export const TURN_SOURCES = new Set(['default', 'scaled', 'caller', 'raised']);
 const TURN_POLICIES = new Set(['auto', 'fixed']);
 const GLOB_CHARACTERS = /[*?[\]{}!]/;
 const RANGE_SUFFIX = /^(.+):(\d{1,7})-(\d{1,7})$/;

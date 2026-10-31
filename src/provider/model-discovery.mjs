@@ -45,10 +45,10 @@ export async function resolveLatestDeepSeekFlash(options = {}) {
 }
 
 /** Highest numeric gpt major/minor in one line; list order and created dates never decide. */
-export async function resolveLatestOpenAI(line, { key, apiKey = key, fetch, fetchImpl = fetch ?? globalThis.fetch, ...options } = {}) {
+export async function resolveLatestOpenAI(line, options = {}) {
   if (!Object.hasOwn(OPENAI_LINES, line)) throw new TypeError('unsupported OpenAI model line');
   const spec = OPENAI_LINES[line];
-  const body = await models('OpenAI', { ...options, apiKey, fetchImpl });
+  const body = await models('OpenAI', options);
   let best;
   for (const entry of Array.isArray(body?.data) ? body.data : []) {
     const id = entry?.id;

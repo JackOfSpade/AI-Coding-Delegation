@@ -1,5 +1,8 @@
 const REGEX_SPECIAL = /[|\\{}()[\]^$+?.]/g;
 
+/** Escape every RegExp metacharacter in a literal string. */
+export const escapeRegExp = (value) => value.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&');
+
 const windows = (platform) => platform === 'win32';
 const reservedWindowsName = (segment) => /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(segment);
 

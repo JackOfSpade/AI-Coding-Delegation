@@ -2,12 +2,23 @@ import { chmodSync, lstatSync, mkdtempSync, readlinkSync, realpathSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { diffTreeFiles, diffTrees, git, gitErrorDetail, snapshotGitEnv, snapshotWorkingTree } from './git-snapshot.mjs';
+import {
+  GitSnapshotError,
+  diffTreeFiles,
+  diffTrees,
+  git,
+  gitErrorDetail,
+  parseNulNameStatus,
+  snapshotGitEnv,
+  snapshotWorkingTree,
+} from './git-snapshot.mjs';
 import { matchesAny, normalizePath } from './glob.mjs';
 import { DEFAULT_DENY_READ } from './policy.mjs';
 import { redactText, stripTerminalControls } from './redact.mjs';
 
 const TREE_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+const PRIVATE_ROOT_NAME = /^offload-worktree-[A-Za-z0-9_-]+$/; // no g/y flag: safe to share with .test()
+const TREE_PIN_NAMES = Object.freeze(['baseline', 'seed', 'after']);
 const nativeRealpath = realpathSync.native || realpathSync;
 
 /** A stable, caller-actionable error boundary for isolated worktree operations. */
@@ -58,7 +69,12 @@ export function createIsolatedWorktree({
     run(primaryPath, ['worktree', 'add', '--detach', '--no-checkout', workspacePath, 'HEAD'], 'E_WORKTREE_CREATE');
     run(workspacePath, ['read-tree', '--reset', '-u', seedTree], 'E_WORKTREE_SEED');
   } catch (error) {
-    safeRemove(primaryPath, workspacePath, privateRoot, { ownPrivateRoot: true, privateBase, privateRootProof });
+    try {
+      safeRemove(primaryPath, workspacePath, privateRoot, { ownPrivateRoot: true, privateBase, privateRootProof });
+    } catch {
+      // Creation is already failing for its original reason. A cleanup failure (for example a pin-release ref lock) must not replace
+      // it; the caller has no handle to retry with, so surfacing E_WORKTREE_PIN 'can be retried' would mislead.
+    }
     if (error instanceof WorktreeIsolationError) throw error;
     throw new WorktreeIsolationError('Could not create isolated worktree', 'E_WORKTREE_CREATE');
   }
@@ -217,7 +233,9 @@ function isolatedHandle({
      */
     verifyPrimary(afterTree, { paths: requestedPaths } = {}) {
       ensureOpen();
-      return verifyPrimaryTree(primaryPath, baselineTree, afterTree, requestedPaths);
+      const result = { ...verifyPrimaryTree(primaryPath, baselineTree, afterTree, requestedPaths) };
+      delete result.change; // keep the public shape and do not hand out the patch bytes
+      return result;
     },
 
     /**
@@ -279,14 +297,14 @@ function verifyPrimaryTree(primaryPath, baselineTree, afterTree, requestedPaths)
   } catch {
     throw new WorktreeIsolationError('Could not snapshot primary working tree', 'E_WORKTREE_PRIMARY_SNAPSHOT');
   }
-  if (paths.length === 0) return { ok: true, baselineTree, primaryTree, conflicts: [] };
+  if (paths.length === 0) return { ok: true, baselineTree, primaryTree, conflicts: [], change };
   let conflictFiles;
   try {
     conflictFiles = diffTreeFilesForPaths(primaryPath, baselineTree, primaryTree, paths);
   } catch {
     throw new WorktreeIsolationError('Could not compare primary working tree', 'E_WORKTREE_VERIFY');
   }
-  return { ok: conflictFiles.length === 0, baselineTree, primaryTree, conflicts: conflictFiles };
+  return { ok: conflictFiles.length === 0, baselineTree, primaryTree, conflicts: conflictFiles, change };
 }
 
 function integrateTree(primaryPath, baselineTree, afterTree, requestedPaths, { dryRun = false } = {}) {
@@ -297,17 +315,9 @@ function integrateTree(primaryPath, baselineTree, afterTree, requestedPaths, { d
       'E_WORKTREE_CONFLICT',
     );
   }
-  let change;
-  try {
-    // Finish every fallible diff calculation before mutating the primary
-    // checkout.  A caller can then treat a successful `git apply` as the
-    // sole primary-write boundary and journal it without a later
-    // best-effort computation obscuring whether the patch landed.
-    change = treeChanges(primaryPath, baselineTree, afterTree, requestedPaths);
-  } catch (error) {
-    if (error instanceof WorktreeIsolationError) throw error;
-    throw new WorktreeIsolationError('Could not create integration patch', 'E_WORKTREE_DIFF');
-  }
+  // The diff was computed during verification, before any primary mutation, so a successful `git apply` stays the sole
+  // primary-write boundary and no later computation can obscure whether the patch landed.
+  const { change } = verification;
   const { patch } = change;
   if (patch.length === 0) return { applied: false, dryRun: true, files: [] };
   try {
@@ -573,16 +583,6 @@ export function workingTreeStatus(repoPath, { execFile = execFileSync } = {}) {
   return { clean: tally.changed === 0, ...tally, sample };
 }
 
-/** Convenience for the normal JobManager baseline capture path. */
-export function snapshotPrimaryWorkingTree(repoPath) {
-  const primaryPath = canonicalRepo(repoPath);
-  try {
-    return snapshotWorkingTree(primaryPath);
-  } catch {
-    throw new WorktreeIsolationError('Could not snapshot primary working tree', 'E_WORKTREE_PRIMARY_SNAPSHOT');
-  }
-}
-
 /**
  * Keep durable job snapshot trees reachable without exposing a general ref
  * writer. JobManager decides when a record is retained or purged; this helper
@@ -711,7 +711,7 @@ function makePrivateRoot(tempRoot, mkdtemp) {
   const supplied = resolve(root);
   // Never delete a path merely because an injected/broken allocator returned
   // it. It first has to prove it is exactly our direct, private child.
-  if (!isChildOf(base, supplied) || !samePath(dirname(supplied), base) || !/^offload-worktree-[A-Za-z0-9_-]+$/.test(basename(supplied)))
+  if (!isChildOf(base, supplied) || !samePath(dirname(supplied), base) || !PRIVATE_ROOT_NAME.test(basename(supplied)))
     throw new WorktreeIsolationError('mkdtemp returned an unsafe private directory', 'E_WORKTREE_TEMP');
   let details;
   let canonicalRoot;
@@ -764,7 +764,7 @@ function privateWorkspaceLocation(workspacePath, tempRoot, { requireExisting }) 
     !samePath(join(privateRoot, 'workspace'), canonicalWorkspace) ||
     !isChildOf(base, privateRoot) ||
     !samePath(dirname(privateRoot), base) ||
-    !/^offload-worktree-[A-Za-z0-9_-]+$/.test(basename(privateRoot))
+    !PRIVATE_ROOT_NAME.test(basename(privateRoot))
   ) {
     throw new WorktreeIsolationError('workspacePath is outside the private offload worktree layout', 'E_WORKTREE_RECOVERY');
   }
@@ -783,7 +783,7 @@ function assertTreeExists(repoPath, tree, code) {
 }
 function treePinRef(privateRoot, name) {
   const rootName = basename(privateRoot);
-  if (!/^offload-worktree-[A-Za-z0-9_-]+$/.test(rootName) || !['baseline', 'seed', 'after'].includes(name))
+  if (!PRIVATE_ROOT_NAME.test(rootName) || !TREE_PIN_NAMES.includes(name))
     throw new WorktreeIsolationError('Invalid private worktree reference', 'E_WORKTREE_PIN');
   return `refs/offload/worktrees/${rootName}/${name}`;
 }
@@ -830,7 +830,7 @@ function releaseTreePins(repoPath, privateRoot, { bestEffort = false } = {}) {
     // overlooked. This transaction removes the fixed namespace or nothing.
     runRefTransaction(
       repoPath,
-      ['baseline', 'seed', 'after'].map((name) => `delete ${treePinRef(privateRoot, name)}`),
+      TREE_PIN_NAMES.map((name) => `delete ${treePinRef(privateRoot, name)}`),
       {
         tolerateMissing: true,
         errorCode: 'E_WORKTREE_PIN',
@@ -842,7 +842,7 @@ function releaseTreePins(repoPath, privateRoot, { bestEffort = false } = {}) {
   }
 }
 function hasTreePins(repoPath, privateRoot) {
-  return ['baseline', 'seed', 'after'].some((name) => {
+  return TREE_PIN_NAMES.some((name) => {
     try {
       run(repoPath, ['show-ref', '--verify', '--quiet', treePinRef(privateRoot, name)], 'E_WORKTREE_PIN');
       return true;
@@ -873,30 +873,16 @@ function diffTreeFilesForPaths(repoPath, before, after, paths) {
     'E_WORKTREE_VERIFY',
     { output: 'buffer' },
   );
-  if (!Buffer.isBuffer(raw)) throw new WorktreeIsolationError('Malformed Git changed-path output', 'E_WORKTREE_VERIFY');
-  const fields = [];
-  let start = 0;
-  for (let index = 0; index < raw.length; index += 1) {
-    if (raw[index] !== 0) continue;
-    fields.push(raw.subarray(start, index));
-    start = index + 1;
+  try {
+    return parseNulNameStatus(raw);
+  } catch (error) {
+    throw new WorktreeIsolationError(
+      error instanceof GitSnapshotError && /UTF-8/.test(error.message)
+        ? 'Git changed-path output is not valid UTF-8'
+        : 'Malformed Git changed-path output',
+      'E_WORKTREE_VERIFY',
+    );
   }
-  if (start !== raw.length || fields.length % 2 !== 0)
-    throw new WorktreeIsolationError('Malformed Git changed-path output', 'E_WORKTREE_VERIFY');
-  const files = [];
-  for (let index = 0; index + 1 < fields.length; index += 2) {
-    let status;
-    let path;
-    try {
-      status = new TextDecoder('utf-8', { fatal: true }).decode(fields[index]);
-      path = new TextDecoder('utf-8', { fatal: true }).decode(fields[index + 1]);
-    } catch {
-      throw new WorktreeIsolationError('Git changed-path output is not valid UTF-8', 'E_WORKTREE_VERIFY');
-    }
-    if (!status || !path) throw new WorktreeIsolationError('Malformed Git changed-path output', 'E_WORKTREE_VERIFY');
-    files.push({ status: status[0], path });
-  }
-  return files;
 }
 function selectChangedFiles(allFiles, paths) {
   if (paths === undefined) return allFiles;
@@ -1026,12 +1012,7 @@ function privateRootExists(privateRoot) {
 }
 function capturePrivateRoot(privateRoot, base) {
   const resolvedRoot = resolve(privateRoot);
-  if (
-    !base ||
-    !isChildOf(base, resolvedRoot) ||
-    dirname(resolvedRoot) !== base ||
-    !/^offload-worktree-[A-Za-z0-9_-]+$/.test(basename(resolvedRoot))
-  ) {
+  if (!base || !isChildOf(base, resolvedRoot) || dirname(resolvedRoot) !== base || !PRIVATE_ROOT_NAME.test(basename(resolvedRoot))) {
     throw new WorktreeIsolationError('private worktree root is outside the managed layout', 'E_WORKTREE_REMOVE');
   }
   let details;

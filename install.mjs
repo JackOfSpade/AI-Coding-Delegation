@@ -17,8 +17,9 @@ import {
   validateConfig,
 } from './src/config.mjs';
 import { parseKeyRef, resolveKeyRef, storeKeychainSecret } from './src/secrets.mjs';
-import { doctor, doctorLive, keysSummary, routeKeyTargets } from './src/doctor.mjs';
+import { doctor, keysSummary, routeKeyTargets } from './src/doctor.mjs';
 import { resolveClientPaths } from './src/client-paths.mjs';
+import { sameBigintFileStat } from './src/stat-identity.mjs';
 import { runtimeIdentityFor } from './src/identity.mjs';
 import {
   COMMAND_SKILL_NAMES as commandSkillNames,
@@ -143,51 +144,52 @@ const exists = async (p) => {
     throw error;
   }
 };
+// Descriptor-checked read: lstat (bigint), require a regular file, open with O_NOFOLLOW|O_NONBLOCK,
+// require identical identity metadata before and after the read, and close the handle.
+// ENOENT and other fs errors propagate unchanged; every safety failure throws a generic 'unsafe'.
+async function readCheckedBytes(path, maximum) {
+  const before = await lstat(path, BIGINT_STAT_OPTIONS);
+  if (!before.isFile() || before.isSymbolicLink() || before.size > BigInt(maximum)) throw new Error('unsafe');
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
+  try {
+    const opened = await handle.stat(BIGINT_STAT_OPTIONS);
+    if (!opened.isFile() || !sameBigintFileStat(before, opened)) throw new Error('unsafe');
+    const bytes = await readHandleBytes(handle, opened.size, maximum);
+    const after = await handle.stat(BIGINT_STAT_OPTIONS);
+    if (!sameBigintFileStat(opened, after)) throw new Error('unsafe');
+    return { bytes, metadata: after };
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
 async function read(p, { withMetadata = false } = {}) {
   // Client state is user data, but never follow a substituted final symlink
   // while inspecting it or creating a backup. The descriptor identity check
   // also catches a same-name replacement between lstat and read.
-  let before, after, handle, bytes;
+  let bytes, metadata;
   try {
-    before = await lstat(p, BIGINT_STAT_OPTIONS);
-    if (!before.isFile() || before.isSymbolicLink() || before.size > BigInt(MAX_CLIENT_FILE_BYTES)) throw new Error('unsafe');
-    handle = await open(p, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
-    const opened = await handle.stat(BIGINT_STAT_OPTIONS);
-    if (!opened.isFile() || !sameArtifactMetadata(before, opened)) throw new Error('unsafe');
-    bytes = await readHandleBytes(handle, opened.size, MAX_CLIENT_FILE_BYTES);
-    after = await handle.stat(BIGINT_STAT_OPTIONS);
-    if (!sameArtifactMetadata(opened, after)) throw new Error('unsafe');
+    ({ bytes, metadata } = await readCheckedBytes(p, MAX_CLIENT_FILE_BYTES));
   } catch (error) {
     if (error?.code === 'ENOENT') return withMetadata ? undefined : '';
     throw new Error(`refusing unsafe installer file: ${p}`);
-  } finally {
-    await handle?.close().catch(() => {});
   }
   try {
     const content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-    return withMetadata ? { content, metadata: after } : content;
+    return withMetadata ? { content, metadata } : content;
   } catch {
     throw new Error(`refusing non-text installer file: ${p}`);
   }
 }
 async function requiredArtifact(path) {
-  let before, handle, bytes;
+  let bytes;
   try {
-    before = await lstat(path, BIGINT_STAT_OPTIONS);
-    if (!before.isFile() || before.isSymbolicLink() || !safeArtifactSize(before.size)) throw new Error('invalid');
     // A package root may be selected through an environment/client hook. Read
     // its static routing artifacts through the checked descriptor rather than
     // following a final-component replacement into an unrelated host file.
-    handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
-    const opened = await handle.stat(BIGINT_STAT_OPTIONS);
-    if (!opened.isFile() || !sameArtifactMetadata(before, opened)) throw new Error('invalid');
-    bytes = await readHandleBytes(handle, opened.size, MAX_ARTIFACT_BYTES);
-    const after = await handle.stat(BIGINT_STAT_OPTIONS);
-    if (!sameArtifactMetadata(opened, after) || !safeArtifactSize(BigInt(bytes.length))) throw new Error('invalid');
+    ({ bytes } = await readCheckedBytes(path, MAX_ARTIFACT_BYTES));
+    if (!safeArtifactSize(BigInt(bytes.length))) throw new Error('invalid');
   } catch {
     throw new Error(`required installer artifact is missing, unsafe, or unreadable: ${path}`);
-  } finally {
-    await handle?.close().catch(() => {});
   }
   let content;
   try {
@@ -212,9 +214,6 @@ async function readHandleBytes(handle, size, maximum) {
     offset += bytesRead;
   }
   return bytes;
-}
-function sameArtifactMetadata(left, right) {
-  return ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].every((key) => typeof left?.[key] === 'bigint' && left[key] === right?.[key]);
 }
 async function atomic(path, content, { mode = 0o600 } = {}) {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
@@ -319,6 +318,19 @@ const shellQuote = (value, platform) => {
   }
   return `'${text.replace(/'/g, `'"'"'`)}'`;
 };
+const doctorHookCommand = (root, platform) =>
+  `${shellQuote(process.execPath, platform)} ${shellQuote(join(root, 'install.mjs'), platform)} --doctor-hook`;
+// Remove the recorded hook, trying the recorded matcher or, for older manifests, the legacy '' and 'startup' matchers.
+function removeRecordedSessionHook(entries, hook, recordedMatcher) {
+  let removed = false;
+  let next = entries;
+  for (const matcher of recordedMatcher ? [recordedMatcher] : ['', 'startup']) {
+    const result = removeExactSessionHook(next, hook, matcher);
+    next = result.next;
+    removed ||= result.removed;
+  }
+  return { next, removed };
+}
 async function readManifest(path) {
   const raw = await read(path);
   if (!raw) return { version: 1, registrations: {}, files: {}, plugins: {} };
@@ -385,7 +397,7 @@ function parseClaudeSettings(raw, path) {
     throw new Error(`refusing invalid Claude settings JSON: ${path}`);
   return value;
 }
-export async function selectedClients(home, clients, { env = process.env, platform = process.platform, commandExists = exists } = {}) {
+async function selectedClients(home, clients, { env = process.env, platform = process.platform, commandExists = exists } = {}) {
   const known = new Set(['claude', 'codex', 'cursor']);
   if (clients != null && clients !== 'detected') {
     const values = Array.isArray(clients) ? clients : String(clients).split(',');
@@ -402,14 +414,10 @@ export async function selectedClients(home, clients, { env = process.env, platfo
   if ((await exists(paths.claudeDir)) || (await exists(paths.claudeState))) selected.add('claude');
   if (await exists(paths.codexDir)) selected.add('codex');
   if (await exists(join(home, '.cursor'))) selected.add('cursor');
-  const delimiter = platform === 'win32' ? ';' : ':';
+  const directories = pathDirectories(env, platform);
   const executableNames = platform === 'win32' ? (value) => [value, `${value}.cmd`, `${value}.exe`] : (value) => [value];
-  // Windows treats environment names case-insensitively, but callers can
-  // supply a plain object (and Windows commonly displays this variable as
-  // `Path`). Honor both spellings instead of relying on Node's live-env shim.
-  const pathValue = platform === 'win32' ? (env.PATH ?? env.Path ?? '') : env.PATH || '';
   for (const client of known)
-    for (const directory of String(pathValue).split(delimiter).filter(Boolean)) {
+    for (const directory of directories) {
       if ((await Promise.all(executableNames(client).map((name) => commandExists(join(directory, name))))).some(Boolean))
         selected.add(client);
     }
@@ -432,17 +440,18 @@ export function replaceManaged(content, block, uninstall = false) {
     return `${content.slice(0, begins[0].index)}${uninstall ? '' : managedBlock}${content.slice(ends[0].index + END.length)}`;
   return uninstall ? content : `${content}${content && !content.endsWith('\n') ? eol : ''}${managedBlock}${eol}`;
 }
+// Keep a one-time backup of the user's original bytes; never overwrite an existing one.
+async function backupOnce(path, content, backups) {
+  const backup = `${path}.offload.bak`;
+  if (await exists(backup)) return;
+  await atomic(backup, content);
+  backups.push(backup);
+}
 async function updateManaged(path, block, uninstall, backups) {
   const original = await read(path);
   const next = replaceManaged(original, block, uninstall);
   if (next === original) return false;
-  if (original && !uninstall) {
-    const backup = `${path}.offload.bak`;
-    if (!(await exists(backup))) {
-      await atomic(backup, original);
-      backups.push(backup);
-    }
-  }
+  if (original && !uninstall) await backupOnce(path, original, backups);
   await atomic(path, next);
   return true;
 }
@@ -465,16 +474,7 @@ async function migrateConfigFile(configPath, backups, changed) {
   if (status.fix === 'manual' && status.reason !== 'conflict') return { migrated: [], pending: status.profiles, reason: status.reason };
   let bytes, stat, user;
   try {
-    stat = await lstat(configPath, BIGINT_STAT_OPTIONS);
-    if (!stat.isFile()) throw new Error('unsafe');
-    const handle = await open(configPath, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
-    try {
-      if (!sameArtifactMetadata(stat, await handle.stat(BIGINT_STAT_OPTIONS))) throw new Error('unsafe');
-      bytes = await readHandleBytes(handle, stat.size, MAX_ARTIFACT_BYTES);
-      if (!sameArtifactMetadata(stat, await handle.stat(BIGINT_STAT_OPTIONS))) throw new Error('unsafe');
-    } finally {
-      await handle.close().catch(() => {});
-    }
+    ({ bytes, metadata: stat } = await readCheckedBytes(configPath, MAX_ARTIFACT_BYTES));
     user = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
   } catch {
     return none;
@@ -616,7 +616,7 @@ async function migrateLegacySkillBackup(skillPath, backupDirectory, backups, cli
   backups.push(destination);
   try {
     const current = await lstat(legacyPath, BIGINT_STAT_OPTIONS);
-    if (current.isFile() && !current.isSymbolicLink() && sameArtifactMetadata(legacy.metadata, current))
+    if (current.isFile() && !current.isSymbolicLink() && sameBigintFileStat(legacy.metadata, current))
       await rm(legacyPath, { force: true });
   } catch {
     // The completed copy is retained. Do not remove a path that changed after
@@ -705,28 +705,6 @@ function validPluginState(state, home) {
     state.version === undefined ||
     (typeof state.version === 'string' && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(state.version))
   );
-}
-function pluginExecutable(env, platform) {
-  const delimiter = platform === 'win32' ? ';' : ':';
-  const pathValue = platform === 'win32' ? (env.PATH ?? env.Path ?? '') : env.PATH || '';
-  // Prefer the native executable: `.cmd` needs cmd.exe's parser and therefore
-  // has a narrower, explicitly quoted fallback below.
-  const names = platform === 'win32' ? ['codex.exe', 'codex.cmd', 'codex'] : ['codex'];
-  return String(pathValue)
-    .split(delimiter)
-    .filter(Boolean)
-    .flatMap((directory) => names.map((name) => join(directory, name)));
-}
-function claudeExecutable(env, platform) {
-  const delimiter = platform === 'win32' ? ';' : ':';
-  const pathValue = platform === 'win32' ? (env.PATH ?? env.Path ?? '') : env.PATH || '';
-  // Prefer a native executable.  A .cmd launcher is safe only through the
-  // deliberately narrow cmd.exe wrapper below.
-  const names = platform === 'win32' ? ['claude.exe', 'claude.cmd', 'claude'] : ['claude'];
-  return String(pathValue)
-    .split(delimiter)
-    .filter(Boolean)
-    .flatMap((directory) => names.map((name) => join(directory, name)));
 }
 function pluginCommandEnv(env, home, platform) {
   // The CLI needs its state and executable search path, not a worker/provider
@@ -833,10 +811,34 @@ function runWindowsCmd(runCommand, executable, args, options, env) {
     windowsVerbatimArguments: true,
   });
 }
-function runCodexPlugin(runCommand, executable, args, options, env, platform) {
-  if (platform === 'win32' && /\.cmd$/i.test(executable)) {
-    return runWindowsCmd(runCommand, executable, args, options, env);
+function pathDirectories(env, platform) {
+  const delimiter = platform === 'win32' ? ';' : ':';
+  // Windows treats environment names case-insensitively, but callers can supply
+  // a plain object (and Windows commonly displays this variable as `Path`).
+  // Honor both spellings instead of relying on Node's live-env shim.
+  const pathValue = platform === 'win32' ? (env.PATH ?? env.Path ?? '') : env.PATH || '';
+  return String(pathValue).split(delimiter).filter(Boolean);
+}
+function executableCandidates(name, env, platform) {
+  // Prefer a native .exe; a .cmd launcher is safe only through the narrow cmd.exe wrapper (runWindowsCmd).
+  const names = platform === 'win32' ? [`${name}.exe`, `${name}.cmd`, name] : [name];
+  return pathDirectories(env, platform).flatMap((directory) => names.map((fileName) => join(directory, fileName)));
+}
+async function findExecutable(name, env, platform, commandExists) {
+  for (const path of executableCandidates(name, env, platform)) {
+    if (platform === 'win32' && /\.cmd$/i.test(path)) {
+      try {
+        windowsCmdQuote(path);
+      } catch {
+        continue;
+      }
+    }
+    if (await commandExists(path)) return path;
   }
+  return undefined;
+}
+function runClientCommand(runCommand, executable, args, options, env, platform) {
+  if (platform === 'win32' && /\.cmd$/i.test(executable)) return runWindowsCmd(runCommand, executable, args, options, env);
   return runCommand(executable, args, options);
 }
 function legacyPluginIdentityMatches(current, marketplace) {
@@ -933,43 +935,11 @@ function pluginListState(result, marketplace) {
  * while older clients get a capability check before we decide on a fallback.
  */
 function pluginCommandCapability(runCommand, executable, options, env, platform) {
-  const result = runCodexPlugin(runCommand, executable, ['plugin', '--help'], options, env, platform);
+  const result = runClientCommand(runCommand, executable, ['plugin', '--help'], options, env, platform);
   if (!commandOk(result)) return 'unknown';
   const text = `${result.stdout || ''}\n${result.stderr || ''}`;
   const commands = /\bCommands:\s*[\s\S]*/i.exec(text)?.[0] || '';
   return /\badd\b/i.test(commands) && /\blist\b/i.test(commands) && /\bremove\b/i.test(commands) ? 'supported' : 'unsupported';
-}
-async function findPluginExecutable(env, platform, commandExists) {
-  for (const path of pluginExecutable(env, platform)) {
-    if (platform === 'win32' && /\.cmd$/i.test(path)) {
-      try {
-        windowsCmdQuote(path);
-      } catch {
-        continue;
-      }
-    }
-    if (await commandExists(path)) return path;
-  }
-  return undefined;
-}
-async function findClaudeExecutable(env, platform, commandExists) {
-  for (const path of claudeExecutable(env, platform)) {
-    if (platform === 'win32' && /\.cmd$/i.test(path)) {
-      try {
-        windowsCmdQuote(path);
-      } catch {
-        continue;
-      }
-    }
-    if (await commandExists(path)) return path;
-  }
-  return undefined;
-}
-function runClaudeMcp(runCommand, executable, args, options, env, platform) {
-  if (platform === 'win32' && /\.cmd$/i.test(executable)) {
-    return runWindowsCmd(runCommand, executable, args, options, env);
-  }
-  return runCommand(executable, args, options);
 }
 function commandOutput(result) {
   return `${result?.stdout || ''}\n${result?.stderr || ''}`;
@@ -1009,7 +979,7 @@ async function manageClaudeMcp({ root, home, uninstall, env, platform, commandEx
     args: [join(root, 'bin', 'offload.mjs'), 'mcp'],
     env: approvalMode === 'approve' ? { OFFLOAD_MCP_APPROVAL_MODE: 'approve' } : {},
   };
-  const executable = await findClaudeExecutable(env, platform, commandExists);
+  const executable = await findExecutable('claude', env, platform, commandExists);
   if (!executable)
     return claudeMcpStatus(
       'unavailable',
@@ -1024,7 +994,7 @@ async function manageClaudeMcp({ root, home, uninstall, env, platform, commandEx
   };
   const invoke = (args) => {
     try {
-      return runClaudeMcp(runCommand, executable, args, options, env, platform);
+      return runClientCommand(runCommand, executable, args, options, env, platform);
     } catch {
       return { status: undefined };
     }
@@ -1112,12 +1082,13 @@ async function manageClaudeMcp({ root, home, uninstall, env, platform, commandEx
       'Claude Code CLI could not refresh Offload MCP after removing the manifest-owned registration; rerun the installer after fixing Claude Code.',
     );
   }
+  // `prior` is always unset here: every manifest-owned case returned above.
   const added = add();
-  if (commandOk(added)) return confirmAdded(prior ? 'refreshed' : 'added', 'Registered Offload MCP through the Claude Code CLI.');
-  if (!prior && claudeDuplicate(added))
+  if (commandOk(added)) return confirmAdded('added', 'Registered Offload MCP through the Claude Code CLI.');
+  if (claudeDuplicate(added))
     return claudeMcpStatus('user-owned', 'Claude already has an Offload MCP registration; leaving that user-owned registration unchanged.');
   return claudeMcpStatus(
-    prior ? 'refresh-add-failed' : 'add-failed',
+    'add-failed',
     'Claude Code CLI could not register Offload MCP; rerun the installer after fixing Claude Code. Existing Claude authentication was not modified by Offload.',
   );
 }
@@ -1203,7 +1174,8 @@ async function removePluginSource(state) {
 }
 /** Install the desktop plugin without taking ownership of pre-existing content. */
 async function manageCodexPlugin({
-  root,
+  artifacts,
+  desiredVersion,
   home,
   uninstall,
   env,
@@ -1216,6 +1188,10 @@ async function manageCodexPlugin({
   skillBackupDirectory,
   nativeSkillBlocksPlugin = false,
 }) {
+  const options = { env: pluginCommandEnv(env, home, platform), timeout: 10_000, maxBuffer: 1_000_000, windowsHide: true };
+  const codex = (executable, args) => runClientCommand(runCommand, executable, args, options, env, platform);
+  const listPluginState = (executable, marketplaceName) =>
+    pluginListState(codex(executable, ['plugin', 'list', '--json']), marketplaceName);
   const state = manifest.plugins.codex;
   // The manifest is evidence, never authority over paths. Derive the sole
   // plugin source we may inspect from the selected home before migrating an
@@ -1243,34 +1219,17 @@ async function manageCodexPlugin({
   const marketplacePath = join(home, '.agents', 'plugins', 'marketplace.json');
   if (uninstall) {
     if (!state) return { active: false, retained: false };
-    const executable = await findPluginExecutable(env, platform, commandExists);
+    const executable = await findExecutable('codex', env, platform, commandExists);
     if (state.enabled && !executable)
       return { active: true, retained: true, reason: 'Codex CLI unavailable; retained installer-owned plugin state' };
     if (state.enabled) {
       const marketplaceName = state.marketplace?.name || state.catalog?.name;
       if (!marketplaceName)
         return { active: true, retained: true, reason: 'installer state lacks a plugin marketplace; retained plugin state' };
-      const result = runCodexPlugin(
-        runCommand,
-        executable,
-        ['plugin', 'remove', `${pluginName}@${marketplaceName}`, '--json'],
-        { env: pluginCommandEnv(env, home, platform), timeout: 10_000, maxBuffer: 1_000_000, windowsHide: true },
-        env,
-        platform,
-      );
+      const result = codex(executable, ['plugin', 'remove', `${pluginName}@${marketplaceName}`, '--json']);
       if (!commandOk(result))
         return { active: true, retained: true, reason: 'Codex plugin removal failed; retained installer-owned plugin state' };
-      const removedState = pluginListState(
-        runCodexPlugin(
-          runCommand,
-          executable,
-          ['plugin', 'list', '--json'],
-          { env: pluginCommandEnv(env, home, platform), timeout: 10_000, maxBuffer: 1_000_000, windowsHide: true },
-          env,
-          platform,
-        ),
-        marketplaceName,
-      );
+      const removedState = listPluginState(executable, marketplaceName);
       if (!['inactive', 'disabled'].includes(removedState))
         return { active: true, retained: true, reason: 'Codex plugin removal was not confirmed; retained plugin state' };
       delete state.enabled;
@@ -1285,11 +1244,7 @@ async function manageCodexPlugin({
       }
       const index = marketplace?.plugins?.findIndex((entry) => equal(entry, state.marketplace.entry));
       if (index >= 0) {
-        const backup = `${marketplacePath}.offload.bak`;
-        if (!(await exists(backup))) {
-          await atomic(backup, raw);
-          backups.push(backup);
-        }
+        await backupOnce(marketplacePath, raw, backups);
         marketplace.plugins.splice(index, 1);
         await atomic(marketplacePath, JSON.stringify(marketplace, null, 2) + '\n');
         changed.push(marketplacePath);
@@ -1306,7 +1261,7 @@ async function manageCodexPlugin({
   if (nativeSkillBlocksPlugin) {
     if (!state?.enabled)
       return { active: false, nativePreferred: true, reason: 'user-owned native Codex offload skill is already installed' };
-    const executable = await findPluginExecutable(env, platform, commandExists);
+    const executable = await findExecutable('codex', env, platform, commandExists);
     if (!executable)
       return {
         active: false,
@@ -1314,41 +1269,12 @@ async function manageCodexPlugin({
         retained: true,
         reason: 'cannot remove installer-owned plugin while preserving user native skill',
       };
-    const removed = runCodexPlugin(
-      runCommand,
-      executable,
-      ['plugin', 'remove', `${pluginName}@${state.enabled.marketplace}`, '--json'],
-      { env: pluginCommandEnv(env, home, platform), timeout: 10_000, maxBuffer: 1_000_000, windowsHide: true },
-      env,
-      platform,
-    );
-    const status = commandOk(removed)
-      ? pluginListState(
-          runCodexPlugin(
-            runCommand,
-            executable,
-            ['plugin', 'list', '--json'],
-            { env: pluginCommandEnv(env, home, platform), timeout: 10_000, maxBuffer: 1_000_000, windowsHide: true },
-            env,
-            platform,
-          ),
-          state.enabled.marketplace,
-        )
-      : 'unknown';
+    const removed = codex(executable, ['plugin', 'remove', `${pluginName}@${state.enabled.marketplace}`, '--json']);
+    const status = commandOk(removed) ? listPluginState(executable, state.enabled.marketplace) : 'unknown';
     if (!['inactive', 'disabled'].includes(status))
       return { active: false, blockNative: true, retained: true, reason: 'installer-owned plugin removal was not confirmed' };
     delete state.enabled;
     return { active: false, nativePreferred: true, reason: 'user-owned native Codex offload skill is already installed' };
-  }
-  let desiredVersion;
-  try {
-    desiredVersion = packagedPluginVersion(
-      Object.fromEntries(
-        await Promise.all(pluginFiles.map(async (path) => [path, await requiredArtifact(join(root, 'plugins', pluginName, path))])),
-      ),
-    );
-  } catch (error) {
-    return { active: false, reason: error.message };
   }
   const expected = pluginEntry();
   const sourceState = state || { source, files: {} };
@@ -1359,7 +1285,7 @@ async function manageCodexPlugin({
     sourceConflict = true;
   for (const relativePath of pluginFiles) {
     const target = join(source, relativePath),
-      desired = await requiredArtifact(join(root, 'plugins', pluginName, relativePath));
+      desired = artifacts[relativePath];
     const current = await read(target);
     if (!(await safePluginDestination(target, source))) sourceConflict = true;
     if (current && current !== desired && sourceState.files[target] !== digest(current)) sourceConflict = true;
@@ -1367,7 +1293,7 @@ async function manageCodexPlugin({
   const invalidMarketplace = async () => {
     if (!sourceState.enabled)
       return { active: false, blockNative: true, reason: 'invalid personal marketplace leaves plugin state ambiguous' };
-    const executable = await findPluginExecutable(env, platform, commandExists);
+    const executable = await findExecutable('codex', env, platform, commandExists);
     if (!executable)
       return {
         active: false,
@@ -1375,17 +1301,7 @@ async function manageCodexPlugin({
         retained: true,
         reason: 'invalid marketplace and unavailable Codex CLI leave plugin state ambiguous',
       };
-    const status = pluginListState(
-      runCodexPlugin(
-        runCommand,
-        executable,
-        ['plugin', 'list', '--json'],
-        { env: pluginCommandEnv(env, home, platform), timeout: 10_000, maxBuffer: 1_000_000, windowsHide: true },
-        env,
-        platform,
-      ),
-      sourceState.enabled.marketplace,
-    );
+    const status = listPluginState(executable, sourceState.enabled.marketplace);
     if (status === 'active') return { active: true, retained: true, reason: 'active plugin retained despite invalid marketplace' };
     if (status === 'unknown')
       return { active: false, blockNative: true, retained: true, reason: 'invalid marketplace plugin state cannot be confirmed' };
@@ -1418,18 +1334,10 @@ async function manageCodexPlugin({
     // A user-owned source/catalog entry can already be active in the desktop
     // app. Do not create a second native skill unless the CLI positively says
     // it is not installed; an unavailable CLI leaves the ambiguity intact.
-    const executable = await findPluginExecutable(env, platform, commandExists);
+    const executable = await findExecutable('codex', env, platform, commandExists);
     if (!executable)
       return { active: false, blockNative: true, reason: 'conflicting plugin ownership cannot be resolved without the Codex CLI' };
-    const listed = runCodexPlugin(
-      runCommand,
-      executable,
-      ['plugin', 'list', '--json'],
-      { env: pluginCommandEnv(env, home, platform), timeout: 10_000, maxBuffer: 1_000_000, windowsHide: true },
-      env,
-      platform,
-    );
-    const state = pluginListState(listed, marketplace.name);
+    const state = listPluginState(executable, marketplace.name);
     if (state === 'unknown')
       return { active: false, blockNative: true, reason: 'Codex plugin state cannot be confirmed after a source conflict' };
     if (state === 'active') return { active: true, preexisting: true, reason: 'conflicting user-owned plugin is active' };
@@ -1439,7 +1347,7 @@ async function manageCodexPlugin({
   }
   for (const relativePath of pluginFiles) {
     const target = join(source, relativePath),
-      desired = await requiredArtifact(join(root, 'plugins', pluginName, relativePath));
+      desired = artifacts[relativePath];
     const current = await read(target);
     if (!current && !(await exists(target))) {
       await atomic(target, desired);
@@ -1447,13 +1355,7 @@ async function manageCodexPlugin({
       changed.push(target);
     } else if (sourceState.files[target] === digest(current) && current !== desired) {
       if (relativePath.endsWith('/SKILL.md')) await preserveSkillBackup(target, skillBackupDirectory, current, backups, home);
-      else {
-        const backup = `${target}.offload.bak`;
-        if (!(await exists(backup))) {
-          await atomic(backup, current);
-          backups.push(backup);
-        }
-      }
+      else await backupOnce(target, current, backups);
       await atomic(target, desired);
       sourceState.files[target] = digest(desired);
       changed.push(target);
@@ -1463,26 +1365,18 @@ async function manageCodexPlugin({
   sourceState.catalog = { path: marketplacePath, name: marketplace.name, entry: expected };
   manifest.plugins.codex = sourceState;
   if (!entry) {
-    if (raw) {
-      const backup = `${marketplacePath}.offload.bak`;
-      if (!(await exists(backup))) {
-        await atomic(backup, raw);
-        backups.push(backup);
-      }
-    }
+    if (raw) await backupOnce(marketplacePath, raw, backups);
     marketplace.plugins.push(expected);
     await atomic(marketplacePath, JSON.stringify(marketplace, null, 2) + '\n');
     changed.push(marketplacePath);
     sourceState.marketplace = { path: marketplacePath, name: marketplace.name, entry: expected };
   }
-  const executable = await findPluginExecutable(env, platform, commandExists);
+  const executable = await findExecutable('codex', env, platform, commandExists);
   if (!executable)
     return sourceState.enabled || preexistingEntry
       ? { active: false, blockNative: true, retained: true, reason: 'Codex CLI unavailable; retained ambiguous plugin activation' }
       : { active: false, reason: 'Codex CLI unavailable' };
-  const options = { env: pluginCommandEnv(env, home, platform), timeout: 10_000, maxBuffer: 1_000_000, windowsHide: true };
-  const list = runCodexPlugin(runCommand, executable, ['plugin', 'list', '--json'], options, env, platform);
-  const listState = pluginListState(list, marketplace.name);
+  const listState = listPluginState(executable, marketplace.name);
   if (listState === 'disabled') return { active: false, reason: 'Codex plugin is explicitly disabled' };
   if (listState === 'unknown') {
     const capability = pluginCommandCapability(runCommand, executable, options, env, platform);
@@ -1503,37 +1397,17 @@ async function manageCodexPlugin({
     // Only an enablement recorded by us may be refreshed. A discovered
     // user-owned plugin can be active, but must never be removed/adopted.
     if (!sourceState.enabled || sourceState.version === desiredVersion) return { active: true, preexisting: !sourceState.enabled };
-    const removed = runCodexPlugin(
-      runCommand,
-      executable,
-      ['plugin', 'remove', `${pluginName}@${marketplace.name}`, '--json'],
-      options,
-      env,
-      platform,
-    );
+    const removed = codex(executable, ['plugin', 'remove', `${pluginName}@${marketplace.name}`, '--json']);
     if (!commandOk(removed)) return { active: true, retained: true, reason: 'Codex plugin refresh removal failed' };
-    const afterRemoval = pluginListState(
-      runCodexPlugin(runCommand, executable, ['plugin', 'list', '--json'], options, env, platform),
-      marketplace.name,
-    );
+    const afterRemoval = listPluginState(executable, marketplace.name);
     if (!['inactive', 'disabled'].includes(afterRemoval))
       return { active: true, retained: true, reason: 'Codex plugin refresh removal was not confirmed' };
-    const refreshed = runCodexPlugin(
-      runCommand,
-      executable,
-      ['plugin', 'add', `${pluginName}@${marketplace.name}`, '--json'],
-      options,
-      env,
-      platform,
-    );
+    const refreshed = codex(executable, ['plugin', 'add', `${pluginName}@${marketplace.name}`, '--json']);
     if (!commandOk(refreshed)) {
       delete sourceState.enabled;
       return { active: false, reason: 'Codex plugin refresh failed; using native skill fallback' };
     }
-    const confirmed = pluginListState(
-      runCodexPlugin(runCommand, executable, ['plugin', 'list', '--json'], options, env, platform),
-      marketplace.name,
-    );
+    const confirmed = listPluginState(executable, marketplace.name);
     if (confirmed !== 'active') {
       if (confirmed === 'unknown') {
         sourceState.enabled = { executable, marketplace: marketplace.name };
@@ -1545,19 +1419,9 @@ async function manageCodexPlugin({
     sourceState.version = desiredVersion;
     return { active: true, refreshed: true };
   }
-  const added = runCodexPlugin(
-    runCommand,
-    executable,
-    ['plugin', 'add', `${pluginName}@${marketplace.name}`, '--json'],
-    options,
-    env,
-    platform,
-  );
+  const added = codex(executable, ['plugin', 'add', `${pluginName}@${marketplace.name}`, '--json']);
   if (!commandOk(added)) return { active: false, reason: 'Codex CLI does not support or failed to add the plugin' };
-  const confirmed = pluginListState(
-    runCodexPlugin(runCommand, executable, ['plugin', 'list', '--json'], options, env, platform),
-    marketplace.name,
-  );
+  const confirmed = listPluginState(executable, marketplace.name);
   if (confirmed !== 'active') {
     if (confirmed === 'unknown') {
       sourceState.enabled = { executable, marketplace: marketplace.name };
@@ -1825,8 +1689,7 @@ export async function install({
   const selected = await selectedClients(home, clients, { env, platform, commandExists });
   // Reject unsafe hook command paths before probing a deliberately malformed root.
   if (selected.has('claude')) {
-    shellQuote(process.execPath, platform);
-    shellQuote(join(root, 'install.mjs'), platform);
+    doctorHookCommand(root, platform);
   }
   // Install validates every source artifact before mutating client files. An
   // uninstall uses only recorded state/current config, so it remains safe from
@@ -1839,10 +1702,11 @@ export async function install({
   if (!uninstall && selected.has('claude')) artifacts.push(join(root, 'templates', 'CLAUDE.md.block.md'));
   if (!uninstall && selected.has('codex')) artifacts.push(join(root, 'templates', 'AGENTS.md.block.md'));
   const artifactContents = new Map(await Promise.all(artifacts.map(async (path) => [path, await requiredArtifact(path)])));
-  if (!uninstall && selected.has('codex'))
-    packagedPluginVersion(
-      Object.fromEntries(pluginFiles.map((path) => [path, artifactContents.get(join(root, 'plugins', 'offload', path))])),
-    );
+  const pluginArtifacts =
+    !uninstall && selected.has('codex')
+      ? Object.fromEntries(pluginFiles.map((path) => [path, artifactContents.get(join(root, 'plugins', 'offload', path))]))
+      : undefined;
+  const desiredPluginVersion = pluginArtifacts ? packagedPluginVersion(pluginArtifacts) : undefined;
   const manifestPath = join(configHome, 'offload', 'installer-state.json');
   const manifest = await readManifest(manifestPath);
   const effectiveApprovalMode = approvalMode ?? manifest.approvalMode ?? 'prompt';
@@ -1917,46 +1781,32 @@ export async function install({
     }
   }
   if (selected.has('cursor') && !uninstall) {
-    try {
-      const parsed = cursorState || {};
-      parsed.mcpServers ||= {};
-      const desired = JSON.parse(cursorJson(root)).mcpServers.offload;
-      const current = parsed.mcpServers.offload;
-      const previous = manifest.registrations.cursor;
-      if (!current) {
-        parsed.mcpServers.offload = desired;
-        manifest.registrations.cursor = desired;
-        if (currentCursor) {
-          const backup = `${cursorConfig}.offload.bak`;
-          if (!(await exists(backup))) {
-            await atomic(backup, currentCursor);
-            backups.push(backup);
-          }
-        }
-        await atomic(cursorConfig, JSON.stringify(parsed, null, 2) + '\n');
-        changed.push(cursorConfig);
-      } else if (equal(current, desired) && previous && equal(current, previous)) manifest.registrations.cursor = desired;
-      else if (previous && equal(current, previous)) {
-        parsed.mcpServers.offload = desired;
-        manifest.registrations.cursor = desired;
-        await atomic(cursorConfig, JSON.stringify(parsed, null, 2) + '\n');
-        changed.push(cursorConfig);
-      }
-      // Any other entry is user-owned. Leave it byte-for-byte semantically intact.
-    } catch {
-      throw new Error(`refusing invalid Cursor MCP JSON: ${cursorConfig}`);
+    const parsed = cursorState || {};
+    parsed.mcpServers ||= {};
+    const desired = JSON.parse(cursorJson(root)).mcpServers.offload;
+    const current = parsed.mcpServers.offload;
+    const previous = manifest.registrations.cursor;
+    if (!current) {
+      parsed.mcpServers.offload = desired;
+      manifest.registrations.cursor = desired;
+      if (currentCursor) await backupOnce(cursorConfig, currentCursor, backups);
+      await atomic(cursorConfig, JSON.stringify(parsed, null, 2) + '\n');
+      changed.push(cursorConfig);
+    } else if (equal(current, desired) && previous && equal(current, previous)) manifest.registrations.cursor = desired;
+    else if (previous && equal(current, previous)) {
+      parsed.mcpServers.offload = desired;
+      manifest.registrations.cursor = desired;
+      await atomic(cursorConfig, JSON.stringify(parsed, null, 2) + '\n');
+      changed.push(cursorConfig);
     }
+    // Any other entry is user-owned. Leave it byte-for-byte semantically intact.
   } else if (selected.has('cursor') && currentCursor) {
-    try {
-      const parsed = cursorState;
-      if (manifest.registrations.cursor && equal(parsed.mcpServers?.offload, manifest.registrations.cursor)) {
-        delete parsed.mcpServers.offload;
-        delete manifest.registrations.cursor;
-        await atomic(cursorConfig, JSON.stringify(parsed, null, 2) + '\n');
-        changed.push(cursorConfig);
-      }
-    } catch {
-      throw new Error(`refusing invalid Cursor MCP JSON: ${cursorConfig}`);
+    const parsed = cursorState;
+    if (manifest.registrations.cursor && equal(parsed.mcpServers?.offload, manifest.registrations.cursor)) {
+      delete parsed.mcpServers.offload;
+      delete manifest.registrations.cursor;
+      await atomic(cursorConfig, JSON.stringify(parsed, null, 2) + '\n');
+      changed.push(cursorConfig);
     }
   }
   const nativeSkill =
@@ -1971,7 +1821,8 @@ export async function install({
     ).some(Boolean);
   const plugin = selected.has('codex')
     ? await manageCodexPlugin({
-        root,
+        artifacts: pluginArtifacts,
+        desiredVersion: desiredPluginVersion,
         home,
         uninstall,
         env,
@@ -2030,117 +1881,100 @@ export async function install({
   // installation is intentionally narrow: it approves Offload's own write
   // tools, not Claude's general file/shell/tool permissions.
   if (selected.has('claude') && !uninstall) {
-    try {
-      const settings = claudeSettingsState || {};
-      settings.permissions ||= {};
-      settings.permissions.allow ||= [];
-      settings.hooks ||= {};
-      settings.hooks.SessionStart ||= [];
-      const readRules = ['mcp__offload__offload_wait', 'mcp__offload__offload_job'];
-      const mutatingRules = [
-        'mcp__offload__offload_start',
-        'mcp__offload__offload_repair',
-        'mcp__offload__offload_continue',
-        'mcp__offload__offload_apply',
-        'mcp__offload__offload_cancel',
-        'mcp__offload__offload_revert',
-      ];
-      const offloadRules = new Set([...readRules, ...mutatingRules]);
-      const rules = effectiveApprovalMode === 'approve' ? [...readRules, ...mutatingRules] : readRules;
-      const formerlyOwned = new Set(manifest.claudeSettings?.rules || []);
-      const staleOwned = [...formerlyOwned].filter((rule) => offloadRules.has(rule) && !rules.includes(rule));
-      if (staleOwned.length) settings.permissions.allow = settings.permissions.allow.filter((rule) => !staleOwned.includes(rule));
-      const missing = rules.filter((rule) => !settings.permissions.allow.includes(rule));
-      const hookCommand = `${shellQuote(process.execPath, platform)} ${shellQuote(join(root, 'install.mjs'), platform)} --doctor-hook`;
-      // Check at session creation, durable resume, and fork.  Deliberately
-      // exclude clear/compact: those happen during normal conversation and
-      // would make a diagnostic hook unnecessarily noisy.
-      const hookMatcher = 'startup|resume|fork';
-      const managedHook = { type: 'command', command: hookCommand };
-      // v1 used an empty matcher; the first optimized release used startup.
-      // Migrate only exact manifest-owned hooks, retaining other handlers a
-      // user added to those same event entries.  New manifests record the
-      // matcher so routine reinstalls do not remove and recreate their hook.
-      const recordedHookCommand = manifest.claudeSettings?.hookCommand;
-      const recordedHookIsSafe = isOffloadDoctorHook(recordedHookCommand, root, platform);
-      const oldHookOwned =
-        (manifest.claudeSettings?.hookOwned === true && recordedHookIsSafe) ||
-        (manifest.claudeSettings?.hookOwned === undefined && (recordedHookCommand === hookCommand || recordedHookIsSafe));
-      const recordedMatcher = typeof manifest.claudeSettings?.hookMatcher === 'string' ? manifest.claudeSettings.hookMatcher : undefined;
-      let migration = { next: settings.hooks.SessionStart, removed: false };
-      // The manifest is the ownership boundary. A recognized path merely
-      // validates its recorded command; it never authorizes us to remove a
-      // separately-added lookalike hook during a later reinstall.
-      if (oldHookOwned && (recordedHookCommand !== hookCommand || recordedMatcher !== hookMatcher))
-        for (const matcher of recordedMatcher ? [recordedMatcher] : ['', 'startup']) {
-          const next = removeExactSessionHook(migration.next, { type: 'command', command: recordedHookCommand }, matcher);
-          migration = { next: next.next, removed: migration.removed || next.removed };
-        }
-      if (migration.removed) settings.hooks.SessionStart = migration.next;
-      const hasHook = settings.hooks.SessionStart.some(
-        (entry) => entry?.matcher === hookMatcher && entry?.hooks?.some((hook) => equal(hook, managedHook)),
-      );
-      const createdHook = !hasHook;
-      const needsOwnershipMigration =
-        manifest.claudeSettings &&
-        (!Object.hasOwn(manifest.claudeSettings, 'hookOwned') || !Object.hasOwn(manifest.claudeSettings, 'hookMatcher'));
-      if (missing.length || staleOwned.length || migration.removed || createdHook) {
-        settings.permissions.allow.push(...missing);
-        if (createdHook) settings.hooks.SessionStart.push({ matcher: hookMatcher, hooks: [managedHook] });
-        await atomic(claudeSettings, JSON.stringify(settings, null, 2) + '\n');
-        changed.push(claudeSettings);
-      }
-      if (missing.length || staleOwned.length || migration.removed || createdHook || needsOwnershipMigration) {
-        // A canonical hook already in the target entry can be user-owned.
-        // Migrating a different recorded legacy command must not transfer that
-        // ownership merely because the desired command was already present.
-        const ownsCurrent = createdHook || (oldHookOwned && recordedHookCommand === hookCommand && recordedMatcher === hookMatcher);
-        manifest.claudeSettings = {
-          hookCommand,
-          hookMatcher,
-          hookOwned: ownsCurrent,
-          rules: [...new Set([...(manifest.claudeSettings?.rules || []).filter((rule) => !mutatingRules.includes(rule)), ...missing])],
-        };
-      }
-    } catch {
-      throw new Error(`refusing invalid Claude settings JSON: ${claudeSettings}`);
+    const settings = claudeSettingsState || {};
+    settings.permissions ||= {};
+    settings.permissions.allow ||= [];
+    settings.hooks ||= {};
+    settings.hooks.SessionStart ||= [];
+    const readRules = ['mcp__offload__offload_wait', 'mcp__offload__offload_job'];
+    const mutatingRules = [
+      'mcp__offload__offload_start',
+      'mcp__offload__offload_repair',
+      'mcp__offload__offload_continue',
+      'mcp__offload__offload_apply',
+      'mcp__offload__offload_cancel',
+      'mcp__offload__offload_revert',
+    ];
+    const offloadRules = new Set([...readRules, ...mutatingRules]);
+    const rules = effectiveApprovalMode === 'approve' ? [...readRules, ...mutatingRules] : readRules;
+    const formerlyOwned = new Set(manifest.claudeSettings?.rules || []);
+    const staleOwned = [...formerlyOwned].filter((rule) => offloadRules.has(rule) && !rules.includes(rule));
+    if (staleOwned.length) settings.permissions.allow = settings.permissions.allow.filter((rule) => !staleOwned.includes(rule));
+    const missing = rules.filter((rule) => !settings.permissions.allow.includes(rule));
+    const hookCommand = doctorHookCommand(root, platform);
+    // Check at session creation, durable resume, and fork.  Deliberately
+    // exclude clear/compact: those happen during normal conversation and
+    // would make a diagnostic hook unnecessarily noisy.
+    const hookMatcher = 'startup|resume|fork';
+    const managedHook = { type: 'command', command: hookCommand };
+    // v1 used an empty matcher; the first optimized release used startup.
+    // Migrate only exact manifest-owned hooks, retaining other handlers a
+    // user added to those same event entries.  New manifests record the
+    // matcher so routine reinstalls do not remove and recreate their hook.
+    const recordedHookCommand = manifest.claudeSettings?.hookCommand;
+    const recordedHookIsSafe = isOffloadDoctorHook(recordedHookCommand, root, platform);
+    const oldHookOwned =
+      (manifest.claudeSettings?.hookOwned === true && recordedHookIsSafe) ||
+      (manifest.claudeSettings?.hookOwned === undefined && (recordedHookCommand === hookCommand || recordedHookIsSafe));
+    const recordedMatcher = typeof manifest.claudeSettings?.hookMatcher === 'string' ? manifest.claudeSettings.hookMatcher : undefined;
+    let migration = { next: settings.hooks.SessionStart, removed: false };
+    // The manifest is the ownership boundary. A recognized path merely
+    // validates its recorded command; it never authorizes us to remove a
+    // separately-added lookalike hook during a later reinstall.
+    if (oldHookOwned && (recordedHookCommand !== hookCommand || recordedMatcher !== hookMatcher))
+      migration = removeRecordedSessionHook(migration.next, { type: 'command', command: recordedHookCommand }, recordedMatcher);
+    if (migration.removed) settings.hooks.SessionStart = migration.next;
+    const hasHook = settings.hooks.SessionStart.some(
+      (entry) => entry?.matcher === hookMatcher && entry?.hooks?.some((hook) => equal(hook, managedHook)),
+    );
+    const createdHook = !hasHook;
+    const needsOwnershipMigration =
+      manifest.claudeSettings &&
+      (!Object.hasOwn(manifest.claudeSettings, 'hookOwned') || !Object.hasOwn(manifest.claudeSettings, 'hookMatcher'));
+    if (missing.length || staleOwned.length || migration.removed || createdHook) {
+      settings.permissions.allow.push(...missing);
+      if (createdHook) settings.hooks.SessionStart.push({ matcher: hookMatcher, hooks: [managedHook] });
+      await atomic(claudeSettings, JSON.stringify(settings, null, 2) + '\n');
+      changed.push(claudeSettings);
+    }
+    if (missing.length || staleOwned.length || migration.removed || createdHook || needsOwnershipMigration) {
+      // A canonical hook already in the target entry can be user-owned.
+      // Migrating a different recorded legacy command must not transfer that
+      // ownership merely because the desired command was already present.
+      const ownsCurrent = createdHook || (oldHookOwned && recordedHookCommand === hookCommand && recordedMatcher === hookMatcher);
+      manifest.claudeSettings = {
+        hookCommand,
+        hookMatcher,
+        hookOwned: ownsCurrent,
+        rules: [...new Set([...(manifest.claudeSettings?.rules || []).filter((rule) => !staleOwned.includes(rule)), ...missing])],
+      };
     }
   } else if (selected.has('claude') && existingSettings) {
-    try {
-      const settings = claudeSettingsState;
-      const rules = new Set(manifest.claudeSettings?.rules || []);
-      const hookCommand =
-        manifest.claudeSettings?.hookCommand ||
-        `${shellQuote(process.execPath, platform)} ${shellQuote(join(root, 'install.mjs'), platform)} --doctor-hook`;
-      let dirty = false;
-      const managedHook = { type: 'command', command: hookCommand };
-      if (Array.isArray(settings.permissions?.allow)) {
-        const next = settings.permissions.allow.filter((rule) => !rules.has(rule));
-        dirty ||= next.length !== settings.permissions.allow.length;
-        settings.permissions.allow = next;
-      }
-      const hookOwned =
-        manifest.claudeSettings?.hookOwned === true ||
-        (manifest.claudeSettings?.hookOwned === undefined && manifest.claudeSettings?.hookCommand === hookCommand);
-      if (hookOwned && Array.isArray(settings.hooks?.SessionStart)) {
-        const recordedMatcher = typeof manifest.claudeSettings?.hookMatcher === 'string' ? manifest.claudeSettings.hookMatcher : undefined;
-        let removal = { next: settings.hooks.SessionStart, removed: false };
-        for (const matcher of recordedMatcher ? [recordedMatcher] : ['', 'startup']) {
-          const next = removeExactSessionHook(removal.next, managedHook, matcher);
-          removal = { next: next.next, removed: removal.removed || next.removed };
-        }
-        dirty ||= removal.removed;
-        settings.hooks.SessionStart = removal.next;
-      }
-      // Permissions and the hook have separate lifecycles: a user can remove
-      // the hook without thereby claiming installer-added approvals.
-      delete manifest.claudeSettings;
-      if (dirty) {
-        await atomic(claudeSettings, JSON.stringify(settings, null, 2) + '\n');
-        changed.push(claudeSettings);
-      }
-    } catch {
-      throw new Error(`refusing invalid Claude settings JSON: ${claudeSettings}`);
+    const settings = claudeSettingsState;
+    const rules = new Set(manifest.claudeSettings?.rules || []);
+    const hookCommand = manifest.claudeSettings?.hookCommand || doctorHookCommand(root, platform);
+    let dirty = false;
+    const managedHook = { type: 'command', command: hookCommand };
+    if (Array.isArray(settings.permissions?.allow)) {
+      const next = settings.permissions.allow.filter((rule) => !rules.has(rule));
+      dirty ||= next.length !== settings.permissions.allow.length;
+      settings.permissions.allow = next;
+    }
+    const hookOwned =
+      manifest.claudeSettings?.hookOwned === true ||
+      (manifest.claudeSettings?.hookOwned === undefined && manifest.claudeSettings?.hookCommand === hookCommand);
+    if (hookOwned && Array.isArray(settings.hooks?.SessionStart)) {
+      const recordedMatcher = typeof manifest.claudeSettings?.hookMatcher === 'string' ? manifest.claudeSettings.hookMatcher : undefined;
+      const removal = removeRecordedSessionHook(settings.hooks.SessionStart, managedHook, recordedMatcher);
+      dirty ||= removal.removed;
+      settings.hooks.SessionStart = removal.next;
+    }
+    // Permissions and the hook have separate lifecycles: a user can remove
+    // the hook without thereby claiming installer-added approvals.
+    delete manifest.claudeSettings;
+    if (dirty) {
+      await atomic(claudeSettings, JSON.stringify(settings, null, 2) + '\n');
+      changed.push(claudeSettings);
     }
   }
   const configPath = join(configHome, 'offload', 'config.json');
@@ -2269,7 +2103,6 @@ function doctorHookWarnings(result) {
     );
   return warnings.map((warning) => ` · ${warning}`).join('');
 }
-export { doctor, doctorLive };
 if (isMainModule()) {
   const args = parseInstallerArgs(process.argv.slice(2));
   if (args.doctorHook) {

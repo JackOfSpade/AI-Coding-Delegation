@@ -1,6 +1,6 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, readFile, readdir, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, rm, readFile, readdir, stat, symlink, writeFile } from 'node:fs/promises';
 import * as nodeFs from 'node:fs/promises';
 import { constants, realpathSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -8,8 +8,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { LocalTools, TOOL_DEFINITIONS, availableToolDefinitions } from '../../src/agent/tools.mjs';
 
+const tempDirs = [];
+async function trackedTemp(prefix) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+}
+after(async () => {
+  await Promise.all(tempDirs.map((dir) => rm(dir, { recursive: true, force: true, maxRetries: 3 })));
+});
 async function fixture() {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-tools-'));
+  const dir = await trackedTemp('offload-tools-');
   await writeFile(path.join(dir, 'a.txt'), 'one\r\ntwo\r\n');
   return { dir, tools: new LocalTools({ repoPath: dir, ownedPaths: ['*.txt'] }) };
 }
@@ -41,6 +50,22 @@ test('tool definitions have stable names and read/edit protects concurrent write
   await tools.read_file({ path: 'a.txt' });
   await writeFile(path.join(dir, 'a.txt'), 'human change');
   await assert.rejects(() => tools.edit_file({ path: 'a.txt', old_string: 'human', new_string: 'x' }), /stale/);
+});
+test('edit_file inserts replacement text literally, without $ pattern expansion', async () => {
+  const { dir, tools } = await fixture();
+  await writeFile(path.join(dir, 'd.txt'), 'one FOO two');
+  await tools.read_file({ path: 'd.txt' });
+  await tools.edit_file({ path: 'd.txt', old_string: 'FOO', new_string: "x=$'\\n' $$ $& $`" });
+  assert.equal(await readFile(path.join(dir, 'd.txt'), 'utf8'), "one x=$'\\n' $$ $& $` two");
+});
+test('write_file accepts ./-prefixed and doubled-slash spellings that read_file accepts', async () => {
+  const dir = await trackedTemp('offload-tools-dotslash-');
+  const tools = new LocalTools({ repoPath: dir, ownedPaths: ['dir/**'] });
+  assert.equal(await tools.write_file({ path: './dir/new.txt', content: 'x' }), 'Wrote dir/new.txt (1 chars).');
+  assert.equal(await readFile(path.join(dir, 'dir', 'new.txt'), 'utf8'), 'x');
+  await tools.write_file({ path: 'dir//deep/n.txt', content: 'y' });
+  assert.equal(await readFile(path.join(dir, 'dir', 'deep', 'n.txt'), 'utf8'), 'y');
+  await assert.rejects(() => tools.write_file({ path: 'dir/../x', content: 'z' }));
 });
 test('read-only report tool definitions exclude edits and shell execution', () => {
   const names = availableToolDefinitions({ allowCommand: false, readOnly: true }).map((tool) => tool.function.name);
@@ -80,7 +105,7 @@ test(
   },
 );
 test('LocalTools rejects control-character paths even with an injected permissive policy', async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-tools-controls-'));
+  const dir = await trackedTemp('offload-tools-controls-');
   const root = await (await import('node:fs/promises')).realpath(dir);
   const policy = {
     repoPath: root,
@@ -168,7 +193,7 @@ test('write_file preserves a human update made after its required read', async (
   assert.equal(await readFile(file, 'utf8'), 'human change');
 });
 test('write_file rejects a same-content inode replacement after its required read', async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-write-identity-race-'));
+  const dir = await trackedTemp('offload-write-identity-race-');
   const file = path.join(dir, 'a.txt');
   await writeFile(file, 'unchanged bytes');
   const root = await (await import('node:fs/promises')).realpath(dir);
@@ -192,7 +217,7 @@ test('write_file rejects a same-content inode replacement after its required rea
   assert.equal(await readFile(file, 'utf8'), 'unchanged bytes');
 });
 test('write_file preserves a change that lands immediately before atomic replacement', async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-write-race-'));
+  const dir = await trackedTemp('offload-write-race-');
   const file = path.join(dir, 'a.txt');
   await writeFile(file, 'original');
   const root = await (await import('node:fs/promises')).realpath(dir);
@@ -215,7 +240,7 @@ test('write_file preserves a change that lands immediately before atomic replace
   assert.equal(await readFile(file, 'utf8'), 'human replacement');
 });
 test('write_file blocks untracked ignored paths, including new children, but permits tracked ignored files', async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-git-ignore-'));
+  const dir = await trackedTemp('offload-git-ignore-');
   git(dir, 'init', '--quiet');
   // This is deliberately added after LocalTools exists: ignore decisions are
   // evaluated for each write rather than cached for the life of a job.
@@ -234,7 +259,7 @@ test('write_file blocks untracked ignored paths, including new children, but per
   assert.equal(await readFile(path.join(dir, 'tracked.txt'), 'utf8'), 'allowed');
 });
 test('Git ignore checks use hardened credential-free plumbing', async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-git-env-'));
+  const dir = await trackedTemp('offload-git-env-');
   const calls = [];
   const saved = {
     OPENAI_API_KEY: process.env.OPENAI_API_KEY,
@@ -284,20 +309,20 @@ test('Git safety failures fail closed when a repository marker exists, including
     throw Object.assign(new Error('bad Git'), { code: 2 });
   };
   for (const kind of ['directory', 'linked-worktree-file']) {
-    const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-git-marker-'));
+    const dir = await trackedTemp('offload-git-marker-');
     if (kind === 'directory') await mkdir(path.join(dir, '.git'));
     else await writeFile(path.join(dir, '.git'), 'gitdir: /private/primary/.git/worktrees/worker\n');
     const tools = new LocalTools({ repoPath: dir, ownedPaths: ['*.txt'], gitExec: failedGit });
     await assert.rejects(() => tools.write_file({ path: 'blocked.txt', content: 'x' }), /Git ignore safety check is unavailable/);
     await assert.rejects(readFile(path.join(dir, 'blocked.txt')));
   }
-  const ordinary = await mkdtemp(path.join(os.tmpdir(), 'offload-not-git-'));
+  const ordinary = await trackedTemp('offload-not-git-');
   const tools = new LocalTools({ repoPath: ordinary, ownedPaths: ['*.txt'], gitExec: failedGit });
   await tools.write_file({ path: 'allowed.txt', content: 'x' });
   assert.equal(await readFile(path.join(ordinary, 'allowed.txt'), 'utf8'), 'x');
 });
 test('read_file rejects a same-inode same-size rewrite between its returned window and hash', async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-read-hash-race-'));
+  const dir = await trackedTemp('offload-read-hash-race-');
   const file = path.join(dir, 'a.txt');
   await writeFile(file, 'before-text');
   let swapped = false;
@@ -322,7 +347,7 @@ test('read_file rejects a same-inode same-size rewrite between its returned wind
   assert.equal(swapped, true);
 });
 test('new files never overwrite a creator that wins the final publication race', async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-no-replace-'));
+  const dir = await trackedTemp('offload-no-replace-');
   const file = path.join(dir, 'new.txt');
   const fileSystem = { ...nodeFs };
   fileSystem.link = async (source, target) => {
@@ -334,7 +359,7 @@ test('new files never overwrite a creator that wins the final publication race',
   assert.equal(await readFile(file, 'utf8'), 'human-created');
 });
 test('new-file publication rechecks a concurrently changed Git ignore rule', async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-ignore-publication-'));
+  const dir = await trackedTemp('offload-ignore-publication-');
   git(dir, 'init', '--quiet');
   let probes = 0;
   const gitExec = async (command, args, options) => {
@@ -351,7 +376,7 @@ test('new-file publication rechecks a concurrently changed Git ignore rule', asy
   await assert.rejects(readFile(path.join(dir, 'new.txt')));
 });
 test('existing-file publication rebinds identity after its final Git ignore query', async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-existing-publication-'));
+  const dir = await trackedTemp('offload-existing-publication-');
   const file = path.join(dir, 'a.txt');
   await writeFile(file, 'original');
   let probes = 0;
@@ -369,7 +394,7 @@ test('existing-file publication rebinds identity after its final Git ignore quer
   assert.equal(await readFile(file, 'utf8'), 'humanity');
 });
 test('edit_file refuses a write that changes after its stale-read check but before replacement', async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-edit-race-'));
+  const dir = await trackedTemp('offload-edit-race-');
   const file = path.join(dir, 'a.txt');
   await writeFile(file, 'original');
   let writeChecks = 0;
@@ -396,8 +421,8 @@ test(
   'write_file never creates a directory through an intermediate symlink substituted after policy approval',
   { skip: process.platform === 'win32' && 'Windows symlink creation requires Developer Mode or elevation' },
   async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-write-parent-'));
-    const outside = await mkdtemp(path.join(os.tmpdir(), 'offload-write-outside-'));
+    const dir = await trackedTemp('offload-write-parent-');
+    const outside = await trackedTemp('offload-write-outside-');
     let checked = false;
     const root = await (await import('node:fs/promises')).realpath(dir);
     const policy = {
@@ -634,7 +659,7 @@ test(
   { skip: process.platform === 'win32' && 'Windows symlink creation requires Developer Mode or elevation' },
   async () => {
     const { dir, tools } = await fixture();
-    const outside = await mkdtemp(path.join(os.tmpdir(), 'offload-grep-outside-'));
+    const outside = await trackedTemp('offload-grep-outside-');
     await mkdir(path.join(dir, 'nested'));
     await writeFile(path.join(dir, 'nested', 'target.txt'), 'needle in target');
     await writeFile(path.join(dir, 'nested', 'other.txt'), 'needle in other');
@@ -757,8 +782,15 @@ test('directory traversal is bounded and reports incomplete listings', async () 
   assert.match(await tools.grep({ pattern: 'not-present' }), /\[file discovery truncated before all files were searched\]/);
 });
 
+test('grep reports the numeric per-file byte cap when it truncates a large file', async () => {
+  const { dir, tools } = await fixture();
+  await writeFile(path.join(dir, 'big.txt'), `needle\n${'x'.repeat(8 * 1024 * 1024 + 16)}`);
+  const output = await tools.grep({ pattern: 'needle', path: '.' });
+  assert.match(output, /\[files truncated at 8388608 bytes each\]/);
+});
+
 test('lineByteWindow returns exact byte windows for a line range and is not a worker tool', async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'offload-window-'));
+  const dir = await trackedTemp('offload-window-');
   await writeFile(path.join(dir, 'a.txt'), 'one\ntwo\nthree\n');
   await writeFile(path.join(dir, 'crlf.txt'), 'one\r\ntwo\r\nthree');
   await writeFile(path.join(dir, 'multi.txt'), 'é€\nnext\n');

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { constants, closeSync, fstatSync, lstatSync, openSync, readSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
+import { constants, closeSync, fstatSync, lstatSync, openSync, readSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { mkdtemp } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -81,4 +81,18 @@ test('POSIX regular-file readers open nonblocking so a raced-in FIFO reaches des
     /changed while opening/,
   );
   assert.equal(closed, 2);
+});
+
+test('readRegularFile rejects a file that no longer matches the caller-supplied expected stat', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'offload-regular-file-expected-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const first = join(dir, 'first.txt'),
+    second = join(dir, 'second.txt');
+  writeFileSync(first, 'one');
+  writeFileSync(second, 'two');
+  const expected = lstatSync(first, { bigint: true });
+  assert.equal((await readRegularFile(first, 1024, { expected })).toString(), 'one');
+  // A swap between the caller's check and the read (modelled as reading a different file) is refused.
+  renameSync(second, first);
+  await assert.rejects(() => readRegularFile(first, 1024, { expected }), /changed while opening/);
 });

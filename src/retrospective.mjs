@@ -4,6 +4,7 @@ import { redactText, redactTokenShapes, redactedSummary, relativizePaths } from 
 import { safeFailureKind, safeToolFailure } from './failure.mjs';
 import { STALL, assessStall, formatDuration, sanitizeTiming, timingTotals } from './timing.mjs';
 import { terminalStatuses } from './report.mjs';
+import { TURN_SOURCES } from './budget-sizing.mjs';
 
 /**
  * The evidence an Offload command run leaves for the person who maintains Offload.
@@ -153,7 +154,6 @@ const familyOf = (code) =>
 const VERIFY_ENV_KIND = /^[a-z][a-z-]{0,39}$/;
 // Turn caps the server chose; one the caller set or raised is the caller's own.
 const SERVER_SIZED = new Set(['scaled', 'default']);
-const TURN_SOURCES = new Set(['default', 'scaled', 'caller', 'raised']);
 const EFFICIENCY_PAIR = new Set(['turn-sizing-outlier', 'repeated-continuation']);
 
 /** What the digest keeps of a job: closed fields, bounded values, no source, diff, path or brief. */
@@ -394,119 +394,133 @@ function promptWarrantSignals(signals) {
 }
 
 /** Every signal the jobs and health support. Pure and deterministic; `nowMs` only ages an active job's stall. */
-export function deriveSignals(jobs, { health: rawHealth, nowMs, secrets = [] } = {}) {
+export function deriveSignals(jobs, { health, nowMs, secrets = [] } = {}) {
+  return signalsFromPairs(factPairs(jobs, { nowMs, secrets }), { health });
+}
+
+function factPairs(jobs, context) {
+  return (Array.isArray(jobs) ? jobs : []).map((job) => [job, jobFacts(job, context)]).filter(([, facts]) => facts);
+}
+
+/** Sizing-efficiency signals for a write job whose turn cap the server chose. */
+function efficiencySignals(record, facts, push, where) {
+  const { id, status } = facts;
+  // A final DONE_VERIFIED is a correctness success, not a failure. It can
+  // still reveal that an automatically sized package was inefficient: the
+  // cap stopped it repeatedly, continuations were needed, and verification
+  // had no chance to run until later. Require explicit server-sizing
+  // provenance so a caller's deliberately fixed cap remains their choice.
+  const history = roundHistoryOf(record, facts);
+  const protocolOrExternalHistory = history.rounds.some(
+    (entry) => entry.status === 'CANCELLED' || entry.providerFailure || ['finish-protocol', 'no-finish'].includes(entry.failureKind),
+  );
+  const sizing = turnSizingOf(record);
+  if (facts.mode === 'write' && sizing && status !== 'CANCELLED' && !facts.providerFailure && !protocolOrExternalHistory) {
+    const turnCaps = history.rounds.filter((entry) => entry.status === 'BUDGET' && entry.budgetStop?.cap === 'turns');
+    const continuations = facts.continuations ?? 0;
+    const source = sizingSourceText(sizing);
+    if (turnCaps.length >= 2) {
+      const rounds = turnCaps.map((entry) => entry.round).filter((round) => round !== undefined);
+      push(
+        'repeated-turn-cap',
+        id,
+        `${where} reached the turn cap ${turnCaps.length} times${rounds.length ? ` in rounds ${rounds.join(', ')}` : ''}; turn-sizing source ${source}`,
+      );
+    }
+    if (
+      facts.turns !== undefined &&
+      facts.turns >= TURN_SIZING_OUTLIER_RATIO * sizing.recommendedTurns &&
+      facts.turns - sizing.recommendedTurns >= TURN_SIZING_OUTLIER_EXCESS
+    )
+      push(
+        'turn-sizing-outlier',
+        id,
+        `${where} used ${facts.turns} actual turns versus ${sizing.recommendedTurns} recommended (${ratioText(facts.turns, sizing.recommendedTurns)}; ${facts.turns - sizing.recommendedTurns} over); turn-sizing source ${source}`,
+      );
+    const causedBy = history.continuationStatuses.slice(0, continuations);
+    if (continuations >= 2 && causedBy.length === continuations)
+      push(
+        'repeated-continuation',
+        id,
+        `${where} needed ${continuations} continuations after ${causedBy.join(', ')}; turn-sizing source ${source}`,
+      );
+    const firstVerificationRound = history.verificationRounds.length ? Math.min(...history.verificationRounds) : undefined;
+    const capsBeforeVerification =
+      firstVerificationRound === undefined
+        ? []
+        : turnCaps.filter((entry) => entry.round !== undefined && entry.round < firstVerificationRound);
+    if (capsBeforeVerification.length >= 2 && continuations >= 1)
+      push(
+        'late-verification',
+        id,
+        `${where} first ran verification in round ${firstVerificationRound} after ${capsBeforeVerification.length} turn-cap BUDGET stops and ${continuations} continuations; turn-sizing source ${source}`,
+      );
+  }
+}
+
+function jobSignals(record, facts, push, environment) {
+  const { id, status } = facts;
+  const where = `job ${id} ${facts.ended ?? status}`;
+  const spent = [
+    `${facts.turns ?? '?'} turns`,
+    facts.costUsd === null ? 'unknown cost' : money(facts.costUsd),
+    ...(facts.wallSec ? [formatDuration(facts.wallSec * 1000)] : []),
+  ].join(', ');
+  const lastCall = facts.toolFailure
+    ? `; last failing call ${facts.toolFailure.tool} x${facts.toolFailure.repeats}${facts.toolFailure.error ? ` "${facts.toolFailure.error}"` : ''}`
+    : '';
+  const attemptMs = Number.isSafeInteger(record.executionProfile?.attemptTimeoutMs)
+    ? record.executionProfile.attemptTimeoutMs
+    : DEFAULT_ATTEMPT_TIMEOUT_MS;
+  const kind = facts.failureKind;
+  if (kind === 'finish-protocol' || kind === 'no-finish') push('protocol-failure-finish', id, `${where} (${kind}) after ${spent}`);
+  if (kind === 'output-cap') push('output-cap-failure', id, `${where} (output-cap) after ${spent}`);
+  if (kind === 'tool-loop' && !facts.toolFailure)
+    push('loop-without-diagnostic', id, `${where} (tool-loop) with no failing call recorded; ${spent}`);
+  if (facts.verifyEnv) {
+    const detail = facts.verifyEnv.detail ? `: "${facts.verifyEnv.detail}"` : '';
+    push(`verify-env-failed:${facts.verifyEnv.kind}`, id, `${where} (${facts.verifyEnv.kind}) after ${spent}${detail}`);
+    environment.set(facts.verifyEnv.kind, [...(environment.get(facts.verifyEnv.kind) ?? []), id]);
+  }
+  const stop = facts.budgetStop;
+  if (stop?.cap === 'turns' && stop.maxUsd > 0 && stop.costUsd < LOW_SPEND_SHARE * stop.maxUsd && SERVER_SIZED.has(stop.turnsSource))
+    push(
+      'budget-stop-low-spend',
+      id,
+      `${where} on the turn cap (${stop.turns}/${stop.maxTurns} turns) with ${money(stop.costUsd)} of ${money(stop.maxUsd)} spent` +
+        `${stop.turnsSource ? `; cap source ${stop.turnsSource}` : ''}`,
+    );
+  efficiencySignals(record, facts, push, where);
+  const time = facts.timeSec ?? {};
+  const slow = [
+    time.providerMax * 1000 >= STALL.providerSevereShare * attemptMs && `longest provider call ${formatDuration(time.providerMax * 1000)}`,
+    time.queue * 1000 >= STALL.queueSevereMs && `${formatDuration(time.queue * 1000)} in the queue`,
+    time.setup * 1000 >= STALL.setupSevereMs && `${formatDuration(time.setup * 1000)} of workspace setup`,
+    facts.stall?.level && `${facts.stall.kind} stall level ${facts.stall.level} for ${formatDuration(facts.stall.sinceSec * 1000)}`,
+  ].filter(Boolean);
+  if (slow.length) push('stall-warning', id, `${where}: ${slow.join(', ')}`);
+  const unverified = object(record.appliedUnverified);
+  if (unverified && facts.apply.via === 'verifiedBy')
+    push(
+      'apply-without-server-verification',
+      id,
+      `${where}: diff applied from ${facts.apply.from ?? 'an unverified state'} on the primary's own check, no server-run command`,
+      ['VERIFY_ENV_FAILED', 'FAILED', 'BUDGET', 'TIMEOUT'].includes(facts.apply.from),
+    );
+  if (status === 'FAILED' && !facts.providerFailure && !facts.apply && !facts.files && facts.costUsd >= WASTE_USD)
+    push('wasted-spend-on-failed-job', id, `${where}${kind ? ` (${kind})` : ''}: ${spent}, no in-scope changes kept${lastCall}`);
+  if (status === 'CANCELLED') push('cancelled-by-user', id, `${where} after ${spent}`);
+  if (facts.providerFailure)
+    push(`provider-failure:${facts.providerFailure}`, id, `${where} on a provider ${facts.providerFailure} failure; ${spent}`);
+}
+
+function signalsFromPairs(pairs, { health: rawHealth }) {
   let health = rawHealth;
-  const pairs = (Array.isArray(jobs) ? jobs : []).map((job) => [job, jobFacts(job, { nowMs, secrets })]).filter(([, facts]) => facts);
   const signals = [];
   const push = (code, jobId, evidence, attributable = FAMILIES[familyOf(code)].attributable) =>
     signals.push({ code, ...(jobId ? { job: jobId } : {}), attributable, evidence: within(evidence, EVIDENCE_CHARS) });
   const environment = new Map();
-  for (const [record, facts] of pairs) {
-    const { id, status } = facts;
-    const where = `job ${id} ${facts.ended ?? status}`;
-    const spent = [
-      `${facts.turns ?? '?'} turns`,
-      facts.costUsd === null ? 'unknown cost' : money(facts.costUsd),
-      ...(facts.wallSec ? [formatDuration(facts.wallSec * 1000)] : []),
-    ].join(', ');
-    const lastCall = facts.toolFailure
-      ? `; last failing call ${facts.toolFailure.tool} x${facts.toolFailure.repeats}${facts.toolFailure.error ? ` "${facts.toolFailure.error}"` : ''}`
-      : '';
-    const attemptMs = Number.isSafeInteger(record.executionProfile?.attemptTimeoutMs)
-      ? record.executionProfile.attemptTimeoutMs
-      : DEFAULT_ATTEMPT_TIMEOUT_MS;
-    const kind = facts.failureKind;
-    if (kind === 'finish-protocol' || kind === 'no-finish') push('protocol-failure-finish', id, `${where} (${kind}) after ${spent}`);
-    if (kind === 'output-cap') push('output-cap-failure', id, `${where} (output-cap) after ${spent}`);
-    if (kind === 'tool-loop' && !facts.toolFailure)
-      push('loop-without-diagnostic', id, `${where} (tool-loop) with no failing call recorded; ${spent}`);
-    if (facts.verifyEnv) {
-      const detail = facts.verifyEnv.detail ? `: "${facts.verifyEnv.detail}"` : '';
-      push(`verify-env-failed:${facts.verifyEnv.kind}`, id, `${where} (${facts.verifyEnv.kind}) after ${spent}${detail}`);
-      environment.set(facts.verifyEnv.kind, [...(environment.get(facts.verifyEnv.kind) ?? []), id]);
-    }
-    const stop = facts.budgetStop;
-    if (stop?.cap === 'turns' && stop.maxUsd > 0 && stop.costUsd < LOW_SPEND_SHARE * stop.maxUsd && SERVER_SIZED.has(stop.turnsSource))
-      push(
-        'budget-stop-low-spend',
-        id,
-        `${where} on the turn cap (${stop.turns}/${stop.maxTurns} turns) with ${money(stop.costUsd)} of ${money(stop.maxUsd)} spent` +
-          `${stop.turnsSource ? `; cap source ${stop.turnsSource}` : ''}`,
-      );
-    // A final DONE_VERIFIED is a correctness success, not a failure. It can
-    // still reveal that an automatically sized package was inefficient: the
-    // cap stopped it repeatedly, continuations were needed, and verification
-    // had no chance to run until later. Require explicit server-sizing
-    // provenance so a caller's deliberately fixed cap remains their choice.
-    const history = roundHistoryOf(record, facts);
-    const protocolOrExternalHistory = history.rounds.some(
-      (entry) => entry.status === 'CANCELLED' || entry.providerFailure || ['finish-protocol', 'no-finish'].includes(entry.failureKind),
-    );
-    const sizing = turnSizingOf(record);
-    if (facts.mode === 'write' && sizing && status !== 'CANCELLED' && !facts.providerFailure && !protocolOrExternalHistory) {
-      const turnCaps = history.rounds.filter((entry) => entry.status === 'BUDGET' && entry.budgetStop?.cap === 'turns');
-      const continuations = facts.continuations ?? 0;
-      const source = sizingSourceText(sizing);
-      if (turnCaps.length >= 2) {
-        const rounds = turnCaps.map((entry) => entry.round).filter((round) => round !== undefined);
-        push(
-          'repeated-turn-cap',
-          id,
-          `${where} reached the turn cap ${turnCaps.length} times${rounds.length ? ` in rounds ${rounds.join(', ')}` : ''}; turn-sizing source ${source}`,
-        );
-      }
-      if (
-        facts.turns !== undefined &&
-        facts.turns >= TURN_SIZING_OUTLIER_RATIO * sizing.recommendedTurns &&
-        facts.turns - sizing.recommendedTurns >= TURN_SIZING_OUTLIER_EXCESS
-      )
-        push(
-          'turn-sizing-outlier',
-          id,
-          `${where} used ${facts.turns} actual turns versus ${sizing.recommendedTurns} recommended (${ratioText(facts.turns, sizing.recommendedTurns)}; ${facts.turns - sizing.recommendedTurns} over); turn-sizing source ${source}`,
-        );
-      const causedBy = history.continuationStatuses.slice(0, continuations);
-      if (continuations >= 2 && causedBy.length === continuations)
-        push(
-          'repeated-continuation',
-          id,
-          `${where} needed ${continuations} continuations after ${causedBy.join(', ')}; turn-sizing source ${source}`,
-        );
-      const firstVerificationRound = history.verificationRounds.length ? Math.min(...history.verificationRounds) : undefined;
-      const capsBeforeVerification =
-        firstVerificationRound === undefined
-          ? []
-          : turnCaps.filter((entry) => entry.round !== undefined && entry.round < firstVerificationRound);
-      if (capsBeforeVerification.length >= 2 && continuations >= 1)
-        push(
-          'late-verification',
-          id,
-          `${where} first ran verification in round ${firstVerificationRound} after ${capsBeforeVerification.length} turn-cap BUDGET stops and ${continuations} continuations; turn-sizing source ${source}`,
-        );
-    }
-    const time = facts.timeSec ?? {};
-    const slow = [
-      time.providerMax * 1000 >= STALL.providerSevereShare * attemptMs &&
-        `longest provider call ${formatDuration(time.providerMax * 1000)}`,
-      time.queue * 1000 >= STALL.queueSevereMs && `${formatDuration(time.queue * 1000)} in the queue`,
-      time.setup * 1000 >= STALL.setupSevereMs && `${formatDuration(time.setup * 1000)} of workspace setup`,
-      facts.stall?.level && `${facts.stall.kind} stall level ${facts.stall.level} for ${formatDuration(facts.stall.sinceSec * 1000)}`,
-    ].filter(Boolean);
-    if (slow.length) push('stall-warning', id, `${where}: ${slow.join(', ')}`);
-    const unverified = object(record.appliedUnverified);
-    if (unverified && facts.apply.via === 'verifiedBy')
-      push(
-        'apply-without-server-verification',
-        id,
-        `${where}: diff applied from ${facts.apply.from ?? 'an unverified state'} on the primary's own check, no server-run command`,
-        ['VERIFY_ENV_FAILED', 'FAILED', 'BUDGET', 'TIMEOUT'].includes(facts.apply.from),
-      );
-    if (status === 'FAILED' && !facts.providerFailure && !facts.apply && !facts.files && facts.costUsd >= WASTE_USD)
-      push('wasted-spend-on-failed-job', id, `${where}${kind ? ` (${kind})` : ''}: ${spent}, no in-scope changes kept${lastCall}`);
-    if (status === 'CANCELLED') push('cancelled-by-user', id, `${where} after ${spent}`);
-    if (facts.providerFailure)
-      push(`provider-failure:${facts.providerFailure}`, id, `${where} on a provider ${facts.providerFailure} failure; ${spent}`);
-  }
+  for (const [record, facts] of pairs) jobSignals(record, facts, push, environment);
   for (const [kind, ids] of environment)
     if (ids.length > 1)
       push('repeated-env-failure', undefined, `verifier environment failure (${kind}) ended ${ids.length} jobs: ${ids.join(', ')}`);
@@ -597,8 +611,9 @@ export function buildRetrospective({
 } = {}) {
   const all = (Array.isArray(jobs) ? jobs : []).slice(0, MAX_RETROSPECTIVE_JOBS);
   const context = { nowMs, secrets };
-  const facts = all.map((job) => jobFacts(job, context)).filter(Boolean);
-  const signals = deriveSignals(all, { health, nowMs, secrets }).sort((a, b) => rank(a) - rank(b));
+  const pairs = factPairs(all, context);
+  const facts = pairs.map(([, f]) => f);
+  const signals = signalsFromPairs(pairs, { health }).sort((a, b) => rank(a) - rank(b));
   const attributable = signals.filter((signal) => signal.attributable);
   const warranting = promptWarrantSignals(signals);
   const tally = new Map();

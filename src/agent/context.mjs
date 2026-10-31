@@ -5,6 +5,7 @@ import {
   validAnthropicContent,
 } from '../anthropic-content.mjs';
 import { cloneOpenAIReasoning, openAIReasoningChars, validOpenAIReasoning } from '../openai-reasoning.mjs';
+import { MAX_MESSAGE_CHARS, MAX_TOOL_ARGUMENT_CHARS, MAX_TOOL_CALLS, validToolIdentifier } from '../transcript-limits.mjs';
 
 /** Append-only conversation store.  Only old bulky tool output is replaced,
  * preserving message order (and therefore provider prefix-cache locality). */
@@ -26,7 +27,7 @@ export class AgentContext {
     )
       throw new TypeError('invalid context options');
     const checked = validateTranscript(messages);
-    this.messages = checked.messages.map(cloneMessage);
+    this.messages = checked.messages.map((value) => cloneMessage(value, { includeElided: true }));
     this.trimmedIncomplete = checked.trimmedIncomplete;
     this.maxToolChars = maxToolChars;
     this.keepRecentToolResults = keepRecentToolResults;
@@ -42,10 +43,7 @@ export class AgentContext {
     validateMessageShape(message);
     // Elision mutates tool records. Stage it on owned clones so a rejected
     // oversized append cannot silently alter an already durable transcript.
-    const candidate = [...this.messages.map((value) => cloneMessage(value, { includeElided: true })), cloneMessage(message)];
-    elideMessages(candidate, this.maxToolChars, this.keepRecentToolResults);
-    if (candidate.reduce((total, value) => total + messageChars(value), 0) > this.maxTranscriptChars)
-      throw new Error('Conversation transcript exceeds size limit');
+    const candidate = this.#staged([message]);
     const stored = candidate.at(-1);
     const inbound = cloneMessage(message, { includeElided: true });
     // A single append is also a durability boundary.  Do not make it visible
@@ -55,15 +53,8 @@ export class AgentContext {
       // Re-stage against the committed transcript after prior queued appends.
       // This retains ordering when callers enqueue multiple records before a
       // flush, while a failed predecessor never leaks into live state.
-      const next = [
-        ...this.messages.map((value) => cloneMessage(value, { includeElided: true })),
-        cloneMessage(inbound, { includeElided: true }),
-      ];
-      elideMessages(next, this.maxToolChars, this.keepRecentToolResults);
-      if (next.reduce((total, value) => total + messageChars(value), 0) > this.maxTranscriptChars)
-        throw new Error('Conversation transcript exceeds size limit');
-      const durable = cloneMessage(next.at(-1), { includeElided: true });
-      if (this.onAppend) await this.onAppend(cloneMessage(durable, { includeElided: true }));
+      const next = this.#staged([inbound]);
+      if (this.onAppend) await this.onAppend(cloneMessage(next.at(-1), { includeElided: true }));
       this.messages = next;
     };
     const queued = this.pending.then(action);
@@ -92,8 +83,7 @@ export class AgentContext {
       if (checked.trimmedIncomplete) throw new Error('Conversation transcript contains an incomplete tool-call transaction');
       const candidate = checked.messages.map((value) => cloneMessage(value, { includeElided: true }));
       elideMessages(candidate, this.maxToolChars, this.keepRecentToolResults);
-      if (candidate.reduce((total, value) => total + messageChars(value), 0) > this.maxTranscriptChars)
-        throw new Error('Conversation transcript exceeds size limit');
+      if (transcriptChars(candidate) > this.maxTranscriptChars) throw new Error('Conversation transcript exceeds size limit');
       const durable = candidate.slice(prior).map((value) => cloneMessage(value, { includeElided: true }));
       if (this.onAppendBatch) await this.onAppendBatch(durable.map((value) => cloneMessage(value, { includeElided: true })));
       else if (this.onAppend) {
@@ -136,7 +126,15 @@ export class AgentContext {
     }
   }
   totalChars() {
-    return this.messages.reduce((total, message) => total + messageChars(message), 0);
+    return transcriptChars(this.messages);
+  }
+  // Stage `extra` after the live transcript on owned clones, applying
+  // retention elision and the size limit without touching live state.
+  #staged(extra) {
+    const next = [...this.messages, ...extra].map((value) => cloneMessage(value, { includeElided: true }));
+    elideMessages(next, this.maxToolChars, this.keepRecentToolResults);
+    if (transcriptChars(next) > this.maxTranscriptChars) throw new Error('Conversation transcript exceeds size limit');
+    return next;
   }
   assertBounded() {
     if (this.totalChars() > this.maxTranscriptChars) throw new Error('Conversation transcript exceeds size limit');
@@ -161,24 +159,9 @@ export class AgentContext {
    * state.
    */
   *providerBudgetElisionSnapshots() {
-    const source = this.snapshot();
-    const toolIndexes = source.flatMap((message, index) => (message.role === 'tool' ? [index] : []));
-    const protectedIndexes = newestCompleteToolTransactionIndexes(source) ?? new Set();
-    const olderToolIndexes = toolIndexes.filter((index) => !protectedIndexes.has(index));
-    const eligible = olderToolIndexes
-      .slice(0, Math.max(0, olderToolIndexes.length - this.keepRecentToolResults))
-      .filter((index) => canElideToolResult(source[index]));
-    const compact = source.map((message) => cloneMessage(message, { includeElided: true }));
-    let elidedToolResults = 0;
-    for (const index of eligible) {
-      const original = compact[index].content;
-      compact[index].content = toolOutputElisionMarker(original.length);
-      elidedToolResults++;
-      yield {
-        messages: compact.map((message) => cloneMessage(message, { includeElided: true })),
-        elidedToolResults,
-      };
-    }
+    const plan = this.#elisionPlan();
+    const compact = plan.source.map((message) => cloneMessage(message, { includeElided: true }));
+    yield* elideProgressively(compact, plan.ordinaryEligible, 0);
   }
   /**
    * Yield a second, provider-only budget fallback after every ordinary
@@ -193,31 +176,35 @@ export class AgentContext {
    * It neither alters durable state nor calls persistence callbacks.
    */
   *providerBudgetDeepElisionSnapshots() {
+    const plan = this.#elisionPlan();
+    if (!plan.protectedIndexes) return;
+    const { source, olderToolIndexes, ordinaryEligible } = plan;
+    const compact = source.map((message) => cloneMessage(message, { includeElided: true }));
+    for (const index of ordinaryEligible) compact[index].content = toolOutputElisionMarker(compact[index].content.length);
+    yield* elideProgressively(
+      compact,
+      olderToolIndexes.filter((index) => !ordinaryEligible.has(index) && canElideToolResult(source[index])),
+      ordinaryEligible.size,
+    );
+  }
+  #elisionPlan() {
     const source = this.snapshot();
     const protectedIndexes = newestCompleteToolTransactionIndexes(source);
-    if (!protectedIndexes) return;
-    const toolIndexes = source.flatMap((message, index) => (message.role === 'tool' ? [index] : []));
-    const olderToolIndexes = toolIndexes.filter((index) => !protectedIndexes.has(index));
+    const skip = protectedIndexes ?? new Set();
+    const olderToolIndexes = source.flatMap((message, index) => (message.role === 'tool' && !skip.has(index) ? [index] : []));
     const ordinaryEligible = new Set(
       olderToolIndexes
         .slice(0, Math.max(0, olderToolIndexes.length - this.keepRecentToolResults))
         .filter((index) => canElideToolResult(source[index])),
     );
-    const compact = source.map((message) => cloneMessage(message, { includeElided: true }));
-    for (const index of ordinaryEligible) compact[index].content = toolOutputElisionMarker(compact[index].content.length);
-    const eligible = olderToolIndexes.filter(
-      (index) => !ordinaryEligible.has(index) && !protectedIndexes.has(index) && canElideToolResult(source[index]),
-    );
-    let elidedToolResults = ordinaryEligible.size;
-    for (const index of eligible) {
-      const original = compact[index].content;
-      compact[index].content = toolOutputElisionMarker(original.length);
-      elidedToolResults++;
-      yield {
-        messages: compact.map((message) => cloneMessage(message, { includeElided: true })),
-        elidedToolResults,
-      };
-    }
+    return { source, protectedIndexes, olderToolIndexes, ordinaryEligible };
+  }
+}
+function* elideProgressively(compact, indexes, elidedToolResults) {
+  for (const index of indexes) {
+    compact[index].content = toolOutputElisionMarker(compact[index].content.length);
+    elidedToolResults++;
+    yield { messages: compact.map((message) => cloneMessage(message, { includeElided: true })), elidedToolResults };
   }
 }
 const toolOutputElisionMarker = (chars) => `[tool output elided: ${chars} chars; request a narrower read if needed]`;
@@ -242,6 +229,7 @@ function newestCompleteToolTransactionIndexes(messages) {
   }
   return newest;
 }
+const transcriptChars = (messages) => messages.reduce((total, message) => total + messageChars(message), 0);
 function messageChars(message) {
   return typeof message?.content === 'string'
     ? message.content.length +
@@ -280,11 +268,7 @@ function elideMessages(messages, maxToolChars, keepRecentToolResults) {
  * to discard on resume; any incomplete/mismatched transaction in the middle
  * would reorder provider state, so reject it rather than guessing.
  */
-const MAX_MESSAGE_CHARS = 1_000_000;
-const MAX_TOOL_CALLS = 64;
-const MAX_TOOL_ARGUMENT_CHARS = 512_000;
 const boundedText = (value, max = MAX_MESSAGE_CHARS) => typeof value === 'string' && value.length <= max;
-const safeIdentifier = (value, max) => boundedText(value, max) && value.length > 0 && !/[\x00-\x1F\x7F]/.test(value);
 function cloneMessage(message, { includeElided = false } = {}) {
   if (message.role === 'system' || message.role === 'user') return { role: message.role, content: message.content };
   if (message.role === 'assistant')
@@ -316,8 +300,8 @@ function validCall(call) {
   return (
     !!call &&
     call.type === 'function' &&
-    safeIdentifier(call.id, 512) &&
-    safeIdentifier(call.function?.name, 128) &&
+    validToolIdentifier(call.id, 512) &&
+    validToolIdentifier(call.function?.name, 128) &&
     boundedText(call.function?.arguments, MAX_TOOL_ARGUMENT_CHARS)
   );
 }
@@ -353,13 +337,21 @@ function validateMessageShape(message) {
   }
   if (
     message.role === 'tool' &&
-    safeIdentifier(message.tool_call_id, 512) &&
+    validToolIdentifier(message.tool_call_id, 512) &&
     boundedText(message.content) &&
-    (message.name === undefined || safeIdentifier(message.name, 128))
+    (message.name === undefined || validToolIdentifier(message.name, 128))
   )
     return;
   throw new Error('Conversation transcript has an invalid message');
 }
+const isToolResultShape = (result) => {
+  try {
+    validateMessageShape(result);
+    return result.role === 'tool';
+  } catch {
+    return false;
+  }
+};
 function validateTranscript(source) {
   const accepted = [];
   for (let index = 0; index < source.length; index += 1) {
@@ -377,16 +369,10 @@ function validateTranscript(source) {
     }
     const ids = new Set(message.tool_calls.map((call) => call.id));
     const results = source.slice(index + 1, index + 1 + message.tool_calls.length);
+    const wellFormed = results.every(isToolResultShape);
     const complete =
       results.length === message.tool_calls.length &&
-      results.every((result) => {
-        try {
-          validateMessageShape(result);
-          return result.role === 'tool';
-        } catch {
-          return false;
-        }
-      }) &&
+      wellFormed &&
       results.every((result) => ids.has(result.tool_call_id)) &&
       new Set(results.map((result) => result.tool_call_id)).size === ids.size;
     if (complete) {
@@ -394,16 +380,7 @@ function validateTranscript(source) {
       index += results.length;
       continue;
     }
-    const reachesEnd =
-      index + 1 + results.length === source.length &&
-      results.every((result) => {
-        try {
-          validateMessageShape(result);
-          return result.role === 'tool';
-        } catch {
-          return false;
-        }
-      });
+    const reachesEnd = index + 1 + results.length === source.length && wellFormed;
     if (reachesEnd) return { messages: accepted, trimmedIncomplete: true };
     throw new Error('Conversation transcript contains an incomplete tool-call transaction');
   }

@@ -1,6 +1,6 @@
 import { lstatSync, readlinkSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, parse, relative, resolve, sep } from 'node:path';
-import { matchesAny, normalizePath } from './glob.mjs';
+import { globToRegExp, normalizePath } from './glob.mjs';
 
 export const DEFAULT_DENY_READ = Object.freeze([
   '.env*',
@@ -108,6 +108,10 @@ export class PolicyError extends Error {
  * All public methods return an absolute, canonical-enough filesystem path.
  */
 export class PathPolicy {
+  #denyReadRe;
+  #denyWriteRe;
+  #ownedRe;
+  #writableRe;
   constructor({ repoPath, ownedPaths, extraWritable = [], denyRead = [], platform = process.platform } = {}) {
     if (!repoPath) throw new PolicyError('repoPath is required', 'E_PATH_REPO');
     this.platform = platform;
@@ -117,6 +121,10 @@ export class PathPolicy {
     this.denyRead = [...DEFAULT_DENY_READ, ...validatePatterns(denyRead, 'denyRead', platform)];
     // Scope is an allowance, never permission to mutate Git metadata or likely secrets.
     this.denyWrite = [...DEFAULT_DENY_WRITE];
+    this.#denyReadRe = compile(this.denyRead, { platform, caseInsensitive: true });
+    this.#denyWriteRe = compile(this.denyWrite, { platform, caseInsensitive: true });
+    this.#ownedRe = compile(this.ownedPaths, { platform });
+    this.#writableRe = compile([...this.ownedPaths, ...this.extraWritable], { platform });
   }
 
   /** Resolve an input path and verify it remains inside the repository after symlinks. */
@@ -127,7 +135,7 @@ export class PathPolicy {
     const target = this.#resolve(path);
     const rel = repoRelative(this.repoPath, target, this.platform);
     const logical = logicalRelative(this.repoPath, path, this.platform);
-    if (matchesDeny(logical, this.denyRead, this.platform) || matchesDeny(rel, this.denyRead, this.platform))
+    if (matchesRe(logical, this.#denyReadRe, this.platform) || matchesRe(rel, this.#denyReadRe, this.platform))
       throw new PolicyError('Reading this path is denied', 'E_READ_DENIED');
     return target;
   }
@@ -135,12 +143,9 @@ export class PathPolicy {
     const target = this.#resolve(path);
     const rel = repoRelative(this.repoPath, target, this.platform);
     const logical = logicalRelative(this.repoPath, path, this.platform);
-    if (matchesDeny(logical, this.denyWrite, this.platform) || matchesDeny(rel, this.denyWrite, this.platform))
+    if (matchesRe(logical, this.#denyWriteRe, this.platform) || matchesRe(rel, this.#denyWriteRe, this.platform))
       throw new PolicyError('Writing protected Git metadata or secret paths is denied', 'E_WRITE_DENIED');
-    if (
-      !matchesAny(logical, [...this.ownedPaths, ...this.extraWritable], this) ||
-      !matchesAny(rel, [...this.ownedPaths, ...this.extraWritable], this)
-    ) {
+    if (!matchesRe(logical, this.#writableRe, this.platform) || !matchesRe(rel, this.#writableRe, this.platform)) {
       throw new PolicyError('Writing outside owned paths is denied', 'E_WRITE_SCOPE');
     }
     return target;
@@ -149,8 +154,8 @@ export class PathPolicy {
     try {
       const target = this.#resolve(path);
       return (
-        matchesAny(logicalRelative(this.repoPath, path, this.platform), this.ownedPaths, this) &&
-        matchesAny(repoRelative(this.repoPath, target, this.platform), this.ownedPaths, this)
+        matchesRe(logicalRelative(this.repoPath, path, this.platform), this.#ownedRe, this.platform) &&
+        matchesRe(repoRelative(this.repoPath, target, this.platform), this.#ownedRe, this.platform)
       );
     } catch {
       return false;
@@ -174,8 +179,12 @@ function validatePatterns(value, name, platform) {
     throw new PolicyError(`${name} contains an invalid path pattern`, 'E_PATH_PATTERNS');
   }
 }
-function matchesDeny(path, patterns, platform) {
-  return matchesAny(path, patterns, { platform, caseInsensitive: true });
+function compile(patterns, options) {
+  return patterns.map((pattern) => globToRegExp(pattern, options));
+}
+function matchesRe(path, regexes, platform) {
+  const normalized = normalizePath(path, { platform });
+  return regexes.some((re) => re.test(normalized));
 }
 function logicalRelative(repo, path, platform) {
   if (typeof path !== 'string' || path.includes('\0')) throw new PolicyError('Invalid path', 'E_PATH_INVALID');
@@ -233,11 +242,13 @@ function followSymlinks(absolute, seen) {
 function repoRelative(repo, target, platform) {
   return normalizePath(relative(repo, target), { platform });
 }
+/** Whether a `path.relative(root, target)` result leaves `root`. */
+export const escapesRoot = (rel) => rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel);
 function isInside(root, target, platform = process.platform) {
   if (platform === 'win32') {
     root = root.toLowerCase();
     target = target.toLowerCase();
   }
   const rel = relative(root, target);
-  return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel));
+  return rel === '' || !escapesRoot(rel);
 }

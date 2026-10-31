@@ -24,6 +24,10 @@ export const isOpenAITerraModel = (model) => typeof model === 'string' && /^gpt-
 export const isOpenAISolModel = (model) => typeof model === 'string' && /^gpt-\d+(?:\.\d+)?-sol$/.test(model);
 export const isOpenAIModel = (model) => isOpenAITerraModel(model) || isOpenAISolModel(model);
 
+/** The provider wire protocols Offload can drive. */
+export const SUPPORTED_PROVIDER_TYPES = Object.freeze(['openai-chat', 'anthropic-messages']);
+export const isSupportedProviderType = (type) => SUPPORTED_PROVIDER_TYPES.includes(type);
+
 const modelTokens = (model) =>
   String(model)
     .toLowerCase()

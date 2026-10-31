@@ -1,5 +1,6 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import { lstat, open } from 'node:fs/promises';
+import { sameBigintFileStat } from './stat-identity.mjs';
 
 const BIGINT_STATS = Object.freeze({ bigint: true });
 
@@ -11,18 +12,6 @@ function checkedCap(cap) {
 function checkedSize(stat, cap) {
   if (typeof stat.size !== 'bigint' || stat.size < 0n || stat.size > cap) throw new Error('file exceeds size limit');
   return Number(stat.size);
-}
-
-function sameFile(before, after) {
-  // Include change timestamps: dev/inode alone cannot detect an in-place
-  // rewrite between lstat and open (or while a descriptor is being read).
-  return (
-    before.dev === after.dev &&
-    before.ino === after.ino &&
-    before.size === after.size &&
-    before.mtimeNs === after.mtimeNs &&
-    before.ctimeNs === after.ctimeNs
-  );
 }
 
 function validRegular(stat, cap) {
@@ -44,7 +33,7 @@ export function readRegularFileSync(path, cap, { platform = process.platform, fs
     const nonBlock = platform === 'win32' ? 0 : fs.constants.O_NONBLOCK || 0;
     fd = fs.openSync(path, fs.constants.O_RDONLY | noFollow | nonBlock);
     const opened = fs.fstatSync(fd, BIGINT_STATS);
-    if (!validRegular(opened, maximum) || !sameFile(before, opened)) throw new Error('file changed while opening');
+    if (!validRegular(opened, maximum) || !sameBigintFileStat(before, opened)) throw new Error('file changed while opening');
     const bytes = Buffer.allocUnsafe(Number(opened.size));
     let offset = 0;
     while (offset < bytes.length) {
@@ -53,7 +42,7 @@ export function readRegularFileSync(path, cap, { platform = process.platform, fs
       offset += count;
     }
     const after = fs.fstatSync(fd, BIGINT_STATS);
-    if (!validRegular(after, maximum) || !sameFile(opened, after)) throw new Error('file changed while reading');
+    if (!validRegular(after, maximum) || !sameBigintFileStat(opened, after)) throw new Error('file changed while reading');
     return bytes;
   } finally {
     if (fd !== undefined)
@@ -63,18 +52,22 @@ export function readRegularFileSync(path, cap, { platform = process.platform, fs
   }
 }
 
-/** Async counterpart used by MCP resource loading. */
-export async function readRegularFile(path, cap, { platform = process.platform, fs = defaultAsyncFs } = {}) {
+/**
+ * Async counterpart used by MCP resource loading. `expected`, a caller's earlier
+ * bigint lstat, extends the identity guard back to that check (for example an allowlist test).
+ */
+export async function readRegularFile(path, cap, { platform = process.platform, fs = defaultAsyncFs, expected } = {}) {
   const maximum = checkedCap(cap);
   let handle;
   try {
     const before = await fs.lstat(path, BIGINT_STATS);
     if (!validRegular(before, maximum)) throw new Error('file is not a bounded regular file');
+    if (expected && !sameBigintFileStat(expected, before)) throw new Error('file changed while opening');
     const noFollow = platform === 'win32' ? 0 : fs.constants.O_NOFOLLOW || 0;
     const nonBlock = platform === 'win32' ? 0 : fs.constants.O_NONBLOCK || 0;
     handle = await fs.open(path, fs.constants.O_RDONLY | noFollow | nonBlock);
     const opened = await handle.stat(BIGINT_STATS);
-    if (!validRegular(opened, maximum) || !sameFile(before, opened)) throw new Error('file changed while opening');
+    if (!validRegular(opened, maximum) || !sameBigintFileStat(before, opened)) throw new Error('file changed while opening');
     const bytes = Buffer.allocUnsafe(Number(opened.size));
     let offset = 0;
     while (offset < bytes.length) {
@@ -83,7 +76,7 @@ export async function readRegularFile(path, cap, { platform = process.platform, 
       offset += bytesRead;
     }
     const after = await handle.stat(BIGINT_STATS);
-    if (!validRegular(after, maximum) || !sameFile(opened, after)) throw new Error('file changed while reading');
+    if (!validRegular(after, maximum) || !sameBigintFileStat(opened, after)) throw new Error('file changed while reading');
     return bytes;
   } finally {
     if (handle) await handle.close().catch(() => {});
@@ -92,3 +85,11 @@ export async function readRegularFile(path, cap, { platform = process.platform, 
 
 const defaultSyncFs = Object.freeze({ constants, lstatSync, openSync, fstatSync, readSync, closeSync });
 const defaultAsyncFs = Object.freeze({ constants, lstat, open });
+
+/** Default cap for small UTF-8 configuration and pricing files. */
+export const MAX_TEXT_FILE_BYTES = 1024 * 1024;
+
+/** Reads a bounded regular file and decodes it as strict UTF-8. */
+export function readUtf8FileSync(path, maxBytes = MAX_TEXT_FILE_BYTES) {
+  return new TextDecoder('utf-8', { fatal: true }).decode(readRegularFileSync(path, maxBytes));
+}

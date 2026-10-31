@@ -3,18 +3,15 @@
 // protocol state separate from Offload's portable text/tool-call transcript:
 // DeepSeek can ignore it, while the Anthropic adapter can reconstruct its
 // native content array without exposing arbitrary provider objects.
-export const MAX_ANTHROPIC_CONTENT_BLOCKS = 128;
-export const MAX_ANTHROPIC_TOOL_INPUT_CHARS = 512_000;
+import { plainObject } from './plain-object.mjs';
+import { MAX_MESSAGE_CHARS, MAX_TOOL_ARGUMENT_CHARS, validToolIdentifier } from './transcript-limits.mjs';
 
-const MAX_TEXT_CHARS = 1_000_000;
-const plainObject = (value) => {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-};
-const validText = (value, limit = MAX_TEXT_CHARS) => typeof value === 'string' && value.length <= limit && !/[\0\x0b\x0c\x7f]/.test(value);
-const validIdentifier = (value, limit) =>
-  typeof value === 'string' && value.length > 0 && value.length <= limit && !/[\0-\x1f\x7f]/.test(value);
+export const MAX_ANTHROPIC_CONTENT_BLOCKS = 128;
+export const MAX_ANTHROPIC_TOOL_INPUT_CHARS = MAX_TOOL_ARGUMENT_CHARS;
+
+export const MAX_TEXT_CHARS = MAX_MESSAGE_CHARS;
+export const validText = (value, limit = MAX_TEXT_CHARS) =>
+  typeof value === 'string' && value.length <= limit && !/[\0\x0b\x0c\x7f]/.test(value);
 const onlyKeys = (value, keys) => Object.keys(value).every((key) => keys.includes(key));
 
 function validToolInput(value) {
@@ -40,8 +37,8 @@ function validBlock(value) {
   return (
     value.type === 'tool_use' &&
     onlyKeys(value, ['type', 'id', 'name', 'input']) &&
-    validIdentifier(value.id, 512) &&
-    validIdentifier(value.name, 128) &&
+    validToolIdentifier(value.id, 512) &&
+    validToolIdentifier(value.name, 128) &&
     validToolInput(value.input)
   );
 }
