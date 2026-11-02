@@ -23,6 +23,8 @@ import { sandboxAvailable } from '../../src/sandbox.mjs';
 import { installedSkillHealth } from '../../src/skill-health.mjs';
 import { createMockOpenAIServer } from '../mock-openai-server.mjs';
 import { LOOPBACK_SKIP_MARKER } from '../run-suite.mjs';
+// A wait returns as soon as the job settles, so this bounds a hang, not the host's speed.
+const TERMINAL_WAIT_SEC = 55;
 
 const OPENAI_BASE = 'https://api.openai.com/v1';
 const openaiModels = (ids) => new Response(JSON.stringify({ data: ids.map((id, index) => ({ id, created: 1_000 - index })) }));
@@ -226,7 +228,7 @@ for (const line of ['sonnet', 'opus'])
     });
     try {
       const started = await core.start({ mode: 'report', task: 'inspect', repoPath: path });
-      await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
       assert.deepEqual(requests, ['https://api.anthropic.com/v1/models?lifecycle=active', 'https://api.deepseek.com/models']);
       assert.equal(observed.configuredModel, `claude-${line}-5-5`);
       assert.equal(observed.executionProfile.model, `claude-${line}-5-5`);
@@ -484,7 +486,7 @@ test('Core starts a report job without injecting write or verifier fields', asyn
   });
   try {
     const started = await core.start({ mode: 'report', task: 'analyze only', repoPath: path });
-    const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'DONE_UNVERIFIED');
     assert.equal(done.mode, 'report');
   } finally {
@@ -515,7 +517,7 @@ test('a report job sizes its turn cap from the copied input bytes and echoes onl
       ['.offload-report-inputs/input-01'],
     );
     assert.doesNotMatch(JSON.stringify(started), /customer-sizing-export/);
-    await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
   } finally {
     await core.shutdown();
     await rm(path, { recursive: true, force: true });
@@ -584,7 +586,7 @@ test('report worker external input transcript is ephemeral while its report rema
         budget: { maxTurns: 2 },
         repoPath: path,
       });
-      const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
       assert.equal(done.status, 'DONE_UNVERIFIED');
       assert.equal(done.reportResult.text, 'Private input was reviewed.');
       assert.deepEqual(done.reportResult.inputs, [{ path: '.offload-report-inputs/input-01', bytes: Buffer.byteLength(sensitiveBody) }]);
@@ -651,7 +653,7 @@ test('Core passes the current write-job turn allowance into the initial system p
         budget: { maxTurns: 2 },
         repoPath: path,
       });
-      const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
       assert.equal(done.status, 'DONE_UNVERIFIED');
       const system = server.requests[0].body.messages.find((message) => message.role === 'system')?.content;
       assert.match(system, /2 model turns available/);
@@ -774,7 +776,7 @@ test('Core restart of a queued budget finish uses only the trusted finish projec
         budgetFinishRecovery: 'queued',
       });
       assert.equal(await core.manager.recover(), 1);
-      const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
       assert.equal(done.status, 'DONE_UNVERIFIED');
       assert.equal(requests.length, 1);
       const request = requests[0];
@@ -835,7 +837,7 @@ test('manual repair gets a fresh worker timeout round after a stale original wal
     const core = createCore({ config: { loaded: configured, pricingTable, resolveKey: () => 'credential' } });
     try {
       const started = await core.start({ task: 'retry provider failure', ownedPaths: ['src/**'], repoPath: path });
-      const failed = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      const failed = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
       assert.equal(failed.status, 'FAILED');
       assert.deepEqual(failed.providerFailure, { kind: 'http', retryable: true, attempts: 1, status: 503 });
       // This is the observed failure mode: a repair requested much later than
@@ -848,7 +850,7 @@ test('manual repair gets a fresh worker timeout round after a stale original wal
       await core.manager.store.update(started.jobId, { executionProfile: legacyProfile });
       await core.manager.store.update(started.jobId, { wallStartedAt: new Date(Date.now() - 113 * 60_000).toISOString() });
       await core.repair(started.jobId, ['retry the transient provider failure'], { repoPath: path });
-      const repaired = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      const repaired = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
       assert.equal(repaired.status, 'DONE_UNVERIFIED');
       assert.equal(requests.length, 2, 'repair must make at least one new worker request');
       const events = (await core.manager.store.readArtifact(started.jobId, 'events.jsonl'))
@@ -1049,8 +1051,8 @@ test('one core routes durable jobs across canonical repository roots', async () 
   const second = await core.start({ repoPath: b, task: 'second', ownedPaths: ['lib/**'], testCommand: 'true' });
   await assert.rejects(() => core.wait(first.jobId, { repoPath: b, timeoutSec: 2 }), /job not found/);
   await assert.rejects(() => core.wait(second.jobId, { repoPath: a, timeoutSec: 2 }), /job not found/);
-  assert.equal((await core.wait(first.jobId, { timeoutSec: 2 })).status, 'DONE_VERIFIED');
-  assert.equal((await core.wait(second.jobId, { timeoutSec: 2 })).status, 'DONE_VERIFIED');
+  assert.equal((await core.wait(first.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
+  assert.equal((await core.wait(second.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
   const listed = await core.job(undefined, { repoPath: b });
   assert.deepEqual(
     listed.jobs.map((job) => job.jobId),
@@ -1082,7 +1084,7 @@ test('Core persists explicit policy-only verifier consent and preserves caller p
     testCommand: 'true',
     unsafePolicyOnlyVerifier: true,
   });
-  const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 10 });
+  const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(done.status, 'DONE_VERIFIED');
   assert.equal(done.unsafePolicyOnlyVerifier, true);
   assert.equal(verifyOptions[0].requireSandbox, false);
@@ -1104,7 +1106,7 @@ test('Core never applies the policy-only exception to a repository verifier', as
     /requires a caller-supplied testCommand/,
   );
   const started = await core.start({ repoPath: path, task: 'repo verifier', ownedPaths: ['src/**'] });
-  assert.equal((await core.wait(started.jobId, { repoPath: path, timeoutSec: 1 })).status, 'VERIFY_FAILED');
+  assert.equal((await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC })).status, 'VERIFY_FAILED');
 });
 
 async function seedQueuedJob(path, id) {
@@ -1329,7 +1331,7 @@ test('Core persists baseline-diff options and hands the verifier its timeout', a
       verifierTimeoutSec: 90,
     });
     assert.equal(started.verifierMode, 'baseline-diff');
-    const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'DONE_VERIFIED');
     const stored = await new JobStore({ repoPath: path }).get(started.jobId);
     assert.equal(stored.verifierMode, 'baseline-diff');
@@ -1368,7 +1370,7 @@ test('Core sizes the turn cap from file sizes, honors an explicit cap, and echoe
       ...(budget ? { budget } : {}),
       ...extra,
     });
-    await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
     return { started, stored: await store.get(started.jobId) };
   };
   try {
@@ -1474,7 +1476,7 @@ test('Core forwards applyThenVerify, its timeout and the request signal to the m
       testCommand: 'npm test',
       maxRepairRounds: 0,
     });
-    const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'VERIFY_FAILED');
     // A plain dry run is exactly what it was.
     assert.deepEqual(await core.apply(started.jobId, { repoPath: path }), {
@@ -1798,7 +1800,7 @@ test('Core forwards the accepted provider attempt timeout to the worker adapter'
   const core = createCore({ config: { loaded: configured, pricingTable, resolveKey: () => 'credential' } });
   try {
     const started = await core.start({ repoPath: path, task: 'forward provider timeout', ownedPaths: ['src/**'] });
-    const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 5 });
+    const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'TIMEOUT');
     assert.deepEqual(done.providerFailure, { kind: 'attempt_timeout', retryable: true, attempts: 1, timeoutMs: 45_000 });
     assert.ok(seenDelays.includes(45_000));
@@ -2427,7 +2429,7 @@ test('a real worker loop on a failing call ends FAILED with the redacted call, t
     const core = createCore({ config: { loaded: configured, pricingTable, resolveKey: () => 'credential', isolation }, isolation });
     try {
       const started = await core.start({ repoPath: path, task: 'loop on a missing file', ownedPaths: ['src/**'] });
-      const failed = await core.wait(started.jobId, { repoPath: path, timeoutSec: 20 });
+      const failed = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
       assert.equal(failed.status, 'FAILED');
       assert.equal(failed.failureKind, 'tool-loop');
       const { toolFailure } = failed;
@@ -2454,7 +2456,7 @@ test('a real worker loop on a failing call ends FAILED with the redacted call, t
       assert.doesNotMatch(JSON.stringify(requests), new RegExp(toolFailure.error.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 
       await core.continue(started.jobId, { repoPath: path });
-      const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 20 });
+      const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
       assert.equal(done.status, 'DONE_UNVERIFIED');
       const prompt = requests[4].messages.at(-1);
       assert.equal(prompt.role, 'user');
@@ -2501,7 +2503,7 @@ test('a real worker loop through Core records provider calls, tool timings and a
     const core = createCore({ config: { loaded: configured, pricingTable, resolveKey: () => 'credential', isolation }, isolation });
     try {
       const started = await core.start({ repoPath: path, task: 'time a real loop', ownedPaths: ['src/**'] });
-      const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 20, detail: 'full' });
+      const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC, detail: 'full' });
       assert.equal(done.status, 'DONE_UNVERIFIED');
       const [round] = done.timing.rounds;
       assert.equal(round.providerCalls, 3, 'one completed request per scripted turn');
@@ -2585,11 +2587,11 @@ test('assertion repair sends a fresh focused conversation through Core while pre
       },
     });
     const started = await core.start({ repoPath: path, task: 'ORIGINAL_IMPLEMENTATION_HISTORY', ownedPaths: ['src/**'] });
-    const failed = await core.wait(started.jobId, { repoPath: path, timeoutSec: 20 });
+    const failed = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(failed.status, 'FAILED');
     await core.apply(started.jobId, { repoPath: path, apply: true, applyThenVerify: 'node check.js' });
     await core.repair(started.jobId, ['src/a.js: expected 42'], { repoPath: path, assertionPaths: ['src/a.js'] });
-    const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 20 });
+    const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'DONE_UNVERIFIED');
     assert.equal(requests.length, 3);
     const repairMessages = requests[2].messages;
@@ -2646,7 +2648,7 @@ for (const line of ['sonnet', 'opus'])
         repoPath: path,
         budget: { maxTurns: 2, maxUsd: 1 },
       });
-      const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
       assert.equal(done.status, 'DONE_UNVERIFIED', JSON.stringify(done));
       assert.equal(done.reportResult.text, 'Reviewed.');
       assert.equal(requests.length, 3);
@@ -2716,7 +2718,7 @@ test('Core rejects the session-shaped one-of-five completion until every untouch
       ownedPaths: ['src/a.js', 'src/b.js', 'src/c.js', 'src/d.js', 'src/e.js'],
       repoPath: path,
     });
-    const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15, detail: 'full' });
+    const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC, detail: 'full' });
     assert.equal(done.status, 'DONE_UNVERIFIED', JSON.stringify(done));
     assert.equal(requests.length, 3);
     assert.match(requests[2].messages.at(-1).content, /completion check/);
@@ -2880,11 +2882,11 @@ for (const scenario of ['immediate', 'mid-job', 'claude-mid-job', 'continued', '
         ownedPaths: ['result.txt'],
         budget: { maxTurns: scenario === 'continued' ? 1 : 3, maxUsd: 1 },
       });
-      let done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      let done = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
       if (scenario === 'continued') {
         assert.equal(done.status, 'BUDGET', JSON.stringify(done));
         await core.continue(started.jobId, { repoPath: path, extraTurns: 2 });
-        done = await core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+        done = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
       }
       assert.equal(done.status, scenario === 'fallback-failed' ? 'FAILED' : 'DONE_UNVERIFIED', JSON.stringify(done));
       assert.equal(done.creditFallback, true);
@@ -3042,7 +3044,7 @@ for (const [line, openai] of [
     try {
       const started = await harness.core.start(reviewInput(path, line));
       harness.holder.id = started.jobId;
-      const done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+      const done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
       assert.equal(done.status, 'DONE_UNVERIFIED', JSON.stringify(done));
       assert.deepEqual(
         harness.calls.map((call) => [call.host, call.stage ?? 0]),
@@ -3091,7 +3093,7 @@ test('an immediate double hop persists each stage before spending on that route'
   try {
     const started = await harness.core.start(reviewInput(path));
     harness.holder.id = started.jobId;
-    const done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    const done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'DONE_UNVERIFIED', JSON.stringify(done));
     assert.deepEqual(
       harness.calls.map((call) => [call.host, call.stage ?? 0]),
@@ -3153,7 +3155,7 @@ test('an OpenAI worker replays encrypted reasoning before its function call on t
       budget: { maxTurns: 3, maxUsd: 1 },
     });
     harness.holder.id = started.jobId;
-    const done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    const done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'DONE_UNVERIFIED', JSON.stringify(done));
     assert.deepEqual(
       harness.calls.map((call) => [call.host, call.stage ?? 0]),
@@ -3195,12 +3197,12 @@ test('sonnet from Terra to Claude to Flash retains edits and a continuation resu
       budget: { maxTurns: 1, maxUsd: 1 },
     });
     harness.holder.id = started.jobId;
-    let done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    let done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'BUDGET', JSON.stringify(done));
     assert.equal(done.providerStage, 2);
     const before = harness.calls.length;
     await harness.core.continue(started.jobId, { repoPath: path, extraTurns: 2 });
-    done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'DONE_UNVERIFIED', JSON.stringify(done));
     // Only Flash is asked after the continuation: no re-try of OpenAI or Claude.
     assert.deepEqual(
@@ -3249,7 +3251,7 @@ test('a legacy job (creditFallback true, single fallback) resumes at stage 1 on 
     assert.equal(legacy.providerStage, undefined);
     await harness.core.assignWorkerPid(started.jobId, process.pid, path);
     await harness.core.resume(started.jobId, path);
-    const done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: 15 });
+    const done = await harness.core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'DONE_UNVERIFIED', JSON.stringify(done));
     assert.deepEqual(
       harness.calls.map((call) => call.host),

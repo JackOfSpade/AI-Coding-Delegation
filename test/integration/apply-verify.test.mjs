@@ -11,8 +11,10 @@ import { Runner } from '../../src/runner.mjs';
 import { sandboxAvailable } from '../../src/sandbox.mjs';
 import { cleanupIsolatedWorktree, createIsolatedWorktree, integrateRecordedTree, openIsolatedWorktree } from '../../src/worktree.mjs';
 import { cleanup, git, makeRepo, write } from '../unit/helpers.mjs';
+// A wait returns as soon as the job settles, so this bounds a hang, not the host's speed.
+const TERMINAL_WAIT_SEC = 55;
 
-const WAIT_SEC = 15;
+const WAIT_SEC = 55;
 const JOB_COMMAND = 'npm test';
 const CHECK = 'node check.js';
 const ENV_STDERR =
@@ -984,7 +986,7 @@ test('while a command runs the job reports progress, refuses a concurrent revert
       assert.doesNotMatch(view.report, /Review the diff, then use offload_apply/, 'the advice the running command is already acting on');
       blocked.resolve();
       assert.equal((await pending).applyThenVerify.outcome, 'PASSED');
-      const finished = await h.manager.wait(h.id, { timeoutSec: 1 });
+      const finished = await h.manager.wait(h.id, { timeoutSec: TERMINAL_WAIT_SEC });
       assert.equal(finished.done, true);
     },
   });

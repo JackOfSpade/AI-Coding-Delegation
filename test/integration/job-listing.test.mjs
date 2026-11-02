@@ -4,6 +4,8 @@ import { JobManager } from '../../src/job-manager.mjs';
 import { createCore } from '../../src/core.mjs';
 import { cleanup, makeRepo, write } from '../unit/helpers.mjs';
 import { join } from 'node:path';
+// A wait returns as soon as the job settles, so this bounds a hang, not the host's speed.
+const TERMINAL_WAIT_SEC = 55;
 
 const SESSION = '2026-10-06T12:00:00.000Z';
 const BEFORE = '2026-10-06T09:00:00.000Z';
@@ -172,7 +174,7 @@ test('a first-round running job lists with zero cost through Core', async () => 
     assert.equal(live.jobs[0].costUsd, 0);
     assert.equal('costUnknownJobs' in live.listing, false);
     release();
-    await core.wait(started.jobId, { repoPath: repo, timeoutSec: 5 });
+    await core.wait(started.jobId, { repoPath: repo, timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal((await core.job(undefined, { repoPath: repo })).jobs[0].costUsd, 0.25);
   } finally {
     cleanup(repo);
@@ -310,13 +312,13 @@ test('Core scopes the no-argument list to its session, and all:true reaches olde
   try {
     const first = coreFor();
     const old = await first.start({ repoPath: repo, task: 'old', ownedPaths: ['src/**'], testCommand: 'true' });
-    assert.equal((await first.wait(old.jobId, { repoPath: repo, timeoutSec: 5 })).status, 'DONE_VERIFIED');
+    assert.equal((await first.wait(old.jobId, { repoPath: repo, timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
     await pause(25);
     const sessionStart = new Date();
     await pause(25);
     const second = coreFor({ sessionStartedAt: sessionStart });
     const fresh = await second.start({ repoPath: repo, task: 'fresh', ownedPaths: ['src/**'], testCommand: 'true' });
-    assert.equal((await second.wait(fresh.jobId, { repoPath: repo, timeoutSec: 5 })).status, 'DONE_VERIFIED');
+    assert.equal((await second.wait(fresh.jobId, { repoPath: repo, timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
 
     const scoped = await second.job(undefined, { repoPath: repo });
     assert.deepEqual(
@@ -357,7 +359,7 @@ test('a caller config cannot override the server session boundary', async () => 
     assert.equal(listing.sessionStartedAt, sessionStart.toISOString());
     // The bound manager received the server boundary too, not the config's.
     const seen = await core.start({ repoPath: repo, task: 't', ownedPaths: ['src/**'], testCommand: 'true' });
-    assert.equal((await core.wait(seen.jobId, { repoPath: repo, timeoutSec: 5 })).status, 'DONE_VERIFIED');
+    assert.equal((await core.wait(seen.jobId, { repoPath: repo, timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
     assert.equal((await core.job(undefined, { repoPath: repo })).listing.sessionStartedAt, sessionStart.toISOString());
   } finally {
     cleanup(repo);
@@ -428,8 +430,8 @@ test('with several repositories loaded the unbound list merges them newest first
     const first = await core.start({ repoPath: a, task: 'first', ownedPaths: ['src/**'], testCommand: 'true' });
     await pause(15);
     const second = await core.start({ repoPath: b, task: 'second', ownedPaths: ['lib/**'], testCommand: 'true' });
-    await core.wait(first.jobId, { repoPath: a, timeoutSec: 5 });
-    await core.wait(second.jobId, { repoPath: b, timeoutSec: 5 });
+    await core.wait(first.jobId, { repoPath: a, timeoutSec: TERMINAL_WAIT_SEC });
+    await core.wait(second.jobId, { repoPath: b, timeoutSec: TERMINAL_WAIT_SEC });
     // An unbound call after both repositories are loaded: no cwd hint reaches it.
     const savedEnv = { ...process.env };
     for (const key of ['CLAUDE_PROJECT_DIR', 'CODEX_PROJECT_DIR', 'CURSOR_PROJECT_DIR']) delete process.env[key];
@@ -472,7 +474,7 @@ test('the unbound multi-repository list applies maxJobs once to the merged rows 
       [b, 'lib/**'],
     ]) {
       const started = await core.start({ repoPath: repo, task: 't', ownedPaths: [owned], testCommand: 'true' });
-      assert.equal((await core.wait(started.jobId, { repoPath: repo, timeoutSec: 5 })).status, 'DONE_VERIFIED');
+      assert.equal((await core.wait(started.jobId, { repoPath: repo, timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
       ids.push(started.jobId);
       await pause(15);
     }

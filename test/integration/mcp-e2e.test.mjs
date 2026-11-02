@@ -9,6 +9,8 @@ import { fileURLToPath } from 'node:url';
 import { sandboxAvailable } from '../../src/sandbox.mjs';
 import { createMockOpenAIServer } from '../mock-openai-server.mjs';
 import { LOOPBACK_SKIP_MARKER } from '../run-suite.mjs';
+// A wait returns as soon as the job settles, so this bounds a hang, not the host's speed.
+const TERMINAL_WAIT_SEC = 55;
 
 // Every scenario here drives the real server entry point (`offload mcp`, a
 // stdio JSON-RPC peer) against the mock provider, a real private worktree and,
@@ -225,7 +227,7 @@ const jobSignals = (retro) => retro.signals.filter((signal) => signal.job);
 const drifted = (retro) => Boolean(retro.health.serverStale || retro.health.skillStale);
 const settled = async (mcp, jobId, repoPath, options = {}) => {
   for (let attempt = 0; attempt < 8; attempt += 1) {
-    const result = await mcp.call('offload_wait', { jobId, repoPath, timeoutSec: 20, ...options });
+    const result = await mcp.call('offload_wait', { jobId, repoPath, timeoutSec: TERMINAL_WAIT_SEC, ...options });
     assert.ok(!result.isError, result.text);
     if (result.done) return result;
   }

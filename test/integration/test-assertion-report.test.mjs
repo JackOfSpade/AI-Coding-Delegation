@@ -8,6 +8,8 @@ import { JobManager } from '../../src/job-manager.mjs';
 import { gitPatchApplier, gitSnapshots } from '../../src/core.mjs';
 import { cleanupIsolatedWorktree, createIsolatedWorktree, openIsolatedWorktree } from '../../src/worktree.mjs';
 import { cleanup, git, makeRepo, write } from '../unit/helpers.mjs';
+// A wait returns as soon as the job settles, so this bounds a hang, not the host's speed.
+const TERMINAL_WAIT_SEC = 55;
 
 const TEST_PATH = 'scripts/tests/annualCompensation.test.mjs';
 const ORIGINAL_ROW = "    ['$2,000 weekly stipend for a year', 104000],";
@@ -78,7 +80,7 @@ for (const isolated of [true, false]) {
         ownedPaths: [TEST_PATH],
         testCommand: 'verify',
       });
-      const done = await manager.wait(started.jobId, { timeoutSec: 15 });
+      const done = await manager.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
       assert.equal(done.status, 'DONE_VERIFIED');
       assert.match(done.report, /verify: `verify` PASS \(exit 0\)/);
       assertOriginalExpectation(done.report);

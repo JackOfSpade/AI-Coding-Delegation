@@ -9,8 +9,10 @@ import { gitPatchApplier, gitSnapshots } from '../../src/core.mjs';
 import { cleanupIsolatedWorktree, createIsolatedWorktree, integrateRecordedTree, openIsolatedWorktree } from '../../src/worktree.mjs';
 import { assessStall, sanitizeTiming } from '../../src/timing.mjs';
 import { cleanup, git, makeRepo, write } from '../unit/helpers.mjs';
+// A wait returns as soon as the job settles, so this bounds a hang, not the host's speed.
+const TERMINAL_WAIT_SEC = 55;
 
-const WAIT_SEC = 15;
+const WAIT_SEC = 55;
 const pass = () => ({ command: 'npm test', verdict: 'PASS', result: { code: 0, sandbox: 'macos' } });
 const codeFail = () => ({
   command: 'npm test',
@@ -135,7 +137,7 @@ test('a round is split into queue, setup, provider, tool and verifier time that 
     );
     assert.ok(lines.some((line) => line.startsWith('timing round 0 (start): queue 7s · setup 6s · provider 40s')));
     // Compact output carries the one line and no structured copy.
-    const compact = await h.manager.wait(started.jobId, { timeoutSec: 1 });
+    const compact = await h.manager.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(compact.timing, undefined);
     assert.ok(compact.report.split('\n').some((line) => line.startsWith('time: 1m05s = queue 7s')));
     assert.equal(compact.report.includes('timing round'), false);

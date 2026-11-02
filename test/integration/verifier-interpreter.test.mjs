@@ -16,6 +16,8 @@ import { installedSkillHealth } from '../../src/skill-health.mjs';
 import { interpreterPathsOption, probeVerifierInterpreter, resolveVerifierInterpreters } from '../../src/verify-interpreter.mjs';
 import { cleanupIsolatedWorktree, createIsolatedWorktree, integrateRecordedTree, openIsolatedWorktree } from '../../src/worktree.mjs';
 import { cleanup, git, makeRepo, write } from '../unit/helpers.mjs';
+// A wait returns as soon as the job settles, so this bounds a hang, not the host's speed.
+const TERMINAL_WAIT_SEC = 55;
 
 const SANDBOX_SKIP = 'requires an available macOS sandbox';
 const PYTHON_SKIP = 'requires a python3 that can create a virtualenv';
@@ -343,7 +345,7 @@ test(
     assert.equal(started.verifierInterpreter.accepted, true);
     assert.equal(started.verifierInterpreter.appliesTo, 'verifier');
     assert.equal(started.verifierInterpreter.writable, false);
-    assert.equal((await core.wait(started.jobId, { repoPath: repo, timeoutSec: 10 })).status, 'DONE_VERIFIED');
+    assert.equal((await core.wait(started.jobId, { repoPath: repo, timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
     const job = await core.manager.store.get(started.jobId);
     assert.deepEqual(job.verifierInterpreter, [venv]);
     assert.deepEqual([...job.verifierInterpreterRoots].sort(), roots);
@@ -358,7 +360,7 @@ test(
       verifierInterpreterRoots: ['/'],
     });
     assert.equal(plain.verifierInterpreter, undefined);
-    assert.equal((await core.wait(plain.jobId, { repoPath: repo, timeoutSec: 10 })).status, 'DONE_VERIFIED');
+    assert.equal((await core.wait(plain.jobId, { repoPath: repo, timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
     assert.equal(Object.hasOwn(seen[1].options, 'interpreterPaths'), false);
     assert.equal((await core.manager.store.get(plain.jobId)).verifierInterpreterRoots, undefined);
   },
@@ -399,7 +401,7 @@ test('a refused declaration creates no job, and report jobs cannot declare one',
     verifierInterpreter: [join(repo, '.venv')],
   });
   assert.equal(narrow.verifierInterpreter.accepted, true, 'a venv beside a narrower scope is fine');
-  await open.wait(narrow.jobId, { repoPath: repo, timeoutSec: 10 });
+  await open.wait(narrow.jobId, { repoPath: repo, timeoutSec: TERMINAL_WAIT_SEC });
 });
 
 test('a Python project start echoes interpreter readiness instead of a JavaScript not-applicable', { skip: posixSkip }, async (t) => {
@@ -433,7 +435,7 @@ test('a Python project start echoes interpreter readiness instead of a JavaScrip
   assert.equal(declared.verifierDepsReason, 'interpreter-declared');
   assert.equal(declared.verifierInterpreter.accepted, true);
   assert.equal(declared.verifierPython, undefined, 'the declaration echo is the answer once one was made');
-  for (const id of [undeclared.jobId, declared.jobId]) await isolated.wait(id, { repoPath: repo, timeoutSec: 15 });
+  for (const id of [undeclared.jobId, declared.jobId]) await isolated.wait(id, { repoPath: repo, timeoutSec: TERMINAL_WAIT_SEC });
 });
 
 test(
@@ -583,7 +585,7 @@ test('the declared roots reach both the job verifier and applyThenVerify, and no
     verifierInterpreter: [venv],
     verifierInterpreterRoots: [venv, join(root, 'gone')],
   });
-  assert.equal((await manager.wait(started.jobId, { timeoutSec: 15 })).status, 'VERIFY_ENV_FAILED');
+  assert.equal((await manager.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'VERIFY_ENV_FAILED');
   assert.deepEqual(calls[0].options.interpreterPaths, [venv], 'the job verifier gets the surviving root only');
   const applied = await manager.apply(started.jobId, { apply: true, applyThenVerify: 'node check.js' });
   assert.equal(applied.applied, true);

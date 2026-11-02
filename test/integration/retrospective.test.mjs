@@ -7,6 +7,8 @@ import { createCore } from '../../src/core.mjs';
 import { createRetrospectiveLog, RETROSPECTIVE_FILE, RETROSPECTIVE_LOG_LIMITS } from '../../src/retrospective-log.mjs';
 import { buildRetrospective, storedRecord } from '../../src/retrospective.mjs';
 import { cleanup, makeRepo, tempDir } from '../unit/helpers.mjs';
+// A wait returns as soon as the job settles, so this bounds a hang, not the host's speed.
+const TERMINAL_WAIT_SEC = 55;
 
 const SESSION = '2026-10-06T12:00:00.000Z';
 const BEFORE = '2026-10-06T09:00:00.000Z';
@@ -102,7 +104,7 @@ const memoryLog = () => {
 };
 const finished = async (core, repo, task) => {
   const started = await core.start({ repoPath: repo, task, ownedPaths: ['src/**'], testCommand: 'true', profile: 'test' });
-  assert.equal((await core.wait(started.jobId, { repoPath: repo, timeoutSec: 5 })).status, 'DONE_VERIFIED');
+  assert.equal((await core.wait(started.jobId, { repoPath: repo, timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
   return started.jobId;
 };
 

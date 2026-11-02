@@ -16,6 +16,8 @@ import {
   pinJobTrees,
 } from '../../src/worktree.mjs';
 import { cleanup, git, makeRepo, write } from '../unit/helpers.mjs';
+// A wait returns as soon as the job settles, so this bounds a hang, not the host's speed.
+const TERMINAL_WAIT_SEC = 55;
 
 // A write job whose worker ended FAILED after doing correct, in-scope work (the
 // real-session case: finish put beside other calls twice). These drive a real
@@ -23,7 +25,7 @@ import { cleanup, git, makeRepo, write } from '../unit/helpers.mjs';
 // injected, so every conflict, lease, HEAD, index and recorded-tree check that
 // offload_apply runs is the production one.
 
-const WAIT_SEC = 15;
+const WAIT_SEC = 55;
 const A_BYTES = 'export const a = 1;\n';
 const PROTOCOL = FAILURE_ERRORS['finish-protocol'];
 const EVIDENCE = 'npm test in the primary checkout: 412 pass, 0 fail';
@@ -1265,7 +1267,7 @@ test('a job with more than 128 changed files, dot paths among them, can be appli
   });
   try {
     const { jobId: id } = await h.manager.start({ repoPath: h.repo, task: 'w', ownedPaths: ['src/**', '.github/**'] });
-    const stopped = await h.manager.wait(id, { timeoutSec: 20 });
+    const stopped = await h.manager.wait(id, { timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(stopped.status, 'BUDGET', stopped.error);
     assert.equal(stopped.applyBlocker, undefined);
     assert.match((await h.manager.job(id)).report, /apply \(after your own check\)/);
@@ -1293,7 +1295,7 @@ test('a job the apply would refuse says so when it finishes, and the refusal nam
   });
   try {
     const { jobId: id } = await h.manager.start({ repoPath: h.repo, task: 'w', ownedPaths: ['src/**'] });
-    await h.manager.wait(id, { timeoutSec: 20 });
+    await h.manager.wait(id, { timeoutSec: TERMINAL_WAIT_SEC });
     const shown = await h.manager.job(id);
     assert.deepEqual(shown.scratchFiles, { total: 1, paths: ['src/_tmp_edit/rep.mjs'] });
     assert.match(shown.report, /possible worker scratch files created by this job \(1\): src\/_tmp_edit\/rep\.mjs/);

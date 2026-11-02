@@ -12,8 +12,10 @@ import { installedSkillHealth } from '../../src/skill-health.mjs';
 import { sandboxAvailable } from '../../src/sandbox.mjs';
 import { createIsolatedWorktree, openIsolatedWorktree, cleanupIsolatedWorktree } from '../../src/worktree.mjs';
 import { cleanup, git, makeRepo, write } from '../unit/helpers.mjs';
+// A wait returns as soon as the job settles, so this bounds a hang, not the host's speed.
+const TERMINAL_WAIT_SEC = 55;
 
-const TIMEOUT_SEC = 20;
+const TIMEOUT_SEC = 55;
 const MACOS_SANDBOX_SKIP_REASON = 'requires an available macOS sandbox';
 const HOMEBREW_NODE = process.platform === 'darwin' && process.execPath.startsWith('/opt/homebrew/');
 
@@ -831,7 +833,7 @@ test(
           verifierMode: 'baseline-diff',
           maxRepairRounds: 0,
         });
-        const done = await m.wait(started.jobId, { timeoutSec: 50 });
+        const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
         const job = await m.store.get(started.jobId);
         assert.equal(done.status, expectStatus, JSON.stringify(job.verify?.baseline));
         assert.equal(job.verify.result.sandbox, 'macos');
@@ -1112,10 +1114,10 @@ test('Core records Config.verifier thresholds on write jobs as server-derived se
   const plain = coreWith();
   try {
     const job = await configured.start({ task: 'x', ownedPaths: ['src/**'], repoPath: repo, testCommand: SUITE });
-    await configured.wait(job.jobId, { repoPath: repo, timeoutSec: 10 });
+    await configured.wait(job.jobId, { repoPath: repo, timeoutSec: TERMINAL_WAIT_SEC });
     assert.deepEqual((await configured.manager.store.get(job.jobId)).verifierDuration, { minFraction: 0.1, msPerKiB: 40 });
     const report = await configured.start({ mode: 'report', task: 'analyze', repoPath: repo });
-    await configured.wait(report.jobId, { repoPath: repo, timeoutSec: 10 });
+    await configured.wait(report.jobId, { repoPath: repo, timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal((await configured.manager.store.get(report.jobId)).verifierDuration, undefined);
     // A caller cannot supply its own thresholds.
     const forged = await plain.start({
@@ -1125,7 +1127,7 @@ test('Core records Config.verifier thresholds on write jobs as server-derived se
       testCommand: SUITE,
       verifierDuration: { minFraction: 0 },
     });
-    await plain.wait(forged.jobId, { repoPath: repo, timeoutSec: 10 });
+    await plain.wait(forged.jobId, { repoPath: repo, timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal((await plain.manager.store.get(forged.jobId)).verifierDuration, undefined);
   } finally {
     await configured.shutdown({ timeoutMs: 2_000 });

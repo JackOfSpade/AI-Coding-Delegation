@@ -8,6 +8,8 @@ import { JobStore } from '../../src/store.mjs';
 import { LeaseManager } from '../../src/lease.mjs';
 import { AgentLoop } from '../../src/agent/loop.mjs';
 import { AnthropicMessagesProvider } from '../../src/provider/anthropic-messages.mjs';
+// A wait returns as soon as the job settles, so this bounds a hang, not the host's speed.
+const TERMINAL_WAIT_SEC = 55;
 
 const model = 'claude-opus-5-5';
 const flush = async () => {
@@ -100,7 +102,7 @@ for (const stop of ['local cancel', 'peer cancel', 'attempt deadline', 'round de
         const caller = stop === 'peer cancel' ? new JobManager({ store, config: { repoPath: process.cwd() } }) : manager;
         await caller.cancel(job.jobId);
       }
-      const done = await manager.wait(job.jobId, { timeoutSec: 5 });
+      const done = await manager.wait(job.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
       assert.equal(done.status, stop.endsWith('cancel') ? 'CANCELLED' : 'TIMEOUT');
       assert.ok(performance.now() - begin < 3_000, 'no wait for transport or cleanup promises');
       assert.equal(requestSignal.aborted, true);

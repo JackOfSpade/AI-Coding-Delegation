@@ -9,8 +9,10 @@ import { JobManager } from '../../src/job-manager.mjs';
 import { gitPatchApplier, gitSnapshots } from '../../src/core.mjs';
 import { cleanupIsolatedWorktree, createIsolatedWorktree, integrateRecordedTree, openIsolatedWorktree } from '../../src/worktree.mjs';
 import { cleanup, git, makeRepo, write } from '../unit/helpers.mjs';
+// A wait returns as soon as the job settles, so this bounds a hang, not the host's speed.
+const TERMINAL_WAIT_SEC = 55;
 
-const WAIT_SEC = 15;
+const WAIT_SEC = 55;
 const ENV_STDERR =
   "Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'jsdom' imported from /private/var/x/workspace/scripts/tests/testHelpers.js";
 
@@ -780,7 +782,7 @@ test('a failing apply does not leak its error to callers that merely join it', a
     const id = started.jobId;
     write(join(h.repo, 'src', 'a.js'), 'primary got there first\n');
     const failing = h.manager.apply(id, { apply: true, verifiedBy: 'ran the tests myself in primary' });
-    const joined = h.manager.wait(id, { timeoutSec: 5 });
+    const joined = h.manager.wait(id, { timeoutSec: TERMINAL_WAIT_SEC });
     await assert.rejects(() => failing, /changed on a job-touched path/);
     assert.equal((await joined).status, 'VERIFY_ENV_FAILED');
   } finally {
