@@ -965,6 +965,20 @@ export function validateJobRequest(input) {
 // confined: a profile can fail to apply between start and execution.  Repair
 // is a privileged new model turn, so accept only the verifier's own exact
 // execution result and fail closed on a missing or unfamiliar value.
+// For work repeated on a timer: a tick that finds the last run unfinished skips,
+// and never adds to a backlog behind a slow store.
+const oneAtATime = (action) => {
+  let running;
+  return () => {
+    if (running) return undefined;
+    running = Promise.resolve()
+      .then(action)
+      .finally(() => {
+        running = undefined;
+      });
+    return running;
+  };
+};
 const verifierUsedMacosSandbox = (verify) => verify?.result?.sandbox === 'macos';
 // The primary worktree snapshot intentionally includes index content, but a
 // staged-only concurrent edit leaves working-tree bytes unchanged. Keep an
@@ -2050,9 +2064,13 @@ export class JobManager {
         }
         if (writeScope(job).length) {
           const every = Number.isFinite(this.leases.heartbeatIntervalMs) ? this.leases.heartbeatIntervalMs : 30_000;
+          // The lease is refreshed on every tick so a slow store cannot let it go
+          // stale, but only one durable stamp is ever in flight: finalization
+          // awaits these, so a backlog would hold the job there until it drained.
+          const stampRunner = oneAtATime(() => this.store.update(id, { runnerHeartbeatAt: this.now().toISOString() }));
           const beat = () => {
             const pending = Promise.resolve(this.leases.heartbeat?.(id, { ownerNonce }))
-              .then(() => this.store.update(id, { runnerHeartbeatAt: this.now().toISOString() }))
+              .then(stampRunner)
               .catch((error) => {
                 leaseLost = error?.message || 'lease heartbeat failed';
                 controller.abort(new Error(`lease lost: ${leaseLost}`));
@@ -2068,13 +2086,14 @@ export class JobManager {
         // flag makes cancellation reach the owner process and its provider/tool
         // signal without putting credentials or IPC endpoints in the command.
         cancellationWatch = setInterval(
-          () =>
+          oneAtATime(() =>
             this.store
               .cancelRequested?.(id)
-              .then((cancelled) => {
+              ?.then((cancelled) => {
                 if (cancelled) controller.abort();
               })
               .catch(() => {}),
+          ),
           100,
         );
         cancellationWatch.unref?.();
@@ -4116,13 +4135,14 @@ export class JobManager {
       // Another process's cancel only leaves the durable marker, as it does
       // for a worker round (and it writes one for a job whose apply is running).
       cancellationWatch = setInterval(
-        () =>
+        oneAtATime(() =>
           this.store
             .cancelRequested?.(id)
-            .then((cancelled) => {
+            ?.then((cancelled) => {
               if (cancelled) controller.abort();
             })
             .catch(() => {}),
+        ),
         100,
       );
       cancellationWatch.unref?.();

@@ -18,18 +18,9 @@ const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 const gitId = 'a'.repeat(40),
   nextGitId = 'b'.repeat(40),
   currentGitId = 'c'.repeat(40);
-// Worktree completion includes Git snapshots, integration, durable report
-// publication, and private-workspace cleanup.  That is deliberately slower
-// than the in-memory lifecycle tests, especially when CI is sharing I/O.
-// Keep these integration assertions about the terminal result, not an
-// incidental two-second host-performance budget.
-const WORKTREE_LIFECYCLE_TIMEOUT_SEC = 15;
-// These recovery cases assert durable lifecycle/accounting state, not a one-
-// second disk-performance SLA. Leave room for contended artifact publication.
-const RECOVERY_LIFECYCLE_TIMEOUT_SEC = 15;
-// Windows runners publish terminal lifecycle state slowly; these waits assert
-// the terminal result, not a host-performance SLA. Other hosts keep their budget.
-const terminalWaitSec = (seconds) => (process.platform === 'win32' ? WORKTREE_LIFECYCLE_TIMEOUT_SEC : seconds);
+// These waits assert a job's terminal result, not how fast the host is. A wait
+// returns as soon as the job settles, so the longest one costs nothing.
+const TERMINAL_WAIT_SEC = 55;
 test('public job IDs share the durable Git-ref component boundary', () => {
   for (const id of ['_private', '-private', '', 'x'.repeat(129)]) assert.throws(() => validateJobId(id), /valid job id/);
   assert.equal(validateJobId('safe_job-1'), 'safe_job-1');
@@ -264,7 +255,7 @@ test('async start and server verification produce a durable final report', async
   });
   const job = await m.start({ task: 'do it', ownedPaths: ['src/**'], repoPath: process.cwd(), testCommand: 'check' });
   assert.equal(job.status, 'QUEUED');
-  const done = await m.wait(job.jobId, { timeoutSec: terminalWaitSec(1) });
+  const done = await m.wait(job.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(done.status, 'DONE_VERIFIED');
   assert.match(done.report, /verify: `check` PASS/);
   assert.match(await m.store.readArtifact(job.jobId, 'patch.diff'), /patch/);
@@ -277,7 +268,7 @@ test('non-isolated verifier receives no private-worktree parent capability', asy
     return { command: 'test', verdict: 'PASS', result: { code: 0, sandbox: 'macos' } };
   };
   const started = await m.start({ task: 'verify primary', ownedPaths: ['src/**'], repoPath: process.cwd(), testCommand: 'check' });
-  assert.equal((await m.wait(started.jobId, { timeoutSec: terminalWaitSec(1) })).status, 'DONE_VERIFIED');
+  assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
   assert.equal(Object.hasOwn(verifierOptions, 'readablePaths'), false);
 });
 test('provider failure classification is durable and replaces an injected raw error', async () => {
@@ -290,7 +281,7 @@ test('provider failure classification is durable and replaces an injected raw er
     }),
   });
   const started = await m.start({ task: 'provider wait', ownedPaths: ['src/**'], repoPath: process.cwd() });
-  const done = await m.wait(started.jobId, { timeoutSec: terminalWaitSec(1) });
+  const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(done.status, 'TIMEOUT');
   assert.deepEqual(done.providerFailure, { kind: 'attempt_timeout', attempts: 1, timeoutMs: 300_000 });
   assert.match(done.report, /provider failure: attempt_timeout after 1 attempt \(300s limit\)/);
@@ -326,7 +317,7 @@ test('redacted durable reasoning blocks detached resume and repair before a work
     },
   });
   const started = await m.start({ task: 'redacted replay', ownedPaths: ['src/**'], repoPath: process.cwd() });
-  const failed = await m.wait(started.jobId, { timeoutSec: terminalWaitSec(1) });
+  const failed = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(failed.status, 'FAILED');
   assert.equal(runs, 1);
   const persisted = await m.store.get(started.jobId);
@@ -352,7 +343,7 @@ test('redacted durable reasoning blocks detached resume and repair before a work
   ]);
   await m.store.update(queued.jobId, { handoffState: 'CHILD_ASSIGNED' });
   await m.resume(queued.jobId);
-  const resumed = await m.wait(queued.jobId, { timeoutSec: terminalWaitSec(1) });
+  const resumed = await m.wait(queued.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(resumed.status, 'FAILED');
   assert.match((await m.store.get(queued.jobId)).error, /reasoning is unavailable for safe provider replay/);
   assert.equal(runs, 1, 'detached resume must fail before worker/provider invocation');
@@ -366,7 +357,7 @@ test('provider finish reasons persist as closed diagnostics and clear for repair
     },
   });
   const started = await m.start({ task: 'provider finish reason', ownedPaths: ['src/**'], repoPath: process.cwd() });
-  const done = await m.wait(started.jobId, { timeoutSec: 1 });
+  const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(done.providerFinishReason, 'other');
   assert.match(done.report, /provider finish reason: other/);
   const stored = await m.store.get(started.jobId);
@@ -412,7 +403,7 @@ test('numeric reservation exhaustion propagates to progress, terminal event, pub
     },
   });
   const started = await m.start({ task: 'budget diagnostic', ownedPaths: ['src/**'], repoPath: process.cwd() });
-  const done = await m.wait(started.jobId, { timeoutSec: terminalWaitSec(1) });
+  const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(done.status, 'BUDGET');
   assert.deepEqual(done.budgetReservation, reservation);
   assert.match(done.report, /budget reservation: deep-tool-elision/);
@@ -494,7 +485,7 @@ test('a BUDGET stop records which cap tripped with the spend so far and publishe
   for (const { name, result, budget, stop, line } of cases) {
     const m = await manager({ run: async () => ({ status: 'BUDGET', ...result }) });
     const started = await m.start({ task: 'budget stop', ownedPaths: ['src/**'], repoPath: process.cwd(), budget });
-    const done = await m.wait(started.jobId, { timeoutSec: terminalWaitSec(1) });
+    const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'BUDGET', name);
     assert.deepEqual((await m.store.get(started.jobId)).budgetStop, stop, name);
     assert.deepEqual(done.budgetStop, stop, name);
@@ -509,7 +500,7 @@ test('a BUDGET stop records which cap tripped with the spend so far and publishe
 test('only a BUDGET job reports a budget stop, and public views drop a malformed stop or sizing record', async () => {
   const m = await manager({ run: async () => ({ status: 'DONE', turns: 1 }) });
   const started = await m.start({ task: 'fine', ownedPaths: ['src/**'], repoPath: process.cwd(), budget: { maxTurns: 5, maxUsd: 1 } });
-  const done = await m.wait(started.jobId, { timeoutSec: 1 });
+  const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(done.budgetStop, undefined);
   assert.deepEqual(budgetStopLines(done.report), []);
 
@@ -564,7 +555,7 @@ test('relevantPaths accept :START-END ranges at the raw and persisted boundaries
     relevantPaths: ['src/a.mjs:1-5', 'src/b.mjs'],
     repoPath: process.cwd(),
   });
-  await m.wait(started.jobId, { timeoutSec: 1 });
+  await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   const stored = await m.store.get(started.jobId);
   assert.deepEqual(stored.relevantPaths, ['src/a.mjs:1-5', 'src/b.mjs']);
   assert.doesNotThrow(() => m.validatePersisted(stored));
@@ -605,7 +596,7 @@ test('a pending provider request clears the prior finish reason before the next 
   assert.equal(progress.at(-1).recentActions?.[0], 'provider_request_pending');
 
   releaseWorker();
-  const done = await m.wait(started.jobId, { timeoutSec: terminalWaitSec(1) });
+  const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(done.status, 'FAILED');
   assert.equal(done.providerFinishReason, undefined);
 });
@@ -622,7 +613,7 @@ test('capped implementation recovery lifecycle settles after its durable respons
     },
   });
   const started = await m.start({ task: 'lifecycle', ownedPaths: ['src/**'], repoPath: process.cwd() });
-  const done = await m.wait(started.jobId, { timeoutSec: RECOVERY_LIFECYCLE_TIMEOUT_SEC });
+  const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(done.status, 'FAILED');
   const stored = await m.store.get(started.jobId);
   assert.equal(stored.cappedFinishRecovery, 'settled');
@@ -639,7 +630,7 @@ test('capped implementation recovery lifecycle settles after its durable respons
       .every((event) => !Object.hasOwn(event, 'turns') && !Object.hasOwn(event, 'costUsd')),
   );
   await m.repair(started.jobId, ['continue after the durable capped implementation response']);
-  const repaired = await m.wait(started.jobId, { timeoutSec: RECOVERY_LIFECYCLE_TIMEOUT_SEC });
+  const repaired = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(repaired.status, 'DONE_UNVERIFIED');
   assert.equal(runs, 2, 'a settled recovery is ordinary resolved history for a later repair run');
 
@@ -658,7 +649,7 @@ test('capped implementation recovery lifecycle settles after its durable respons
     },
   });
   const wrongStarted = await wrongOrder.start({ task: 'wrong transition', ownedPaths: ['src/**'], repoPath: process.cwd() });
-  const wrongDone = await wrongOrder.wait(wrongStarted.jobId, { timeoutSec: RECOVERY_LIFECYCLE_TIMEOUT_SEC });
+  const wrongDone = await wrongOrder.wait(wrongStarted.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(wrongDone.status, 'FAILED');
   assert.match((await wrongOrder.store.get(wrongStarted.jobId)).error, /invalid capped implementation recovery state transition/);
 });
@@ -688,7 +679,7 @@ test('a consumed capped implementation recovery suppresses automatic verifier re
     testCommand: 'fail',
     maxRepairRounds: 1,
   });
-  const done = await m.wait(started.jobId, { timeoutSec: RECOVERY_LIFECYCLE_TIMEOUT_SEC });
+  const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   const stored = await m.store.get(started.jobId);
 
   assert.equal(done.status, 'VERIFY_FAILED');
@@ -719,7 +710,7 @@ test('a queued capped implementation recovery also suppresses automatic verifier
     testCommand: 'fail',
     maxRepairRounds: 1,
   });
-  const done = await m.wait(started.jobId, { timeoutSec: RECOVERY_LIFECYCLE_TIMEOUT_SEC });
+  const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   const stored = await m.store.get(started.jobId);
 
   assert.equal(done.status, 'VERIFY_FAILED');
@@ -749,7 +740,7 @@ test('budget-finish lifecycle transitions are durable, validated, and suppress r
     testCommand: 'fail',
     maxRepairRounds: 1,
   });
-  const done = await m.wait(started.jobId, { timeoutSec: terminalWaitSec(1) });
+  const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   const stored = await m.store.get(started.jobId);
   assert.equal(done.status, 'VERIFY_FAILED');
   assert.equal(runs, 1, 'verifier failure must not append a repair prompt after this lifecycle');
@@ -775,7 +766,7 @@ test('budget-finish lifecycle transitions are durable, validated, and suppress r
     },
   });
   const wrongStarted = await wrongOrder.start({ task: 'wrong budget transition', ownedPaths: ['src/**'], repoPath: process.cwd() });
-  const wrongDone = await wrongOrder.wait(wrongStarted.jobId, { timeoutSec: terminalWaitSec(1) });
+  const wrongDone = await wrongOrder.wait(wrongStarted.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(wrongDone.status, 'FAILED');
   assert.match((await wrongOrder.store.get(wrongStarted.jobId)).error, /invalid budget finish recovery state transition/);
 });
@@ -789,7 +780,7 @@ test('a structured provider failure cannot be smuggled through as a successful w
     return { command: 'should not run', verdict: 'PASS', result: { code: 0, sandbox: 'macos' } };
   };
   const started = await m.start({ task: 'provider failed', ownedPaths: ['src/**'], repoPath: process.cwd() });
-  const done = await m.wait(started.jobId, { timeoutSec: terminalWaitSec(1) });
+  const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(done.status, 'FAILED');
   assert.deepEqual(done.providerFailure, { kind: 'transport', attempts: 1 });
   assert.equal(verified, 0);
@@ -827,7 +818,7 @@ test('isolated lifecycle keeps primary unchanged until verified integration and 
     });
     const started = await m.start({ task: 'isolated apply', ownedPaths: ['src/**'], repoPath: repo, testCommand: 'verify' });
     assert.equal(existsSync(join(repo, 'src', 'owned.txt')), false, 'worker must not mutate primary');
-    const done = await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC });
+    const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'DONE_VERIFIED');
     const job = await m.store.get(started.jobId);
     assert.notEqual(workerPath, repo);
@@ -886,7 +877,7 @@ test('an isolated verifier is granted only the primary node_modules read root, a
         },
       });
       const started = await m.start({ task: 'deps', ownedPaths: ['src/**'], repoPath: repo, testCommand: 'verify' });
-      const done = await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC });
+      const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
       assert.equal(done.status, 'DONE_VERIFIED');
       const job = await m.store.get(started.jobId);
       assert.equal(job.workspaceDependencies, withDependencies ? 'linked' : 'absent');
@@ -962,7 +953,7 @@ test('report jobs copy allowlisted scratch inputs read-only, return structured f
     });
     const started = await m.start({ mode: 'report', task: 'Analyze the connector result', inputFiles: [input], repoPath: repo });
     assert.equal(started.mode, 'report');
-    const done = await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC });
+    const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'DONE_UNVERIFIED');
     assert.match(done.reportResult.text, /Detailed report: two rows reference limit/);
     assert.ok(done.reportResult.text.length > 95 * 1024, 'detailed report is not limited to the summary cap');
@@ -1003,7 +994,7 @@ test('report jobs copy allowlisted scratch inputs read-only, return structured f
     assert.doesNotMatch(rawStored, /not-for-output|\x1b|\x85|\u200e|\u202e/i);
     assert.equal(rawStored.includes(scratch), false, 'raw caller scratch input paths are not persisted');
     const expanded = await m.start({ mode: 'report', task: 'redaction expansion', repoPath: repo });
-    const expandedDone = await m.wait(expanded.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC });
+    const expandedDone = await m.wait(expanded.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(expandedDone.status, 'DONE_UNVERIFIED');
     assert.ok(Buffer.byteLength(expandedDone.reportResult.text, 'utf8') <= 256_000);
     assert.equal(
@@ -1016,7 +1007,7 @@ test('report jobs copy allowlisted scratch inputs read-only, return structured f
       assert.equal(Buffer.from(entry).toString('utf8'), entry, 'list cap keeps UTF-8 code points intact');
     }
     const failed = await m.start({ mode: 'report', task: 'report failure', repoPath: repo });
-    const failedDone = await m.wait(failed.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC });
+    const failedDone = await m.wait(failed.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(failedDone.status, 'FAILED');
     const failedStored = JSON.stringify(await m.store.get(failed.jobId));
     assert.doesNotMatch(failedStored, /not-for-output|\x85|\u202e|\x1b/i);
@@ -1025,7 +1016,7 @@ test('report jobs copy allowlisted scratch inputs read-only, return structured f
       /outside the caller scratch\/temp allowlist/,
     );
     const missing = await m.start({ mode: 'report', task: 'missing detailed report', repoPath: repo });
-    const missingDone = await m.wait(missing.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC });
+    const missingDone = await m.wait(missing.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(missingDone.status, 'FAILED');
     assert.match(missingDone.report, /without a detailed report/);
     for (const cancelled of [false, true]) {
@@ -1163,7 +1154,7 @@ test('isolated JobManager apply and revert preserve non-NUL invalid UTF-8 patch 
       },
     });
     const started = await m.start({ task: 'preserve bytes', ownedPaths: ['tracked.txt'], repoPath: repo, testCommand: 'verify' });
-    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'DONE_VERIFIED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
     assert.deepEqual(await readFile(join(repo, 'tracked.txt')), expected);
     const rawRevert = await m.store.readArtifactBytes(started.jobId, 'revert.diff');
     assert.ok(rawRevert.includes(Buffer.from([0xff])));
@@ -1207,7 +1198,7 @@ test('isolated ephemeral output is discarded while an outside-scope write blocks
       repoPath: pair.repo,
       testCommand: 'verify',
     });
-    assert.equal((await pair.m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'DONE_VERIFIED');
+    assert.equal((await pair.m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
     assert.equal(existsSync(join(pair.repo, 'src', 'ok.txt')), true);
     assert.equal(existsSync(join(pair.repo, 'cache', 'build.log')), false);
     const job = await pair.m.store.get(started.jobId);
@@ -1225,7 +1216,7 @@ test('isolated ephemeral output is discarded while an outside-scope write blocks
   });
   try {
     const started = await pair.m.start({ task: 'violation', ownedPaths: ['src/**'], repoPath: pair.repo, testCommand: 'verify' });
-    assert.equal((await pair.m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'FAILED');
+    assert.equal((await pair.m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'FAILED');
     assert.equal(existsSync(join(pair.repo, 'src', 'ok.txt')), false);
     assert.match(await pair.m.store.readArtifact(started.jobId, 'patch.diff'), /rogue\.txt/);
   } finally {
@@ -1262,13 +1253,13 @@ test('manual isolated repair reseeds accumulated workspace changes from the orig
       testCommand: 'verify',
       maxRepairRounds: 1,
     });
-    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'FAILED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'FAILED');
     const failed = await m.store.get(started.jobId);
     assert.equal(existsSync(failed.workspacePath), false);
     assert.ok(failed.workspaceAfter);
     pass = true;
     await m.repair(started.jobId, ['finish accumulated work']);
-    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'DONE_VERIFIED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
     assert.equal(await readFile(join(repo, 'src', 'first.txt'), 'utf8'), '1\n');
     assert.equal(await readFile(join(repo, 'src', 'second.txt'), 'utf8'), '2\n');
   } finally {
@@ -1298,7 +1289,7 @@ test('an index-only primary edit on an owned path blocks isolated integration', 
       },
     });
     const started = await m.start({ task: 'index race', ownedPaths: ['src/**'], repoPath: repo, testCommand: 'verify' });
-    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'FAILED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'FAILED');
     assert.equal(await readFile(join(repo, 'src', 'same.txt'), 'utf8'), 'human staged\n');
     assert.equal((await m.store.get(started.jobId)).integrationConflict, true);
   } finally {
@@ -1331,7 +1322,7 @@ test('a verifier cannot silently author owned output after the worker completes'
       },
     });
     const started = await m.start({ task: 'do not trust verifier writes', ownedPaths: ['src/**'], repoPath: repo, testCommand: 'verify' });
-    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'FAILED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'FAILED');
     const job = await m.store.get(started.jobId);
     assert.deepEqual(job.verifierMutations, ['src/verifier.txt']);
     assert.ok(job.scopeViolations.includes('src/verifier.txt'));
@@ -1375,7 +1366,7 @@ test('a failing verifier cannot seed its owned mutation into automatic or manual
       testCommand: 'verify',
       maxRepairRounds: 1,
     });
-    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'FAILED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'FAILED');
     assert.equal(runs, 1, 'verification mutation must suppress automatic repair');
     const failed = await m.store.get(started.jobId);
     assert.deepEqual(failed.verifierMutations, ['src/verifier.txt']);
@@ -1406,7 +1397,7 @@ test('isolated revert rejects selected-path index drift even when worktree bytes
       },
     });
     const started = await m.start({ task: 'index-aware revert', ownedPaths: ['src/**'], repoPath: repo, testCommand: 'verify' });
-    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'DONE_VERIFIED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
     // The primary worktree still has exactly the worker bytes, but its index
     // now has a new selected-path entry that git apply would leave behind.
     git(repo, ['add', 'src/owned.txt']);
@@ -1544,7 +1535,7 @@ test('terminal revert journals are reconciled after a post-apply persistence fai
       },
     });
     const started = await m.start({ task: 'revert journal', ownedPaths: ['src/**'], repoPath: repo, testCommand: 'verify' });
-    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'DONE_VERIFIED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
     const originalUpdate = store.update.bind(store);
     store.update = async (id, changes) => {
       if (changes?.revertOutcome) throw new Error('simulated post-reverse persistence failure');
@@ -1654,7 +1645,7 @@ test('manual repair clears an old cleanup marker so a replacement workspace is r
       },
     });
     const started = await m.start({ task: 'repair cleanup marker', ownedPaths: ['src/**'], repoPath: repo });
-    assert.equal((await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC })).status, 'FAILED');
+    assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'FAILED');
     const failed = await m.store.get(started.jobId);
     assert.ok(failed.workspaceCleanedAt);
     await m.repair(started.jobId, ['continue'], { launch: false });
@@ -1765,7 +1756,7 @@ test('cancel preserves a terminal job and validation rejects unsafe scope', asyn
   await assert.rejects(() => m.start({ task: 'x', ownedPaths: ['../outside'] }), /ownedPaths/);
   const job = await m.start({ task: 'x', ownedPaths: ['**'], repoPath: process.cwd() });
   await m.cancel(job.jobId);
-  assert.equal((await m.wait(job.jobId, { timeoutSec: terminalWaitSec(1) })).status, 'CANCELLED');
+  assert.equal((await m.wait(job.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'CANCELLED');
 });
 test('local cancellation marks and aborts promptly while its owner publishes terminal cleanup', async () => {
   const repo = makeRepo();
@@ -1817,7 +1808,7 @@ test('local cancellation marks and aborts promptly while its owner publishes ter
     assert.equal(await m.store.cancelRequested(started.jobId), true);
     assert.equal(existsSync(workspacePath), true, 'cancel does not race the owner workspace cleanup');
     releaseWorker();
-    const done = await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC });
+    const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'CANCELLED');
     assert.ok(cleanupCalls > 0, 'the worker owner performs cleanup before terminal publication');
     assert.equal(existsSync(workspacePath), false);
@@ -1943,7 +1934,7 @@ test('persisted jobs cannot redirect repositories, Git revisions, or write scope
   await scoped.store.update(job.jobId, { writePaths: ['**'], handoffState: 'CHILD_ASSIGNED' });
   await scoped.resume(job.jobId);
   assert.deepEqual(acquired.at(-1), ['src/**']);
-  await scoped.wait(job.jobId, { timeoutSec: 1 });
+  await scoped.wait(job.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
 });
 test('policy-only verifier failures never trigger or permit repair', async () => {
   let policyRuns = 0;
@@ -1965,13 +1956,13 @@ test('policy-only verifier failures never trigger or permit repair', async () =>
     sandboxMode: 'policy-only',
     maxRepairRounds: 1,
   });
-  assert.equal((await policyOnly.wait(failed.jobId, { timeoutSec: terminalWaitSec(1) })).status, 'VERIFY_FAILED');
+  assert.equal((await policyOnly.wait(failed.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'VERIFY_FAILED');
   assert.equal(policyRuns, 1, 'a policy-only verifier must not schedule automatic repair');
   await assert.rejects(() => policyOnly.repair(failed.jobId, ['retry']), /policy-only.*fresh start/);
 
   const unverified = await manager({ run: async () => ({ status: 'DONE' }) });
   const noVerifier = await unverified.start({ task: 'x', ownedPaths: ['src/**'], repoPath: process.cwd(), sandboxMode: 'policy-only' });
-  assert.equal((await unverified.wait(noVerifier.jobId, { timeoutSec: terminalWaitSec(1) })).status, 'DONE_UNVERIFIED');
+  assert.equal((await unverified.wait(noVerifier.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_UNVERIFIED');
   await unverified.repair(noVerifier.jobId, ['caller-authorized'], { launch: false });
 });
 test('verifier repair trusts only the actual macOS result, never start-time sandbox metadata', async () => {
@@ -1997,7 +1988,7 @@ test('verifier repair trusts only the actual macOS result, never start-time sand
     maxRepairRounds: 1,
     unsafePolicyOnlyVerifier: true,
   });
-  assert.equal((await m.wait(started.jobId, { timeoutSec: terminalWaitSec(1) })).status, 'VERIFY_FAILED');
+  assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'VERIFY_FAILED');
   assert.equal(runs, 1);
   await assert.rejects(() => m.repair(started.jobId, ['retry']), /policy-only or unknown verifier result/);
 });
@@ -2027,7 +2018,7 @@ test('sealed lifecycle updates preserve transcript integrity across automatic re
     sandboxMode: 'macos',
     executionProfile: { type: 'openai-chat', baseUrl: 'https://provider.example.test/v1', keyRef: 'env:GOOD', model: 'model' },
   });
-  assert.equal((await m.wait(started.jobId, { timeoutSec: terminalWaitSec(2) })).status, 'VERIFY_FAILED');
+  assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'VERIFY_FAILED');
   assert.equal(runs, 2);
   assert.equal((await store.readMessages(started.jobId)).length, 2);
   assert.equal(store.verifyJob(await store.get(started.jobId)), true);
@@ -2044,7 +2035,7 @@ test('automatic repair clears its per-round scheduling marker through the final 
     maxRepairRounds: 2,
     sandboxMode: 'macos',
   });
-  const done = await m.wait(started.jobId, { timeoutSec: terminalWaitSec(2) });
+  const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(done.status, 'VERIFY_FAILED');
   assert.equal(runs, 3, 'the initial attempt plus every permitted automatic repair must finish');
   assert.equal(m.running.has(started.jobId), false, 'a capped repair lifecycle must not leave a worker task running');
@@ -2141,7 +2132,7 @@ test('wait does not publish terminal verification before slow snapshot finalizat
   } finally {
     releaseSnapshot();
   }
-  assert.equal((await m.wait(started.jobId, { timeoutSec: 5 })).status, 'DONE_VERIFIED');
+  assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
 });
 test('terminal status and wait stay behind an in-flight owned cleanup attempt', async () => {
   const m = await manager({ run: async () => ({ status: 'FAILED' }) });
@@ -2163,7 +2154,7 @@ test('terminal status and wait stay behind an in-flight owned cleanup attempt', 
   await cleanupEntered;
   assert.equal((await m.store.get(started.jobId)).status, 'FINALIZING');
   let waitSettled = false;
-  const waiting = m.wait(started.jobId, { timeoutSec: 1 }).then((result) => {
+  const waiting = m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC }).then((result) => {
     waitSettled = true;
     return result;
   });
@@ -2204,7 +2195,7 @@ test('shutdown cancellation suppresses an automatic repair queued at the schedul
   const stopping = m.shutdown();
   releaseSchedule();
   await stopping;
-  assert.equal((await m.wait(started.jobId, { timeoutSec: terminalWaitSec(1) })).status, 'CANCELLED');
+  assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'CANCELLED');
   assert.equal(runs, 1, 'shutdown must not install a replacement lifecycle after the old task was snapshotted');
   assert.equal(m.running.has(started.jobId), false);
 });
@@ -2234,11 +2225,40 @@ test('an in-flight lease heartbeat cannot strand an automatic repair re-queue', 
     maxRepairRounds: 1,
     sandboxMode: 'macos',
   });
-  const done = await m.wait(started.jobId, { timeoutSec: terminalWaitSec(5) });
+  const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(runs, 2, 'the authorized repair round must still start');
   assert.notEqual(done.status, 'REPAIR_QUEUED');
   const stored = await get(started.jobId);
   assert.equal(stored.rounds, 1);
+});
+test('a store slower than the heartbeat cannot build a backlog that holds a job in finalization', async () => {
+  const leaseBeats = [];
+  const m = await manager({
+    run: async () => {
+      await pause(300);
+      return { status: 'DONE', summary: 'done' };
+    },
+  });
+  m.leases.heartbeatIntervalMs = 5;
+  m.leases.heartbeat = (id) => leaseBeats.push(id);
+  const update = m.store.update.bind(m.store);
+  let stamps = 0,
+    inFlight = 0,
+    peak = 0;
+  m.store.update = async (id, changes) => {
+    if (changes.runnerHeartbeatAt === undefined) return update(id, changes);
+    stamps += 1;
+    peak = Math.max(peak, ++inFlight);
+    await pause(50);
+    inFlight -= 1;
+    return update(id, changes);
+  };
+  const started = await m.start({ task: 'slow store', ownedPaths: ['src/**'], repoPath: process.cwd() });
+  const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
+  assert.equal(done.status, 'DONE_UNVERIFIED');
+  assert.equal(peak, 1, 'one durable stamp at a time');
+  assert.ok(stamps >= 2, `the stamp keeps being refreshed (${stamps})`);
+  assert.ok(leaseBeats.length > stamps * 2, `the lease is refreshed on every tick (${leaseBeats.length} beats, ${stamps} stamps)`);
 });
 test('a long report-mode worker error is truncated and redacted, not replaced by the generic message', async () => {
   for (const error of [
@@ -2265,7 +2285,7 @@ test('a long report-mode worker error is truncated and redacted, not replaced by
         },
       });
       const started = await m.start({ task: 'inspect', mode: 'report', repoPath: repo });
-      await m.wait(started.jobId, { timeoutSec: WORKTREE_LIFECYCLE_TIMEOUT_SEC });
+      await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
       const stored = await m.store.get(started.jobId);
       assert.equal(stored.status, 'FAILED');
       assert.ok(stored.error.length <= 1500);
@@ -2303,7 +2323,8 @@ test('shutdown retains worker ownership through blocked terminal report publicat
   const started = await m.start({ task: 'publish', ownedPaths: ['src/**'], repoPath: process.cwd() });
   await reportEntered;
   let shutdownSettled = false;
-  const shutdown = m.shutdown({ timeoutMs: 1_000 }).then(() => {
+  // The bound only has to outlast the host: the report is released below.
+  const shutdown = m.shutdown({ timeoutMs: 60_000 }).then(() => {
     shutdownSettled = true;
   });
   await pause(20);
@@ -2328,7 +2349,7 @@ test('manager enforces cumulative worker budgets and honors cancellation during 
     testCommand: 'check',
     budget: { maxTurns: 1, maxUsd: 1 },
   });
-  assert.equal((await overBudget.wait(started.jobId, { timeoutSec: terminalWaitSec(1) })).status, 'BUDGET');
+  assert.equal((await overBudget.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'BUDGET');
   assert.equal(verified, false);
 
   let creates = 0,
@@ -2354,7 +2375,7 @@ test('manager enforces cumulative worker budgets and honors cancellation during 
   while (creates < 2) await pause(2);
   await store.requestCancel(cancelling.jobId);
   releaseFinalSnapshot();
-  assert.equal((await m.wait(cancelling.jobId, { timeoutSec: terminalWaitSec(1) })).status, 'CANCELLED');
+  assert.equal((await m.wait(cancelling.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'CANCELLED');
 });
 test('revert permits unrelated changes but rejects a change to an owned patch path', async () => {
   const gitDir = await mkdtemp(`${tmpdir()}/offload-revert-scope-`);
@@ -2498,7 +2519,7 @@ test('recovery relaunches only a dead queued budget-finish worker through its pr
     config: { repoPath: process.cwd(), git: { branch: async () => 'main', head: async () => gitId } },
   });
   assert.equal(await m.recover(), 4);
-  const done = await m.wait(restart.id, { timeoutSec: terminalWaitSec(1) });
+  const done = await m.wait(restart.id, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(done.status, 'DONE_UNVERIFIED');
   assert.deepEqual(runs, [{ id: restart.id, state: 'queued', defects: undefined }]);
   assert.equal((await store.get(restart.id)).budgetFinishRecovery, 'consumed');
@@ -2730,7 +2751,7 @@ test('recovery leaves a stale-heartbeat live detached child alone and the child 
   assert.equal(cleanups, 0);
   releaseClaim();
   await resuming;
-  const result = await child.wait(job.id, { timeoutSec: terminalWaitSec(2) });
+  const result = await child.wait(job.id, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(result.status, 'FAILED');
   assert.equal(runs, 1);
 });
@@ -3040,7 +3061,7 @@ test('scope attribution retains owned changes and exempts a live disjoint lease'
     config: { repoPath: process.cwd(), git: { branch: async () => 'main', head: async () => gitId } },
   });
   const started = await m.start({ task: 'x', ownedPaths: ['src/**'], repoPath: process.cwd(), testCommand: 'true' });
-  await m.wait(started.jobId, { timeoutSec: 1 });
+  await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   const job = await m.store.get(started.jobId);
   assert.deepEqual(
     job.files.map((x) => x.path),
@@ -3076,7 +3097,7 @@ test('review diffs retain outside-scope changes while revert artifacts never do'
     },
   });
   const started = await m.start({ task: 'scope split', ownedPaths: ['src/**'], repoPath: process.cwd(), testCommand: 'true' });
-  assert.equal((await m.wait(started.jobId, { timeoutSec: terminalWaitSec(1) })).status, 'FAILED');
+  assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'FAILED');
   const job = await m.store.get(started.jobId);
   assert.deepEqual(job.revertFiles, ['src/a.mjs']);
   assert.match(await m.store.readArtifact(started.jobId, 'patch.diff'), /rogue\.mjs/);
@@ -3120,7 +3141,7 @@ test('scope attribution retains a disjoint peer that was queued first but began 
   await pause(2);
   await store.update(peer.id, { startedAt: new Date().toISOString() });
   finish();
-  assert.equal((await m.wait(started.jobId, { timeoutSec: terminalWaitSec(1) })).status, 'DONE_VERIFIED');
+  assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
   const job = await store.get(started.jobId);
   assert.deepEqual(
     job.files.map((file) => file.path),
@@ -3173,7 +3194,7 @@ test('scope attribution retains a peer live at the baseline snapshot that releas
   });
   const started = await m.start({ task: 'main', ownedPaths: ['src/**'], repoPath: process.cwd(), testCommand: 'true' });
   finish();
-  assert.equal((await m.wait(started.jobId, { timeoutSec: terminalWaitSec(1) })).status, 'DONE_VERIFIED');
+  assert.equal((await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_VERIFIED');
   const job = await store.get(started.jobId);
   assert.deepEqual(job.concurrentScopes, ['test/**']);
   assert.deepEqual(job.scopeViolations, []);
@@ -3264,7 +3285,7 @@ test('worker cache writes survive durable accounting and appear in public hit-ra
     },
   });
   const start = await m.start({ task: 'cache diagnostics', ownedPaths: ['src/**'] });
-  const done = await m.wait(start.jobId, { timeoutSec: 1 });
+  const done = await m.wait(start.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.deepEqual(done.promptCache, { inputTokens: 10000, cacheHitTokens: 8000, cacheWriteTokens: 1500, hitRate: 0.8 });
   assert.equal((await m.store.get(start.jobId)).usage.cacheWriteTokens, 1500);
   assert.match(done.report, /prompt cache: 80\.0%/);
@@ -3305,7 +3326,7 @@ test('a budget outlook reaches progress, the job and the report, and a later ok 
   const cleared = await until((job) => job.turns === 2 && steps.length === 1);
   assert.equal(cleared.budgetOutlook, undefined);
   release();
-  const done = await m.wait(start.jobId, { timeoutSec: 2 });
+  const done = await m.wait(start.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(done.status, 'BUDGET', done.error);
   assert.equal(done.budgetWarning, undefined, 'a stopped job is past the prediction');
   assert.doesNotMatch(done.report, /budget warning/);
@@ -3448,7 +3469,7 @@ test('offload_cancel interrupts an in-flight provider request whose body hangs, 
     const reply = await m.cancel(job.jobId);
     // Either still pending (and flagged), or the abort already finished it.
     assert.ok(reply.cancelRequested === true || reply.status === 'CANCELLED', JSON.stringify(reply.status));
-    const done = await m.wait(job.jobId, { timeoutSec: 10 });
+    const done = await m.wait(job.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'CANCELLED');
     assert.ok(Date.now() - started < 5_000, 'the request was aborted, not waited out');
     assert.ok((await eventTypes(m, job.jobId)).includes('cancel_requested'), 'the cancel is in the job log');
@@ -3472,7 +3493,7 @@ test('the wall-clock watchdog ends a round that cannot stop itself as TIMEOUT', 
     { setTimeoutFn: (fn) => setTimeout(fn, 20) },
   );
   const job = await m.start({ task: 'x', ownedPaths: ['src/**'], repoPath: process.cwd(), budget: { timeoutMinutes: 1 } });
-  const done = await m.wait(job.jobId, { timeoutSec: 10 });
+  const done = await m.wait(job.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(done.status, 'TIMEOUT');
   assert.equal(observedReason?.code, 'OFFLOAD_WALL_TIMEOUT');
   // The watchdog aborts first and logs afterwards, so a busy job lock never
@@ -3528,7 +3549,11 @@ test("a RUNNING round this process claimed but no task owns is finalized; anothe
     // The live round is owned by a task in this process, in another manager.
     assert.equal((await store.get(live.jobId)).status, 'RUNNING');
     release();
-    assert.equal((await owner.wait(live.jobId, { timeoutSec: 10 })).status, 'DONE_UNVERIFIED', 'it finished on its own terms');
+    assert.equal(
+      (await owner.wait(live.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status,
+      'DONE_UNVERIFIED',
+      'it finished on its own terms',
+    );
   } finally {
     release();
   }
@@ -3575,7 +3600,7 @@ test('offload_wait and offload_job show a pending cancel and how long ago it was
     assert.equal((await m.job(job.jobId, { include: 'log' })).cancelRequestedSec, 17);
     assert.equal((await m.wait(job.jobId, { timeoutSec: 0, detail: 'full' })).progress.cancelRequestedSec, 17);
     release();
-    const done = await m.wait(job.jobId, { timeoutSec: 10 });
+    const done = await m.wait(job.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'CANCELLED');
     assert.equal(done.cancelRequested, undefined, 'a finished job has no pending cancel');
   } finally {
@@ -3867,7 +3892,7 @@ test('start, wait and job responses carry a compact verifier preflight unless de
   // Through the real start/wait/job paths too.
   const started = await m.start({ task: 'x', ownedPaths: ['src/**'], repoPath: process.cwd() });
   await m.store.update(started.jobId, { verifierPreflight });
-  const waited = await m.wait(started.jobId, { timeoutSec: 5 });
+  const waited = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
   assert.equal(waited.verifierPreflight.resolvedFiles, undefined);
   assert.equal(waited.verifierPreflight.counts.resolvedFiles, 159);
   assert.equal((await m.wait(started.jobId, { timeoutSec: 0, detail: 'full' })).verifierPreflight.resolvedFiles.length, 159);
