@@ -836,7 +836,7 @@ test('listing keeps a job whose job.json is atomically replaced during the read'
       for (let i = 0; running; i += 1) {
         writeFileSync(`${file}.swap`, bytes, { mode: 0o600 });
         renameSync(`${file}.swap`, file);
-        // Pace the replacements so one retry is enough while still racing the checked read's lstat/open window.
+        // Keep publications frequent enough to race the checked read's lstat/open window, repeatedly on a loaded host.
         await sleep(4);
       }
     })();
