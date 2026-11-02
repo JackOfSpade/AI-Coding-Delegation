@@ -2229,11 +2229,13 @@ test('detached CLI worker inherits env keyRef without putting it in argv or outp
         default: 'mock',
       }),
     );
+    // Only bounds a hang: a CLI command on a Windows runner can take several seconds to start.
+    const CLI_TIMEOUT_MS = 60_000;
     const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, 'config'), OFFLOAD_E2E_KEY: 'not-in-output' };
     const start = spawnSync(
       process.execPath,
       ['bin/offload.mjs', 'start', '--task', 'finish', '--ownedPaths', '["src/**"]', '--repoPath', path],
-      { cwd: process.cwd(), encoding: 'utf8', env, timeout: 5_000 },
+      { cwd: process.cwd(), encoding: 'utf8', env, timeout: CLI_TIMEOUT_MS },
     );
     assert.equal(start.status, 0, start.stderr);
     assert.doesNotMatch(`${start.stdout}${start.stderr}`, /not-in-output/);
@@ -2244,7 +2246,7 @@ test('detached CLI worker inherits env keyRef without putting it in argv or outp
         cwd: process.cwd(),
         encoding: 'utf8',
         env,
-        timeout: 5_000,
+        timeout: CLI_TIMEOUT_MS,
       });
       assert.equal(query.status, 0, query.stderr);
       inspected = JSON.parse(query.stdout);
