@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import {
@@ -13,7 +13,7 @@ import {
   snapshotGitEnv,
   snapshotWorkingTree,
 } from '../../src/git-snapshot.mjs';
-import { cleanup, git, makeRepo, write } from './helpers.mjs';
+import { cleanup, git, makeRepo, tempDir, write } from './helpers.mjs';
 
 test('snapshot exclusions handle ignored and non-ignored node_modules symlinks without changing the index or HEAD', () => {
   const repo = makeRepo();
@@ -156,6 +156,169 @@ test('a required-only filter is explicitly disabled before every snapshot Git co
     );
     assert.equal(calls.length, 2);
     assert.ok(calls[1].includes('filter.required-only.required=false'));
+  } finally {
+    cleanup(repo);
+  }
+});
+// A clean/smudge filter and a required process filter that each leave a marker,
+// selected for tracked files that are dirty on disk. Node launches the fixtures
+// so this works on Git for Windows too.
+function armFilterTripwire(repo, fixture) {
+  const marker = join(fixture, 'filter-ran');
+  const script = join(fixture, 'trip.cjs');
+  write(
+    script,
+    `const fs = require('node:fs');
+fs.appendFileSync(${JSON.stringify(marker)}, process.argv[2] + '\\n');
+if (process.argv[2] !== 'process') process.stdout.write(fs.readFileSync(0));
+`,
+  );
+  const quote = (value) => `'${(process.platform === 'win32' ? value.replaceAll('\\', '/') : value).replaceAll("'", "'\"'\"'")}'`;
+  const command = (kind) => `${quote(process.execPath)} ${quote(script)} ${kind}`;
+  write(join(repo, '.gitattributes'), 'tracked.txt filter=trip\nprocessed.txt filter=trip-process\n');
+  write(join(repo, 'processed.txt'), 'base\n');
+  git(repo, ['add', '.']);
+  git(repo, ['commit', '-m', 'filtered fixtures']);
+  git(repo, ['config', 'filter.trip.clean', command('clean')]);
+  git(repo, ['config', 'filter.trip.smudge', command('smudge')]);
+  git(repo, ['config', 'filter.trip-process.process', command('process')]);
+  git(repo, ['config', 'filter.trip-process.required', 'true']);
+  write(join(repo, 'tracked.txt'), 'dirty\n');
+  write(join(repo, 'processed.txt'), 'dirty\n');
+  return marker;
+}
+function recordingExec(calls) {
+  return (command, args, options) => {
+    calls.push(args);
+    return execFileSync(command, args, options);
+  };
+}
+const isProbe = (args) => args.includes('--get-regexp');
+
+test('filter-inert commands skip the probe and do not run configured filters', () => {
+  const repo = makeRepo();
+  const fixture = tempDir();
+  try {
+    const marker = armFilterTripwire(repo, fixture);
+    const tree = git(repo, ['rev-parse', 'HEAD^{tree}']);
+    const ref = 'refs/offload-test/pin';
+    const inert = [
+      ['rev-parse', '--show-toplevel'],
+      ['rev-parse', '--git-dir'],
+      ['rev-parse', '--git-common-dir'],
+      ['rev-parse', 'HEAD'],
+      ['rev-parse', '--verify', `${tree}^{tree}`],
+      ['branch', '--show-current'],
+      ['cat-file', '-e', `${tree}^{tree}`],
+      ['update-ref', '--create-reflog', ref, tree],
+      ['show-ref', '--verify', '--quiet', ref],
+      ['worktree', 'list', '--porcelain', '-z'],
+    ];
+    // Every filter path runs through the index or the working tree. A corrupt
+    // index fails any command that loads it, including a racy-entry re-check
+    // no marker would catch unless the timestamps happened to line up.
+    const index = join(repo, '.git', 'index');
+    const realIndex = readFileSync(index);
+    writeFileSync(index, 'not an index');
+    for (const args of inert) {
+      const calls = [];
+      snapshotGit(repo, args, {}, { execFile: recordingExec(calls) });
+      assert.equal(calls.length, 1, `${args.join(' ')} must not probe`);
+      assert.ok(!calls[0].some((arg) => arg.startsWith('filter.')));
+      // The remaining hardening still applies without the probe.
+      assert.ok(calls[0].includes('core.fsmonitor=false'));
+      assert.ok(calls[0].some((arg) => arg.startsWith('core.hooksPath=')));
+      assert.equal(existsSync(marker), false, `${args.join(' ')} must not run a filter`);
+    }
+    assert.throws(() => git(repo, ['ls-files']), /index/, 'the corrupt index must be fatal to a command that loads it');
+    writeFileSync(index, realIndex);
+    assert.throws(() => git(repo, ['add', 'tracked.txt', 'processed.txt']));
+    assert.ok(existsSync(marker), 'unhardened Git executes the same fixtures on the same files');
+  } finally {
+    cleanup(repo);
+    cleanup(fixture);
+  }
+});
+test('any command outside the exact filter-inert shapes is probed before it runs', () => {
+  const repo = makeRepo();
+  try {
+    const tree = git(repo, ['rev-parse', 'HEAD^{tree}']);
+    const probed = [
+      ['add', '-A'],
+      ['status', '--porcelain'],
+      ['diff', '--no-ext-diff', tree, tree],
+      ['diff', '--cached', '--quiet', tree],
+      ['apply', '--check'],
+      ['read-tree', '--reset', '-u', tree],
+      ['worktree', 'remove', '--force', 'absent'],
+      ['worktree', 'list'],
+      ['ls-files', '-m'],
+      // Rewrites the index, which runs the clean filter on racily clean entries.
+      ['write-tree'],
+      // Near misses of an inert shape: extra, reordered or option-like arguments.
+      ['cat-file', '--filters', `${tree}^{tree}`],
+      ['cat-file', '-e', '--filters'],
+      ['rev-parse', '--verify', '--end-of-options'],
+      ['rev-parse', '--git-dir', '--show-toplevel'],
+      ['update-ref', '--stdin'],
+      ['write-tree', '--prefix=tracked'],
+      ['branch'],
+    ];
+    for (const args of probed) {
+      const calls = [];
+      try {
+        snapshotGit(repo, args, {}, { execFile: recordingExec(calls) });
+      } catch (error) {
+        assert.equal(error.code, 'E_GIT_COMMAND', `${args.join(' ')} failed for a reason other than Git itself`);
+      }
+      assert.ok(isProbe(calls[0]), `${args.join(' ')} must probe first`);
+      assert.equal(calls.length, 2, `${args.join(' ')} must run once after one probe`);
+    }
+  } finally {
+    cleanup(repo);
+  }
+});
+test('a filter added between commands of one snapshot sequence is disabled for the next filter-capable command', () => {
+  const repo = makeRepo();
+  const fixture = tempDir();
+  try {
+    const indexFile = join(fixture, 'index');
+    write(join(repo, 'tracked.txt'), 'first\n');
+    snapshotGit(repo, ['add', '-A'], { GIT_INDEX_FILE: indexFile });
+    // An inert command in between must not stand in for the next probe.
+    snapshotGit(repo, ['rev-parse', 'HEAD']);
+    const marker = armFilterTripwire(repo, fixture);
+    const calls = [];
+    snapshotGit(repo, ['add', '-A'], { GIT_INDEX_FILE: indexFile }, { execFile: recordingExec(calls) });
+    assert.equal(existsSync(marker), false, 'the late filter must not run');
+    assert.ok(isProbe(calls[0]));
+    for (const setting of ['filter.trip.clean=', 'filter.trip-process.process=', 'filter.trip-process.required=false']) {
+      assert.ok(calls[1].includes(setting), `${setting} must reach the command`);
+    }
+    // The whole operation sees the armed filters as well.
+    write(join(repo, 'tracked.txt'), 'second\n');
+    snapshotWorkingTree(repo);
+    assert.equal(existsSync(marker), false, 'snapshotWorkingTree must not run the filter');
+  } finally {
+    cleanup(repo);
+    cleanup(fixture);
+  }
+});
+test('unsafe filter configuration leaves inert commands working and still stops filter-capable ones', () => {
+  const repo = makeRepo();
+  try {
+    // A key this module cannot turn into a -c override: inert commands cannot
+    // reach the filter, and the first command that could fails closed.
+    git(repo, ['config', 'filter.bad name.clean', 'false']);
+    assert.equal(snapshotGit(repo, ['rev-parse', 'HEAD']).trim(), git(repo, ['rev-parse', 'HEAD']));
+    assert.throws(
+      () => snapshotGit(repo, ['add', '-A']),
+      (error) => error.code === 'E_GIT_FILTER',
+    );
+    assert.throws(
+      () => snapshotWorkingTree(repo),
+      (error) => error.code === 'E_GIT_FILTER',
+    );
   } finally {
     cleanup(repo);
   }

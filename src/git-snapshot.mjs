@@ -11,6 +11,27 @@ const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 const SNAPSHOT_ENV_ALLOW =
   /^(?:PATH|LANG|LC_[A-Z0-9_]*|TERM|TZ|HOME|XDG_CONFIG_HOME|SYSTEMROOT|COMSPEC|PATHEXT|USERPROFILE|HOMEDRIVE|HOMEPATH|APPDATA|LOCALAPPDATA)$/i;
 const CREDENTIAL_ENV = /(?:^|_)(?:api[_-]?key|token|secret|password|authorization|credential)(?:$|_)/i;
+// Exact argument shapes that only touch refs, config and the object store. They
+// never load the index or read working-tree content, so Git has no path to a
+// clean, smudge or process filter and the filter probe protects nothing. Match
+// whole shapes rather than subcommands, and do not add a command because it
+// looks like plumbing: `write-tree` rewrites the index, which re-checks racily
+// clean entries through the clean filter; `cat-file --filters`, `read-tree -u`
+// and `worktree remove` (which runs status) reach filters too. Anything not
+// listed here is probed.
+const OPERAND = Symbol('operand');
+const FILTER_INERT_SHAPES = [
+  ['rev-parse', '--show-toplevel'],
+  ['rev-parse', '--git-dir'],
+  ['rev-parse', '--git-common-dir'],
+  ['rev-parse', 'HEAD'],
+  ['rev-parse', '--verify', OPERAND],
+  ['branch', '--show-current'],
+  ['cat-file', '-e', OPERAND],
+  ['show-ref', '--verify', '--quiet', OPERAND],
+  ['update-ref', '--create-reflog', OPERAND, OPERAND],
+  ['worktree', 'list', '--porcelain', '-z'],
+];
 
 export class GitSnapshotError extends Error {
   constructor(message, code = 'E_GIT_SNAPSHOT') {
@@ -160,7 +181,7 @@ export function git(repoPath, args, extraEnv = {}, { hooksPath, execFile = execF
     'core.eol=lf',
     '-c',
     `core.hooksPath=${inertHooks}`,
-    ...disabledFilters(repoPath, env, execFile),
+    ...(isFilterInert(args) ? [] : disabledFilters(repoPath, env, execFile)),
   ];
   try {
     return execFile('git', [...hardening, ...args], {
@@ -244,6 +265,15 @@ function pathspecs(paths, { literal = false } = {}) {
     }
     return literal ? `:(top,literal)${normalized}` : `:(top,glob)${normalized}`;
   });
+}
+function isFilterInert(args) {
+  return FILTER_INERT_SHAPES.some(
+    (shape) =>
+      shape.length === args.length &&
+      // An operand starting with '-' would be parsed as an option, so it could
+      // turn an inert shape into one that is not.
+      shape.every((part, index) => (part === OPERAND ? !String(args[index]).startsWith('-') : part === args[index])),
+  );
 }
 function disabledFilters(repoPath, env, execFile = execFileSync) {
   try {
