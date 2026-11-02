@@ -15,6 +15,11 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
       'detached worker remains alive across automatic repair and publishes the repaired result',
       'automatic repair requires an actual macOS verifier sandbox',
     ],
+    // It makes a directory read-only with chmod, which does not deny a write on Windows.
+    [
+      'installer reports filesystem failures instead of mislabelling them as invalid Cursor JSON',
+      'requires POSIX permissions and a non-root user',
+    ],
     ['macOS sandbox blocks out-of-scope and git writes', ''],
     ['macOS sandbox broad writable scope cannot overwrite protected secrets or future policy', ''],
     ['macOS sandbox cannot rewrite a linked-worktree .git pointer through broad writable scope', ''],
