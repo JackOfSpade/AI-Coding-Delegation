@@ -39,6 +39,7 @@ const LOCK_TIMEOUT_MS = 120_000;
 // it, so it is reclaimed at once instead of blocking every later write.
 const HELD_PUBLICATION_TOKENS = new Set();
 const WINDOWS_RENAME_ATTEMPTS = 8;
+const JOB_READ_ATTEMPTS = 16;
 const validId = validJobId;
 const lifecycleIdentity = (job) => ({
   status: job?.status,
@@ -456,15 +457,16 @@ export class JobStore {
   async getOperational(id) {
     return this.#readJob(id, { authenticate: false });
   }
-  // A normal writer publishes with same-directory rename. Retry one checked read if that benign replacement races our
-  // descriptor identity check; a persistent link/corruption still fails closed.
+  // A normal writer publishes with same-directory rename without blocking readers, and that benign replacement can race
+  // our descriptor identity check. A loaded host stretches each read across several publications, so one retry can lose
+  // again; back off for a bounded number of checked reads. A persistent link/corruption still fails closed.
   async #readJobFile(path) {
     for (let attempt = 0; ; attempt += 1) {
       try {
         return await json(path);
       } catch (error) {
-        if (attempt === 0 && /^stored file .*changed/.test(error.message || '')) continue;
-        throw error;
+        if (attempt >= JOB_READ_ATTEMPTS - 1 || !/^stored file .*changed/.test(error.message || '')) throw error;
+        await sleep(Math.min(2 ** attempt, 32));
       }
     }
   }
