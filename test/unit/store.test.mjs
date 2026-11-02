@@ -835,7 +835,12 @@ test('listing keeps a job whose job.json is atomically replaced during the read'
     const replacer = (async () => {
       for (let i = 0; running; i += 1) {
         writeFileSync(`${file}.swap`, bytes, { mode: 0o600 });
-        renameSync(`${file}.swap`, file);
+        try {
+          renameSync(`${file}.swap`, file);
+        } catch (error) {
+          // Windows denies a rename over a file a reader has open; the store's own publish retries this.
+          if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) throw error;
+        }
         // Keep publications frequent enough to race the checked read's lstat/open window, repeatedly on a loaded host.
         await sleep(4);
       }
