@@ -456,7 +456,7 @@ test('MCP exposes the bounded log window on offload_job, forwards it only when s
   const description = tools.find((candidate) => candidate.name === 'offload_continue').description;
   assert.match(
     description,
-    /FAILED on transcript corruption or in a worker-side way \(a repeated failing tool call, ending without finish, exhausting output-cap recovery, or putting finish in a turn with other tool calls twice\)/,
+    /FAILED on transcript corruption or in a worker-side way \(a repeated failing tool call, ending without finish, exhausting output-cap recovery, or repeatedly putting finish in a turn with other tool calls or giving it invalid arguments\)/,
   );
   assert.match(description, /Refused for other provider or protocol failures, integrity failures, scope violations/);
   assert.match(description, /transcript corruption may be retried before any edits/);
@@ -1679,7 +1679,7 @@ test('MCP answers an oversized tool result with a small error and keeps serving'
   );
   input.write('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}\n');
   input.write(
-    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"offload_job","arguments":{"jobId":"j","include":"diff"}}}\n',
+    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"offload_job","arguments":{"jobId":"j","include":"files"}}}\n',
   );
   await new Promise((resolve) => setTimeout(resolve, 100));
   input.write('{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n');
@@ -1690,7 +1690,7 @@ test('MCP answers an oversized tool result with a small error and keeps serving'
     .map((line) => JSON.parse(line));
   const tooLarge = frames.find((frame) => frame.id === 1);
   assert.equal(tooLarge.error.code, -32603);
-  assert.equal(tooLarge.error.message, 'response too large');
+  assert.match(tooLarge.error.message, /^response too large \(\d+ bytes, limit \d+\); ask for less/);
   assert.equal(shutdowns, 0);
   assert.equal(output.destroyed, false);
   assert.ok(frames.find((frame) => frame.id === 2)?.result?.tools, 'server keeps answering after the oversized result');
@@ -1731,5 +1731,62 @@ test('MCP retries a failed skill-catalog load instead of caching the failure', a
   const second = await frameFor(2);
   assert.equal(second.error, undefined, JSON.stringify(second));
   assert.equal(loads, 2);
+  await server.close();
+});
+
+test('a real 2.5 MB diff over MCP arrives in frames the transport accepts, and pages rebuild it', async () => {
+  const diff = Array.from({ length: 60_000 }, (_, index) => `+"line" ${index} \\ of a large patch ${'x'.repeat(20)}`).join('\n') + '\n';
+  assert.ok(Buffer.byteLength(diff) > 2_500_000);
+  const input = new PassThrough(),
+    output = new PassThrough();
+  let wire = '';
+  output.on('data', (chunk) => (wire += chunk));
+  const forwarded = [];
+  const server = createMcpServer(
+    {
+      job: async (id, options) => {
+        forwarded.push(options);
+        return { jobId: id, status: 'BUDGET', diff };
+      },
+    },
+    { input, output },
+  );
+  input.write('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}\n');
+  const frames = async (id) => {
+    for (let wait = 0; wait < 200; wait++) {
+      const found = wire
+        .trim()
+        .split('\n')
+        .map(JSON.parse)
+        .find((frame) => frame.id === id);
+      if (found) return found;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.fail(`no response to ${id}`);
+  };
+  const call = (id, args) =>
+    input.write(`${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'offload_job', arguments: args } })}\n`);
+  let rebuilt = '';
+  let offset;
+  let id = 1;
+  for (;;) {
+    call(id, { jobId: 'j', include: 'diff', ...(offset !== undefined ? { offset } : {}) });
+    const frame = await frames(id++);
+    assert.equal(frame.error, undefined);
+    const page = frame.result.structuredContent;
+    rebuilt += page.diff;
+    if (!page.diffWindow.truncated) break;
+    offset = page.diffWindow.nextOffset;
+  }
+  assert.equal(rebuilt, diff);
+  assert.ok(id > 3);
+  for (const options of forwarded) assert.deepEqual(Object.keys(options).sort(), ['include', 'repoPath'], 'the core call is unchanged');
+
+  call(100, { jobId: 'j', include: 'files', offset: 1 });
+  assert.match(JSON.stringify((await frames(100)).result), /offset and maxBytes apply only to include/);
+  call(101, { include: 'diff', maxBytes: 2000 });
+  assert.match(JSON.stringify((await frames(101)).result), /offset and maxBytes apply only to include/);
+  call(102, { jobId: 'j', include: 'diff', maxBytes: 300_001 });
+  assert.equal((await frames(102)).result.isError, true);
   await server.close();
 });

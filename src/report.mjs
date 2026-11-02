@@ -1,3 +1,5 @@
+import { budgetWarningLine } from './budget-outlook.mjs';
+import { scratchFilesLine } from './scratch-audit.mjs';
 import { continuationBlocker, promptCacheSummary } from './continuation.mjs';
 import { verifierPreflightLines } from './verifier-preflight.mjs';
 import { redactText, stripTerminalControls } from './redact.mjs';
@@ -5,6 +7,7 @@ import { TURN_SOURCES } from './budget-sizing.mjs';
 import {
   APPLY_ELIGIBLE_STATUSES,
   continuableFailure,
+  applyBlocker,
   failedApplyRefusal,
   retryableTranscriptFailure,
   safeFailureKind,
@@ -81,7 +84,7 @@ function nextActionLines(job, { reportMode, violations, files, continuationReaso
     nextActions.push(!capStop && budgetSpent ? 'continue (extraTurns/extraUsd needed: the cumulative budget is spent)' : 'continue');
   }
   // A FAILED job only through the gate offload_apply enforces on its retained diff.
-  const appliable = APPLY_ELIGIBLE.has(job.status) || (job.status === 'FAILED' && !failedApplyRefusal(job));
+  const appliable = !applyBlocker(job) && (APPLY_ELIGIBLE.has(job.status) || (job.status === 'FAILED' && !failedApplyRefusal(job)));
   const verifiedNoFinish =
     !reportMode &&
     job.status === 'FAILED' &&
@@ -336,6 +339,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     meta,
     spendLine,
     cacheLine,
+    budgetWarningLine(job),
     ...verifierPreflightLines(job.verifierPreflight, { lean }),
     remaining,
     ...timingLines(job, { lean, elapsed }),
@@ -346,6 +350,10 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     scope,
     isolation,
     discarded,
+    !reportMode && terminal.has(job.status) && scratchFilesLine(job, scalar),
+    !reportMode &&
+      applyBlocker(job) &&
+      `apply: BLOCKED: ${scalar(applyBlocker(job))}. offload_apply will refuse this job, so review the diff and start a fresh job, or integrate it yourself knowing offload_revert cannot undo that.`,
     verify,
     !reportMode && terminal.has(job.status) && testAssertionLines(job.testAssertionChanges, lean),
     job.retainedDiffRecovery === true &&

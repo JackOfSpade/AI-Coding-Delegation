@@ -1,4 +1,5 @@
 /** Newline-delimited JSON-RPC 2.0 MCP stdio adapter; supports legacy and modern discovery. */
+import { DIFF_WINDOW_BYTES, windowedDiffResult } from './diff-window.mjs';
 import { createHash } from 'node:crypto';
 import { lstat, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -65,7 +66,7 @@ const startProps = {
   acceptVerifierBlockers: {
     type: 'boolean',
     description:
-      'Start even though the static verifier preflight found blocking findings: writes the verifier sandbox is certain to deny (a hard-coded system temp path, or a worktree path outside ownedPaths/extraWritable such as mkdtemp(join(process.cwd(), ".x-"))). Without it such a start is refused before any job exists, naming each file:line and target, the extraWritable glob that would cover a worktree target, and a narrowed testCommand when one can be derived. Pass it only after deciding the finding is a false positive or the failure is acceptable.',
+      'Start even though the static verifier preflight found blocking findings: writes the verifier sandbox is certain to deny (a hard-coded system temp path, or a worktree path outside ownedPaths/extraWritable such as mkdtemp(join(process.cwd(), ".x-"))). Without it such a start is refused before any job exists, naming each file:line and target, the extraWritable glob that would cover a worktree target, and a narrowed testCommand when one can be derived. A write target with an unresolved leading segment is reported as uncertain and never refused, so it needs no acceptance. Pass it only after deciding the finding is a false positive or the failure is acceptable.',
   },
   verifierMode: {
     enum: ['standard', 'baseline-diff'],
@@ -198,6 +199,18 @@ const TOOLS = [
       },
       tail: { type: 'integer', minimum: 0, maximum: 1000 },
       limit: { type: 'integer', minimum: 2000, maximum: 60000 },
+      offset: {
+        type: 'integer',
+        minimum: 0,
+        description:
+          'include "diff" only: where the window starts, in characters of the displayed diff. Pass the nextOffset of the previous window until diffWindow.truncated is false.',
+      },
+      maxBytes: {
+        type: 'integer',
+        minimum: 2000,
+        maximum: DIFF_WINDOW_BYTES,
+        description: `include "diff" only: the most bytes one window returns (default and maximum ${DIFF_WINDOW_BYTES}). A diff over that always arrives in windows.`,
+      },
       all: { type: 'boolean' },
       maxJobs: { type: 'integer', minimum: 1, maximum: 100 },
       detail,
@@ -238,7 +251,7 @@ const TOOLS = [
   ],
   [
     'offload_continue',
-    'Resume a job that stopped on BUDGET or TIMEOUT, or that FAILED on transcript corruption or in a worker-side way (a repeated failing tool call, ending without finish, exhausting output-cap recovery, or putting finish in a turn with other tool calls twice), keeping its work and conversation. Worker-side failures require in-scope changes; transcript corruption may be retried before any edits. Local malformed transcript bytes are preserved for audit while a fresh conversation starts. Raises the cumulative caps by extraTurns/extraUsd (bounded; pass the one that stopped a BUDGET job; a FAILED continuation needs no increase unless the cumulative budget is spent), consumes one repair round, and spends provider budget. A FAILED continuation tells the worker which call failed (or, for finish-protocol, to call finish alone). Refused for other provider or protocol failures, integrity failures, scope violations and every other FAILED cause, and when the same call looped again after an earlier round (use offload_repair or a fresh job then).',
+    'Resume a job that stopped on BUDGET or TIMEOUT, or that FAILED on transcript corruption or in a worker-side way (a repeated failing tool call, ending without finish, exhausting output-cap recovery, or repeatedly putting finish in a turn with other tool calls or giving it invalid arguments), keeping its work and conversation. Worker-side failures require in-scope changes; transcript corruption may be retried before any edits. Local malformed transcript bytes are preserved for audit while a fresh conversation starts. Raises the cumulative caps by extraTurns/extraUsd (bounded; pass the one that stopped a BUDGET job; a FAILED continuation needs no increase unless the cumulative budget is spent), consumes one repair round, and spends provider budget. A FAILED continuation tells the worker which call failed (or, for finish-protocol, to call finish alone). Refused for other provider or protocol failures, integrity failures, scope violations and every other FAILED cause, and when the same call looped again after an earlier round (use offload_repair or a fresh job then).',
     {
       jobId,
       extraTurns: { type: 'integer', minimum: 1, maximum: 500 },
@@ -432,6 +445,17 @@ async function loadSkillCatalog() {
   const catalogs = await Promise.all(SKILL_NAMES.map(loadSkillCatalogFor));
   return { entries: catalogs.map((catalog) => catalog.entry), resources: new Map(catalogs.flatMap((catalog) => [...catalog.resources])) };
 }
+// Windowing happens here because only this transport has a frame limit: a CLI caller
+// still gets a whole diff from the same core call.
+const jobWithDiffWindow = (args, core) => ({
+  job: async (...call) => {
+    if ((args.offset !== undefined || args.maxBytes !== undefined) && (args.include !== 'diff' || args.jobId === undefined))
+      throw new Error('offset and maxBytes apply only to include "diff" with a jobId');
+    const result = await core.job(...call);
+    return args.include === 'diff' ? windowedDiffResult(result, { offset: args.offset, maxBytes: args.maxBytes }) : result;
+  },
+});
+
 export function createMcpServer(
   core,
   {
@@ -536,7 +560,14 @@ export function createMcpServer(
       // An oversized answer to a request is a per-request failure: reply with a small id-bearing
       // error instead of tearing down the transport. Notifications and errors still fail closed.
       if (value?.id !== undefined && value.result !== undefined) {
-        send({ jsonrpc: '2.0', id: value.id, error: { code: -32603, message: 'response too large' } });
+        send({
+          jsonrpc: '2.0',
+          id: value.id,
+          error: {
+            code: -32603,
+            message: `response too large (${bytes} bytes, limit ${maxQueuedOutputBytes}); ask for less, such as include "summary" or a smaller maxJobs`,
+          },
+        });
         return;
       }
       failOutput();
@@ -736,7 +767,7 @@ export function createMcpServer(
       offload_job: () =>
         args.include === 'retrospective'
           ? core.retrospective({ repoPath: args.repoPath, ...(args.jobIds !== undefined ? { jobIds: args.jobIds } : {}) })
-          : core.job(args.jobId, {
+          : jobWithDiffWindow(args, core).job(args.jobId, {
               repoPath: args.repoPath,
               include: args.include,
               ...(args.detail !== undefined ? { detail: args.detail } : {}),

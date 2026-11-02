@@ -175,6 +175,7 @@ const COMPACT_FINDINGS = 3;
 const MAX_SCAN_FINDINGS = 256;
 // Calls that create or write a path. Only their first argument (Python: dir=)
 // is resolved; a call whose target cannot be resolved statically is ignored.
+// A member call may not take a path at all: a FileHandle's writeFile takes data.
 const JS_WRITE_CALL = /\b(mkdtemp(?:Sync)?|mkdir(?:Sync)?|writeFile(?:Sync)?|appendFile(?:Sync)?|createWriteStream)\s*\(/g;
 const PY_TEMP_CALL = /\b(mkdtemp|mkstemp|TemporaryDirectory|NamedTemporaryFile)\s*\(/g;
 const PY_MKDIR_CALL = /\bos\.(makedirs|mkdir)\s*\(/g;
@@ -212,6 +213,11 @@ function callArguments(text, from) {
 // A `${...}` interpolation. It never spans another `{`, so a run of `${`
 // cannot be rescanned from every position.
 const INTERPOLATION = /\$\{[^{}]*\}/g;
+// Stands in for a value the scan cannot know, inside a resolved path. It never
+// leaves this file: findings render it as DYNAMIC_LABEL.
+const DYNAMIC_SEGMENT = 'OFFLOAD_UNRESOLVED_VALUE';
+const DYNAMIC_LABEL = '<dynamic>';
+const shownTarget = (path) => path.replaceAll(DYNAMIC_SEGMENT, DYNAMIC_LABEL);
 /** The index of the `)` closing the `(` just before `from`, skipping quoted text; -1 when unbalanced. */
 function closingParen(text, from) {
   for (let i = from, depth = 0; i < text.length; i++) {
@@ -234,7 +240,8 @@ function closingParen(text, from) {
  * `{ kind: 'repo', path }` (relative to the worktree root, where the verifier
  * runs), `{ kind: 'system', path }` (a hard-coded system temp path),
  * `{ kind: 'tmp' }` (TMPDIR-based) or `{ kind: 'other' }`; undefined when it
- * cannot be resolved. Interpolations become `x`: only the directory matters.
+ * cannot be resolved. Interpolations become DYNAMIC_SEGMENT: a known directory
+ * still places the write, and an unknown leading one means it is not placed.
  */
 function resolvePathExpression(expression, context, depth = 0) {
   const { file, text, at, inCode } = context;
@@ -264,8 +271,8 @@ function resolvePathExpression(expression, context, depth = 0) {
   if (expr.startsWith('`') && expr.endsWith('`')) {
     const body = expr.slice(1, -1);
     const lead = /^\$\{([^}]+)\}(.*)$/s.exec(body);
-    if (lead) return append(resolvePathExpression(lead[1], context, depth + 1), lead[2].replace(INTERPOLATION, 'x'));
-    return literal(body.replace(INTERPOLATION, 'x'));
+    if (lead) return append(resolvePathExpression(lead[1], context, depth + 1), lead[2].replace(INTERPOLATION, DYNAMIC_SEGMENT));
+    return literal(body.replace(INTERPOLATION, DYNAMIC_SEGMENT));
   }
   if (/^(?:process\.cwd\(\)|os\.getcwd\(\)|(?:pathlib\.)?Path\.cwd\(\))$/.test(expr)) return { kind: 'repo', path: '' };
   if (/^(?:os\.)?tmpdir\(\)$|^process\.env\.(?:TMPDIR|TMP|TEMP)\b|^tempfile\.gettempdir\(\)$/.test(expr)) return { kind: 'tmp' };
@@ -304,10 +311,14 @@ function resolvePathExpression(expression, context, depth = 0) {
     let base = resolvePathExpression(parts[0], context, depth + 1);
     for (const part of parts.slice(1)) {
       // Literal segments join as written, so `..` climbs from the base;
-      // interpolations become `x`.
-      const quoted = /^(['"])([^'"\\]*)\1$/.exec(part)?.[2] ?? /^`([^`]*)`$/.exec(part)?.[1].replace(INTERPOLATION, 'x');
+      // interpolations become DYNAMIC_SEGMENT.
+      const quoted = /^(['"])([^'"\\]*)\1$/.exec(part)?.[2] ?? /^`([^`]*)`$/.exec(part)?.[1].replace(INTERPOLATION, DYNAMIC_SEGMENT);
       if (quoted !== undefined) base = append(base, quoted);
-      else base = resolvePathExpression(part, context, depth + 1)?.kind === 'system' ? { kind: 'other' } : append(base, 'x');
+      else {
+        // A segment bound to a literal places the write as surely as the literal would.
+        const bound = resolvePathExpression(part, context, depth + 1);
+        base = bound?.kind === 'system' ? { kind: 'other' } : append(base, bound?.kind === 'repo' ? bound.path : DYNAMIC_SEGMENT);
+      }
     }
     return base;
   }
@@ -376,18 +387,22 @@ function codeMask(text, python) {
   }
   return (index) => !skip[index];
 }
+const UNCERTAIN_WRITE = 'write-target-unresolved';
 const globLiteral = (path) => !/[*?[\]{}]/.test(path);
 
 /**
  * Writes the verifier sandbox is certain to deny: a hard-coded system temp
  * path, or a worktree path outside the job's write scope. Each finding names
  * the file, line and resolved target, plus the narrow extraWritable glob that
- * would cover a worktree target.
+ * would cover a worktree target. A target whose leading segment is unknown is
+ * not certain of anything, so it gets its own code (UNCERTAIN_WRITE), which
+ * scanVerifier reports without refusing.
  */
 function writeFindings(text, file, { repoPath, writeScope }) {
   const findings = [];
   const add = (call, index, target, temp) => {
-    if (!target || findings.length >= MAX_FINDINGS) return;
+    // Certain findings have their own cap: unplaced targets must not crowd out a real denial.
+    if (!target || findings.filter((finding) => finding.code !== UNCERTAIN_WRITE).length >= MAX_FINDINGS) return;
     const before = findings.length;
     record(call, index, target, temp);
     // Not serialized: only runner scoping reads it.
@@ -398,7 +413,13 @@ function writeFindings(text, file, { repoPath, writeScope }) {
   const record = (call, index, target, temp) => {
     const line = lineOf(text, index);
     if (target.kind === 'system')
-      findings.push({ code: 'system-temp-write', path: file, line, call, target: temp ? `${target.path}XXXXXX` : target.path });
+      findings.push({
+        code: 'system-temp-write',
+        path: file,
+        line,
+        call,
+        target: shownTarget(temp ? `${target.path}XXXXXX` : target.path),
+      });
     if (target.kind !== 'repo' || !Array.isArray(writeScope)) return;
     const node = temp ? `${target.path}XXXXXX` : target.path;
     if (!node) return;
@@ -409,13 +430,27 @@ function writeFindings(text, file, { repoPath, writeScope }) {
     if (writable) return;
     // A recursive mkdir of a directory that already exists writes nothing.
     if (/^mkdir|^makedirs/.test(call) && existsSync(join(repoPath, node))) return;
-    const glob = temp ? `${target.path}**` : /^mkdir|^makedirs/.test(call) ? `${node}/**` : node;
+    if (node.startsWith(DYNAMIC_SEGMENT)) {
+      if (findings.filter((finding) => finding.code === UNCERTAIN_WRITE).length < MAX_FINDINGS)
+        findings.push({ code: UNCERTAIN_WRITE, path: file, line, call, target: shownTarget(node) });
+      return;
+    }
+    // With a dynamic name, the literal text before it is all a glob can honestly cover.
+    const dynamicAt = target.path.indexOf(DYNAMIC_SEGMENT);
+    const glob =
+      dynamicAt >= 0
+        ? `${target.path.slice(0, dynamicAt)}**`
+        : temp
+          ? `${target.path}**`
+          : /^mkdir|^makedirs/.test(call)
+            ? `${node}/**`
+            : node;
     findings.push({
       code: 'temp-outside-scope',
       path: file,
       line,
       call,
-      target: node,
+      target: shownTarget(node),
       ...(globLiteral(target.path) ? { extraWritable: glob } : {}),
     });
   };
@@ -533,12 +568,15 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
     if (!edges.has(from)) edges.set(from, new Set());
     edges.get(from).add(to);
   };
+  const uncertainFound = [];
   const block = (findings) => {
     for (const finding of findings) {
       const key = `${finding.code}:${finding.path}:${finding.line}`;
-      if (blocking.length >= MAX_SCAN_FINDINGS || seenWarnings.has(key)) continue;
+      // Collected apart, so that targets the scan cannot place never crowd out a real denial.
+      const list = finding.code === UNCERTAIN_WRITE ? uncertainFound : blocking;
+      if (list.length >= MAX_SCAN_FINDINGS || seenWarnings.has(key)) continue;
       seenWarnings.add(key);
-      blocking.push(finding);
+      list.push(finding);
     }
   };
   const warn = (code, path) => {
@@ -733,6 +771,8 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
   // (a harness, a reporter) always runs and stays blocking. A runner that any
   // segment runs without file arguments is never scoped, and a scope is
   // trusted only when every file its selected suites reach was read.
+  const selectedSuites = new Set();
+  const scopeUnavailable = [];
   const scopes = [...new Set(runners.map((runner) => runner.path))].flatMap((path) => {
     const calls = runners.filter((runner) => runner.path === path);
     if (!resolvedFiles.has(path) || calls.some((call) => !call.operands.length)) return [];
@@ -740,12 +780,19 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
     const direct = [...(edges.get(path) ?? [])];
     const selected = direct.filter((file) => operands.some((operand) => file === operand || file.endsWith(`/${operand}`)));
     if (!selected.length) return [];
+    for (const file of selected) selectedSuites.add(file);
     const closure = new Set(selected.flatMap((file) => [...reachable(file)]));
-    if (![...closure].every((file) => resolvedFiles.has(file))) return [];
+    const unread = [...closure].filter((file) => !resolvedFiles.has(file)).length;
+    if (unread) {
+      scopeUnavailable.push({ runner: path, unreadFiles: unread });
+      return [];
+    }
     const folders = new Set(selected.map((file) => dirname(file)));
     const suites = direct.filter((file) => !selected.includes(file) && TEST_CODE.test(file) && folders.has(dirname(file)));
     return suites.length ? [{ runner: path, selected, suites }] : [];
   });
+  // Not certain to be denied, so never refused; scoping treats them like the rest.
+  let uncertain = uncertainFound;
   let advisory = [];
   let scopedWarnings = 0;
   if (scopes.length) {
@@ -763,23 +810,28 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
     const demoted = blocking.filter((finding) => finding.path !== 'testCommand' && !finding.moduleScope && unselected(finding.path));
     advisory = demoted.map((finding) => ({ ...finding, runner: unselected(finding.path).runner }));
     blocking.splice(0, blocking.length, ...blocking.filter((finding) => !demoted.includes(finding)));
+    uncertain = uncertain.filter((finding) => finding.moduleScope || !unselected(finding.path));
     const before = warnings.length;
     warnings.splice(0, warnings.length, ...warnings.filter((warning) => warning.path === 'testCommand' || !unselected(warning.path)));
     scopedWarnings = before - warnings.length;
   }
   blocking.splice(MAX_FINDINGS);
-  for (const finding of blocking) {
-    const testFiles = finding.path === 'testCommand' ? [] : testFilesFor(finding.path);
+  for (const finding of [...blocking, ...uncertain]) {
+    // Naming the runner says nothing when it was given files: name those that reach the write.
+    const bySuite = finding.path === 'testCommand' ? [] : [...selectedSuites].filter((suite) => reachable(suite).has(finding.path)).sort();
+    const testFiles = bySuite.length ? bySuite : finding.path === 'testCommand' ? [] : testFilesFor(finding.path);
     if (testFiles.length && !(testFiles.length === 1 && testFiles[0] === finding.path)) finding.testFiles = testFiles.slice(0, 8);
   }
   const result = {
-    status: blocking.length ? 'blocking' : warnings.length || advisory.length ? 'warning' : 'unknown',
+    status: blocking.length ? 'blocking' : warnings.length || advisory.length || uncertain.length ? 'warning' : 'unknown',
     scannedFiles: resolvedFiles.size,
     resolvedFiles: [...resolvedFiles],
     commandBytes,
     limited: limited || !resolvedFiles.size,
     warnings,
     ...(blocking.length ? { blocking } : {}),
+    ...(uncertain.length ? { uncertain: uncertain.slice(0, MAX_FINDINGS), uncertainCount: uncertain.length } : {}),
+    ...(scopeUnavailable.length ? { scopeUnavailable: scopeUnavailable.slice(0, MAX_FINDINGS) } : {}),
     ...(scopes.length
       ? {
           scoped: scopes.map((scope) => ({ runner: scope.runner, files: scope.selected.sort().slice(0, MAX_FINDINGS) })),
@@ -966,6 +1018,27 @@ function verifierAdvisoryLines(value, { limit = MAX_FINDINGS } = {}) {
     `verifier advisory: ${total} denied-write finding(s) in ${files.length === 1 ? files[0] : `${files.length} suites (${files.slice(0, limit).join(', ')}${files.length > limit ? ', …' : ''})`}, which ${runner || 'the runner'} imports but was not given as an argument; not refused (they fail the run only if the runner ignores its file arguments)`,
   ];
 }
+/** Writes whose target the scan could not place: reported, never refused. */
+function verifierUncertainLines(value, { limit = MAX_FINDINGS } = {}) {
+  if (!Array.isArray(value?.uncertain)) return [];
+  const shown = value.uncertain.filter((finding) => typeof finding?.path === 'string');
+  const total = Number.isInteger(value.uncertainCount) ? value.uncertainCount : shown.length;
+  const lines = shown
+    .slice(0, limit)
+    .map(
+      (finding) =>
+        `verifier uncertain: ${finding.path}${Number.isInteger(finding.line) ? `:${finding.line}` : ''}: ${finding.call || 'write'} target ${finding.target} is not statically known; not refused (it may not be a path at all, and the sandbox denies it only if it lands outside the write scope)${finding.testFiles?.length ? `; run by ${finding.testFiles.join(', ')}` : ''}`,
+    );
+  return total > lines.length ? [...lines, `verifier uncertain: ${total - lines.length} more (detail "full" lists them)`] : lines;
+}
+/** Why a runner's file arguments could not limit the findings. */
+const verifierScopeLines = (value) =>
+  (Array.isArray(value?.scopeUnavailable) ? value.scopeUnavailable : [])
+    .filter((gap) => typeof gap?.runner === 'string' && Number.isInteger(gap.unreadFiles))
+    .map(
+      (gap) =>
+        `verifier scope: the suites ${gap.runner} was given reach ${gap.unreadFiles} file(s) past the scan limits, so findings could not be limited to those suites`,
+    );
 const narrowingLine = (value) =>
   value?.suggestedTestCommand
     ? `verifier suggestion: drop ${(value.drop ?? []).join(', ')} from testCommand: \`${value.suggestedTestCommand}\` (static rewrite; review before use)`
@@ -979,6 +1052,7 @@ export function verifierBlockingMessage(value) {
     [
       'verifier preflight refused the start: the testCommand runs writes the verifier sandbox is certain to deny, so the job would end VERIFY_ENV_FAILED after spending its budget.',
       ...verifierBlockingLines(value, { limit: COMPACT_FINDINGS }),
+      ...verifierScopeLines(value),
       narrowingLine(value),
       'Fix the tests, declare the listed extraWritable glob, drop the files from testCommand (and check them in the primary), or pass acceptVerifierBlockers: true to start anyway.',
     ]
@@ -1005,6 +1079,8 @@ export function verifierPreflightLines(value, { lean = false } = {}) {
     `verifier preflight: ${value.scannedFiles ?? 0} file(s) scanned; static advisory${value.limited ? ' (incomplete)' : ''}, not a sandbox test${value.blockersAccepted ? '; blocking findings accepted by the caller' : ''}`,
     ...verifierBlockingLines(value, { limit }),
     ...verifierAdvisoryLines(value, { limit }),
+    ...verifierUncertainLines(value, { limit }),
+    ...verifierScopeLines(value),
     ...(value.previousFailures ?? []).map((failure) =>
       failure.inCommand?.length === 0 && failure.files?.length
         ? `verifier session note: ${failure.jobId} (${failure.kind}): ${failure.files.join(', ')} no longer run by this testCommand`
@@ -1040,6 +1116,7 @@ export function compactVerifierPreflight(value) {
   const findings = [
     ...list('blocking').map((finding) => ({ severity: 'blocking', ...findingView(finding) })),
     ...list('advisory').map((finding) => ({ severity: 'advisory', ...findingView(finding) })),
+    ...list('uncertain').map((finding) => ({ severity: 'uncertain', ...findingView(finding) })),
     ...list('warnings').map(({ code, path }) => ({ severity: 'warning', code, path })),
   ];
   return {
@@ -1049,6 +1126,9 @@ export function compactVerifierPreflight(value) {
     counts: {
       blocking: list('blocking').length,
       advisory: advisoryCount,
+      ...(list('uncertain').length
+        ? { uncertain: Number.isInteger(value.uncertainCount) ? value.uncertainCount : list('uncertain').length }
+        : {}),
       warnings: list('warnings').length,
       resolvedFiles: list('resolvedFiles').length,
       ...(list('previousFailures').length ? { previousFailures: list('previousFailures').length } : {}),
@@ -1066,6 +1146,7 @@ export function compactVerifierPreflight(value) {
             })),
         }
       : {}),
+    ...(list('scopeUnavailable').length ? { scopeUnavailable: list('scopeUnavailable').slice(0, COMPACT_FINDINGS) } : {}),
     ...(Array.isArray(value.scoped) ? { scoped: value.scoped.map(({ runner, files }) => ({ runner, files: (files ?? []).length })) } : {}),
     ...(value.suggestedTestCommand ? { suggestedTestCommand: value.suggestedTestCommand } : {}),
     ...(value.narrowing ? { narrowing: value.narrowing } : {}),

@@ -208,7 +208,7 @@ test('stale-skill-ignored and stale-server-ignored: only when jobs ran, from hea
   const staleSkill = { staleSkill: true, server: { skill: { stale: true, state: 'stale' } } };
   const signal = only([job('a')], { health: staleSkill });
   assert.equal(signal.code, 'stale-skill-ignored');
-  assert.match(signal.evidence, /1 job\(s\) ran while the installed skill was stale \(stale\)/);
+  assert.match(signal.evidence, /1 job\(s\) have no start-runtime snapshot and the installed skill is stale now \(stale\)/);
   assert.deepEqual(codes([job('a')], { health: { staleSkill: false, server: { skill: { stale: false, state: 'current' } } } }), []);
   assert.deepEqual(codes([], { health: staleSkill }), [], 'with no job the preflight stop worked as designed');
   assert.equal(only([job('a')], { health: { server: { stale: true } } }).code, 'stale-server-ignored');
@@ -891,4 +891,40 @@ test('history parsing tolerates malformed job entries and skips excessively nest
   assert.deepEqual(parseStoredRecord(JSON.stringify(source)).jobs, [{ id: 'job' }]);
   const nested = '{"v":1,"at":"x","signals":[],"health":' + '['.repeat(5000) + '0' + ']'.repeat(5000) + '}';
   assert.equal(parseStoredRecord(nested), undefined);
+});
+
+test('a skill that went stale after a recorded-current start is not attributed to the caller, whichever artifacts changed', () => {
+  const current = (letter) => job(letter, { runtimePreflight: { server: 'current' } });
+  const skillStale = { staleSkill: true, server: { skill: { stale: true, state: 'stale' } } };
+  const both = { staleSkill: true, server: { stale: true, skill: { stale: true, state: 'stale' } } };
+
+  // The real session: six recorded-current jobs, then an update.
+  const six = ['a', 'b', 'c', 'd', 'e', 'f'].map(current);
+  const session = deriveSignals(six, { health: both, nowMs: NOW });
+  assert.deepEqual(
+    session.map((signal) => [signal.code, signal.attributable]),
+    [['runtime-changed-after-start', false]],
+    'the two signals can no longer disagree',
+  );
+  assert.match(
+    session[0].evidence,
+    /^6 job\(s\) passed a current runtime preflight; runtime artifacts and the installed skill changed after start/,
+  );
+
+  const skillOnly = only([current('a')], { health: skillStale });
+  assert.equal(skillOnly.code, 'runtime-changed-after-start');
+  assert.match(skillOnly.evidence, /; the installed skill changed after start/);
+
+  const quiet = buildRetrospective({ jobs: six, health: both, nowMs: NOW, maintainerRoot: ROOT });
+  assert.equal(quiet.maintainerPromptWarranted, false);
+
+  // A mixed set splits by what each record can prove, and counts only the unprovable.
+  const mixed = deriveSignals([current('a'), job('b'), job('c')], { health: both, nowMs: NOW });
+  assert.deepEqual(mixed.map((signal) => signal.code).sort(), [
+    'runtime-changed-after-start',
+    'stale-server-ignored',
+    'stale-skill-ignored',
+  ]);
+  assert.match(mixed.find((signal) => signal.code === 'stale-skill-ignored').evidence, /^2 job\(s\) have no start-runtime snapshot/);
+  assert.match(mixed.find((signal) => signal.code === 'runtime-changed-after-start').evidence, /^1 job\(s\)/);
 });

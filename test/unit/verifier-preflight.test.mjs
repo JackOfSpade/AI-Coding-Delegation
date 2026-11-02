@@ -202,7 +202,7 @@ test('a worktree-relative mkdtemp outside the write scope is a blocking finding 
     preflightVerifier({ repoPath: root, testCommand: 'node --test test/deep/up.test.mjs', writeScope: ['src/**'] }).blocking.map(
       (finding) => finding.target,
     ),
-    ['.up-x-XXXXXX'],
+    ['.up-<dynamic>-XXXXXX'],
   );
   // Fixture text and comments are not calls, and a name resolves from its nearest declaration.
   write(
@@ -547,7 +547,7 @@ test('the path, comment, interpolation and import patterns resolve as before aft
   );
   assert.ok(py.warnings.some((warning) => warning.code === 'native-import'));
   const js = preflightVerifier({ repoPath: root, testCommand: 'node --test test/interp.test.mjs', writeScope: [] });
-  assert.match(js.blocking[0].target, /^build\/x\//);
+  assert.match(js.blocking[0].target, /^build\/<dynamic>\//);
 });
 
 test('long adversarial source lines are scanned in linear time', (t) => {
@@ -568,4 +568,157 @@ test('long adversarial source lines are scanned in linear time', (t) => {
     preflightVerifier({ repoPath: root, testCommand: path.endsWith('.py') ? `pytest ${path}` : `node --test ${path}`, writeScope: [] });
   const elapsed = performance.now() - started;
   assert.ok(elapsed < 2_000, `${Math.round(elapsed)} ms`);
+});
+
+test('a write target the scan cannot place is uncertain, never a certain denial, and carries no invented path or glob', (t) => {
+  const { root, write } = fixture(t);
+  // The real false positive: a FileHandle's writeFile takes data, and its template was read as a path.
+  write(
+    'test/handle.test.mjs',
+    "import { open } from 'node:fs/promises';\nconst handle = await open(p, 'a');\nlet separator = '';\nawait handle.writeFile(`${separator}${text}`, 'utf8');\nawait mkdir(join(process.cwd(), name));\n",
+  );
+  const result = preflightVerifier({ repoPath: root, testCommand: 'node --test test/handle.test.mjs', writeScope: ['src/**'] });
+  assert.equal(result.blocking, undefined);
+  assert.equal(result.status, 'warning');
+  assert.deepEqual(
+    result.uncertain.map((finding) => [finding.code, finding.line, finding.call, finding.target, finding.extraWritable]),
+    [
+      ['write-target-unresolved', 4, 'writeFile', '<dynamic>', undefined],
+      ['write-target-unresolved', 5, 'mkdir', '<dynamic>', undefined],
+    ],
+  );
+  assert.equal(result.uncertainCount, 2);
+  const lines = verifierPreflightLines(result);
+  assert.ok(lines.some((line) => /^verifier uncertain: test\/handle\.test\.mjs:4: writeFile target <dynamic>.*not refused/.test(line)));
+  assert.equal(
+    lines.some((line) => line.startsWith('verifier blocker')),
+    false,
+  );
+  const compact = compactVerifierPreflight(result);
+  assert.equal(compact.counts.uncertain, 2);
+  assert.equal(compact.counts.blocking, 0);
+  assert.equal(compact.findings[0].severity, 'uncertain');
+  assert.equal(JSON.stringify(result).includes('OFFLOAD_UNRESOLVED_VALUE'), false, 'the internal placeholder never leaves the scan');
+});
+
+test('a known location with a dynamic name, and every literal denial, still blocks', (t) => {
+  const { root, write } = fixture(t);
+  write(
+    'test/real.test.mjs',
+    [
+      "writeFileSync('out/data.json', 'x');",
+      'writeFileSync(`out/${name}.json`, data);',
+      "mkdirSync(join('logs', name));",
+      "mkdtempSync(join(process.cwd(), '.literal-'));",
+      "mkdirSync('/tmp/fixed');",
+      'writeFileSync(`/tmp/${name}`, data);',
+    ].join('\n'),
+  );
+  const result = preflightVerifier({ repoPath: root, testCommand: 'node --test test/real.test.mjs', writeScope: ['src/**'] });
+  assert.equal(result.status, 'blocking');
+  assert.equal(result.uncertain, undefined);
+  assert.deepEqual(
+    result.blocking.map((finding) => [finding.code, finding.target, finding.extraWritable]),
+    [
+      ['temp-outside-scope', 'out/data.json', 'out/data.json'],
+      ['temp-outside-scope', 'out/<dynamic>.json', 'out/**'],
+      ['temp-outside-scope', 'logs/<dynamic>', 'logs/**'],
+      ['temp-outside-scope', '.literal-XXXXXX', '.literal-**'],
+      ['system-temp-write', '/tmp/fixed', undefined],
+      ['system-temp-write', '/tmp/<dynamic>', undefined],
+    ],
+  );
+  // A dynamic target already inside the write scope is not a finding at all.
+  const inScope = preflightVerifier({
+    repoPath: root,
+    testCommand: 'node --test test/real.test.mjs',
+    writeScope: ['out/**', 'logs/**', '.literal-*'],
+  });
+  assert.deepEqual(
+    inScope.blocking.map((finding) => finding.code),
+    ['system-temp-write', 'system-temp-write'],
+  );
+});
+
+test('runner scoping treats uncertain findings like the rest and names the selected suite that reaches a write', (t) => {
+  const { root, write } = runnerFixture(t, { suites: ['a.js', 'b.js', 'diag.js', 'other.js'] });
+  const suiteWrite = "let separator = '';\nexport default [(handle, text) => handle.writeFile(`${separator}${text}`, 'utf8')];";
+  write('scripts/tests/other.js', suiteWrite);
+  const unselected = preflightVerifier({ repoPath: root, testCommand: `${RUNNER} a.js`, writeScope: ['src/**'] });
+  assert.equal(unselected.uncertain, undefined, 'a write only an unselected suite reaches is out of scope');
+  assert.ok(unselected.scoped);
+
+  const selected = preflightVerifier({ repoPath: root, testCommand: `${RUNNER} other.js`, writeScope: ['src/**'] });
+  assert.deepEqual(
+    selected.uncertain.map((finding) => [finding.path, finding.testFiles]),
+    [['scripts/tests/other.js', undefined]],
+  );
+  assert.equal(selected.blocking, undefined);
+
+  // Reached through an import of the selected suite: that suite, not the runner, is what runs it.
+  write('scripts/helper.js', suiteWrite);
+  write('scripts/tests/other.js', "import '../helper.js';\nexport default [];");
+  const helper = preflightVerifier({ repoPath: root, testCommand: `${RUNNER} other.js`, writeScope: ['src/**'] });
+  assert.deepEqual(
+    helper.uncertain.map((finding) => [finding.path, finding.testFiles]),
+    [['scripts/helper.js', ['scripts/tests/other.js']]],
+  );
+
+  // A whole-suite run has no selection: a real denial stays blocking, an uncertain one stays reported.
+  const whole = preflightVerifier({ repoPath: root, testCommand: RUNNER, writeScope: ['src/**'] });
+  assert.ok(whole.blocking.some((finding) => finding.path === 'scripts/tests/diag.js'));
+  assert.equal(whole.scoped, undefined);
+  assert.ok(whole.uncertain.some((finding) => finding.path === 'scripts/helper.js'));
+});
+
+test('when selected suites reach past the scan limits, a real denial stays blocking and the report says why', (t) => {
+  const { root, write } = runnerFixture(t, { suites: ['a.js', 'diag.js'] });
+  // A chain longer than the file limit, so the selected closure cannot be read whole.
+  for (let index = 0; index < 300; index++) write(`scripts/chain/c${index}.js`, `import './c${index + 1}.js';\nexport default 1;`);
+  write('scripts/chain/c300.js', 'export default 1;');
+  write(
+    'scripts/tests/a.js',
+    "import '../chain/c0.js';\nimport { mkdtempSync } from 'node:fs';\nexport default [() => mkdtempSync('/tmp/a-')];",
+  );
+  const result = preflightVerifier({ repoPath: root, testCommand: `${RUNNER} a.js`, writeScope: ['src/**'] });
+  assert.equal(result.scoped, undefined);
+  assert.equal(result.limited, true);
+  assert.equal(result.scopeUnavailable[0].runner, 'scripts/test-runner.js');
+  assert.ok(result.scopeUnavailable[0].unreadFiles > 0);
+  assert.ok(result.blocking.some((finding) => finding.code === 'system-temp-write'));
+  const expected = /verifier scope: the suites scripts\/test-runner\.js was given reach \d+ file\(s\) past the scan limits/;
+  assert.ok(verifierPreflightLines(result).some((line) => expected.test(line)));
+  assert.match(verifierBlockingMessage(result), expected);
+  assert.equal(compactVerifierPreflight(result).scopeUnavailable[0].runner, 'scripts/test-runner.js');
+});
+
+test('unplaced targets never crowd out a real denial, in one file or across a scan', (t) => {
+  const { root, write } = fixture(t);
+  const dynamic = (count) => Array.from({ length: count }, () => 'mkdirSync(join(process.cwd(), name));').join('\n');
+  write('test/many.test.mjs', `${dynamic(30)}\nmkdtempSync('/tmp/real-');\n`);
+  const oneFile = preflightVerifier({ repoPath: root, testCommand: 'node --test test/many.test.mjs', writeScope: ['src/**'] });
+  assert.equal(oneFile.status, 'blocking');
+  assert.deepEqual(
+    oneFile.blocking.map((finding) => finding.target),
+    ['/tmp/real-XXXXXX'],
+  );
+  assert.equal(oneFile.uncertainCount, 24);
+
+  const imports = Array.from({ length: 12 }, (_, index) => `import './noise${index}.test.mjs';`).join('\n');
+  for (let index = 0; index < 12; index++) write(`test/noise${index}.test.mjs`, dynamic(24));
+  write('test/z-last.test.mjs', "mkdtempSync('/tmp/last-');");
+  write('test/all.test.mjs', `${imports}\nimport './z-last.test.mjs';`);
+  const scan = preflightVerifier({ repoPath: root, testCommand: 'node --test test/all.test.mjs', writeScope: ['src/**'] });
+  assert.ok(scan.blocking.some((finding) => finding.target === '/tmp/last-XXXXXX'));
+});
+
+test('a join segment bound to a literal places the write, so a real denial still blocks', (t) => {
+  const { root, write } = fixture(t);
+  write('test/bound.test.mjs', "const sub = 'build';\nmkdtempSync(join(process.cwd(), sub, 'p-'));\n");
+  const result = preflightVerifier({ repoPath: root, testCommand: 'node --test test/bound.test.mjs', writeScope: ['src/**'] });
+  assert.equal(result.uncertain, undefined);
+  assert.deepEqual(
+    result.blocking.map((finding) => [finding.target, finding.extraWritable]),
+    [['build/p-XXXXXX', 'build/p-**']],
+  );
 });

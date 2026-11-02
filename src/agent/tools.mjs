@@ -206,7 +206,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   ),
   schema(
     'finish',
-    'Finish the job with this mandatory tool call, not completion prose. Once the requested edits or analysis and necessary checks are complete, invoke this tool in your next response; do not end with a Markdown summary or print a tool-call example instead of invoking it. If a check is blocked or unavailable, record that in concerns and list only checks actually run in testsRun; still call finish when your in-scope work is ready. The server runs any configured verifier after this call. Use only after every other needed tool result has returned, in a response containing exactly this one tool call; pairing it with another call rejects the entire response. Keep summary to 1-2 short sentences, at most 1500 characters. Put details in report. Minimal call: {"summary":"Implemented the requested changes."}.',
+    'Call this as the only tool call of its response, after every other needed tool result has returned; pairing it with another call rejects the entire response. Finish the job with this mandatory tool call, not completion prose. Once the requested edits or analysis and necessary checks are complete, invoke this tool in your next response; do not end with a Markdown summary or print a tool-call example instead of invoking it. If a check is blocked or unavailable, record that in concerns and list only checks actually run in testsRun; still call finish when your in-scope work is ready. The server runs any configured verifier after this call. Keep summary to 1-2 short sentences, at most 1500 characters. Put details in report. concerns and testsRun are arrays of strings, even for one item. Minimal call: {"summary":"Implemented the requested changes."}.',
     {
       summary: {
         type: 'string',
@@ -219,8 +219,18 @@ export const TOOL_DEFINITIONS = Object.freeze([
         maxLength: 256_000,
         description: 'Detailed findings beyond the short summary; required for read-only report jobs.',
       },
-      concerns: { type: 'array', items: str, maxItems: 100 },
-      testsRun: { type: 'array', items: str, maxItems: 100 },
+      concerns: {
+        type: 'array',
+        items: { type: 'string', maxLength: 1000 },
+        maxItems: 100,
+        description: 'An array of strings, even for one concern: ["..."]. Each at most 1000 characters; longer detail belongs in report.',
+      },
+      testsRun: {
+        type: 'array',
+        items: { type: 'string', maxLength: 1000 },
+        maxItems: 100,
+        description: 'An array of strings, even for one check: ["..."]. Only checks actually run.',
+      },
       untouchedPaths: {
         type: 'array',
         maxItems: 256,
@@ -1055,3 +1065,38 @@ export const validUntouchedPaths = (value) =>
         Object.keys(entry).every((key) => ['path', 'reason'].includes(key)),
     ) &&
     new Set(value.map((entry) => entry.path)).size === value.length);
+
+const finishListProblem = (name, value) =>
+  value === undefined ||
+  (Array.isArray(value) && value.length <= 100 && value.every((item) => typeof item === 'string' && item.length <= 1000))
+    ? []
+    : [`${name} must be an array of at most 100 strings of at most 1000 characters each, even for one item: ["..."]`];
+/**
+ * What is wrong with finish arguments, field by field. The text is fixed apart
+ * from a length, so nothing provider-controlled reaches a correction, and it
+ * names only the fields at fault: a worker told to fix the wrong one repeats
+ * the mistake and loses a correct diff to the finish protocol.
+ */
+export function finishArgumentProblems(value) {
+  const { summary, report, concerns, testsRun, untouchedPaths } = value;
+  return [
+    ...(typeof summary !== 'string' || summary.length === 0
+      ? ['summary is required: a string of 1-1500 characters']
+      : summary.length > 1500
+        ? [`summary has ${summary.length} characters and the limit is 1500: keep 1-2 sentences and move details to report`]
+        : []),
+    ...(report === undefined || (typeof report === 'string' && report.length <= 256_000)
+      ? []
+      : ['report must be a string of at most 256000 characters']),
+    ...finishListProblem('concerns', concerns),
+    ...finishListProblem('testsRun', testsRun),
+    ...(validUntouchedPaths(untouchedPaths) ? [] : ['untouchedPaths must be an array of {path, reason} objects']),
+  ];
+}
+/** A lone string where finish takes a list says the same thing as a list of one; only the shape is wrong. */
+export function normalizeFinishArgs(value) {
+  const normalized = { ...value };
+  for (const name of ['concerns', 'testsRun'])
+    if (typeof normalized[name] === 'string') normalized[name] = normalized[name] ? [normalized[name]] : [];
+  return normalized;
+}

@@ -1224,6 +1224,21 @@ test('a blocking verifier finding refuses the start before any job or spend, unl
       /blocking findings accepted by the caller[\s\S]*verifier blocker: test\/career\.test\.mjs:3/,
     );
     await h.manager.cancel(accepted.jobId);
+    // A target the scan cannot place is reported, not refused, and needs no consent.
+    write(join(h.repo, 'test/handle.test.mjs'), "let separator = '';\nawait handle.writeFile(`${separator}${text}`, 'utf8');\n");
+    const uncertain = await h.manager.start(
+      { repoPath: h.repo, task: 'w', ownedPaths: ['src/**'], testCommand: 'node --test test/handle.test.mjs' },
+      { launch: false },
+    );
+    assert.equal(uncertain.verifierPreflight.status, 'warning');
+    assert.equal(uncertain.verifierPreflight.counts.blocking, 0);
+    assert.equal(uncertain.verifierPreflight.counts.uncertain, 1);
+    assert.equal(uncertain.verifierPreflight.blockersAccepted, undefined);
+    assert.match(
+      (await h.manager.job(uncertain.jobId)).report,
+      /verifier uncertain: test\/handle\.test\.mjs:2: writeFile target <dynamic>/,
+    );
+    await h.manager.cancel(uncertain.jobId);
     // baseline-diff tolerates failures the snapshot shares: advisory there.
     const baseline = await h.manager.start(
       { repoPath: h.repo, task: 'w', ownedPaths: ['src/**'], testCommand, verifierMode: 'baseline-diff' },
@@ -1236,6 +1251,64 @@ test('a blocking verifier finding refuses the start before any job or spend, unl
     assert.throws(() => validateJobRequest({ task: 't', ownedPaths: ['a'], acceptVerifierBlockers: 'yes' }), /must be boolean/);
     assert.throws(() => validateJobRequest({ task: 't', mode: 'report', acceptVerifierBlockers: true }), /verifier sandbox options/);
   } finally {
+    cleanup(h.repo);
+  }
+});
+
+test('a job with more than 128 changed files, dot paths among them, can be applied and reverted', async () => {
+  const names = [...Array.from({ length: 139 }, (_, index) => `src/many/f${index}.js`), '.github/dependabot.yml'];
+  const h = await harness({
+    worker: async (job) => {
+      for (const name of names) write(join(job.workspacePath, name), `${name}\n`);
+      return { status: 'BUDGET', turns: 1, error: 'budget' };
+    },
+  });
+  try {
+    const { jobId: id } = await h.manager.start({ repoPath: h.repo, task: 'w', ownedPaths: ['src/**', '.github/**'] });
+    const stopped = await h.manager.wait(id, { timeoutSec: 20 });
+    assert.equal(stopped.status, 'BUDGET', stopped.error);
+    assert.equal(stopped.applyBlocker, undefined);
+    assert.match((await h.manager.job(id)).report, /apply \(after your own check\)/);
+    const dry = await h.manager.apply(id);
+    assert.equal(dry.files.length, names.length);
+    const applied = await h.manager.apply(id, { apply: true, verifiedBy: 'ran the suite in the primary: all green' });
+    assert.equal(applied.applied, true, JSON.stringify(applied));
+    assert.equal(readFileSync(join(h.repo, '.github/dependabot.yml'), 'utf8'), '.github/dependabot.yml\n');
+    const reverted = await h.manager.revert(id, { apply: true });
+    assert.equal(reverted.applied, true, JSON.stringify(reverted));
+    assert.equal(existsSync(join(h.repo, '.github/dependabot.yml')), false);
+  } finally {
+    await h.manager.shutdown?.();
+    cleanup(h.repo);
+  }
+});
+
+test('a job the apply would refuse says so when it finishes, and the refusal names the same fault; scratch files are warned about', async () => {
+  const h = await harness({
+    worker: async (job) => {
+      writeSrc(job, 'a.js', A_BYTES);
+      writeSrc(job, '_tmp_edit/rep.mjs', 'scratch\n');
+      return { status: 'BUDGET', turns: 1, error: 'budget' };
+    },
+  });
+  try {
+    const { jobId: id } = await h.manager.start({ repoPath: h.repo, task: 'w', ownedPaths: ['src/**'] });
+    await h.manager.wait(id, { timeoutSec: 20 });
+    const shown = await h.manager.job(id);
+    assert.deepEqual(shown.scratchFiles, { total: 1, paths: ['src/_tmp_edit/rep.mjs'] });
+    assert.match(shown.report, /possible worker scratch files created by this job \(1\): src\/_tmp_edit\/rep\.mjs/);
+    const dry = await h.manager.apply(id);
+    assert.deepEqual(dry.scratchFiles, { total: 1, paths: ['src/_tmp_edit/rep.mjs'] });
+
+    const record = await h.manager.store.get(id);
+    await h.manager.store.update(id, { revertFiles: [...record.revertFiles, record.revertFiles[0]] });
+    const blocked = await h.manager.job(id);
+    assert.match(blocked.applyBlocker, /is listed twice/);
+    assert.match(blocked.report, /apply: BLOCKED: path ".*" is listed twice/);
+    assert.doesNotMatch(blocked.report, /apply \(after your own check\)/);
+    await assert.rejects(() => h.manager.apply(id), /this job cannot be applied: path ".*" is listed twice/);
+  } finally {
+    await h.manager.shutdown?.();
     cleanup(h.repo);
   }
 });

@@ -135,12 +135,12 @@ const FAMILIES = Object.freeze({
   'stale-skill-ignored': {
     attributable: true,
     request:
-      'Jobs were started while the installed skill was stale. Make the stale-skill preflight harder to skip (for example, refuse or loudly warn at offload_start) and make the restart instruction unmissable.',
+      'Jobs with no start-runtime snapshot may have started while the installed skill was stale. Make the stale-skill preflight harder to skip (for example, refuse or loudly warn at offload_start) and make the restart instruction unmissable.',
   },
   'stale-server-ignored': {
     attributable: true,
     request:
-      'Jobs were started against a stale server. Make the stale-server preflight harder to skip (for example, refuse or loudly warn at offload_start).',
+      'Jobs with no start-runtime snapshot may have started against a stale server. Make the stale-server preflight harder to skip (for example, refuse or loudly warn at offload_start).',
   },
   // Runtime files may change because a worker just edited the checkout. This
   // is useful restart context, not evidence that the job bypassed preflight.
@@ -526,24 +526,31 @@ function signalsFromPairs(pairs, { health: rawHealth }) {
       push('repeated-env-failure', undefined, `verifier environment failure (${kind}) ended ${ids.length} jobs: ${ids.join(', ')}`);
   health = healthFacts(health);
   if (pairs.length) {
-    if (health.skillStale)
-      push(
-        'stale-skill-ignored',
-        undefined,
-        `${pairs.length} job(s) ran while the installed skill was stale (${health.skillState ?? 'state unknown'})`,
-      );
-    if (health.serverStale) {
+    // Health is read now, not when the jobs started, and an update can land long
+    // after they finished. The start boundary refuses a stale server, and on the
+    // MCP route a stale skill (a CLI start has no skill to read), so a recorded
+    // start proves neither was ignored. Older records have no start snapshot:
+    // keep the old signals only for that ambiguity.
+    if (health.serverStale || health.skillStale) {
       const currentAtStart = pairs.filter(([record]) => record?.runtimePreflight?.server === 'current');
       const withoutSnapshot = pairs.length - currentAtStart.length;
-      if (currentAtStart.length)
+      if (currentAtStart.length) {
+        const changed = health.serverStale
+          ? `runtime artifacts${health.skillStale ? ' and the installed skill' : ''}`
+          : 'the installed skill';
         push(
           'runtime-changed-after-start',
           undefined,
-          `${currentAtStart.length} job(s) passed a current runtime preflight; runtime artifacts changed after start. Those jobs used the loaded runtime; restart the MCP client before starting another job.`,
+          `${currentAtStart.length} job(s) passed a current runtime preflight; ${changed} changed after start. Those jobs used the loaded runtime; restart the MCP client before starting another job.`,
         );
-      // Older records have no start snapshot. Keep the old signal only for
-      // that ambiguity; never describe a recorded-current start as stale.
-      if (withoutSnapshot)
+      }
+      if (withoutSnapshot && health.skillStale)
+        push(
+          'stale-skill-ignored',
+          undefined,
+          `${withoutSnapshot} job(s) have no start-runtime snapshot and the installed skill is stale now (${health.skillState ?? 'state unknown'}); restart before another job.`,
+        );
+      if (withoutSnapshot && health.serverStale)
         push(
           'stale-server-ignored',
           undefined,

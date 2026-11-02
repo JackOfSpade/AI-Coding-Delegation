@@ -19,7 +19,7 @@ import {
 } from './job-manager.mjs';
 import { probeVerifierTemp, sandboxAvailable, sandboxStatus } from './sandbox.mjs';
 import { healthIdentity, runtimeIdentity } from './identity.mjs';
-import { assertStartRuntimeCurrent, installedSkillHealth, withSkillHealth } from './skill-health.mjs';
+import { assertStartRuntimeCurrent, installedSkillHealth, withRestartNotice, withSkillHealth } from './skill-health.mjs';
 import {
   normalizeInterpreterDeclaration,
   normalizeVerifierImports,
@@ -1417,8 +1417,9 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       };
       // `verifierInterpreter` makes health actually run the declared interpreter
       // inside the verifier sandbox, so the primary learns before spending a job.
+      const restartNoticeOptions = { requireCurrentSkill: config.enforceInstalledSkillPreflight === true };
       const probed = async (listing, root) => {
-        if (opts.verifierInterpreter === undefined) return listing;
+        if (opts.verifierInterpreter === undefined) return withRestartNotice(listing, restartNoticeOptions);
         const probe = await probeVerifierInterpreter(opts.verifierInterpreter, {
           repoPath: root,
           allowlist: interpreterAllowlist(root),
@@ -1426,7 +1427,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           ...(config.runVerifierProbe ? { run: config.runVerifierProbe } : {}),
         });
         const mirror = root && pythonProjectMarkers(root).length ? pythonDeps(verifierDependencyStatus(root), probe) : {};
-        return { ...listing, health: { ...listing.health, ...mirror, verifierPython: probe } };
+        return withRestartNotice({ ...listing, health: { ...listing.health, ...mirror, verifierPython: probe } }, restartNoticeOptions);
       };
       if (!contextualHint) return probed(await healthWithoutRepo(listOptions));
       try {

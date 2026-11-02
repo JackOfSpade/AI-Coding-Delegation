@@ -181,6 +181,7 @@ export function compareRuntimeIdentity(loaded, current) {
     ...loaded,
     installedBuildHash: current.buildHash,
     installedSkillHash: current.skillHash,
+    ...(current.opusSkillHash ? { installedOpusSkillHash: current.opusSkillHash } : {}),
     stale: true,
     staleReason: 'runtime-artifacts-changed',
     restartRequired: true,

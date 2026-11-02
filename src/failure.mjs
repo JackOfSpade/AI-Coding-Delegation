@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { revertPathsProblem } from './revert-paths.mjs';
 import { applyPathAliases, redact, redactText, stripTerminalControls } from './redact.mjs';
 
 /**
@@ -243,6 +244,8 @@ export function failedApplyRefusal(job) {
     return 'no result snapshot was recorded for it, so its diff was never captured; start a fresh job';
   if (!Array.isArray(job.revertFiles) || !job.revertFiles.length)
     return 'it has no in-scope changes to apply (its retained diff is empty); start a fresh job with a better brief';
+  const pathsProblem = revertPathsProblem(job.revertFiles);
+  if (pathsProblem) return pathsProblem;
   // The capture is stamped with the round that made it. A failure after a
   // repair or continuation that never reached its own capture would otherwise
   // leave an earlier round's diff looking like the failed round's.
@@ -250,6 +253,17 @@ export function failedApplyRefusal(job) {
   if (Number.isSafeInteger(job.patchRound) ? job.patchRound !== round : round !== 0)
     return `its retained diff is not from its final round (round ${round}), so it does not describe the failed state; start a fresh job`;
   return undefined;
+}
+
+/**
+ * Why a finished job with changes could not be applied, from the same check the
+ * apply itself makes, so the report and job view cannot promise what it refuses.
+ */
+export function applyBlocker(job) {
+  if (!job || job.mode === 'report' || job.applied === true || job.revertedAt) return undefined;
+  if (job.status !== 'FAILED' && !APPLY_ELIGIBLE_STATUSES.includes(job.status)) return undefined;
+  if (!Array.isArray(job.files) || !job.files.length || !Array.isArray(job.revertFiles)) return undefined;
+  return revertPathsProblem(job.revertFiles);
 }
 
 /** The same call already looped once after a continuation or repair: another one will not help. */
@@ -262,7 +276,7 @@ export const loopedAgain = (job) =>
 
 const DEFECT_LEAD = {
   'finish-protocol':
-    'Your previous pass was stopped because you called finish in the same turn as other tool calls (or with invalid arguments) twice; the server ran none of the calls in those turns, so re-issue any that you still need. Your partial work is already in the workspace (inspect it with git status / git diff or by reading the files). Do not restart, redo, or discard it. Finish any remaining work with ordinary tool calls first, then call finish ALONE: finish must be the only tool call in its turn, with a valid summary.',
+    'Your previous pass was stopped because you kept calling finish in the same turn as other tool calls or with invalid arguments; the server ran none of the calls in those turns, so re-issue any that you still need. Keep summary to 1-2 sentences, and make concerns and testsRun arrays of strings. Your partial work is already in the workspace (inspect it with git status / git diff or by reading the files). Do not restart, redo, or discard it. Finish any remaining work with ordinary tool calls first, then call finish ALONE: finish must be the only tool call in its turn, with a valid summary.',
   'no-finish':
     'Your previous pass ended without calling the finish tool, so the server stopped it. Your partial work is already in the workspace (inspect it with git status / git diff or by reading the files). Do not restart, redo, or discard it. Complete the remaining acceptance criteria, then call finish as the sole tool call.',
   'output-cap':

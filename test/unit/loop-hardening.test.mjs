@@ -294,7 +294,10 @@ test('a finish with invalid arguments is corrected once, with the argument limit
   assert.deepEqual(invoked, ['finish'], 'only the valid finish ran');
   const answer = requests[1].at(-1);
   assert.deepEqual([answer.role, answer.tool_call_id, answer.name], ['tool', 'bad', 'finish']);
-  assert.ok(answer.content.startsWith('TOOL_ERROR: finish arguments are invalid: summary is required (1-1500 characters)'), answer.content);
+  assert.ok(
+    answer.content.startsWith('TOOL_ERROR: finish arguments are invalid: summary has 1501 characters and the limit is 1500'),
+    answer.content,
+  );
   assert.ok(!answer.content.includes('xxxxxxxxxx'), 'the rejected arguments are never echoed');
   // The same fixed text is used when the invalid finish also shares its turn.
   const both = [];
@@ -989,13 +992,15 @@ test('invalid or duplicate tool calls are not persisted into a repair transcript
   const failed = await new AgentLoop({ provider: invalid, context, tools: { execute: async () => '' } }).run({ task: 'first' });
   assert.equal(failed.status, 'FAILED');
   assert.equal(failed.failureKind, 'finish-protocol');
-  // The first invalid finish was corrected and is durable only together with its result; the fatal repeat is not persisted.
+  // Each corrected invalid finish is durable only together with its result; the fatal repeat is not persisted.
   assert.deepEqual(
     context.snapshot().map((m) => [m.role, m.tool_call_id ?? m.tool_calls?.[0].id]),
     [
       ['system', undefined],
       ['user', undefined],
       ['user', undefined],
+      ['assistant', 'bad'],
+      ['tool', 'bad'],
       ['assistant', 'bad'],
       ['tool', 'bad'],
     ],
@@ -1014,7 +1019,7 @@ test('invalid or duplicate tool calls are not persisted into a repair transcript
   }).run({ task: 'repair' });
   assert.deepEqual(
     replay.map((m) => m.role),
-    ['system', 'user', 'user', 'assistant', 'tool', 'user'],
+    ['system', 'user', 'user', 'assistant', 'tool', 'assistant', 'tool', 'user'],
   );
   assert.equal(replay.at(-1).content, 'repair');
   const duplicate = {
@@ -3766,11 +3771,15 @@ test('capped implementation recovery is strict, one-shot, and requires its exact
     return { result, requests };
   };
 
-  for (const options of [{ finishReason: 'stop' }, { maxTurns: 2 }]) {
+  // An ordinary stop after a write gets the one no-finish reminder; with no turn left it cannot.
+  for (const [options, requests] of [
+    [{ finishReason: 'stop' }, 3],
+    [{ maxTurns: 2 }, 2],
+  ]) {
     const runResult = await run(options);
     assert.equal(runResult.result.status, 'FAILED');
     assert.equal(runResult.result.error, 'Worker ended without mandatory finish call');
-    assert.equal(runResult.requests, 2);
+    assert.equal(runResult.requests, requests);
   }
 
   const once = await run();
@@ -4395,7 +4404,7 @@ test('finish contract teaches a short summary and recovers the real-session over
     assert.deepEqual(invoked, ['finish']);
     assert.match(
       requests[1].at(-1).content,
-      /Your edits are retained\. Do not redo them\. Shorten summary to 1-2 sentences and move details to report/,
+      /keep 1-2 sentences and move details to report\. Your edits are retained\. Do not redo them\./,
     );
     assert.match(requests[1].at(-1).content, /\{"summary":"Implemented the requested changes\."\}/);
   }
@@ -4738,4 +4747,276 @@ test('a resumed transcript keeps elided flags, so markers are not re-elided and 
   assert.equal(snapshot[3].content, marker, 'a resumed elision marker is not re-elided');
   assert.deepEqual([...context.providerBudgetElisionSnapshots()], []);
   assert.deepEqual([...context.providerBudgetDeepElisionSnapshots()], []);
+});
+
+const recordingFinish = (seen) => ({
+  execute: async (name, args) => {
+    if (name !== 'finish') return name === 'write_file' ? 'written' : 'read';
+    seen.push(args);
+    return { finish: { summary: args.summary, concerns: args.concerns ?? [], testsRun: args.testsRun ?? [] } };
+  },
+});
+
+test('a lone string for concerns or testsRun, the shape that cost a correct diff in a real session, is accepted as a list of one', async () => {
+  const seen = [];
+  const requests = [];
+  const result = await new AgentLoop({
+    provider: scripted(
+      [[call('finish', JSON.stringify({ summary: 'done', concerns: 'one concern', testsRun: 'npm test' }), 'f')]],
+      requests,
+    ),
+    tools: recordingFinish(seen),
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'DONE');
+  assert.equal(requests.length, 1, 'no correction turn was spent');
+  assert.deepEqual([seen[0].concerns, seen[0].testsRun], [['one concern'], ['npm test']]);
+});
+
+test('a finish correction names only the fields at fault, and never tells a worker to shorten a valid summary', async () => {
+  const cases = [
+    [{ summary: 'fine', concerns: 7 }, /concerns must be an array/, /summary|testsRun|report must/],
+    [{ summary: 'fine', testsRun: ['y'.repeat(1001)] }, /testsRun must be an array/, /summary|concerns|yyyy/],
+    [{ summary: 'fine', report: 3 }, /report must be a string/, /summary|concerns/],
+    [{ summary: 'fine', untouchedPaths: 'a.js' }, /untouchedPaths must be an array of \{path, reason\}/, /summary|concerns/],
+    [{ concerns: [] }, /summary is required/, /concerns must/],
+  ];
+  for (const [args, names, omits] of cases) {
+    const requests = [];
+    const result = await new AgentLoop({
+      provider: scripted([[call('finish', JSON.stringify(args), 'bad')], [call('finish', '{"summary":"ok"}', 'ok')]], requests),
+      tools: recordingFinish([]),
+    }).run({ task: 'x' });
+    assert.equal(result.status, 'DONE');
+    const correction = requests[1].at(-1).content.split('. Your edits are retained')[0];
+    assert.match(correction, names);
+    assert.doesNotMatch(correction, omits);
+    assert.match(requests[1].at(-1).content, /^TOOL_ERROR: .*Your edits are retained\. Do not redo them/);
+  }
+});
+
+test('invalid finish arguments get two corrections, then fail with a continuable kind; a mixed turn still gets one', async () => {
+  const bad = (id) => [call('finish', '{"summary":"s","concerns":7}', id)];
+  const twice = [];
+  const recovered = await new AgentLoop({
+    provider: scripted([bad('a'), bad('b'), [call('finish', '{"summary":"ok"}', 'c')]], twice),
+    tools: recordingFinish([]),
+  }).run({ task: 'x' });
+  assert.equal(recovered.status, 'DONE');
+  assert.equal(twice.length, 3);
+  assertToolProtocol(twice[2]);
+
+  const thrice = [];
+  const failed = await new AgentLoop({ provider: scripted([bad('a'), bad('b'), bad('c')], thrice), tools: recordingFinish([]) }).run({
+    task: 'x',
+  });
+  assert.equal(failed.status, 'FAILED');
+  assert.equal(failed.failureKind, 'finish-protocol');
+  assert.equal(thrice.length, 3, 'no fourth request');
+  assert.equal(continuableFailure({ status: 'FAILED', failureKind: failed.failureKind, error: failed.error }), true);
+
+  const mixed = [];
+  const pair = (id) => [call('finish', '{"summary":"s"}', `${id}f`), call('read_file', '{"path":"y"}', `${id}r`)];
+  const mixedFailed = await new AgentLoop({ provider: scripted([pair('a'), pair('b')], mixed), tools: recordingFinish([]) }).run({
+    task: 'x',
+  });
+  assert.equal(mixedFailed.failureKind, 'finish-protocol');
+  assert.equal(mixed.length, 2);
+});
+
+const proseAfterWrite = (stops, requests) => ({
+  async *chat({ messages }) {
+    requests.push(structuredClone(messages));
+    const stop = requests.length === 1 ? undefined : stops[requests.length - 2];
+    if (requests.length === 1) yield { toolCalls: [call('write_file', '{"path":"a.js","content":"x"}', 'w')] };
+    else if (stop === 'finish') yield { toolCalls: [call('finish', '{"summary":"ok"}', 'f')] };
+    else yield { text: 'All done: here is a summary.', providerFinishReason: stop };
+    yield { usage: { inputTokens: 1, outputTokens: 1 } };
+  },
+});
+
+test('prose after a successful write gets one reminder and can still finish; only a repeat fails', async () => {
+  const requests = [];
+  const recovered = await new AgentLoop({ provider: proseAfterWrite(['stop', 'finish'], requests), tools: recordingFinish([]) }).run({
+    task: 'x',
+  });
+  assert.equal(recovered.status, 'DONE');
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[2].at(-2), { role: 'assistant', content: 'All done: here is a summary.' });
+  assert.match(requests[2].at(-1).content, /^No tool was called.*Your edits are retained/);
+  assertToolProtocol(requests[2]);
+
+  const repeated = [];
+  const failed = await new AgentLoop({ provider: proseAfterWrite(['stop', 'stop'], repeated), tools: recordingFinish([]) }).run({
+    task: 'x',
+  });
+  assert.equal(failed.status, 'FAILED');
+  assert.equal(failed.failureKind, 'no-finish');
+  assert.equal(repeated.length, 3, 'one reminder, not a retry loop');
+
+  const filtered = [];
+  const stopped = await new AgentLoop({ provider: proseAfterWrite(['content_filter'], filtered), tools: recordingFinish([]) }).run({
+    task: 'x',
+  });
+  assert.equal(stopped.status, 'FAILED');
+  assert.equal(stopped.failureKind, undefined, 'a provider filter stop is not the worker forgetting finish');
+  assert.equal(filtered.length, 2);
+
+  const noWrite = [];
+  const unwritten = await new AgentLoop({
+    provider: {
+      async *chat({ messages }) {
+        noWrite.push(messages);
+        yield { text: 'Nothing to do.', providerFinishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1 } };
+      },
+    },
+    tools: recordingFinish([]),
+  }).run({ task: 'x' });
+  assert.equal(unwritten.failureKind, 'no-finish');
+  assert.equal(noWrite.length, 1, 'with no work to protect there is no reminder');
+});
+
+test('a job on course for its reservation warns from observed spend, and tells a worker with edits to wrap up once', async () => {
+  const run = async ({ firstWrite = 1, maxUsd = 0.3, maxTurns = 60, unlimited = false } = {}) => {
+    const events = [];
+    const requests = [];
+    const result = await new AgentLoop({
+      provider: {
+        async *chat({ messages }) {
+          requests.push(structuredClone(messages));
+          const index = requests.length;
+          yield {
+            toolCalls: [
+              index >= firstWrite
+                ? call('write_file', '{"path":"a.js","content":"x"}', `w${index}`)
+                : call('read_file', '{"path":"a.js"}', `r${index}`),
+            ],
+          };
+          yield { usage: { inputTokens: 10_000, outputTokens: 2_000, cacheHitTokens: 1_000, cacheMissTokens: 9_000 } };
+        },
+      },
+      tools: recordingFinish([]),
+      model: 'm',
+      pricing: unlimited ? undefined : priceTable(['m']),
+      ...(unlimited ? {} : { maxUsd }),
+      maxTurns,
+      progress: (event) => events.push(event),
+    }).run({ task: 'x' });
+    return { result, events, requests };
+  };
+  const { result, events, requests } = await run();
+  const outlooks = events.filter((event) => event.budgetOutlook).map((event) => event.budgetOutlook);
+  assert.equal(result.status, 'BUDGET');
+  assert.ok(outlooks.length > 0, 'the stop was announced');
+  assert.equal(outlooks[0].level, 'watch', 'the first warning comes well before the critical level');
+  assert.ok(outlooks[0].turnsLeft <= 12);
+  assert.ok(outlooks[0].remainingUsd > outlooks[0].requiredUsd);
+  assert.ok(outlooks.some((outlook) => outlook.level === 'critical'));
+  assert.equal(outlooks[0].recentCacheHitRate, 0.1);
+  const stoppedAfter = requests.length;
+  const firstWarned = events.findIndex((event) => event.budgetOutlook);
+  assert.ok(events[firstWarned].turn < stoppedAfter, 'the warning precedes the stop');
+  const notices = requests.at(-1).filter((message) => message.role === 'user' && message.content.startsWith('Budget notice:'));
+  assert.equal(notices.length, 1, 'the worker is told once');
+  assert.match(notices[0].content, /about \d+ more request\(s\).*Your edits are retained.*call finish as the only tool call/);
+  assert.equal(events.filter((event) => event.action === 'budget_notice').length, 1);
+  assertToolProtocol(requests.at(-1));
+
+  const unwritten = await run({ firstWrite: Infinity });
+  assert.ok(
+    unwritten.events.some((event) => event.budgetOutlook),
+    'the caller is warned either way',
+  );
+  assert.equal(
+    unwritten.events.some((event) => event.action === 'budget_notice'),
+    false,
+    'a worker with no edits gets no wrap-up notice',
+  );
+
+  const roomy = await run({ maxUsd: 1_000, maxTurns: 8 });
+  assert.equal(
+    roomy.events.some((event) => event.budgetOutlook),
+    false,
+    'no warning while the budget is not at risk',
+  );
+  assert.equal(roomy.result.budgetCap, 'turns');
+
+  const capped = await run({ maxTurns: 10 });
+  assert.equal(
+    capped.events.some((event) => event.budgetOutlook),
+    false,
+    'a turn cap that binds first is not a reservation stop',
+  );
+
+  const unlimited = await run({ unlimited: true, maxTurns: 8 });
+  assert.equal(
+    unlimited.events.some((event) => event.budgetOutlook || event.action === 'budget_notice'),
+    false,
+  );
+});
+
+test('retention elides old tool output in batches, so large reads do not rewrite the prompt prefix on nearly every turn', async () => {
+  const history = (context) => context.snapshot().map((message) => message.content);
+  const small = new AgentContext([{ role: 'system', content: 's' }]);
+  let batches = 0;
+  for (let turn = 0; turn < 60; turn++) {
+    const before = history(small);
+    small.add({
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: `c${turn}`, type: 'function', function: { name: 'read_file', arguments: '{}' } }],
+    });
+    small.addToolResult(`c${turn}`, 'r'.repeat(4_000), 'read_file');
+    await small.flush();
+    const after = history(small);
+    if (before.some((content, index) => content !== after[index])) batches++;
+  }
+  const liveChars = small
+    .snapshot()
+    .filter((message) => message.role === 'tool' && !message.elided)
+    .reduce((sum, message) => sum + message.content.length, 0);
+  assert.ok(liveChars <= 96_000, 'the retention limit still holds');
+  assert.ok(
+    batches >= 1 && batches <= 6,
+    `one pass makes room for many appends (${batches} rewrites in 60 turns; one result at a time would be over 30)`,
+  );
+});
+
+test('the budget outlook counts correction spend and forgets the prices from before a credit fallback', async () => {
+  const run = async ({ hopAt, corrections = 0, maxUsd = 0.3 }) => {
+    const events = [];
+    let requests = 0;
+    const provider = {
+      stage: 0,
+      async *chat() {
+        requests++;
+        if (requests === hopAt) provider.stage = 1;
+        if (requests <= corrections) yield { toolCalls: [call('finish', '{"summary":"s","concerns":7}', `f${requests}`)] };
+        else yield { toolCalls: [call('write_file', '{"path":"a.js","content":"x"}', `w${requests}`)] };
+        yield { usage: { inputTokens: 10_000, outputTokens: 2_000, cacheHitTokens: 0, cacheMissTokens: 10_000 } };
+      },
+    };
+    await new AgentLoop({
+      provider,
+      tools: recordingFinish([]),
+      model: 'm',
+      pricing: priceTable(['m']),
+      maxUsd,
+      maxTurns: 60,
+      progress: (event) => events.push(event),
+    }).run({ task: 'x' });
+    return events.filter((event) => event.budgetOutlook).map((event) => event.budgetOutlook);
+  };
+  const plain = await run({});
+  assert.ok(plain.length > 0);
+  // A hop just before the first warning restarts the history: nothing is projected
+  // from the old route's prices until six turns have run on the new one.
+  const hopped = await run({ hopAt: 12 });
+  const requestUsd = 0.012;
+  assert.ok(hopped.length > 0);
+  assert.ok(Math.abs(plain[0].remainingUsd - hopped[0].remainingUsd - 6 * requestUsd) < 1e-9);
+  // Two correction turns are recorded with the next tool turn, so their spend counts.
+  const lean = (await run({ maxUsd: 0.15 }))[0];
+  const corrected = (await run({ corrections: 2, maxUsd: 0.15 }))[0];
+  assert.ok(Math.abs(lean.avgTurnUsd - requestUsd) < 1e-9);
+  assert.ok(Math.abs(corrected.avgTurnUsd - (8 * requestUsd) / 6) < 1e-9, 'eight requests paid for over six recorded turns');
 });

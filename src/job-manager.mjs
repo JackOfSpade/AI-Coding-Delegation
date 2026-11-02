@@ -19,6 +19,7 @@ import {
   FAILURE_KINDS,
   LOCAL_TRANSCRIPT_CORRUPTION,
   continuableFailure,
+  applyBlocker,
   failedApplyRefusal,
   failureContinueDefect,
   isWallTimeout,
@@ -32,6 +33,9 @@ import {
 import { isolatedDependencyReadPaths, sameWorktreePath } from './worktree.mjs';
 import { classifyVerifierEnvironment, isVerifierEnvironmentKind } from './verify-env.mjs';
 import { continuationBlocker, promptCacheSummary } from './continuation.mjs';
+import { budgetWarning, safeBudgetOutlook } from './budget-outlook.mjs';
+import { MAX_PATH_LENGTH, revertPathsProblem, safeRevertPath, safeRevertPaths } from './revert-paths.mjs';
+import { scratchFiles } from './scratch-audit.mjs';
 import { compactVerifierPreflight, narrowTestCommand, preflightVerifier, verifierBlockingMessage } from './verifier-preflight.mjs';
 import {
   expectedVerifierMs,
@@ -101,7 +105,6 @@ const final = (status) => terminalStatuses.has(status);
 // environment, inert hooks, disabled filters, and fsmonitor hardening.
 const git = (repo, args) => snapshotGit(repo, args).trim();
 const MAX_PATHS = 128,
-  MAX_PATH_LENGTH = 1024,
   MAX_TASK = 32_000,
   MAX_CRITERIA = 100,
   MAX_CRITERION = 4_000,
@@ -963,17 +966,6 @@ export function validateJobRequest(input) {
 // is a privileged new model turn, so accept only the verifier's own exact
 // execution result and fail closed on a missing or unfamiliar value.
 const verifierUsedMacosSandbox = (verify) => verify?.result?.sandbox === 'macos';
-// git-snapshot's literal-path boundary deliberately rejects control bytes.
-// Keep such paths visible in review metadata, but never turn them into an
-// executable reverse-patch pathspec.
-const safeRevertPath = (path) =>
-  typeof path === 'string' && path.length > 0 && path.length <= MAX_PATH_LENGTH && !/[\x00-\x1f\x7f\\]/.test(path);
-const safeRevertPaths = (paths) =>
-  Array.isArray(paths) &&
-  paths.length > 0 &&
-  paths.length <= MAX_PATHS &&
-  paths.every(safeRevertPath) &&
-  new Set(paths).size === paths.length;
 // The primary worktree snapshot intentionally includes index content, but a
 // staged-only concurrent edit leaves working-tree bytes unchanged. Keep an
 // independent index tree and compare only exact owned paths immediately
@@ -2201,6 +2193,8 @@ export class JobManager {
               else if (providerFinishReason !== undefined) progress.providerFinishReason = providerFinishReason;
               const budgetReservation = safeBudgetReservation(event?.budgetReservation);
               if (budgetReservation) progress.budgetReservation = budgetReservation;
+              const outlook = safeBudgetOutlook(event?.budgetOutlook);
+              if (outlook) progress.budgetOutlook = outlook.level === 'ok' ? undefined : outlook;
               const actions = Array.isArray(event?.recentActions)
                 ? event.recentActions
                 : Array.isArray(event?.actions)
@@ -2806,6 +2800,7 @@ export class JobManager {
                   autoRepairScheduled: false,
                   providerFinishReason: undefined,
                   budgetReservation: undefined,
+                  budgetOutlook: undefined,
                   roundQueue: this.#roundQueue(this.#nowMs()),
                   activity: undefined,
                   ...ROUND_SCOPED_VERIFIER_STATE,
@@ -3250,6 +3245,9 @@ export class JobManager {
         ? { verifierPreflight: detail === 'full' ? job.verifierPreflight : compactVerifierPreflight(job.verifierPreflight) }
         : {}),
       ...(promptCacheSummary(job.usage) ? { promptCache: promptCacheSummary(job.usage) } : {}),
+      ...(budgetWarning(job) ? { budgetWarning: budgetWarning(job) } : {}),
+      ...(applyBlocker(job) ? { applyBlocker: applyBlocker(job) } : {}),
+      ...(job.mode !== 'report' && scratchFiles(job) ? { scratchFiles: scratchFiles(job) } : {}),
       ...(['BUDGET', 'TIMEOUT', 'FAILED'].includes(job.status) && continuationBlocker(job)
         ? { continuation: { resumable: false, reason: continuationBlocker(job) } }
         : {}),
@@ -3343,6 +3341,7 @@ export class JobManager {
       costUsd: job.costUsd,
       recentActions: job.recentActions || [],
       status: job.status,
+      ...(budgetWarning(job) ? { budgetWarning: budgetWarning(job) } : {}),
       ...(activity
         ? {
             phase: {
@@ -3826,6 +3825,7 @@ export class JobManager {
         providerFailure: undefined,
         providerFinishReason: undefined,
         budgetReservation: undefined,
+        budgetOutlook: undefined,
         ...(workspace
           ? {
               workspacePath: workspace.path,
@@ -4050,7 +4050,9 @@ export class JobManager {
       throw new Error('late integration is unavailable for this job (it did not run in an isolated worktree)');
     if (!validGitObjectId(job.before) || !validGitObjectId(job.workspaceAfter)) throw new Error('job has no recorded result to apply');
     const paths = job.revertFiles;
-    if (!safeRevertPaths(paths) || !paths.length) throw new Error('job has no in-scope changes to apply');
+    if (Array.isArray(paths) && !paths.length) throw new Error('job has no in-scope changes to apply');
+    const pathsProblem = revertPathsProblem(paths);
+    if (pathsProblem) throw new Error(`this job cannot be applied: ${pathsProblem}`);
     if (plan) this.#assertApplyVerifySandbox(plan);
     // Origin of the applied diff: only a FAILED job needs it spelled out, as it
     // is the one whose worker did not end cleanly.
@@ -4084,6 +4086,7 @@ export class JobManager {
         applied: false,
         files: (preview.files || []).map((file) => file.path),
         fromStatus: job.status,
+        ...(scratchFiles(job) ? { scratchFiles: scratchFiles(job) } : {}),
         ...(failure ? { failure } : {}),
         ...(plan
           ? {
@@ -4241,6 +4244,7 @@ export class JobManager {
         dryRun: false,
         applied: true,
         files: paths,
+        ...(scratchFiles(job) ? { scratchFiles: scratchFiles(job) } : {}),
         previousStatus: job.status,
         status: 'DONE_UNVERIFIED',
         ...(failure ? { failure } : {}),
@@ -4376,6 +4380,7 @@ export class JobManager {
           dryRun: false,
           applied: true,
           files: paths,
+          ...(scratchFiles(job) ? { scratchFiles: scratchFiles(job) } : {}),
           previousStatus: job.status,
           status: 'DONE_UNVERIFIED',
           ...(failure ? { failure } : {}),
@@ -4814,7 +4819,7 @@ export class JobManager {
     if (job.revertedAt) throw new Error('job patch has already been reverted');
     if (job.revertUncertain === true) throw new Error('cannot revert a job whose prior reverse-application outcome is uncertain');
     const revertPaths = job.revertFiles || job.files?.map((file) => file.path) || [];
-    if (!safeRevertPaths(revertPaths)) throw new Error('job has no safe owned patch to revert');
+    if (!safeRevertPaths(revertPaths)) throw new Error(`job has no safe owned patch to revert: ${revertPathsProblem(revertPaths)}`);
     if (job.workspacePath && primaryIndexChanged(job.repoPath, job.primaryIndexBefore, revertPaths))
       throw new Error('job patch is stale; primary index changed on a job-owned file');
     if (job.workspacePath) {

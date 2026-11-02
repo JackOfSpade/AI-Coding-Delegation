@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { runtimeIdentity, skillHashOf } from '../../src/identity.mjs';
 import {
   SKILL_RESTART_ACTION,
+  withRestartNotice,
   assertStartRuntimeCurrent,
   installedSkillHealth,
   skillCopyStatus,
@@ -167,4 +168,68 @@ test('a stale premium command blocks starts even when the economy command is cur
   assert.equal(health.clients.claude.status, 'current');
   assert.equal(health.clients.claudeOpus.status, 'stale');
   assert.throws(() => assertStartRuntimeCurrent(withSkillHealth({ restartRequired: false }, health)), /STALE/);
+});
+
+test('after an update during a session the action is restart only; a skill that matches nothing still says to install', () => {
+  const server = {
+    stale: true,
+    restartRequired: true,
+    restartAction: 'Restart the MCP client to load the updated Offload server and skill.',
+    staleReason: 'runtime-artifacts-changed',
+    installedSkillHash: 'new',
+    installedOpusSkillHash: 'new-opus',
+  };
+  const copies = (clients) => ({ stale: true, state: 'stale', clients });
+  const stale = (installedHash) => ({ status: 'stale', installedHash });
+  const updated = withSkillHealth(server, copies({ claude: stale('new'), claudeOpus: stale('new-opus'), codex: { status: 'missing' } }));
+  assert.equal(updated.restartAction, server.restartAction);
+  assert.doesNotMatch(updated.restartAction, /node install\.mjs/);
+  assert.equal(updated.restartRequired, true);
+  assert.equal(updated.staleSkill, true);
+
+  for (const clients of [{ claude: stale('other') }, { claude: stale('new'), codex: stale('old') }, { claude: stale('new-opus') }, {}]) {
+    const action = withSkillHealth(server, copies(clients)).restartAction;
+    assert.match(action, /node install\.mjs/, JSON.stringify(clients));
+  }
+  // A skill stale against a server that is not stale is not an update during the session.
+  const local = withSkillHealth({ stale: false, restartRequired: false, installedSkillHash: 'new' }, copies({ claude: stale('new') }));
+  assert.equal(local.restartAction, SKILL_RESTART_ACTION);
+});
+
+test('a job-less response leads with the restart notice for as long as health requires one', () => {
+  assert.deepEqual(withRestartNotice({ jobs: [], health: { restartRequired: false } }), { jobs: [], health: { restartRequired: false } });
+  const stale = withSkillHealth(
+    { stale: true, restartRequired: true, restartAction: 'Restart the MCP client.', staleReason: 'runtime-artifacts-changed' },
+    { stale: false, state: 'current' },
+  );
+  const listing = withRestartNotice({ jobs: [{ jobId: 'a' }], health: stale });
+  assert.equal(Object.keys(listing)[0], 'restart', 'it comes before the job list');
+  assert.deepEqual(listing.restart, {
+    required: true,
+    reason: 'runtime-artifacts-changed',
+    action: 'Restart the MCP client.',
+    startsRefused: true,
+  });
+
+  const skill = withSkillHealth(
+    { stale: false, restartRequired: false },
+    { stale: true, state: 'stale', reason: 'installed-skill-differs-from-server' },
+  );
+  assert.equal(withRestartNotice({ health: skill }).restart.reason, 'installed-skill-differs-from-server');
+  assert.match(withRestartNotice({ health: { restartRequired: true } }).restart.action, /node install\.mjs/, 'never an empty instruction');
+});
+
+test('the restart notice says whether a start would really be refused', () => {
+  const skillOnly = withSkillHealth(
+    { stale: false, restartRequired: false },
+    { stale: true, state: 'stale', reason: 'installed-skill-differs-from-server' },
+  );
+  assert.equal(withRestartNotice({ health: skillOnly }, { requireCurrentSkill: true }).restart.startsRefused, true);
+  assert.equal(
+    withRestartNotice({ health: skillOnly }, { requireCurrentSkill: false }).restart.startsRefused,
+    false,
+    'a CLI start reads no skill',
+  );
+  const server = withSkillHealth({ stale: true, restartRequired: true, restartAction: 'Restart.' }, { stale: false, state: 'current' });
+  assert.equal(withRestartNotice({ health: server }, { requireCurrentSkill: false }).restart.startsRefused, true);
 });

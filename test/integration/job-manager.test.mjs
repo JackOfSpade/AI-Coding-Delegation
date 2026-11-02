@@ -3270,6 +3270,47 @@ test('worker cache writes survive durable accounting and appear in public hit-ra
   assert.match(done.report, /prompt cache: 80\.0%/);
 });
 
+test('a budget outlook reaches progress, the job and the report, and a later ok outlook clears it', async () => {
+  const outlook = { level: 'watch', turnsLeft: 9, avgTurnUsd: 0.2, remainingUsd: 2.5, requiredUsd: 0.7, recentCacheHitRate: 0.2 };
+  const steps = [];
+  const release = () => steps.shift()?.();
+  const m = await manager({
+    run: async (_job, api) => {
+      await api.progress({ turn: 1, budgetOutlook: outlook });
+      await new Promise((resolve) => steps.push(resolve));
+      await api.progress({ turn: 2, budgetOutlook: { ...outlook, level: 'ok' } });
+      await new Promise((resolve) => steps.push(resolve));
+      await api.progress({ turn: 3, budgetOutlook: { level: 'panic' } });
+      const usage = { inputTokens: 100, cacheHitTokens: 0, cacheMissTokens: 100, outputTokens: 10 };
+      await api.progress({ turn: 4, usage, costUsd: 0.5, budgetOutlook: outlook });
+      return { status: 'BUDGET', turns: 4, usage, costUsd: 0.5 };
+    },
+  });
+  const start = await m.start({ task: 'outlook', ownedPaths: ['src/**'] });
+  const until = async (check) => {
+    for (let i = 0; i < 400; i++) {
+      const job = await m.store.get(start.jobId);
+      if (check(job)) return job;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.fail('progress did not arrive');
+  };
+  await until((job) => job.budgetOutlook?.level === 'watch' && steps.length === 1);
+  const running = await m.wait(start.jobId, { timeoutSec: 0 });
+  assert.deepEqual(running.progress.budgetWarning, outlook);
+  const report = (await m.job(start.jobId)).report;
+  assert.match(report, /budget warning \(watch\): on course for the reservation stop in about 9 request\(s\)/);
+  assert.match(report, /recent prompt cache hit rate 20\.0%/);
+  release();
+  const cleared = await until((job) => job.turns === 2 && steps.length === 1);
+  assert.equal(cleared.budgetOutlook, undefined);
+  release();
+  const done = await m.wait(start.jobId, { timeoutSec: 2 });
+  assert.equal(done.status, 'BUDGET', done.error);
+  assert.equal(done.budgetWarning, undefined, 'a stopped job is past the prediction');
+  assert.doesNotMatch(done.report, /budget warning/);
+});
+
 test('continuation events preserve the terminal status that requested the next round', async () => {
   for (const status of ['BUDGET', 'TIMEOUT', 'FAILED']) {
     const m = await manager({ run: async () => assert.fail('this test queues without launching') });

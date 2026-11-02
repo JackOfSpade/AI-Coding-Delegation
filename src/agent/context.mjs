@@ -8,7 +8,10 @@ import { cloneOpenAIReasoning, openAIReasoningChars, validOpenAIReasoning } from
 import { MAX_MESSAGE_CHARS, MAX_TOOL_ARGUMENT_CHARS, MAX_TOOL_CALLS, validToolIdentifier } from '../transcript-limits.mjs';
 
 /** Append-only conversation store.  Only old bulky tool output is replaced,
- * preserving message order (and therefore provider prefix-cache locality). */
+ * preserving message order.  Replacing a message rewrites every byte after it,
+ * so a provider prefix cache misses and the whole suffix is written again:
+ * retention elides in batches, down to half its limit, rather than one result
+ * per append. */
 export class AgentContext {
   constructor(
     messages = [],
@@ -248,12 +251,17 @@ function elideMessages(messages, maxToolChars, keepRecentToolResults) {
   const protectedIndexes = newestCompleteToolTransactionIndexes(messages) ?? new Set();
   const olderTools = tools.filter(([, index]) => !protectedIndexes.has(index));
   let chars = tools.reduce((total, [message]) => total + (message.content?.length ?? 0), 0);
+  if (chars <= maxToolChars) return;
+  // Past the limit, one pass makes room for many later appends. Stopping just
+  // under it would elide again on nearly every large tool result, and each
+  // elision costs a full prompt cache rewrite.
+  const target = Math.floor(maxToolChars / 2);
   // A current tool-call transaction is an atomic provider replay unit. Its
   // results may exceed maxToolChars together, but splitting or eliding one
   // would make the preceding assistant call unreplayable. Retention applies
   // in addition to that transaction, to the newest older results.
   for (const [message] of olderTools.slice(0, Math.max(0, olderTools.length - keepRecentToolResults))) {
-    if (chars <= maxToolChars) break;
+    if (chars <= target) break;
     if (!canElideToolResult(message)) continue;
     const original = message.content ?? '';
     message.content = toolOutputElisionMarker(original.length);

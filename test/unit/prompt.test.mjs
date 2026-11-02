@@ -8,6 +8,7 @@ import {
   WORKER_ASSERTION_PRESERVATION_RULE,
   WORKER_COMPLETION_RULE,
   WORKER_GENERATOR_DEPENDENCY_RULE,
+  WORKER_SCRATCH_CLEANUP_RULE,
   WORKER_TEST_QUALITY_RULE,
   WORKER_VERIFIER_INTERPRETER_RULE,
   annotateRelevantPaths,
@@ -241,4 +242,11 @@ test('completion protocol follows repository conventions and addresses the Opus 
     assert.match(finish.description, /record that in concerns and list only checks actually run in testsRun/);
     assert.match(finish.description, /server runs any configured verifier after this call/);
   }
+});
+
+test('a write worker is told not to leave scratch files in owned paths; a report worker writes none', async () => {
+  const write = await buildSystemPrompt({ task: 'x' });
+  assert.equal(write.split('\n').filter((line) => line === WORKER_SCRATCH_CLEANUP_RULE).length, 1);
+  const report = await buildSystemPrompt({ task: 'x', mode: 'report' });
+  assert.equal(report.includes(WORKER_SCRATCH_CLEANUP_RULE), false);
 });

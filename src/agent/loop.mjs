@@ -1,6 +1,14 @@
 import { isAnthropicModel } from '../model-policy.mjs';
 import { AgentContext } from './context.mjs';
-import { DEFAULT_COMMAND_TIMEOUT_SEC, MAX_COMMAND_TIMEOUT_SEC, TOOL_DEFINITIONS, isReadOnlyTool, validUntouchedPaths } from './tools.mjs';
+import {
+  DEFAULT_COMMAND_TIMEOUT_SEC,
+  MAX_COMMAND_TIMEOUT_SEC,
+  TOOL_DEFINITIONS,
+  finishArgumentProblems,
+  isReadOnlyTool,
+  normalizeFinishArgs,
+} from './tools.mjs';
+import { budgetNotice, budgetOutlook } from '../budget-outlook.mjs';
 import { Meter, resolveModel, samePricedModel } from '../pricing.mjs';
 import { OpenAIChatProvider, PROVIDER_FINISH_REASONS, ProviderError, providerFailure } from '../provider/openai-chat.mjs';
 import { FAILURE_ERRORS, isWallTimeout, summarizeToolFailure, toolErrorHint } from '../failure.mjs';
@@ -48,17 +56,6 @@ const safeJson = (source) => {
     throw new Error('Invalid tool arguments');
   }
 };
-const finishList = (value) =>
-  value === undefined ||
-  (Array.isArray(value) && value.length <= 100 && value.every((item) => typeof item === 'string' && item.length <= 1000));
-const finishArgs = (value) =>
-  typeof value.summary === 'string' &&
-  value.summary.length > 0 &&
-  value.summary.length <= 1500 &&
-  (value.report === undefined || (typeof value.report === 'string' && value.report.length <= 256_000)) &&
-  finishList(value.concerns) &&
-  finishList(value.testsRun) &&
-  validUntouchedPaths(value.untouchedPaths);
 const BASE_PROMPT_TOKEN_OVERHEAD = 256;
 const MIN_REQUEST_OUTPUT_TOKENS = 16;
 const MAX_REQUEST_OUTPUT_TOKENS = 16_384;
@@ -89,8 +86,13 @@ const REPORT_FINISH_MESSAGE =
 // text (names, arguments) never appears in either.
 const FINISH_ALONE_CORRECTION =
   'TOOL_ERROR: finish must be the only tool call in its turn; nothing in this turn was executed. The prior implementation may already be complete. On your next response, either call finish alone if no actual work remains, or make only the non-finish calls needed for remaining work; after their results, call finish alone in a later response. Do not repeat or pair a rejected call with finish.';
-const FINISH_ARGUMENTS_CORRECTION =
-  'finish arguments are invalid: summary is required (1-1500 characters); concerns and testsRun are optional arrays of up to 100 strings of up to 1000 characters; report is an optional string of up to 256000 characters. Your edits are retained. Do not redo them. Shorten summary to 1-2 sentences and move details to report. Call finish alone, for example {"summary":"Implemented the requested changes."}';
+// Rejected finish arguments run nothing and lose nothing, so unlike a mixed turn
+// they earn a second correction before the round fails.
+const MAX_FINISH_ARGUMENT_CORRECTIONS = 2;
+const finishArgumentsCorrection = (problems) =>
+  `finish arguments are invalid: ${problems.join('; ')}. Your edits are retained. Do not redo them. Fix only what is listed and call finish alone; the smallest valid call is {"summary":"Implemented the requested changes."}`;
+const NO_FINISH_REMINDER =
+  'No tool was called, and prose does not complete the job. Your edits are retained. If your in-scope work is complete, call finish as the only tool call now; otherwise make the remaining tool calls first.';
 const MISSING_TOOL_RECOVERY_REMINDER =
   'Do not reply with prose only. Invoke one or more allowed non-finish tools to continue, or call finish as the sole tool call if complete.';
 // A provider-controlled name never reaches a durable record or the model. The
@@ -502,6 +504,15 @@ export class AgentLoop {
     // One finish-protocol correction per run (so per round of a job): a second
     // violation is the worker's, not a fluke, and ends the round.
     let finishProtocolRecoveryUsed = false;
+    let finishArgumentCorrections = 0;
+    let noFinishRecoveryUsed = false;
+    // Finite non-report budgets only: what each completed request cost and
+    // what the next one had to reserve, for the outlook on the reservation.
+    const budgetTurns = [];
+    let budgetRecordedUsd = this.meter.usd;
+    let budgetRecordedUsage = this.meter.usage;
+    let budgetOutlookLevel = 'ok';
+    let budgetNoticeUsed = false;
     // The durable lifecycle state—not a human-language transcript marker—is
     // the authority for the one post-write implementation continuation. In
     // particular, a user task equal to the reminder remains an ordinary task.
@@ -602,6 +613,8 @@ export class AgentLoop {
     try {
       for (let turn = 1; turn <= this.maxTurns; turn++) {
         providerFinishReason = undefined;
+        const turnRouteStage = this.provider.stage;
+        let turnRequiredUsd;
         await this.context.flush();
         if (this.signal?.aborted) return outcome(stopped(), turn - 1);
         if (this.now() - started > this.timeoutMs) return outcome('TIMEOUT', turn - 1);
@@ -805,6 +818,7 @@ export class AgentLoop {
               });
             }
           }
+          turnRequiredUsd = reservation.inputUsd + reservation.minOutputUsd;
           maxTokens =
             budgetFinishRecovery || budgetFinishRecoveryPending
               ? Math.min(reservation.maxTokens, 128)
@@ -1145,6 +1159,27 @@ export class AgentLoop {
           // chance to produce an allowed tool call. A second cap is terminal,
           // not a safe basis for another provider POST; make that distinction
           // visible to callers instead of misclassifying it as ordinary prose.
+          // A worker that has edited and then stops in prose has usually just
+          // finished its work. The response is complete and billed, so one
+          // durable reminder costs one ordinary turn; the same stop again is
+          // the worker's. A cap or filter stop has its own handling above and below.
+          const recoverNoFinish =
+            directWriteSucceeded &&
+            !noFinishRecoveryUsed &&
+            !cappedFinishRecoveryUsed &&
+            !budgetFinishRecovery &&
+            !reportFinalizationUsed &&
+            turn < this.maxTurns &&
+            usageRecords === 1 &&
+            providerFinishReason !== 'length' &&
+            providerFinishReason !== 'content_filter';
+          if (recoverNoFinish) {
+            noFinishRecoveryUsed = true;
+            await this.context.addBatch([assistant, { role: 'user', content: NO_FINISH_REMINDER }]);
+            await this.context.flush();
+            await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'provider_no_finish_recover' });
+            continue;
+          }
           const outputCapRecoveryExhausted =
             (cappedReasoningContinuationUsed || cappedFinishRecoveryUsed) &&
             maxTokens !== undefined &&
@@ -1170,21 +1205,27 @@ export class AgentLoop {
         if (new Set(calls.map((call) => call.id)).size !== calls.length)
           return responseOutcome('FAILED', turn, responseModel, { error: 'Duplicate tool call id' });
         const finishIndex = calls.findIndex((call) => call.name === 'finish');
+        if (finishIndex !== -1) parsed[finishIndex] = normalizeFinishArgs(parsed[finishIndex]);
         const finishNotAlone = finishIndex !== -1 && calls.length !== 1;
-        const finishInvalid = finishIndex !== -1 && !finishArgs(parsed[finishIndex]);
+        const finishProblems = finishIndex === -1 ? [] : finishArgumentProblems(parsed[finishIndex]);
+        const finishInvalid = finishProblems.length > 0;
         if (finishNotAlone || finishInvalid) {
-          // One bounded, execute-nothing correction, like the unadvertised-tool
+          // A bounded, execute-nothing correction, like the unadvertised-tool
           // one above. The response was already metered, nothing in it runs, the
           // retry takes a normal turn (so it counts against maxTurns, and needs
           // one left) and keeps every reservation, timeout and accounting check.
           // The finish-only budget recovery and report finalization stay fail-closed.
           const recoverFinishProtocol =
-            !finishProtocolRecoveryUsed && !budgetFinishRecovery && !reportFinalizationUsed && turn < this.maxTurns;
+            (finishNotAlone ? !finishProtocolRecoveryUsed : finishArgumentCorrections < MAX_FINISH_ARGUMENT_CORRECTIONS) &&
+            !budgetFinishRecovery &&
+            !reportFinalizationUsed &&
+            turn < this.maxTurns;
           if (recoverFinishProtocol) {
-            finishProtocolRecoveryUsed = true;
+            if (finishNotAlone) finishProtocolRecoveryUsed = true;
+            else finishArgumentCorrections++;
             const correction = finishNotAlone
-              ? `${FINISH_ALONE_CORRECTION}${finishInvalid ? `; also, ${FINISH_ARGUMENTS_CORRECTION}` : ''}`
-              : `TOOL_ERROR: ${FINISH_ARGUMENTS_CORRECTION}; nothing in this turn was executed; call finish alone again`;
+              ? `${FINISH_ALONE_CORRECTION}${finishInvalid ? `; also, ${finishArgumentsCorrection(finishProblems)}` : ''}`
+              : `TOOL_ERROR: ${finishArgumentsCorrection(finishProblems)}; nothing in this turn was executed`;
             // One atomic, durable batch: a crash can never leave an assistant
             // tool_call without its result.
             await this.context.addBatch([
@@ -1314,6 +1355,35 @@ export class AgentLoop {
             !(typeof values[index] === 'string' && values[index].startsWith('TOOL_ERROR:')),
         );
         directWriteSucceeded ||= successfulDirectWrite;
+        if (this.maxUsd !== Infinity && !this.reportMode && turnRequiredUsd !== undefined) {
+          // A credit fallback changes the prices, so history from before it predicts nothing.
+          if (this.provider.stage !== turnRouteStage) budgetTurns.length = 0;
+          else
+            budgetTurns.push({
+              // Since the last record, so a correction turn's spend is not lost.
+              costUsd: this.meter.usd - budgetRecordedUsd,
+              requiredUsd: turnRequiredUsd,
+              inputTokens: totalUsage.inputTokens - (budgetRecordedUsage?.inputTokens ?? 0),
+              cacheHitTokens: (totalUsage.cacheHitTokens ?? 0) - (budgetRecordedUsage?.cacheHitTokens ?? 0),
+            });
+          budgetRecordedUsd = this.meter.usd;
+          budgetRecordedUsage = totalUsage;
+          const outlook = budgetOutlook({
+            turns: budgetTurns,
+            remainingUsd: this.maxUsd - this.meter.usd,
+            turnsLeftInCap: this.maxTurns - turn,
+          });
+          if (outlook && (outlook.level !== 'ok' || budgetOutlookLevel !== 'ok')) await this.progress?.({ turn, budgetOutlook: outlook });
+          if (outlook) budgetOutlookLevel = outlook.level;
+          // Only with work to protect: before the first write, the caller owns
+          // whether this budget was ever enough for the task.
+          if (outlook && outlook.level !== 'ok' && directWriteSucceeded && !budgetNoticeUsed && turn < this.maxTurns) {
+            budgetNoticeUsed = true;
+            this.context.add({ role: 'user', content: budgetNotice(outlook.turnsLeft) });
+            await this.context.flush();
+            await this.progress?.({ turn, action: 'budget_notice' });
+          }
+        }
         if (this.serverVerifierConfigured && successfulDirectWrite && !verifierCompletionCheckpointUsed && turn < this.maxTurns) {
           verifierCompletionCheckpointUsed = true;
           this.context.add({ role: 'user', content: verifierCompletionCheckpoint(this.maxTurns - turn) });

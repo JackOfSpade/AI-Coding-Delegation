@@ -205,3 +205,43 @@ test('the real MCP host refuses a stale installed skill before it creates a job'
   assert.match(text, /No job was created and no provider budget was spent/i);
   assert.match(text, /node install\.mjs.*restart/i);
 });
+
+test('after the runtime changes mid-session, the next job-less response leads with the restart until it is done', async (t) => {
+  const home = await homeWith(t, { claude: packaged });
+  const stale = {
+    ...runtimeIdentity(),
+    stale: true,
+    staleReason: 'runtime-artifacts-changed',
+    restartRequired: true,
+    restartAction: 'Restart the MCP client to load the updated Offload server and skill.',
+  };
+  let runtime = { ...runtimeIdentity(), stale: false, restartRequired: false };
+  const core = createCore({
+    config: {
+      loaded,
+      probeVerifierTemp: async () => ({ status: 'writable' }),
+      skillHealth: (options) => installedSkillHealth({ ...options, home, env: {} }),
+      runtimeHealth: () => runtime,
+      enforceInstalledSkillPreflight: true,
+    },
+  });
+  try {
+    assert.equal((await core.job()).restart, undefined);
+    runtime = stale;
+    for (let call = 0; call < 2; call++) {
+      const listing = await core.job();
+      assert.equal(Object.keys(listing)[0], 'restart', 'above the job list and health');
+      assert.deepEqual(listing.restart, {
+        required: true,
+        reason: 'runtime-artifacts-changed',
+        action: stale.restartAction,
+        startsRefused: true,
+      });
+    }
+    await assert.rejects(() => core.start({ task: 'x', ownedPaths: ['src/**'] }), /OFFLOAD START REFUSED/);
+    runtime = { ...runtimeIdentity(), stale: false, restartRequired: false };
+    assert.equal((await core.job()).restart, undefined);
+  } finally {
+    await core.shutdown({ timeoutMs: 2_000 });
+  }
+});
