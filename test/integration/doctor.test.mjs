@@ -463,6 +463,16 @@ test('doctor reports a stale installed skill and another Offload hook root witho
   await writeFile(join(claudeDir, 'skills', 'offload_economy', 'SKILL.md'), `${packaged}\nolder protocol\n`);
   assert.equal(run().skill.claude, 'stale');
 
+  // Codex can receive both skills through the Offload plugin instead of native copies.
+  const pluginSkills = join(home, '.codex', 'plugins', 'cache', 'personal', 'offload', '0.1.0+codex.test', 'skills');
+  for (const name of ['offload_economy', 'offload_premium']) {
+    await mkdir(join(pluginSkills, name), { recursive: true });
+    await writeFile(join(pluginSkills, name, 'SKILL.md'), await readFile(join(root, 'plugins', 'offload', 'skills', name, 'SKILL.md')));
+  }
+  assert.equal(run().skill.codex, 'current', 'a current plugin copy is not reported missing');
+  await writeFile(join(pluginSkills, 'offload_premium', 'SKILL.md'), 'an older plugin skill\n');
+  assert.equal(run().skill.codex, 'stale', 'a stale plugin copy is drift');
+
   const hook = (installer) => ({ type: 'command', command: `'/usr/bin/node' '${installer}' --doctor-hook` });
   await writeFile(
     join(claudeDir, 'settings.json'),

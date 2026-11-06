@@ -6,7 +6,10 @@
  * given file. They differ only in what they compare against: the hook uses the
  * checkout it was launched from, health the loaded server's own skill hash.
  */
+import { readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { resolveClientPaths } from './client-paths.mjs';
+import { ECONOMY_SKILL, PREMIUM_SKILL } from './command-skills.mjs';
 import { skillHashOf } from './identity.mjs';
 import { readRegularFileSync } from './regular-file.mjs';
 
@@ -33,20 +36,80 @@ export function skillCopyStatus(file, expectedHash, options) {
   return { status: found.hash === expectedHash ? 'current' : 'stale', installedHash: found.hash };
 }
 
+const PLUGIN_NAME = 'offload';
+const MAX_PLUGIN_DIRS = 16;
+// Real directories only: a symlinked cache entry is not followed.
+const subdirectories = (dir, list) => {
+  try {
+    return list(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort()
+      .slice(0, MAX_PLUGIN_DIRS);
+  } catch {
+    return [];
+  }
+};
+
+/**
+ * The skill files of every cached Codex copy of the Offload plugin, which is
+ * how the installer delivers the skills when the Codex CLI supports plugins.
+ * `skill` is the command skill's directory name.
+ */
+export function codexPluginSkillFiles(paths, skill, { list = readdirSync } = {}) {
+  const cache = paths?.codexPluginCache;
+  if (!cache) return [];
+  const files = [];
+  for (const marketplace of subdirectories(cache, list)) {
+    const pluginDir = join(cache, marketplace, PLUGIN_NAME);
+    for (const version of subdirectories(pluginDir, list)) files.push(join(pluginDir, version, 'skills', skill, 'SKILL.md'));
+  }
+  return files;
+}
+
+/**
+ * A Codex skill copy: the native one when present, otherwise the Offload
+ * plugin's cached copies. Any stale plugin copy reports stale (Codex may load
+ * it), any current one current, and no copy at all `missing`.
+ */
+export function codexSkillCopyStatus(nativeFile, pluginFiles, expectedHash, options) {
+  const native = skillCopyStatus(nativeFile, expectedHash, options);
+  if (native.status !== 'missing' || !pluginFiles.length) return native;
+  const copies = pluginFiles.map((file) => skillCopyStatus(file, expectedHash, options));
+  const found =
+    copies.find((copy) => copy.status === 'stale') ??
+    copies.find((copy) => copy.status === 'current') ??
+    copies.find((copy) => copy.status !== 'missing');
+  return found ? { ...found, source: 'plugin' } : native;
+}
+
 /**
  * Installed skill copies (Claude and Codex) against the server's expected hash.
  * A copy that is absent is normal (client not installed, or a plugin supplies
  * the skill), so health never fails and never reports staleness for it.
  */
-export function installedSkillHealth({ expectedHash, expectedOpusHash, home, env = process.env, platform = process.platform, read } = {}) {
+export function installedSkillHealth({
+  expectedHash,
+  expectedOpusHash,
+  home,
+  env = process.env,
+  platform = process.platform,
+  read,
+  list,
+} = {}) {
   const paths = resolveClientPaths({ home, env, platform });
   const clients = {
     claude: skillCopyStatus(paths.claudeSkill, expectedHash, { read }),
-    codex: skillCopyStatus(paths.codexSkill, expectedHash, { read }),
+    codex: codexSkillCopyStatus(paths.codexSkill, codexPluginSkillFiles(paths, ECONOMY_SKILL.name, { list }), expectedHash, { read }),
   };
   if (expectedOpusHash) {
     clients.claudeOpus = skillCopyStatus(paths.claudeOpusSkill, expectedOpusHash, { read });
-    clients.codexOpus = skillCopyStatus(paths.codexOpusSkill, expectedOpusHash, { read });
+    clients.codexOpus = codexSkillCopyStatus(
+      paths.codexOpusSkill,
+      codexPluginSkillFiles(paths, PREMIUM_SKILL.name, { list }),
+      expectedOpusHash,
+      { read },
+    );
   }
   const statuses = Object.values(clients).map((copy) => copy.status);
   const stale = statuses.includes('stale');

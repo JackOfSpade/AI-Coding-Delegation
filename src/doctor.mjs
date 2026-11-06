@@ -25,7 +25,7 @@ import { priceUsage, resolveModel, samePricedModel, validatePricingTable } from 
 import { snapshotGitEnv } from './git-snapshot.mjs';
 import { readUtf8FileSync } from './regular-file.mjs';
 import { plainObject } from './plain-object.mjs';
-import { skillCopyStatus, skillFileHash } from './skill-health.mjs';
+import { codexPluginSkillFiles, codexSkillCopyStatus, skillFileHash } from './skill-health.mjs';
 import { ECONOMY_SKILL, PREMIUM_SKILL, packagedSkillPath } from './command-skills.mjs';
 import { gitBinary } from './git-binary.mjs';
 
@@ -242,16 +242,23 @@ function registrations(home, root, platform, env) {
 // skillCopyStatus, so the hook banner and `server.skill` cannot disagree.
 function skillStatus(paths, root, path) {
   const packaged = skillFileHash(path.join(root, packagedSkillPath(ECONOMY_SKILL.name)));
-  const status = (file, expectedHash = packaged.hash) => {
-    const { status: state } = skillCopyStatus(file, expectedHash);
+  const status = (file, expectedHash = packaged.hash, pluginFiles = []) => {
+    const { status: state } = codexSkillCopyStatus(file, pluginFiles, expectedHash);
     return state === 'unreadable' ? 'missing' : state;
   };
   const opus = skillFileHash(path.join(root, packagedSkillPath(PREMIUM_SKILL.name)));
-  const combined = (sonnetFile, opusFile) => {
-    const statuses = [status(sonnetFile), status(opusFile, opus.hash)];
+  const combined = (sonnetFile, opusFile, plugin = false) => {
+    const statuses = [
+      status(sonnetFile, packaged.hash, plugin ? codexPluginSkillFiles(paths, ECONOMY_SKILL.name) : []),
+      status(opusFile, opus.hash, plugin ? codexPluginSkillFiles(paths, PREMIUM_SKILL.name) : []),
+    ];
     return statuses.includes('stale') ? 'stale' : statuses.includes('current') ? 'current' : statuses[0];
   };
-  return { claude: combined(paths.claudeSkill, paths.claudeOpusSkill), codex: combined(paths.codexSkill, paths.codexOpusSkill) };
+  // Codex may receive the skills through the Offload plugin instead of a native copy.
+  return {
+    claude: combined(paths.claudeSkill, paths.claudeOpusSkill),
+    codex: combined(paths.codexSkill, paths.codexOpusSkill, true),
+  };
 }
 // Session hooks from another Offload install root print a second, possibly
 // older runtime banner at every start. Installer ownership rules mean it will

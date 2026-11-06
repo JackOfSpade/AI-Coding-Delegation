@@ -8,6 +8,7 @@ import {
   SKILL_RESTART_ACTION,
   withRestartNotice,
   assertStartRuntimeCurrent,
+  codexPluginSkillFiles,
   installedSkillHealth,
   skillCopyStatus,
   skillFileHash,
@@ -94,6 +95,51 @@ test('health compares every installed client copy and any difference is stale', 
 
   const unknown = installedSkillHealth({ home: path, env: {} });
   assert.deepEqual([unknown.stale, unknown.state, unknown.reason], [false, 'unknown', 'no-expected-skill-hash']);
+});
+
+async function installPlugin(path, version, bytes, { marketplace = 'personal', skill = 'offload_economy' } = {}) {
+  const directory = join(path, '.codex', 'plugins', 'cache', marketplace, 'offload', version, 'skills', skill);
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, 'SKILL.md'), bytes);
+}
+
+test('a Codex skill delivered by the Offload plugin counts when there is no native copy', async (t) => {
+  const path = await home(t);
+  await installPlugin(path, '0.1.0+codex.new', SKILL);
+  const viaPlugin = health(path);
+  assert.deepEqual(viaPlugin.clients.codex, { status: 'current', installedHash: EXPECTED, source: 'plugin' });
+  assert.deepEqual([viaPlugin.stale, viaPlugin.state], [false, 'current']);
+
+  // A second cached version that differs is one Codex may load: stale wins.
+  await installPlugin(path, '0.1.0+codex.old', 'an older plugin copy\n');
+  const mixed = health(path);
+  assert.deepEqual(mixed.clients.codex, {
+    status: 'stale',
+    installedHash: skillHashOf(Buffer.from('an older plugin copy\n')),
+    source: 'plugin',
+  });
+  assert.equal(mixed.stale, true);
+
+  // A native copy is authoritative: plugin copies are not consulted.
+  await install(path, 'codex', SKILL);
+  assert.deepEqual(health(path).clients.codex, { status: 'current', installedHash: EXPECTED });
+});
+
+test('Codex plugin skill discovery reads real directories only and ignores other plugins', { skip: SYMLINK_SKIP }, async (t) => {
+  const path = await home(t);
+  await installPlugin(path, '1', SKILL);
+  await installPlugin(path, '1', SKILL, { marketplace: 'other-market' });
+  await mkdir(join(path, '.codex', 'plugins', 'cache', 'personal', 'not-offload', '1', 'skills', 'offload_economy'), { recursive: true });
+  const outside = join(path, 'outside');
+  await mkdir(join(outside, 'skills', 'offload_economy'), { recursive: true });
+  await symlink(outside, join(path, '.codex', 'plugins', 'cache', 'personal', 'offload', 'linked'));
+  const paths = { codexPluginCache: join(path, '.codex', 'plugins', 'cache') };
+  assert.deepEqual(codexPluginSkillFiles(paths, 'offload_economy'), [
+    join(path, '.codex', 'plugins', 'cache', 'other-market', 'offload', '1', 'skills', 'offload_economy', 'SKILL.md'),
+    join(path, '.codex', 'plugins', 'cache', 'personal', 'offload', '1', 'skills', 'offload_economy', 'SKILL.md'),
+  ]);
+  assert.deepEqual(codexPluginSkillFiles({ codexPluginCache: join(path, 'absent') }, 'offload_economy'), []);
+  assert.deepEqual(codexPluginSkillFiles({}, 'offload_economy'), []);
 });
 
 test('health follows CLAUDE_CONFIG_DIR like the installer', async (t) => {

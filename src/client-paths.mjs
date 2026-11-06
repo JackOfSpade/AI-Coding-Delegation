@@ -27,6 +27,8 @@ export function resolveClientPaths({ home, env = process.env, platform = process
     codexOpusSkill: join(codexDir, 'skills', PREMIUM_SKILL.name, 'SKILL.md'),
     codexSkill: join(codexDir, 'skills', ECONOMY_SKILL.name, 'SKILL.md'),
     codexSkillBackupDir: join(codexDir, 'offload-backups'),
+    // Codex installs plugins as copies under cache/<marketplace>/<plugin>/<version>.
+    codexPluginCache: join(codexDir, 'plugins', 'cache'),
     cursorConfig: join(userHome, '.cursor', 'mcp.json'),
     cursorRule: join(userHome, '.cursor', 'rules', 'offload.md'),
   };
