@@ -8,6 +8,7 @@ import {
   WORKER_ASSERTION_PRESERVATION_RULE,
   WORKER_COMPLETION_RULE,
   WORKER_GENERATOR_DEPENDENCY_RULE,
+  WORKER_INCREMENTAL_WRITE_RULE,
   WORKER_SCRATCH_CLEANUP_RULE,
   WORKER_TEST_QUALITY_RULE,
   WORKER_VERIFIER_INTERPRETER_RULE,
@@ -161,6 +162,28 @@ test('every worker brief forbids fake generator imports and reports missing real
         assert.match(rules[0], /primary can run it with the real environment/);
         assert.match(rules[0], /List only checks actually run in finish.testsRun/);
         assert.match(rules[0], /a passing server verifier does not validate output produced with fake dependencies\./);
+      }
+    }
+  }
+});
+test('write-mode worker prompts carry the incremental-write rule exactly once as their own line; report mode never does', async () => {
+  assert.match(
+    WORKER_INCREMENTAL_WRITE_RULE,
+    /^File size per call: never put more than about 150 lines or 6 KB of file content in one tool call\./,
+  );
+  assert.match(WORKER_INCREMENTAL_WRITE_RULE, /then add each next part with write_file append true, one part per tool call\./);
+  for (const mode of ['write', 'report']) {
+    for (const allowCommand of [true, false]) {
+      for (const serverVerifierConfigured of [true, false]) {
+        for (const remainingTurns of [undefined, 12]) {
+          const options = { mode, allowCommand, serverVerifierConfigured, remainingTurns, ownedPaths: ['src/**'] };
+          const prompt = await buildSystemPrompt(options);
+          const count = prompt.split('\n').filter((line) => line === WORKER_INCREMENTAL_WRITE_RULE).length;
+          assert.equal(count, mode === 'write' ? 1 : 0, JSON.stringify(options));
+          assert.equal(prompt.split(WORKER_INCREMENTAL_WRITE_RULE).length - 1, count, JSON.stringify(options));
+          if (mode === 'write' && remainingTurns)
+            assert.ok(prompt.includes('build a larger file with write_file append parts instead'), JSON.stringify(options));
+        }
       }
     }
   }

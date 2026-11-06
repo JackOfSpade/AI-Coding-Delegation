@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { readRegularFileSync } from './regular-file.mjs';
 import { redactText, stripTerminalControls } from './redact.mjs';
+import { gitBinary } from './git-binary.mjs';
 
 const GIT_TIMEOUT_MS = 30_000;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
@@ -184,7 +185,7 @@ export function git(repoPath, args, extraEnv = {}, { hooksPath, execFile = execF
     ...(isFilterInert(args) ? [] : disabledFilters(repoPath, env, execFile)),
   ];
   try {
-    return execFile('git', [...hardening, ...args], {
+    return execFile(gitBinary(env), [...hardening, ...args], {
       cwd: repoPath,
       encoding: output === 'buffer' ? 'buffer' : 'utf8',
       env: { ...env, ...extraEnv },
@@ -279,7 +280,7 @@ function disabledFilters(repoPath, env, execFile = execFileSync) {
   try {
     // Include every effective scope: a global/system filter can be selected by
     // repository .gitattributes just as readily as a local one.
-    const output = execFile('git', ['config', '--null', '--get-regexp', '^filter\\..*\\.(clean|smudge|process|required)$'], {
+    const output = execFile(gitBinary(env), ['config', '--null', '--get-regexp', '^filter\\..*\\.(clean|smudge|process|required)$'], {
       cwd: repoPath,
       encoding: 'utf8',
       env,

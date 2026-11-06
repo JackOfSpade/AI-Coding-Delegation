@@ -1,4 +1,5 @@
 import { budgetWarningLine } from './budget-outlook.mjs';
+import { outputCapLine } from './output-cap.mjs';
 import { scratchFilesLine } from './scratch-audit.mjs';
 import { continuationBlocker, promptCacheSummary } from './continuation.mjs';
 import { verifierPreflightLines } from './verifier-preflight.mjs';
@@ -340,6 +341,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     spendLine,
     cacheLine,
     budgetWarningLine(job),
+    outputCapLine(job),
     ...verifierPreflightLines(job.verifierPreflight, { lean }),
     remaining,
     ...timingLines(job, { lean, elapsed }),

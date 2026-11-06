@@ -11,7 +11,13 @@ import {
 import { assertModelAllowed, modelPolicyViolation } from '../model-policy.mjs';
 import { plainObject } from '../plain-object.mjs';
 import { MAX_OPENAI_REASONING_ITEMS, cloneOpenAIReasoning, validOpenAIReasoning } from '../openai-reasoning.mjs';
-import { MAX_MESSAGE_CHARS, MAX_TOOL_ARGUMENT_CHARS, MAX_TOOL_CALLS, validToolIdentifier } from '../transcript-limits.mjs';
+import {
+  MAX_MESSAGE_CHARS,
+  MAX_TOOL_ARGUMENT_CHARS,
+  MAX_TOOL_CALLS,
+  largerTruncation,
+  validToolIdentifier,
+} from '../transcript-limits.mjs';
 
 const MAX_OUTPUT_ITEMS = 1_024;
 const MAX_CONTENT_PARTS = 256;
@@ -226,6 +232,7 @@ function responseOutput(json) {
     } else throw invalidResponse('Unsupported response output item');
   }
   const toolCalls = [];
+  let truncatedToolCall;
   for (const call of calls) {
     if ((call.status === undefined || call.status === 'completed') && validArguments(call.arguments)) {
       toolCalls.push({ id: call.id, name: call.name, arguments: call.arguments || '{}' });
@@ -235,9 +242,16 @@ function responseOutput(json) {
     // billed `length` response, not a malformed one: drop the unexecutable
     // fragment and let the loop's output-cap recovery see the finish reason.
     if (stop !== 'length') throw invalidResponse('Incomplete tool JSON');
+    truncatedToolCall = largerTruncation(truncatedToolCall, call.name, call.arguments.length);
   }
   stop ??= toolCalls.length ? 'tool_calls' : 'stop';
-  return { text: texts.join('\n'), openaiReasoning: reasoning.length ? cloneOpenAIReasoning(reasoning) : undefined, toolCalls, stop };
+  return {
+    text: texts.join('\n'),
+    openaiReasoning: reasoning.length ? cloneOpenAIReasoning(reasoning) : undefined,
+    toolCalls,
+    truncatedToolCall,
+    stop,
+  };
 }
 
 /** OpenAI Responses adapter for the official endpoint. Chat Completions there
@@ -370,11 +384,12 @@ export class OpenAIResponsesProvider {
       yield { usage, model: responseModel };
       throw error;
     }
-    const { text, openaiReasoning, toolCalls, stop } = output;
+    const { text, openaiReasoning, toolCalls, truncatedToolCall, stop } = output;
     if (text) yield { text, model: responseModel };
     if (openaiReasoning) yield { openaiReasoning, model: responseModel };
     if (toolCalls.length) yield { toolCalls, model: responseModel };
     yield { usage, model: responseModel };
+    if (truncatedToolCall) yield { truncatedToolCall };
     yield { providerFinishReason: stop };
   }
 }

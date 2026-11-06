@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, readdir, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { existsSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { JobStore } from '../../src/store.mjs';
 import { JobManager, creditExhaustions, validateJobId, validateJobRequest } from '../../src/job-manager.mjs';
@@ -245,6 +246,34 @@ test('a failed repair setup reports retention of its replacement workspace', asy
 
 test('direct Git patch application accepts only byte buffers', () => {
   assert.throws(() => gitPatchApplier(process.cwd(), 'diff --git a/a b/a\n', { reverse: false, check: true }), /patch must be a Buffer/);
+});
+test('direct Git patch application runs no configured clean, smudge or required filter', { skip: process.platform === 'win32' }, () => {
+  const repo = makeRepo();
+  const marker = join(tmpdir(), `offload-filter-marker-${process.pid}-${Date.now()}`);
+  try {
+    write(join(repo, '.gitattributes'), 'probed.txt filter=probe\n');
+    write(join(repo, 'probed.txt'), 'one\n');
+    git(repo, ['add', '.']);
+    git(repo, ['commit', '-m', 'probe fixture']);
+    write(join(repo, 'probed.txt'), 'two\n');
+    const patch = Buffer.from(execFileSync('git', ['diff'], { cwd: repo }));
+    git(repo, ['checkout', '--', 'probed.txt']);
+    // Configured after the fixture exists, so only the applier can reach them.
+    // A required filter whose command fails would make an unhardened apply fail.
+    git(repo, ['config', 'filter.probe.clean', `sh -c 'echo clean >> "${marker}"; cat'`]);
+    git(repo, ['config', 'filter.probe.smudge', `sh -c 'echo smudge >> "${marker}"; cat'`]);
+    git(repo, ['config', 'filter.probe.required', 'true']);
+    assert.deepEqual(gitPatchApplier(repo, patch, { reverse: false, check: true }), { dryRun: true, applied: false });
+    assert.equal(readFileSync(join(repo, 'probed.txt'), 'utf8'), 'one\n');
+    assert.deepEqual(gitPatchApplier(repo, patch, { reverse: false, check: false }), { dryRun: false, applied: true });
+    assert.equal(readFileSync(join(repo, 'probed.txt'), 'utf8'), 'two\n');
+    assert.deepEqual(gitPatchApplier(repo, patch, { reverse: true, check: false }), { dryRun: false, applied: true });
+    assert.equal(readFileSync(join(repo, 'probed.txt'), 'utf8'), 'one\n');
+    assert.equal(existsSync(marker), false, 'a configured Git filter ran during patch application');
+  } finally {
+    cleanup(repo);
+    rmSync(marker, { force: true });
+  }
 });
 test('async start and server verification produce a durable final report', async () => {
   const m = await manager({
@@ -3330,6 +3359,114 @@ test('a budget outlook reaches progress, the job and the report, and a later ok 
   assert.equal(done.status, 'BUDGET', done.error);
   assert.equal(done.budgetWarning, undefined, 'a stopped job is past the prediction');
   assert.doesNotMatch(done.report, /budget warning/);
+});
+
+test('the first output-cap diagnostic of a round is persisted, offset by prior turns, shown while running, and cleared by the next round', async () => {
+  const cap = { turn: 2, tool: 'write_file', chars: 45000, steer: 'write-in-parts' };
+  const steps = [];
+  const release = () => steps.shift()?.();
+  const m = await manager({
+    run: async (job, api) => {
+      if ((job.rounds || 0) === 0) {
+        await api.progress({ turn: 1, outputCap: { turn: 1, steer: 'continue' } });
+        await api.progress({ turn: 2 });
+        return { status: 'BUDGET', turns: 3 };
+      }
+      await api.progress({ turn: 1, outputCap: { turn: 'bad', steer: 'continue' } });
+      await api.progress({ turn: 1, outputCap: { turn: 1, steer: 'write-in-parts' } }); // a write steer without its call is malformed
+      await api.progress({ turn: 2, outputCap: cap });
+      await api.progress({ turn: 2, outputCap: { turn: 2, steer: 'continue' } });
+      await new Promise((resolve) => steps.push(resolve));
+      return { status: 'BUDGET', turns: 5 };
+    },
+  });
+  const start = await m.start({ task: 'cap', ownedPaths: ['src/**'], budget: { maxTurns: 10, maxUsd: 5 } });
+  const first = await m.wait(start.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
+  assert.equal(first.status, 'BUDGET', first.error);
+  assert.deepEqual(first.outputCap, {
+    turn: 1,
+    steer: 'continue',
+    recovered: true,
+    advice: 'Turn 1 hit the provider output cap before any tool call ran. The worker was given one continuation.',
+  });
+  assert.match(first.report, /^output cap: Turn 1 hit the provider output cap before any tool call ran\./m);
+  await m.store.update(start.jobId, { turns: 3, files: [{ path: 'src/a.mjs', status: 'M' }] });
+  await m.continue(start.jobId, { extraTurns: 5, extraUsd: 1 });
+  const until = async (check) => {
+    for (let i = 0; i < 400; i++) {
+      const job = await m.store.get(start.jobId);
+      if (check(job)) return job;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.fail('progress did not arrive');
+  };
+  // Two round-two events are malformed and one is a later cap; the first valid one is kept, offset by the 3 earlier turns.
+  const stored = await until((job) => job.rounds === 1 && job.outputCap?.turn === 5 && steps.length === 1);
+  assert.deepEqual(
+    stored.outputCap,
+    { ...cap, turn: 5, recovered: true },
+    'the later valid cap and the malformed ones did not replace or precede it',
+  );
+  const running = await m.wait(start.jobId, { timeoutSec: 0 });
+  assert.equal(running.status, 'REPAIRING', 'a continued round is active while it runs');
+  assert.deepEqual(running.progress.outputCap, {
+    turn: 5,
+    tool: 'write_file',
+    chars: 45000,
+    steer: 'write-in-parts',
+    recovered: true,
+    advice:
+      'Turn 5 hit the provider output cap inside a write_file call of about 44 KB, which was not run. The worker was told to write that file in parts (a small first part, then write_file append chunks of at most about 6 KB). A second cap fails the round with output-cap; if it does, continue or rebrief asking for large files to be built incrementally rather than retrying the same brief.',
+  });
+  assert.match(
+    running.progress.outputCap.advice,
+    /^Turn 5 hit the provider output cap inside a write_file call of about 44 KB, which was not run\./,
+  );
+  const shown = await m.job(start.jobId);
+  assert.deepEqual(shown.outputCap, running.progress.outputCap);
+  assert.match(shown.report, /^output cap: Turn 5 hit the provider output cap inside a write_file call of about 44 KB/m);
+  release();
+  const done = await m.wait(start.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
+  assert.equal(done.status, 'BUDGET', done.error);
+});
+
+test('a finished job shows the output-cap advice in the past tense, without predicting a second cap', async () => {
+  const cap = { turn: 3, tool: 'write_file', chars: 45000, steer: 'write-in-parts', recovered: true };
+  const what = 'Turn 3 hit the provider output cap inside a write_file call of about 44 KB, which was not run.';
+  const told =
+    ' The worker was told to write that file in parts (a small first part, then write_file append chunks of at most about 6 KB).';
+  const rebrief =
+    ' Continue or rebrief asking for large files to be built incrementally (a small first write_file, then append parts of at most about 6 KB) rather than retrying the same brief.';
+  const cases = [
+    { status: 'DONE', advice: `${what}${told}` },
+    {
+      status: 'FAILED',
+      advice: `${what}${told}${rebrief}`,
+      extra: { failureKind: 'output-cap', error: 'Worker exhausted output-cap recovery' },
+    },
+    {
+      status: 'FAILED',
+      recovered: false,
+      advice: `${what} No recovery turn was available, so the round stopped there.${rebrief}`,
+      extra: { failureKind: 'output-cap' },
+    },
+  ];
+  for (const { status, advice, extra, recovered } of cases) {
+    const m = await manager({ run: async () => assert.fail('this test queues without launching') });
+    const started = await m.start({ task: 'cap', ownedPaths: ['src/**'], budget: { maxTurns: 10, maxUsd: 1 } }, { launch: false });
+    await m.store.update(started.jobId, {
+      status,
+      turns: 3,
+      outputCap: { ...cap, ...(recovered === false ? { recovered } : {}) },
+      ...extra,
+    });
+    const shown = await m.job(started.jobId);
+    assert.equal(shown.outputCap.advice, advice, status);
+    assert.equal(shown.outputCap.recovered, recovered ?? true);
+    assert.match(shown.report, new RegExp(`^output cap: ${advice.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
+    if (status === 'DONE') assert.doesNotMatch(shown.report, /rebrief/i);
+    assert.doesNotMatch(shown.report, /A second cap fails the round/);
+  }
 });
 
 test('continuation events preserve the terminal status that requested the next round', async () => {

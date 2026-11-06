@@ -2,7 +2,13 @@ import { sseJson } from './sse.mjs';
 import { bestEffort, fetchAbortable, readJsonAbortable } from './abort.mjs';
 import { assertModelAllowed, isOpenAIEndpoint, modelPolicyViolation } from '../model-policy.mjs';
 import { plainObject } from '../plain-object.mjs';
-import { MAX_MESSAGE_CHARS, MAX_TOOL_ARGUMENT_CHARS, MAX_TOOL_CALLS, validToolIdentifier } from '../transcript-limits.mjs';
+import {
+  MAX_MESSAGE_CHARS,
+  MAX_TOOL_ARGUMENT_CHARS,
+  MAX_TOOL_CALLS,
+  largerTruncation,
+  validToolIdentifier,
+} from '../transcript-limits.mjs';
 
 export const DEFAULT_ATTEMPT_TIMEOUT_MS = 300_000;
 
@@ -412,6 +418,7 @@ function* chatResponseEvents(chunks, { openai, requestModel }) {
     }
   }
   const toolCalls = [];
+  let truncatedToolCall;
   for (const [, call] of [...calls.entries()].sort(([left], [right]) => left - right)) {
     let complete = Boolean(call.id && call.name);
     if (complete)
@@ -421,6 +428,8 @@ function* chatResponseEvents(chunks, { openai, requestModel }) {
         complete = false;
       }
     if (complete) toolCalls.push(call);
+    else if (providerFinishReason === 'length')
+      truncatedToolCall = largerTruncation(truncatedToolCall, call.name, (call.arguments || '').length);
     // An output cap can cut a tool call mid-arguments. That is a completed,
     // billed `length` response, not a malformed one: drop the unexecutable
     // fragment and let the loop's output-cap recovery see the finish reason.
@@ -439,6 +448,7 @@ function* chatResponseEvents(chunks, { openai, requestModel }) {
   // record. Surface that conflict too: otherwise a loop would account the
   // response yet proceed to execute a previously accumulated tool call.
   if (modelConflict && !conflictReported) yield { model, modelConflict: true };
+  if (truncatedToolCall) yield { truncatedToolCall };
   if (providerFinishReason !== undefined) yield { providerFinishReason };
 }
 

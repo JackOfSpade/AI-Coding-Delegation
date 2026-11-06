@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { cp, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { compareRuntimeIdentity, runtimeIdentity, runtimeIdentityFor } from '../../src/identity.mjs';
+import { RUNTIME_CAPABILITIES, compareRuntimeIdentity, runtimeIdentity, runtimeIdentityFor } from '../../src/identity.mjs';
 
 test('runtime identity is deterministic and stale decisions expose an actionable installed identity', () => {
   const loaded = runtimeIdentity();
@@ -103,5 +103,7 @@ test('runtime identity advertises the OpenAI credit tier as an additive capabili
   assert.equal(identity.capabilities.creditCooldown, true);
   assert.equal(identity.capabilities.compactPreflight, true);
   assert.equal(identity.capabilities.runnerScopedPreflight, true);
+  assert.equal(identity.capabilities.outputCapDiagnostic, true);
+  assert.equal(RUNTIME_CAPABILITIES.outputCapDiagnostic, true);
   assert.equal(identity.schemaRevision, 2, 'an additive capability does not bump the schema revision');
 });

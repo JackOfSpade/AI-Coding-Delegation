@@ -27,6 +27,7 @@ import { readUtf8FileSync } from './regular-file.mjs';
 import { plainObject } from './plain-object.mjs';
 import { skillCopyStatus, skillFileHash } from './skill-health.mjs';
 import { ECONOMY_SKILL, PREMIUM_SKILL, packagedSkillPath } from './command-skills.mjs';
+import { gitBinary } from './git-binary.mjs';
 
 const utf8File = (file) => readUtf8FileSync(file);
 const read = (file) => {
@@ -54,13 +55,18 @@ const gitProbe = (args, { env = process.env, platform = process.platform, spawnP
   const inertHooks = platform === 'win32' ? 'NUL' : '/dev/null';
   // Doctor needs only local plumbing. Do not give a repository config a
   // chance to invoke hooks/fsmonitor with provider credentials in scope.
-  return spawnProcess('git', ['--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${inertHooks}`, ...args], {
-    encoding: 'utf8',
-    timeout: 2_000,
-    maxBuffer: 64 * 1024,
-    windowsHide: true,
-    env: snapshotGitEnv(env),
-  });
+  const gitEnv = snapshotGitEnv(env);
+  return spawnProcess(
+    gitBinary(gitEnv, { platform }),
+    ['--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${inertHooks}`, ...args],
+    {
+      encoding: 'utf8',
+      timeout: 2_000,
+      maxBuffer: 64 * 1024,
+      windowsHide: true,
+      env: gitEnv,
+    },
+  );
 };
 const exactArgs = (value, bin) => Array.isArray(value) && value.length === 2 && value[0] === bin && value[1] === 'mcp';
 

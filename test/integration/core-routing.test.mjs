@@ -1206,6 +1206,7 @@ test('a no-id server listing does not bind its incidental cwd as a repository', 
     creditCooldown: true,
     compactPreflight: true,
     runnerScopedPreflight: true,
+    outputCapDiagnostic: true,
   });
   assert.match(result.health.server.buildHash, /^sha256:[0-9a-f]{64}$/);
   assert.match(result.health.server.skillHash, /^sha256:[0-9a-f]{64}$/);

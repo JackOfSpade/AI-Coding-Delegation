@@ -10,3 +10,9 @@ export const MAX_TOOL_ARGUMENT_CHARS = 512_000;
 /** A non-empty string of at most `max` characters with no C0 or DEL control character. */
 export const validToolIdentifier = (value, max) =>
   typeof value === 'string' && value.length > 0 && value.length <= max && !/[\x00-\x1F\x7F]/.test(value);
+
+// The largest tool call an output cap cut off, reported by provider adapters
+// (never executed) so the loop can steer its one-shot recovery away from
+// resending the same oversized call.
+export const largerTruncation = (current, name, chars) =>
+  typeof name === 'string' && name.length >= 1 && name.length <= 128 && (!current || chars > current.chars) ? { name, chars } : current;

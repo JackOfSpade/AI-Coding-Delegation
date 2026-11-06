@@ -15,6 +15,7 @@ import {
 import { matchesAny, normalizePath } from './glob.mjs';
 import { DEFAULT_DENY_READ } from './policy.mjs';
 import { redactText, stripTerminalControls } from './redact.mjs';
+import { gitBinary } from './git-binary.mjs';
 
 const TREE_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 const PRIVATE_ROOT_NAME = /^offload-worktree-[A-Za-z0-9_-]+$/; // no g/y flag: safe to share with .test()
@@ -666,7 +667,7 @@ function runRefTransaction(
   // object IDs. `update-ref --stdin` commits all updates as one transaction.
   const input = `start\n${commands.join('\n')}\nprepare\ncommit\n`;
   try {
-    execFileSync('git', ['-C', repoPath, '-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${hooks}`, 'update-ref', '--stdin'], {
+    execFileSync(gitBinary(env), ['-C', repoPath, '-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${hooks}`, 'update-ref', '--stdin'], {
       input,
       encoding: 'utf8',
       env,

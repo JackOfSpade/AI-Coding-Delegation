@@ -64,6 +64,67 @@ test('DeepSeek wire is unchanged', async () => {
   assert.equal(payload.messages[0].reasoning_content, 'r');
 });
 
+const toolDelta = (index, fields) => ({ model: 'gpt-6.1-terra', choices: [{ delta: { tool_calls: [{ index, ...fields }] } }] });
+const finishChunk = (reason) => ({ model: 'gpt-6.1-terra', choices: [{ delta: {}, finish_reason: reason }] });
+const usageChunk = { model: 'gpt-6.1-terra', choices: [], usage: { prompt_tokens: 3, completion_tokens: 1 } };
+const truncatedEvents = (events) => events.filter((event) => 'truncatedToolCall' in event);
+
+test('Chat: a length stop that cuts write_file yields one truncatedToolCall with the exact argument length just before the finish', async () => {
+  const partial = '{"path":"a.js","content":"export const';
+  const events = await drain(
+    openai(async () =>
+      sse(
+        toolDelta(0, { id: 'call_w', function: { name: 'write_file', arguments: partial.slice(0, 10) } }),
+        toolDelta(0, { function: { arguments: partial.slice(10) } }),
+        finishChunk('length'),
+        usageChunk,
+        '[DONE]',
+      ),
+    ),
+  );
+  assert.equal(
+    events.some((event) => event.toolCalls),
+    false,
+  );
+  assert.deepEqual(truncatedEvents(events), [{ truncatedToolCall: { name: 'write_file', chars: partial.length } }]);
+  assert.deepEqual(events.at(-2), { truncatedToolCall: { name: 'write_file', chars: partial.length } });
+  assert.deepEqual(events.at(-1), { providerFinishReason: 'length' });
+});
+
+test('Chat: with two truncated calls the larger one is reported', async () => {
+  const small = '{"path":"s"';
+  const large = '{"path":"big.js","content":"' + 'x'.repeat(500);
+  const events = await drain(
+    openai(async () =>
+      sse(
+        toolDelta(0, { id: 'call_a', function: { name: 'edit_file', arguments: small } }),
+        toolDelta(1, { id: 'call_b', function: { name: 'write_file', arguments: large } }),
+        finishChunk('length'),
+        usageChunk,
+        '[DONE]',
+      ),
+    ),
+  );
+  assert.deepEqual(truncatedEvents(events), [{ truncatedToolCall: { name: 'write_file', chars: large.length } }]);
+  assert.deepEqual(events.at(-1), { providerFinishReason: 'length' });
+});
+
+test('Chat: a complete non-length tool call yields no truncatedToolCall event', async () => {
+  const events = await drain(
+    openai(async () =>
+      sse(
+        toolDelta(0, { id: 'call_w', function: { name: 'write_file', arguments: '{"path":"a.js","content":"x"}' } }),
+        finishChunk('tool_calls'),
+        usageChunk,
+        '[DONE]',
+      ),
+    ),
+  );
+  assert.deepEqual(truncatedEvents(events), []);
+  assert.equal(events.find((event) => event.toolCalls).toolCalls.length, 1);
+  assert.deepEqual(events.at(-1), { providerFinishReason: 'tool_calls' });
+});
+
 test('OpenAI credit exhaustion detection table', async () => {
   const cases = [
     [429, { error: { code: 'credit_balance_exhausted', message: 'SECRET BODY' } }, true],

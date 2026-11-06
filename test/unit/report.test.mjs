@@ -1731,3 +1731,16 @@ test('a job started past cooling routes names the skipped routes, and only its o
     'provider transition: claude-opus-5-5 -> deepseek-flash (explicit credit exhaustion; work and conversation retained)',
   ]);
 });
+
+test('compactReport shows the output-cap diagnostic line only for a valid diagnostic', () => {
+  const lines = (job) =>
+    compactReport({ id: 'oj-1', status: 'RUNNING', ...job })
+      .split('\n')
+      .filter((line) => line.startsWith('output cap:'));
+  assert.deepEqual(lines({ outputCap: { turn: 3, tool: 'write_file', chars: 45000, steer: 'write-in-parts' } }), [
+    'output cap: Turn 3 hit the provider output cap inside a write_file call of about 44 KB, which was not run. The worker was told to write that file in parts (a small first part, then write_file append chunks of at most about 6 KB). A second cap fails the round with output-cap; if it does, continue or rebrief asking for large files to be built incrementally rather than retrying the same brief.',
+  ]);
+  assert.deepEqual(lines({}), []);
+  assert.deepEqual(lines({ outputCap: { turn: 'x', steer: 'continue' } }), []);
+  assert.deepEqual(lines({ outputCap: { turn: 3, steer: 'write-in-parts' } }), []);
+});

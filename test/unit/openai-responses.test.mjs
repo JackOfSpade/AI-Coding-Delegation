@@ -288,6 +288,47 @@ test('text-only responses finish with stop and reasoning without ciphertext is s
   assert.equal(events.at(-1).providerFinishReason, 'stop');
 });
 
+const lengthBody = (calls) => body(calls, { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } });
+const truncatedEvents = (events) => events.filter((event) => 'truncatedToolCall' in event);
+
+test('a length stop that cuts write_file yields one truncatedToolCall with the exact argument length just before the finish', async () => {
+  const partial = '{"path":"a.js","content":"export const';
+  const events = await drain(
+    provider(async () => json(lengthBody([callItem('call_1', partial, { status: 'incomplete', name: 'write_file' })]))),
+  );
+  assert.equal(
+    events.some((event) => event.toolCalls),
+    false,
+  );
+  assert.deepEqual(truncatedEvents(events), [{ truncatedToolCall: { name: 'write_file', chars: partial.length } }]);
+  assert.deepEqual(events.at(-2), { truncatedToolCall: { name: 'write_file', chars: partial.length } });
+  assert.deepEqual(events.at(-1), { providerFinishReason: 'length' });
+});
+
+test('with two truncated calls the larger one is reported', async () => {
+  const small = '{"path":"s"';
+  const large = '{"path":"big.js","content":"' + 'x'.repeat(500);
+  const events = await drain(
+    provider(async () =>
+      json(
+        lengthBody([
+          callItem('call_1', small, { status: 'incomplete', name: 'edit_file' }),
+          callItem('call_2', large, { status: 'incomplete', name: 'write_file' }),
+        ]),
+      ),
+    ),
+  );
+  assert.deepEqual(truncatedEvents(events), [{ truncatedToolCall: { name: 'write_file', chars: large.length } }]);
+  assert.deepEqual(events.at(-1), { providerFinishReason: 'length' });
+});
+
+test('a complete non-length response yields no truncatedToolCall event', async () => {
+  const events = await drain(provider(async () => json(body([callItem('call_1', '{"path":"a"}')]))));
+  assert.deepEqual(truncatedEvents(events), []);
+  assert.equal(events.find((event) => event.toolCalls).toolCalls.length, 1);
+  assert.deepEqual(events.at(-1), { providerFinishReason: 'tool_calls' });
+});
+
 test('incomplete responses map to length or content_filter and drop a partial call', async () => {
   const capped = await drain(
     provider(async () =>

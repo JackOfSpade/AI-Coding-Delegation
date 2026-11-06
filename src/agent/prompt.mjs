@@ -2,7 +2,7 @@ import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { PAGE_PAYLOAD, splitRelevantPath } from '../budget-sizing.mjs';
 import { readRegularFile } from '../regular-file.mjs';
-import { DEFAULT_OUTPUT_CAP, DEFAULT_READ_CAP } from './tools.mjs';
+import { DEFAULT_OUTPUT_CAP, DEFAULT_READ_CAP, INCREMENTAL_WRITE_BYTES, INCREMENTAL_WRITE_LINES } from './tools.mjs';
 
 const MAX_CONVENTIONS_BYTES = 128 * 1024;
 const MAX_RELEVANT_PATHS = 50;
@@ -20,6 +20,10 @@ export const WORKER_GENERATOR_DEPENDENCY_RULE =
   'Never stub, fake, mock, or replace an import or dependency to run a generator whose output will be integrated. Generated files must come from the real dependencies. If a required dependency is missing, leave the generator unrun and report the missing dependency and blocked generator in finish.concerns so the primary can run it with the real environment. List only checks actually run in finish.testsRun; a passing server verifier does not validate output produced with fake dependencies.';
 export const WORKER_SCRATCH_CLEANUP_RULE =
   'Scratch files: anything you create in an owned path is integrated with your changes. Keep throwaway scripts and helper files out of the repository where you can, delete the ones you create as soon as they have served their purpose rather than at the end, and list any you could not delete in finish.concerns.';
+// A provider output cap cuts a response off mid tool call, and the cut call
+// never runs. One large write_file is the usual cause, and the same call
+// fails the same way when retried, so large files are built in parts.
+export const WORKER_INCREMENTAL_WRITE_RULE = `File size per call: never put more than about ${INCREMENTAL_WRITE_LINES} lines or ${INCREMENTAL_WRITE_BYTES / 1024} KB of file content in one tool call. Build a larger file incrementally: write_file a small first part (for example a skeleton or the first section), then add each next part with write_file append true, one part per tool call. A response cut off by the output cap runs none of its tool calls, so an oversized write is lost and must be redone.`;
 // Keep the terminal protocol after repository conventions too: a normal
 // assistant summary ends an Anthropic turn, but does not complete an Offload job.
 export const WORKER_COMPLETION_RULE =
@@ -137,8 +141,9 @@ export async function buildSystemPrompt({
     WORKER_VERIFIER_INTERPRETER_RULE,
     WORKER_GENERATOR_DEPENDENCY_RULE,
     reportMode ? '' : WORKER_SCRATCH_CLEANUP_RULE,
+    reportMode ? '' : WORKER_INCREMENTAL_WRITE_RULE,
     !reportMode && finiteRemainingTurns
-      ? `You have ${finiteRemainingTurns} model turn${finiteRemainingTurns === 1 ? '' : 's'} available. Batch independent reads and lists, then after their required reads make an allowed tool call immediately. Do not emit source code, a plan, progress update, or other narrative outside tool calls; put source only in write_file.content. Prefer read_file, list_dir, glob, and grep for ordinary inspection. When read_file returns [truncated; next offset N], continue that file with exactly offset N. ${allowCommand ? (serverVerifierConfigured ? 'The configured focused verifier runs server-side after finish, so reserve one final response containing only finish rather than rerunning or searching for tests. ' : 'Reserve run_command for focused build, test, or diagnostic work after changes. ') : ''}Prefer writing complete final file content with write_file over a write-then-edit sequence. If several new files are needed, write one complete file per tool-call response, then continue with the next file. edit_file requires a fresh read of that file, including after write_file. Reserve time for the configured verifier and the mandatory single finish call.`
+      ? `You have ${finiteRemainingTurns} model turn${finiteRemainingTurns === 1 ? '' : 's'} available. Batch independent reads and lists, then after their required reads make an allowed tool call immediately. Do not emit source code, a plan, progress update, or other narrative outside tool calls; put source only in write_file.content. Prefer read_file, list_dir, glob, and grep for ordinary inspection. When read_file returns [truncated; next offset N], continue that file with exactly offset N. ${allowCommand ? (serverVerifierConfigured ? 'The configured focused verifier runs server-side after finish, so reserve one final response containing only finish rather than rerunning or searching for tests. ' : 'Reserve run_command for focused build, test, or diagnostic work after changes. ') : ''}Prefer writing complete final file content with write_file over a write-then-edit sequence, within the per-call size rule; build a larger file with write_file append parts instead. If several new files are needed, write one complete file per tool-call response, then continue with the next file. edit_file requires a fresh read of that file, including after write_file. Reserve time for the configured verifier and the mandatory single finish call.`
       : '',
     reportMode
       ? `You must call finish with a concise summary and your detailed findings in its report field (up to 256000 characters), plus concerns and testsRun. ${FINISH_ALONE_RULE}`

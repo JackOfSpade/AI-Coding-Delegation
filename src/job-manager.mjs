@@ -34,6 +34,7 @@ import { isolatedDependencyReadPaths, sameWorktreePath } from './worktree.mjs';
 import { classifyVerifierEnvironment, isVerifierEnvironmentKind } from './verify-env.mjs';
 import { continuationBlocker, promptCacheSummary } from './continuation.mjs';
 import { budgetWarning, safeBudgetOutlook } from './budget-outlook.mjs';
+import { outputCapView, safeOutputCap } from './output-cap.mjs';
 import { MAX_PATH_LENGTH, revertPathsProblem, safeRevertPath, safeRevertPaths } from './revert-paths.mjs';
 import { scratchFiles } from './scratch-audit.mjs';
 import { compactVerifierPreflight, narrowTestCommand, preflightVerifier, verifierBlockingMessage } from './verifier-preflight.mjs';
@@ -2116,6 +2117,9 @@ export class JobManager {
           // authenticated for real Core stores and awaited before AgentLoop is
           // allowed to cross the provider POST boundary.
           let cappedFinishRecoveryState = job.cappedFinishRecovery;
+          // Keep the round's first output-cap diagnostic: that is the early
+          // warning, and a resumed worker must not replace it.
+          let roundOutputCapSeen = safeOutputCap(job.outputCap) !== undefined;
           let budgetFinishRecoveryState = job.budgetFinishRecovery;
           let providerStageState = recordedProviderStage(job);
           let providerTransitionsState = Array.isArray(job.providerTransitions) ? job.providerTransitions : [];
@@ -2214,6 +2218,17 @@ export class JobManager {
               if (budgetReservation) progress.budgetReservation = budgetReservation;
               const outlook = safeBudgetOutlook(event?.budgetOutlook);
               if (outlook) progress.budgetOutlook = outlook.level === 'ok' ? undefined : outlook;
+              // The first capped, tool-less turn of the round, shown to the
+              // primary while it can still act on it. Its turn is counted like
+              // `turns`, across this job's rounds.
+              const outputCap = safeOutputCap(event?.outputCap);
+              if (outputCap && !roundOutputCapSeen && finiteCount((job.turns || 0) + outputCap.turn)) {
+                const placed = safeOutputCap({ ...outputCap, turn: (job.turns || 0) + outputCap.turn });
+                if (placed) {
+                  roundOutputCapSeen = true;
+                  progress.outputCap = placed;
+                }
+              }
               const actions = Array.isArray(event?.recentActions)
                 ? event.recentActions
                 : Array.isArray(event?.actions)
@@ -2820,6 +2835,7 @@ export class JobManager {
                   providerFinishReason: undefined,
                   budgetReservation: undefined,
                   budgetOutlook: undefined,
+                  outputCap: undefined,
                   roundQueue: this.#roundQueue(this.#nowMs()),
                   activity: undefined,
                   ...ROUND_SCOPED_VERIFIER_STATE,
@@ -3265,6 +3281,7 @@ export class JobManager {
         : {}),
       ...(promptCacheSummary(job.usage) ? { promptCache: promptCacheSummary(job.usage) } : {}),
       ...(budgetWarning(job) ? { budgetWarning: budgetWarning(job) } : {}),
+      ...(outputCapView(job) ? { outputCap: outputCapView(job) } : {}),
       ...(applyBlocker(job) ? { applyBlocker: applyBlocker(job) } : {}),
       ...(job.mode !== 'report' && scratchFiles(job) ? { scratchFiles: scratchFiles(job) } : {}),
       ...(['BUDGET', 'TIMEOUT', 'FAILED'].includes(job.status) && continuationBlocker(job)
@@ -3318,6 +3335,7 @@ export class JobManager {
         value.costUsd,
         value.recentActions || [],
         value.applyVerify?.phase,
+        safeOutputCap(value.outputCap)?.turn ?? null,
         stall ? [stall.kind, stall.level] : null,
         cancelRequested,
       ]);
@@ -3361,6 +3379,7 @@ export class JobManager {
       recentActions: job.recentActions || [],
       status: job.status,
       ...(budgetWarning(job) ? { budgetWarning: budgetWarning(job) } : {}),
+      ...(outputCapView(job) ? { outputCap: outputCapView(job) } : {}),
       ...(activity
         ? {
             phase: {
@@ -3845,6 +3864,7 @@ export class JobManager {
         providerFinishReason: undefined,
         budgetReservation: undefined,
         budgetOutlook: undefined,
+        outputCap: undefined,
         ...(workspace
           ? {
               workspacePath: workspace.path,

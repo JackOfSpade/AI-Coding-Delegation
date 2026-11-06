@@ -16,7 +16,7 @@ import {
   validAnthropicContent,
   validText,
 } from '../anthropic-content.mjs';
-import { MAX_TOOL_ARGUMENT_CHARS, MAX_TOOL_CALLS, validToolIdentifier } from '../transcript-limits.mjs';
+import { MAX_TOOL_ARGUMENT_CHARS, MAX_TOOL_CALLS, largerTruncation, validToolIdentifier } from '../transcript-limits.mjs';
 
 export const DEFAULT_ANTHROPIC_VERSION = '2023-06-01';
 const MAX_SSE_EVENT_BYTES = 1_000_000;
@@ -404,6 +404,7 @@ export class AnthropicMessagesProvider {
       const toolCalls = [];
       const anthropicContent = [];
       let hasThinking = false;
+      let truncatedToolCall;
       for (const [, block] of [...blocks.entries()].sort(([a], [b]) => a - b)) {
         if (block.type === 'text') {
           text += block.text;
@@ -416,7 +417,10 @@ export class AnthropicMessagesProvider {
             // max_tokens can cut a tool call mid-input. That is a completed,
             // billed `length` response, not a malformed one: drop the
             // unexecutable fragment and let output-cap recovery see the reason.
-            if (stop === 'length') continue;
+            if (stop === 'length') {
+              truncatedToolCall = largerTruncation(truncatedToolCall, block.name, (block.input || '').length);
+              continue;
+            }
             throw new ProviderError('Incomplete Anthropic tool JSON', { kind: 'response' });
           }
           toolCalls.push({ id: block.id, name: block.name, arguments: block.input || '{}' });
@@ -449,6 +453,7 @@ export class AnthropicMessagesProvider {
       const usage = normalizedUsage(inputUsage, outputUsage);
       usageYielded = true;
       yield { usage, model: modelName };
+      if (truncatedToolCall) yield { truncatedToolCall };
       if (stop !== undefined) yield { providerFinishReason: stop };
     } catch (error) {
       if (billed && !usageYielded) yield billed;

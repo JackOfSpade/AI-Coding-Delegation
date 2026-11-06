@@ -1,4 +1,3 @@
-import { execFileSync } from 'node:child_process';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -28,7 +27,7 @@ import {
   resolveVerifierInterpreters,
   verifierPythonStatus,
 } from './verify-interpreter.mjs';
-import { snapshotWorkingTree, diffTrees, diffTreeFiles, git as snapshotGit, snapshotGitEnv } from './git-snapshot.mjs';
+import { snapshotWorkingTree, diffTrees, diffTreeFiles, git as snapshotGit } from './git-snapshot.mjs';
 import {
   createIsolatedWorktree,
   openIsolatedWorktree,
@@ -278,38 +277,15 @@ export function gitSnapshots() {
 export function gitPatchApplier(repoPath, patch, { reverse, check }) {
   if (!Buffer.isBuffer(patch)) throw new TypeError('patch must be a Buffer');
   // A reverse check is compulsory even when application was requested.
-  const env = snapshotGitEnv();
-  const hooks = process.platform === 'win32' ? 'NUL' : '/dev/null';
-  // Apply exactly the byte-oriented tree semantics used by snapshots. In
-  // particular, a host-wide core.autocrlf setting must not rewrite a raw
-  // stored patch between apply and reverse/reconciliation on Windows.
-  const hardening = [
-    '-C',
-    repoPath,
-    '-c',
-    'core.fsmonitor=false',
-    '-c',
-    `core.hooksPath=${hooks}`,
-    '-c',
-    'core.autocrlf=false',
-    '-c',
-    'core.eol=lf',
-  ];
-  execFileSync('git', [...hardening, 'apply', ...(reverse ? ['-R'] : []), '--check'], {
-    input: patch,
-    encoding: 'buffer',
-    env,
-    timeout: 30_000,
-    maxBuffer: 64 * 1024 * 1024,
-  });
-  if (!check)
-    execFileSync('git', [...hardening, 'apply', ...(reverse ? ['-R'] : [])], {
-      input: patch,
-      encoding: 'buffer',
-      env,
-      timeout: 30_000,
-      maxBuffer: 64 * 1024 * 1024,
-    });
+  // `git apply` reads and writes working-tree files through the configured
+  // clean and smudge filters, so it goes through the same hardened runner as
+  // snapshots: every configured filter disabled, inert hooks, no fsmonitor,
+  // the byte-oriented autocrlf/eol settings (a host-wide core.autocrlf must not
+  // rewrite a raw stored patch between apply and reconciliation on Windows),
+  // and the credential-free Git environment.
+  const args = ['apply', ...(reverse ? ['-R'] : [])];
+  snapshotGit(repoPath, [...args, '--check'], {}, { input: patch, output: 'buffer' });
+  if (!check) snapshotGit(repoPath, args, {}, { input: patch, output: 'buffer' });
   return { dryRun: !!check, applied: !check };
 }
 export function createCore({ store, runner, worker, snapshots, leases, config = {}, now, sessionStartedAt } = {}) {

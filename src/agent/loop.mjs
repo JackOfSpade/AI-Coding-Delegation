@@ -16,6 +16,13 @@ import { MAX_BATCH_COMMAND_SEC } from '../timing.mjs';
 import { anthropicContentMatchesAssistant, cloneAnthropicContent, validAnthropicContent } from '../anthropic-content.mjs';
 import { cloneOpenAIReasoning, validOpenAIReasoning } from '../openai-reasoning.mjs';
 import { plainObject } from '../plain-object.mjs';
+import {
+  LARGE_EDIT_CAPPED_REMINDER,
+  LARGE_WRITE_CAPPED_REMINDER,
+  outputCapReminder,
+  outputCapSteer,
+  validTruncatedToolCall,
+} from '../output-cap.mjs';
 import { MAX_MESSAGE_CHARS, MAX_TOOL_ARGUMENT_CHARS, MAX_TOOL_CALLS, validToolIdentifier } from '../transcript-limits.mjs';
 
 // Progress is advisory and goes to the job store, whose write can wait on a busy
@@ -146,13 +153,15 @@ const successfulDirectWriteInTranscript = (messages) => {
 const cappedImplementationRecoveryPendingInTranscript = (messages) =>
   messages.length >= 2 &&
   messages.at(-1)?.role === 'user' &&
-  messages.at(-1)?.content === CAPPED_IMPLEMENTATION_RECOVERY_REMINDER &&
+  // The one post-write continuation carries one of these fixed reminders: the
+  // generic one, or the write-in-parts steer after a large write was cut off.
+  [CAPPED_IMPLEMENTATION_RECOVERY_REMINDER, LARGE_WRITE_CAPPED_REMINDER, LARGE_EDIT_CAPPED_REMINDER].includes(messages.at(-1)?.content) &&
   messages.at(-2)?.role === 'assistant' &&
   typeof messages.at(-2)?.content === 'string' &&
   !Object.hasOwn(messages.at(-2), 'tool_calls');
 const implementationCheckpoint = (remainingTurns) => {
   const prefix = `Implementation checkpoint: ${remainingTurns} model turn${remainingTurns === 1 ? '' : 's'} remain.`;
-  return `${prefix} The next response must make an allowed tool call. If necessary information remains unread, read or list it now; otherwise make a mutation immediately. Put source only in write_file.content. To avoid output caps, write one complete file per response when multiple files are material. Finish when complete.`;
+  return `${prefix} The next response must make an allowed tool call. If necessary information remains unread, read or list it now; otherwise make a mutation immediately. Put source only in write_file.content. To avoid output caps, write one file per response when multiple files are material, and build any file larger than about 6 KB in parts with write_file append. Finish when complete.`;
 };
 const verifierCompletionCheckpoint = (remainingTurns) => {
   const prefix = `Completion checkpoint: ${remainingTurns} model turn${remainingTurns === 1 ? '' : 's'} remain.`;
@@ -630,6 +639,7 @@ export class AgentLoop {
           toolCallRecords = 0,
           anthropicContentRecords = 0,
           openaiReasoningRecords = 0,
+          truncatedToolCall,
           unauthorizedResponseModel,
           modelConflict = false;
         const usageCharges = [];
@@ -896,6 +906,7 @@ export class AgentLoop {
               (event.model !== undefined && !validMetadata(event.model)) ||
               (event.modelConflict !== undefined && typeof event.modelConflict !== 'boolean') ||
               (event.providerFinishReason !== undefined && !PROVIDER_FINISH_REASONS.has(event.providerFinishReason)) ||
+              (event.truncatedToolCall !== undefined && !validTruncatedToolCall(event.truncatedToolCall)) ||
               (event.toolCalls !== undefined &&
                 (!Array.isArray(event.toolCalls) ||
                   event.toolCalls.length > MAX_TOOL_CALLS ||
@@ -917,6 +928,9 @@ export class AgentLoop {
               reasoningWasExplicitString = true;
               reasoning += event.reasoning;
             }
+            // Diagnostic only: a dropped fragment is never executed or replayed.
+            if (event.truncatedToolCall !== undefined && (!truncatedToolCall || event.truncatedToolCall.chars > truncatedToolCall.chars))
+              truncatedToolCall = { name: event.truncatedToolCall.name, chars: event.truncatedToolCall.chars };
             // Adapters must emit one normalized, terminal tool-call event.  In
             // particular, never accept a later event that silently replaces a
             // previously authorized call list from a custom provider.
@@ -1077,6 +1091,21 @@ export class AgentLoop {
         // remain non-thinking for the rest of this conversation.
         if (calls.length && !reasoning) deepSeekNonThinkingReplay = true;
         if (!calls.length) {
+          // What a capped, tool-less turn tells the worker and the primary. A
+          // provider-supplied name counts only when it is a tool this turn
+          // advertised, so no arbitrary provider text reaches either.
+          const cappedCall =
+            providerFinishReason === 'length' && truncatedToolCall && activeToolNames.has(truncatedToolCall.name)
+              ? truncatedToolCall
+              : undefined;
+          const capSteer = outputCapSteer(cappedCall);
+          // `recovered` says whether this turn earns a continuation request.
+          const outputCapFor = (recovered) => ({
+            turn,
+            ...(cappedCall ? { tool: cappedCall.name, chars: cappedCall.chars } : {}),
+            steer: capSteer,
+            recovered,
+          });
           // A direct source mutation is durable, but a provider can cap before
           // the next allowed tool call while the worker is still planning a
           // later file. Permit one—not a retry loop—crash-safe implementation
@@ -1099,10 +1128,17 @@ export class AgentLoop {
             // a later resume must see both this authenticated state and the
             // exact internal tail before it can send the one allowed
             // implementation-continuation request.
-            await this.persistCappedFinishRecovery({ action: 'provider_capped_finish_recovery_queued', cappedFinishRecovery: 'queued' });
+            await this.persistCappedFinishRecovery({
+              action: 'provider_capped_finish_recovery_queued',
+              cappedFinishRecovery: 'queued',
+              outputCap: outputCapFor(true),
+            });
             cappedFinishRecoveryState = 'queued';
             cappedFinishRecoveryUsed = true;
-            await this.context.addBatch([assistant, { role: 'user', content: CAPPED_IMPLEMENTATION_RECOVERY_REMINDER }]);
+            await this.context.addBatch([
+              assistant,
+              { role: 'user', content: outputCapReminder(capSteer) ?? CAPPED_IMPLEMENTATION_RECOVERY_REMINDER },
+            ]);
             await this.context.flush();
             cappedFinishRecoveryPending = true;
             continue;
@@ -1124,10 +1160,23 @@ export class AgentLoop {
             cappedReasoningContinuationUsed = true;
             await this.context.addBatch([
               assistant,
-              { role: 'user', content: forcedImplementationFocus ? FORCED_FOCUS_CAPPED_REASONING_REMINDER : CAPPED_REASONING_REMINDER },
+              {
+                role: 'user',
+                content:
+                  outputCapReminder(capSteer) ??
+                  (forcedImplementationFocus ? FORCED_FOCUS_CAPPED_REASONING_REMINDER : CAPPED_REASONING_REMINDER),
+              },
             ]);
             if (forcedImplementationFocus) forcedImplementationFocusContinuationPending = true;
-            await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'provider_output_capped_continue' });
+            await this.progress?.({
+              turn,
+              usage: totalUsage,
+              costUsd: this.meter.usd,
+              action: 'provider_output_capped_continue',
+              // Report finalization never sends the continuation (its next
+              // turn ends the round), so it reports no recovery it cannot make.
+              ...(reportFinalizationUsed ? {} : { outputCap: outputCapFor(true) }),
+            });
             continue;
           }
           // A capped response may resume with an uncapped,
@@ -1180,14 +1229,21 @@ export class AgentLoop {
             await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'provider_no_finish_recover' });
             continue;
           }
+          // A large write cut off by the cap is the output-cap failure even
+          // when no recovery turn was available (no finite budget, the last
+          // turn, or the one-shot already spent): its continuation must say
+          // to write in parts, not merely to call finish.
           const outputCapRecoveryExhausted =
-            (cappedReasoningContinuationUsed || cappedFinishRecoveryUsed) &&
-            maxTokens !== undefined &&
             usageRecords === 1 &&
-            providerFinishReason === 'length';
+            providerFinishReason === 'length' &&
+            (((cappedReasoningContinuationUsed || cappedFinishRecoveryUsed) && maxTokens !== undefined) || capSteer !== 'continue');
           this.context.add(assistant);
           await this.context.flush();
           await settleCappedImplementationRecovery();
+          // The primary hears about a terminal cap too; the manager keeps the
+          // round's first diagnostic, so an earlier recovered one stands.
+          if (providerFinishReason === 'length' && usageRecords === 1)
+            await this.progress?.({ turn, action: 'provider_output_capped_final', outputCap: outputCapFor(false) });
           return responseOutcome('FAILED', turn, responseModel, {
             // A closed, worker-side cause that offload_continue may resume. A
             // content-filter stop is the provider's, and would simply recur.

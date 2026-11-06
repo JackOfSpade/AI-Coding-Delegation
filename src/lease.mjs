@@ -21,6 +21,7 @@ import { normalizePath, pathsOverlap } from './glob.mjs';
 import { atomicWrite, snapshotGitEnv } from './git-snapshot.mjs';
 import { pidAlive as defaultPidAlive } from './pid.mjs';
 import { sameFileIdentity as sameIdentity, sameStatFields } from './stat-identity.mjs';
+import { gitBinary } from './git-binary.mjs';
 
 const MAX_LEASE_FILES = 512;
 const MAX_LOCK_BYTES = 64 * 1024;
@@ -316,14 +317,19 @@ export function getGitDir(repoPath, { execFile = execFileSync, env = process.env
   // This is a local plumbing query, so it needs neither provider credentials
   // nor repository hook/fsmonitor execution. Keep its environment contract
   // aligned with the snapshot path used for tree construction.
-  const value = execFile('git', ['-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${inertHooks}`, 'rev-parse', '--git-dir'], {
-    cwd: repoPath,
-    encoding: 'utf8',
-    env: snapshotGitEnv(env),
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 30_000,
-    maxBuffer: 1024 * 1024,
-  }).trim();
+  const gitEnv = snapshotGitEnv(env);
+  const value = execFile(
+    gitBinary(gitEnv, { platform }),
+    ['-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${inertHooks}`, 'rev-parse', '--git-dir'],
+    {
+      cwd: repoPath,
+      encoding: 'utf8',
+      env: gitEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+    },
+  ).trim();
   // Tests and callers can explicitly select the Git platform; do not let the
   // host's path implementation reinterpret a POSIX fixture on Windows.
   const paths = platform === 'win32' ? win32 : posix;

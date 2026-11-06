@@ -11,6 +11,7 @@ import { OpenAIChatProvider, ProviderError } from '../../src/provider/openai-cha
 import { CreditFallbackProvider } from '../../src/provider/fallback.mjs';
 import { JobStore } from '../../src/store.mjs';
 import { FAILURE_ERRORS, continuableFailure, wallTimeoutError } from '../../src/failure.mjs';
+import { LARGE_EDIT_CAPPED_REMINDER, LARGE_WRITE_CAPPED_REMINDER } from '../../src/output-cap.mjs';
 import { cleanup, tempDir } from './helpers.mjs';
 
 const call = (name, argText = '{}', id = 'id') => ({ id, name, arguments: argText });
@@ -1478,7 +1479,7 @@ test('finite write jobs persist one implementation checkpoint after durable disc
   assert.equal(
     requests[2].messages.at(-1).content,
     checkpoint +
-      ' The next response must make an allowed tool call. If necessary information remains unread, read or list it now; otherwise make a mutation immediately. Put source only in write_file.content. To avoid output caps, write one complete file per response when multiple files are material. Finish when complete.',
+      ' The next response must make an allowed tool call. If necessary information remains unread, read or list it now; otherwise make a mutation immediately. Put source only in write_file.content. To avoid output caps, write one file per response when multiple files are material, and build any file larger than about 6 KB in parts with write_file append. Finish when complete.',
   );
   assert.deepEqual(requests[2].tools, requests[0].tools, 'the generic checkpoint keeps the complete job-authorized schema');
   assert.ok(!Object.hasOwn(requests[2].options, 'thinking'), 'generic providers retain the advisory focus request');
@@ -4503,6 +4504,41 @@ test('a finish-protocol or unadvertised-tool violation on the report finalizatio
   assert.equal(unadvertised.requests.length, 2);
 });
 
+test('a capped report finalization turn continues without reporting an output-cap diagnostic', async () => {
+  const rates = { peak: 1, off_peak: 1 };
+  const pricing = { models: { mock: { usd_per_1m: { input_cache_hit: rates, input_cache_miss: rates, output: rates } } } };
+  const findings = 'Evidence from the survey. '.repeat(4800);
+  const requests = [];
+  const progress = [];
+  const result = await new AgentLoop({
+    provider: {
+      async *chat(request) {
+        requests.push(request);
+        if (requests.length === 1) yield { model: 'mock', toolCalls: [call('read_file', '{"path":"survey.txt"}')] };
+        else if (requests.length === 2) yield { model: 'mock', text: 'planning the report' };
+        else yield { model: 'mock', toolCalls: [call('finish', '{"summary":"Partial","report":"Saved survey findings."}')] };
+        yield { usage: { inputTokens: 100, outputTokens: 20 } };
+        if (requests.length === 2) yield { providerFinishReason: 'length' };
+      },
+    },
+    model: 'mock',
+    pricing,
+    maxUsd: 0.2,
+    maxTurns: 80,
+    reportMode: true,
+    progress: async (event) => progress.push(structuredClone(event)),
+    toolDefinitions: availableToolDefinitions({ readOnly: true }),
+    tools: { execute: async (name, args) => (name === 'finish' ? { finish: args } : findings) },
+  }).run({ task: 'Survey the repository' });
+  // Finalization never sends the continuation: the next turn ends the round.
+  assert.equal(result.status, 'BUDGET');
+  assert.equal(result.error, 'Report finalization did not finish');
+  assert.equal(requests.length, 2);
+  assert.ok(progress.some((event) => event.action === 'report_budget_finalize'));
+  assert.ok(progress.some((event) => event.action === 'provider_output_capped_continue'));
+  assert.ok(!progress.some((event) => Object.hasOwn(event, 'outputCap')));
+});
+
 test('report uses its last allowed turn to finish even with unlimited USD', async () => {
   const requests = [];
   const result = await new AgentLoop({
@@ -5004,13 +5040,19 @@ test('the budget outlook counts correction spend and forgets the prices from bef
       maxTurns: 60,
       progress: (event) => events.push(event),
     }).run({ task: 'x' });
-    return events.filter((event) => event.budgetOutlook).map((event) => event.budgetOutlook);
+    const outlooks = events.filter((event) => event.budgetOutlook);
+    return Object.assign(
+      outlooks.map((event) => event.budgetOutlook),
+      { firstTurn: outlooks[0]?.turn },
+    );
   };
   const plain = await run({});
   assert.ok(plain.length > 0);
+  assert.ok(Number.isSafeInteger(plain.firstTurn) && plain.firstTurn > 6);
   // A hop just before the first warning restarts the history: nothing is projected
-  // from the old route's prices until six turns have run on the new one.
-  const hopped = await run({ hopAt: 12 });
+  // from the old route's prices until six turns have run on the new one. The turn
+  // follows from the request size, so it is taken from the plain run.
+  const hopped = await run({ hopAt: plain.firstTurn });
   const requestUsd = 0.012;
   assert.ok(hopped.length > 0);
   assert.ok(Math.abs(plain[0].remainingUsd - hopped[0].remainingUsd - 6 * requestUsd) < 1e-9);
@@ -5019,4 +5061,248 @@ test('the budget outlook counts correction spend and forgets the prices from bef
   const corrected = (await run({ corrections: 2, maxUsd: 0.15 }))[0];
   assert.ok(Math.abs(lean.avgTurnUsd - requestUsd) < 1e-9);
   assert.ok(Math.abs(corrected.avgTurnUsd - (8 * requestUsd) / 6) < 1e-9, 'eight requests paid for over six recorded turns');
+});
+
+const CAPPED_REASONING_TEXT = 'Continue using an allowed tool call. When complete, call finish as the sole tool call.';
+const FINISH_EVENT = { toolCalls: [call('finish', '{"summary":"done"}', 'finish')], usage: { inputTokens: 0, outputTokens: 1 } };
+const FINISH_TOOLS = { execute: async () => ({ finish: { summary: 'done', concerns: [], testsRun: [] } }) };
+
+// Runs one capped, tool-less first turn carrying `truncated` (or none), then a finish.
+async function cappedPreWrite(truncated) {
+  const requests = [];
+  const progress = [];
+  let calls = 0;
+  const result = await new AgentLoop({
+    provider: {
+      async *chat(options) {
+        requests.push(structuredClone(options.messages));
+        calls++;
+        if (calls === 1) {
+          yield { usage: { inputTokens: 0, outputTokens: 4_096 } };
+          if (truncated) yield { truncatedToolCall: truncated };
+          yield { providerFinishReason: 'length' };
+        } else yield FINISH_EVENT;
+      },
+    },
+    tools: FINISH_TOOLS,
+    model: 'm',
+    pricing: priceTable(['m']),
+    maxUsd: 1,
+    maxTurns: 3,
+    progress: async (event) => progress.push(event),
+  }).run({ task: 'x' });
+  const capEvents = progress.filter((event) => event.action === 'provider_output_capped_continue');
+  assert.equal(capEvents.length, 1);
+  return { result, requests, outputCap: capEvents[0].outputCap };
+}
+
+test('a large truncated write_file steers the worker to write in parts', async () => {
+  const { result, requests, outputCap } = await cappedPreWrite({ name: 'write_file', chars: 45_000 });
+  assert.equal(result.status, 'DONE');
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[1].at(-1), { role: 'user', content: LARGE_WRITE_CAPPED_REMINDER });
+  assert.deepEqual(outputCap, { turn: 1, tool: 'write_file', chars: 45_000, steer: 'write-in-parts', recovered: true });
+});
+
+test('a small truncated write_file or no truncation keeps the generic capped reminder', async () => {
+  const small = await cappedPreWrite({ name: 'write_file', chars: 100 });
+  assert.equal(small.result.status, 'DONE');
+  assert.deepEqual(small.requests[1].at(-1), { role: 'user', content: CAPPED_REASONING_TEXT });
+  assert.deepEqual(small.outputCap, { turn: 1, tool: 'write_file', chars: 100, steer: 'continue', recovered: true });
+
+  const none = await cappedPreWrite(undefined);
+  assert.equal(none.result.status, 'DONE');
+  assert.deepEqual(none.requests[1].at(-1), { role: 'user', content: CAPPED_REASONING_TEXT });
+  assert.deepEqual(none.outputCap, { turn: 1, steer: 'continue', recovered: true });
+});
+
+test('a large truncated edit_file steers the worker to split the edit', async () => {
+  const { result, requests, outputCap } = await cappedPreWrite({ name: 'edit_file', chars: 9_000 });
+  assert.equal(result.status, 'DONE');
+  assert.deepEqual(requests[1].at(-1), { role: 'user', content: LARGE_EDIT_CAPPED_REMINDER });
+  assert.deepEqual(outputCap, { turn: 1, tool: 'edit_file', chars: 9_000, steer: 'edit-in-parts', recovered: true });
+});
+
+test('a truncated call naming an unadvertised tool is treated as no tool call', async () => {
+  const { result, requests, outputCap } = await cappedPreWrite({ name: 'write_files', chars: 45_000 });
+  assert.equal(result.status, 'DONE');
+  assert.deepEqual(requests[1].at(-1), { role: 'user', content: CAPPED_REASONING_TEXT });
+  assert.deepEqual(outputCap, { turn: 1, steer: 'continue', recovered: true });
+  assert.ok(!Object.hasOwn(outputCap, 'tool'));
+  assert.ok(!Object.hasOwn(outputCap, 'chars'));
+});
+
+test('a large truncated write after a successful write queues the write-in-parts recovery with its diagnostic', async () => {
+  const requests = [];
+  const persisted = [];
+  let calls = 0;
+  const result = await new AgentLoop({
+    provider: {
+      async *chat(options) {
+        requests.push(structuredClone(options.messages));
+        calls++;
+        if (calls === 1)
+          yield {
+            toolCalls: [call('write_file', '{"path":"src/a.mjs","content":"export default 1;"}', 'write')],
+            usage: { inputTokens: 0, outputTokens: 1 },
+          };
+        else if (calls === 2) {
+          yield { text: 'next file', usage: { inputTokens: 0, outputTokens: 4_096 } };
+          yield { truncatedToolCall: { name: 'write_file', chars: 45_000 } };
+          yield { providerFinishReason: 'length' };
+        } else yield FINISH_EVENT;
+      },
+    },
+    tools: { execute: async (name) => (name === 'finish' ? { finish: { summary: 'done', concerns: [], testsRun: [] } } : 'written') },
+    model: 'm',
+    pricing: priceTable(['m']),
+    maxUsd: 1,
+    maxTurns: 4,
+    persistCappedFinishRecovery: async (event) => persisted.push(structuredClone(event)),
+  }).run({ task: 'implement x' });
+  assert.equal(result.status, 'DONE');
+  assert.equal(calls, 3);
+  assert.deepEqual(requests[2].at(-1), { role: 'user', content: LARGE_WRITE_CAPPED_REMINDER });
+  const queued = persisted.find((event) => event.cappedFinishRecovery === 'queued');
+  assert.deepEqual(queued, {
+    action: 'provider_capped_finish_recovery_queued',
+    cappedFinishRecovery: 'queued',
+    outputCap: { turn: 2, tool: 'write_file', chars: 45_000, steer: 'write-in-parts', recovered: true },
+  });
+});
+
+test('a queued capped recovery carrying the write-in-parts reminder resumes instead of being rejected', async () => {
+  const transcript = [
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'write', type: 'function', function: { name: 'write_file', arguments: '{"path":"src/a.mjs","content":"x"}' } }],
+    },
+    { role: 'tool', tool_call_id: 'write', name: 'write_file', content: 'written' },
+    { role: 'assistant', content: 'next file' },
+    { role: 'user', content: LARGE_WRITE_CAPPED_REMINDER },
+  ];
+  let requests = 0;
+  const done = await new AgentLoop({
+    provider: {
+      async *chat(options) {
+        requests++;
+        assert.deepEqual(options.messages.at(-1), { role: 'user', content: LARGE_WRITE_CAPPED_REMINDER });
+        yield FINISH_EVENT;
+      },
+    },
+    context: new AgentContext(transcript),
+    tools: FINISH_TOOLS,
+    model: 'm',
+    pricing: priceTable(['m']),
+    maxUsd: 1,
+    maxTurns: 2,
+    cappedFinishRecovery: 'queued',
+    persistCappedFinishRecovery: async () => {},
+  }).run();
+  assert.equal(done.status, 'DONE');
+  assert.equal(requests, 1);
+});
+
+test('an invalid truncatedToolCall event is rejected as an invalid provider event', async () => {
+  for (const bad of [
+    { name: 'write_file', chars: -1 },
+    { name: 7, chars: 10 },
+    { name: '', chars: 10 },
+    { name: 'write_file', chars: 1.5 },
+  ]) {
+    const invoked = [];
+    await assert.rejects(
+      new AgentLoop({
+        provider: {
+          async *chat() {
+            yield { truncatedToolCall: bad, usage: { inputTokens: 0, outputTokens: 1 } };
+            yield { providerFinishReason: 'length' };
+          },
+        },
+        tools: { execute: async (name) => (invoked.push(name), {}) },
+        model: 'm',
+        pricing: priceTable(['m']),
+        maxUsd: 1,
+        maxTurns: 3,
+      }).run({ task: 'x' }),
+      /Provider yielded invalid event/,
+      JSON.stringify(bad),
+    );
+    assert.deepEqual(invoked, []);
+  }
+});
+
+test('a second consecutive output cap after the write-in-parts steer still fails with output-cap', async () => {
+  const requests = [];
+  const progress = [];
+  let calls = 0;
+  const result = await new AgentLoop({
+    provider: {
+      async *chat(options) {
+        requests.push(structuredClone(options.messages));
+        calls++;
+        yield { usage: { inputTokens: 0, outputTokens: 4_096 } };
+        yield { truncatedToolCall: { name: 'write_file', chars: 45_000 } };
+        yield { providerFinishReason: 'length' };
+      },
+    },
+    tools: { execute: async () => assert.fail('no tool may execute') },
+    model: 'm',
+    pricing: priceTable(['m']),
+    maxUsd: 1,
+    maxTurns: 4,
+    progress: async (event) => progress.push(structuredClone(event)),
+  }).run({ task: 'x' });
+  assert.equal(calls, 2);
+  const capEvents = progress.filter((event) => event.outputCap);
+  assert.deepEqual(
+    capEvents.map((event) => [event.action, event.outputCap]),
+    [
+      ['provider_output_capped_continue', { turn: 1, tool: 'write_file', chars: 45_000, steer: 'write-in-parts', recovered: true }],
+      ['provider_output_capped_final', { turn: 2, tool: 'write_file', chars: 45_000, steer: 'write-in-parts', recovered: false }],
+    ],
+  );
+  assert.deepEqual(requests[1].at(-1), { role: 'user', content: LARGE_WRITE_CAPPED_REMINDER });
+  assert.equal(result.status, 'FAILED');
+  assert.equal(result.error, 'Worker exhausted output-cap recovery without an allowed tool call');
+  assert.equal(result.failureKind, 'output-cap');
+});
+
+// One capped, tool-less turn with an unlimited budget: no maxUsd, so no recovery turn exists.
+async function cappedUnlimited(truncated) {
+  const progress = [];
+  const result = await new AgentLoop({
+    provider: {
+      async *chat() {
+        yield { usage: { inputTokens: 0, outputTokens: 4_096 } };
+        if (truncated) yield { truncatedToolCall: truncated };
+        yield { providerFinishReason: 'length' };
+      },
+    },
+    tools: { execute: async () => assert.fail('no tool may execute') },
+    model: 'm',
+    pricing: priceTable(['m']),
+    maxTurns: 3,
+    progress: async (event) => progress.push(structuredClone(event)),
+  }).run({ task: 'x' });
+  return { result, finals: progress.filter((event) => event.action === 'provider_output_capped_final'), progress };
+}
+
+test('an unlimited-budget capped large write fails with output-cap and reports an unrecovered diagnostic', async () => {
+  const { result, finals, progress } = await cappedUnlimited({ name: 'write_file', chars: 45_000 });
+  assert.equal(result.status, 'FAILED');
+  assert.equal(result.failureKind, 'output-cap');
+  assert.equal(result.error, 'Worker exhausted output-cap recovery without an allowed tool call');
+  assert.equal(finals.length, 1);
+  assert.deepEqual(finals[0].outputCap, { turn: 1, tool: 'write_file', chars: 45_000, steer: 'write-in-parts', recovered: false });
+  assert.ok(!progress.some((event) => event.action === 'provider_output_capped_continue'));
+});
+
+test('an unlimited-budget capped turn without a large write stays no-finish and reports an unrecovered diagnostic', async () => {
+  const { result, finals } = await cappedUnlimited(undefined);
+  assert.equal(result.status, 'FAILED');
+  assert.equal(result.failureKind, 'no-finish');
+  assert.equal(finals.length, 1);
+  assert.deepEqual(finals[0].outputCap, { turn: 1, steer: 'continue', recovered: false });
 });

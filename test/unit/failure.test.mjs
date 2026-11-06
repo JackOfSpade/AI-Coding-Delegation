@@ -318,6 +318,11 @@ test('the continuation text names the failing call for a loop and differs for th
   assert.equal(new Set([loop, noFinish, outputCap, finishProtocol]).size, 4);
   assert.ok(noFinish.includes('without calling the finish tool'));
   assert.ok(outputCap.includes('response-size cap'));
+  const capText = failureContinueDefect({ failureKind: 'output-cap', error: FAILURE_ERRORS['output-cap'] });
+  assert.equal(capText, outputCap);
+  assert.ok(!capText.includes('write one complete file per response'));
+  assert.ok(capText.includes('write_file append true'));
+  assert.ok(capText.includes('at most about 150 lines or 6 KB'));
   // The worker is told what to do, not merely what it did: finish goes alone, after any remaining work.
   assert.ok(finishProtocol.includes('call finish ALONE: finish must be the only tool call in its turn'));
   assert.ok(finishProtocol.includes('the server ran none of the calls in those turns, so re-issue any that you still need'));
@@ -355,6 +360,32 @@ test('the worker hint is a fixed string chosen by pattern and never echoes the m
     undefined,
   ])
     assert.equal(toolErrorHint(unhinted), undefined);
+});
+
+test('append refusals and the oversized-content refusal give fixed write-in-parts hints', () => {
+  assert.equal(
+    toolErrorHint(new Error('Refusing append to missing file: secret/x.js')),
+    'append needs an existing file; write_file a small first part without append, then append the next part',
+  );
+  assert.equal(
+    toolErrorHint(new Error('Refusing append without prior read or write: secret/x.js')),
+    'read_file that file first (any window), then append',
+  );
+  assert.equal(toolErrorHint(new Error('append must be a boolean')), 'write_file append must be true or false');
+  assert.equal(
+    toolErrorHint(new Error('content must be a string up to 256000 UTF-8 bytes')),
+    'content is too large for one write; write a small first part, then add the rest with write_file append true',
+  );
+  assert.equal(
+    toolErrorHint(new Error('Refusing append of file larger than 8388608 bytes')),
+    'that file is over the in-place edit size limit; do not retry it',
+  );
+  // The stale-append refusal gets the generic stale hint, never its path.
+  assert.equal(
+    toolErrorHint(new Error('Refusing stale append: secret/x.js changed since read')),
+    'the file changed since you read it; read_file it again',
+  );
+  assert.equal(toolErrorHint(new Error('prefix Refusing append to missing file')), undefined);
 });
 
 test('a read_file limit refusal tells the worker the byte cap and nothing else', () => {

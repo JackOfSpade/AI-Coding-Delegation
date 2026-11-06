@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, win32 } from 'node:path';
 import { doctor, doctorLive, keysSummary } from '../../src/doctor.mjs';
 import { runCli } from '../../src/cli.mjs';
+import { gitBinary } from '../../src/git-binary.mjs';
 
 function sink() {
   let text = '';
@@ -43,7 +44,8 @@ test('doctor runs Git plumbing with a credential-free hardened environment', () 
   assert.equal(result.repo.ok, true);
   assert.equal(calls.length, 2);
   for (const call of calls) {
-    assert.equal(call.command, 'git');
+    // Plain `git`, or what macOS's /usr/bin/git shim would run, for the call's own environment.
+    assert.equal(call.command, gitBinary(call.options.env));
     assert.deepEqual(call.args.slice(0, 5), [
       '--no-optional-locks',
       '-c',

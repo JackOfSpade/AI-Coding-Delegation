@@ -564,6 +564,56 @@ test('Anthropic: max_tokens mid tool_use drops the fragment and reports a length
   assert.deepEqual(events.at(-1), { providerFinishReason: 'length' });
 });
 
+const toolUseBlock = (index, id, name, partial) => [
+  { type: 'content_block_start', index, content_block: { type: 'tool_use', id, name } },
+  { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: partial } },
+];
+const cutStream = (blocks, stopReason) => [
+  { type: 'message_start', message: { model: 'claude-opus-5-5', usage: { input_tokens: 10 } } },
+  ...blocks.flat(),
+  { type: 'message_delta', delta: { stop_reason: stopReason }, usage: { output_tokens: 16_384 } },
+  { type: 'message_stop' },
+];
+
+test('Anthropic: a length stop that cuts write_file yields one truncatedToolCall with the exact partial length just before the finish', async () => {
+  const partial = '{"path":"a.js","content":"export const';
+  const events = await collect(cappedProvider(cutStream([toolUseBlock(0, 'toolu_w', 'write_file', partial)], 'max_tokens')));
+  assert.equal(
+    events.some((event) => event.toolCalls),
+    false,
+  );
+  assert.equal(events.filter((event) => event.truncatedToolCall).length, 1);
+  assert.deepEqual(events.at(-2), { truncatedToolCall: { name: 'write_file', chars: partial.length } });
+  assert.deepEqual(events.at(-1), { providerFinishReason: 'length' });
+});
+
+test('Anthropic: with two truncated calls the larger one is reported', async () => {
+  const small = '{"path":"s.js"';
+  const large = '{"path":"big.js","content":"' + 'x'.repeat(500);
+  const events = await collect(
+    cappedProvider(
+      cutStream([toolUseBlock(0, 'toolu_a', 'edit_file', small), toolUseBlock(1, 'toolu_b', 'write_file', large)], 'max_tokens'),
+    ),
+  );
+  assert.deepEqual(
+    events.filter((event) => event.truncatedToolCall),
+    [{ truncatedToolCall: { name: 'write_file', chars: large.length } }],
+  );
+  assert.deepEqual(events.at(-1), { providerFinishReason: 'length' });
+});
+
+test('Anthropic: a complete non-length tool call yields no truncatedToolCall event', async () => {
+  const events = await collect(
+    cappedProvider(cutStream([toolUseBlock(0, 'toolu_w', 'write_file', '{"path":"a.js","content":"x"}')], 'tool_use')),
+  );
+  assert.equal(
+    events.some((event) => 'truncatedToolCall' in event),
+    false,
+  );
+  assert.equal(events.find((event) => event.toolCalls).toolCalls.length, 1);
+  assert.deepEqual(events.at(-1), { providerFinishReason: 'tool_calls' });
+});
+
 test('Anthropic: incomplete tool JSON without a cap is a non-retryable response failure with a redacted reason', async () => {
   await assert.rejects(collect(cappedProvider(truncatedToolUse('tool_use'))), (error) => {
     assert.ok(error instanceof ProviderError);

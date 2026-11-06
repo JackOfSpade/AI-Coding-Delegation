@@ -33,6 +33,7 @@ export const RUNTIME_CAPABILITIES = Object.freeze({
   creditCooldown: true,
   compactPreflight: true,
   runnerScopedPreflight: true,
+  outputCapDiagnostic: true,
 });
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));

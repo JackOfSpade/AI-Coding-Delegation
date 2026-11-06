@@ -8,6 +8,7 @@ import { RedactionProjector, redactText, stripTerminalControls } from '../redact
 import { snapshotGitEnv } from '../git-snapshot.mjs';
 import { globToRegExp, normalizePath } from '../glob.mjs';
 import { statTimestamp } from '../stat-identity.mjs';
+import { gitBinary } from '../git-binary.mjs';
 
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const MAX_READ_CAP = 256_000;
@@ -26,6 +27,11 @@ export const MAX_COMMAND_TIMEOUT_SEC = 900;
 const MAX_READ_PREFIX_SCAN = 8 * 1024 * 1024;
 const MAX_EDITABLE_BYTES = 8 * 1024 * 1024;
 const MAX_EDIT_ARG_CAP = 64_000;
+// Advisory per-call size for file content a worker emits. A single response
+// that streams a whole large file as tool arguments is the commonest cause of
+// a provider output cap, after which the truncated call is dropped unrun.
+export const INCREMENTAL_WRITE_BYTES = 6 * 1024;
+export const INCREMENTAL_WRITE_LINES = 150;
 const MAX_GREP_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_GREP_MATCHES = 300;
 const MAX_DIRECTORY_ENTRIES = 500;
@@ -191,8 +197,16 @@ export const TOOL_DEFINITIONS = Object.freeze([
   ),
   schema(
     'write_file',
-    'Write one complete owned repository file. Put all source content in content, never in prose.',
-    { path: str, content: { type: 'string', maxLength: MAX_READ_CAP } },
+    `Write one complete owned repository file. Put all source content in content, never in prose. Keep content to about ${INCREMENTAL_WRITE_LINES} lines or ${INCREMENTAL_WRITE_BYTES / 1024} KB per call: build a larger file in parts by writing a small first part, then calling write_file again with append true to add each next part to the end of that same file.`,
+    {
+      path: str,
+      content: { type: 'string', maxLength: MAX_READ_CAP },
+      append: {
+        type: 'boolean',
+        description:
+          'true adds content to the end of an existing file that you wrote or read earlier in this job, instead of replacing it.',
+      },
+    },
     ['path', 'content'],
   ),
   schema(
@@ -297,6 +311,10 @@ export class LocalTools {
     this.fs = fileSystem;
     this.gitExec = gitExec;
     this.readHashes = new Map();
+    // Fingerprints of content this worker itself published. Only an append
+    // consults them, so building a file in parts needs no re-read, while
+    // edit_file and an overwrite keep their read-before-change rule.
+    this.ownWrites = new Map();
   }
   #relative(canonical) {
     return path.relative(this.root, canonical).split(path.sep).join('/');
@@ -331,9 +349,10 @@ export class LocalTools {
     const inertHooks = process.platform === 'win32' ? 'NUL' : '/dev/null';
     const hardened = ['--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${inertHooks}`, ...args];
     try {
-      const result = await this.gitExec('git', hardened, {
+      const env = snapshotGitEnv();
+      const result = await this.gitExec(gitBinary(env), hardened, {
         cwd: this.root,
-        env: snapshotGitEnv(),
+        env,
         timeout: GIT_TIMEOUT_MS,
         maxBuffer: GIT_OUTPUT_CAP,
         windowsHide: true,
@@ -958,13 +977,16 @@ export class LocalTools {
     const after = replace_all ? before.split(old_string).join(replacement) : before.replace(old_string, () => replacement);
     await this.#atomicWrite(file, canonical, after, { mode: mode & 0o777, expected: identity });
     this.readHashes.delete(canonical);
+    await this.#recordOwnWrite(canonical, Buffer.from(after, 'utf8'));
     return `Edited ${this.#relative(canonical)} (${replace_all ? hits : 1} replacement${hits === 1 ? '' : 's'}).`;
   }
-  async write_file({ path: file, content } = {}) {
+  async write_file({ path: file, content, append = false } = {}) {
     if (typeof content !== 'string' || Buffer.byteLength(content, 'utf8') > MAX_READ_CAP)
       throw new Error(`content must be a string up to ${MAX_READ_CAP} UTF-8 bytes`);
+    if (typeof append !== 'boolean') throw new Error('append must be a boolean');
     const canonical = this.#writable(file);
     await this.#rejectIgnoredUntracked(canonical);
+    if (append) return this.#appendFile(file, canonical, content);
     await this.#prepareWriteParent(file, canonical);
     let mode = 0o600,
       expected = { absent: true };
@@ -992,7 +1014,52 @@ export class LocalTools {
     }
     await this.#atomicWrite(file, canonical, content, { mode, expected, staleLabel: 'write' });
     this.readHashes.delete(canonical);
+    await this.#recordOwnWrite(canonical, Buffer.from(content, 'utf8'));
     return `Wrote ${this.#relative(canonical)} (${content.length} chars).`;
+  }
+  // Best effort: a missing record only means the next append needs a read.
+  async #recordOwnWrite(canonical, bytes) {
+    this.ownWrites.delete(canonical);
+    try {
+      const stat = await this.fs.lstat(canonical, BIGINT_STAT_OPTIONS);
+      if (!stat.isFile() || stat.isSymbolicLink() || Number(stat.size) !== bytes.length) return;
+      this.ownWrites.set(canonical, { hash: hash(bytes), size: bytes.length, identity: this.#identity(stat) });
+    } catch {}
+  }
+  // Appends keep every write_file guarantee: an owned, non-ignored regular
+  // text file, an unchanged fingerprint since the worker last read or wrote
+  // it, and an atomic identity-checked replacement. Raw bytes are kept, so
+  // an existing byte-order mark or line ending style survives untouched.
+  async #appendFile(file, canonical, content) {
+    let existing;
+    try {
+      existing = await this.fs.lstat(canonical);
+    } catch (error) {
+      if (error?.code === 'ENOENT') throw new Error(`Refusing append to missing file: ${this.#relative(canonical)}`);
+      throw error;
+    }
+    if (existing.isSymbolicLink()) throw new Error('Refusing symbolic link');
+    if (!existing.isFile()) throw new Error('Refusing non-regular file');
+    const seen = this.readHashes.get(canonical) ?? this.ownWrites.get(canonical);
+    if (!seen) throw new Error(`Refusing append without prior read or write: ${this.#relative(canonical)}`);
+    const addition = Buffer.from(content, 'utf8');
+    const { handle, size, mode, identity } = await this.#openText(canonical, file, { writable: true });
+    let raw;
+    try {
+      if (seen.tooLarge || size + addition.length > MAX_EDITABLE_BYTES)
+        throw new Error(`Refusing append of file larger than ${MAX_EDITABLE_BYTES} bytes`);
+      raw = await this.#readAll(handle, size);
+      this.#decode(raw);
+      if (this.#changedSinceRead(seen, raw, size, identity))
+        throw new Error(`Refusing stale append: ${this.#relative(canonical)} changed since read`);
+    } finally {
+      await handle.close();
+    }
+    const after = Buffer.concat([raw, addition]);
+    await this.#atomicWrite(file, canonical, after, { mode: mode & 0o777, expected: identity, staleLabel: 'append' });
+    this.readHashes.delete(canonical);
+    await this.#recordOwnWrite(canonical, after);
+    return `Appended to ${this.#relative(canonical)} (${content.length} chars; now ${after.length} bytes).`;
   }
   async run_command({ command, timeoutSec = DEFAULT_COMMAND_TIMEOUT_SEC } = {}, { signal } = {}) {
     if (typeof command !== 'string' || !command || command.length > 8192)

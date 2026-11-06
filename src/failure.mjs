@@ -280,7 +280,7 @@ const DEFECT_LEAD = {
   'no-finish':
     'Your previous pass ended without calling the finish tool, so the server stopped it. Your partial work is already in the workspace (inspect it with git status / git diff or by reading the files). Do not restart, redo, or discard it. Complete the remaining acceptance criteria, then call finish as the sole tool call.',
   'output-cap':
-    'Your previous pass kept hitting the response-size cap without making a tool call, so the server stopped it. Your partial work is already in the workspace (inspect it with git status / git diff or by reading the files). Do not restart, redo, or discard it. Keep each response short, write one complete file per response, call a tool immediately, and call finish when the acceptance criteria are met.',
+    'Your previous pass kept hitting the response-size cap without making a tool call, so the server stopped it. Your partial work is already in the workspace (inspect it with git status / git diff or by reading the files). Do not restart, redo, or discard it. Keep each response short and call a tool immediately. Never put a whole large file in one tool call: write a small first part (at most about 150 lines or 6 KB), then add each next part with write_file append true, one part per call. Call finish when the acceptance criteria are met.',
 };
 
 /**
@@ -320,8 +320,17 @@ const MESSAGE_HINTS = [
   [/^old_string must match exactly once/, 'old_string matches more than once; add surrounding lines or set replace_all'],
   [/^old_string must not be empty/, 'old_string must not be empty'],
   [/^edit arguments are invalid/, 'edit_file needs string path, old_string and new_string and a boolean replace_all'],
-  [/^content must be a string up to/, 'content is too large for one write; split it across files or use edit_file'],
-  [/^Refusing (?:edit|overwrite) of file larger than/, 'that file is over the in-place edit size limit; do not retry it'],
+  [
+    /^content must be a string up to/,
+    'content is too large for one write; write a small first part, then add the rest with write_file append true',
+  ],
+  [/^Refusing (?:edit|overwrite|append) of file larger than/, 'that file is over the in-place edit size limit; do not retry it'],
+  [
+    /^Refusing append to missing file/,
+    'append needs an existing file; write_file a small first part without append, then append the next part',
+  ],
+  [/^Refusing append without prior read or write/, 'read_file that file first (any window), then append'],
+  [/^append must be a boolean/, 'write_file append must be true or false'],
   [/^Refusing read: requested/, 'that offset is too deep; use grep to locate the lines or read from a smaller offset'],
   // The one digit run echoed is the tool's own byte cap, matched in full: no path or file text can reach the worker.
   [

@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { LocalTools, TOOL_DEFINITIONS, availableToolDefinitions } from '../../src/agent/tools.mjs';
+import { gitBinary } from '../../src/git-binary.mjs';
 
 const tempDirs = [];
 async function trackedTemp(prefix) {
@@ -291,7 +292,9 @@ test('Git ignore checks use hardened credential-free plumbing', async () => {
   }
   assert.equal(calls.length, 6, 'new-file publication rechecks ignore state');
   for (const { command, args, options } of calls) {
-    assert.equal(command, 'git');
+    // The resolved executable for that call's own environment: plain `git`
+    // everywhere except behind macOS's /usr/bin/git developer-tool shim.
+    assert.equal(command, gitBinary(options.env));
     assert.deepEqual(args.slice(0, 5), [
       '--no-optional-locks',
       '-c',
@@ -873,4 +876,96 @@ test('read_file accepts its advertised maximum limit and refuses anything above 
   assert.match(await tools.read_file({ path: 'big.txt', limit: advertised }), /\[truncated; next offset \d+\]$/);
   await assert.rejects(() => tools.read_file({ path: 'big.txt', limit: advertised + 1 }), /limit must be an integer between 0 and 64000/);
   await assert.rejects(() => tools.read_file({ path: 'big.txt', limit: 256_000 }), /limit must be an integer between 0 and 64000/);
+});
+test('write_file append builds a file in parts with no reads in between', async () => {
+  const { dir, tools } = await fixture();
+  assert.equal(await tools.write_file({ path: 'big.txt', content: 'head\n' }), 'Wrote big.txt (5 chars).');
+  assert.equal(
+    await tools.write_file({ path: 'big.txt', content: 'middle\n', append: true }),
+    'Appended to big.txt (7 chars; now 12 bytes).',
+  );
+  assert.equal(await tools.write_file({ path: 'big.txt', content: 'é\n', append: true }), 'Appended to big.txt (2 chars; now 15 bytes).');
+  assert.equal(await readFile(path.join(dir, 'big.txt'), 'utf8'), 'head\nmiddle\né\n');
+});
+test('write_file append works on a file that was read but never written by the worker', async () => {
+  const { dir, tools } = await fixture();
+  await tools.read_file({ path: 'a.txt' });
+  assert.equal(await tools.write_file({ path: 'a.txt', content: 'three\r\n', append: true }), 'Appended to a.txt (7 chars; now 17 bytes).');
+  assert.equal(await readFile(path.join(dir, 'a.txt'), 'utf8'), 'one\r\ntwo\r\nthree\r\n');
+});
+test('write_file append refuses a missing file and leaves nothing behind', async () => {
+  const { dir, tools } = await fixture();
+  await assert.rejects(() => tools.write_file({ path: 'nope.txt', content: 'x', append: true }), {
+    message: 'Refusing append to missing file: nope.txt',
+  });
+  assert.deepEqual(
+    (await readdir(dir)).filter((name) => name !== 'a.txt'),
+    [],
+  );
+});
+test('write_file append refuses an existing file the worker never read or wrote', async () => {
+  const { dir, tools } = await fixture();
+  await assert.rejects(() => tools.write_file({ path: 'a.txt', content: 'x', append: true }), {
+    message: 'Refusing append without prior read or write: a.txt',
+  });
+  assert.equal(await readFile(path.join(dir, 'a.txt'), 'utf8'), 'one\r\ntwo\r\n');
+});
+test('write_file append refuses a file changed by someone else after the worker wrote it', async () => {
+  const { dir, tools } = await fixture();
+  await tools.write_file({ path: 'p.txt', content: 'part one\n' });
+  await writeFile(path.join(dir, 'p.txt'), 'human edit\n');
+  await assert.rejects(() => tools.write_file({ path: 'p.txt', content: 'part two\n', append: true }), {
+    message: 'Refusing stale append: p.txt changed since read',
+  });
+  assert.equal(await readFile(path.join(dir, 'p.txt'), 'utf8'), 'human edit\n');
+});
+test('write_file append refuses a file changed after the worker read it', async () => {
+  const { dir, tools } = await fixture();
+  await tools.read_file({ path: 'a.txt' });
+  await writeFile(path.join(dir, 'a.txt'), 'human change');
+  await assert.rejects(() => tools.write_file({ path: 'a.txt', content: 'x', append: true }), {
+    message: 'Refusing stale append: a.txt changed since read',
+  });
+  assert.equal(await readFile(path.join(dir, 'a.txt'), 'utf8'), 'human change');
+});
+test('write_file rejects a non-boolean append before touching the file', async () => {
+  const { dir, tools } = await fixture();
+  for (const append of ['true', 1, null, {}]) {
+    await assert.rejects(() => tools.write_file({ path: 'n.txt', content: 'x', append }), { message: 'append must be a boolean' });
+  }
+  assert.deepEqual(
+    (await readdir(dir)).filter((name) => name !== 'a.txt'),
+    [],
+  );
+});
+test('write_file append keeps a UTF-8 BOM and CRLF line endings byte for byte', async () => {
+  const { dir, tools } = await fixture();
+  const original = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('one\r\ntwo\r\n')]);
+  await writeFile(path.join(dir, 'bom.txt'), original);
+  await tools.read_file({ path: 'bom.txt' });
+  await tools.write_file({ path: 'bom.txt', content: 'three\r\n', append: true });
+  await tools.write_file({ path: 'bom.txt', content: 'four\n', append: true });
+  const expected = Buffer.concat([original, Buffer.from('three\r\nfour\n')]);
+  assert.ok((await readFile(path.join(dir, 'bom.txt'))).equals(expected));
+});
+test('edit_file after write_file is still refused without a read, and succeeds after one', async () => {
+  const { dir, tools } = await fixture();
+  await tools.write_file({ path: 'e.txt', content: 'alpha\n' });
+  await tools.write_file({ path: 'e.txt', content: 'beta\n', append: true });
+  await assert.rejects(() => tools.edit_file({ path: 'e.txt', old_string: 'alpha', new_string: 'ALPHA' }), {
+    message: 'Refusing edit without prior read: e.txt',
+  });
+  await tools.read_file({ path: 'e.txt' });
+  await tools.edit_file({ path: 'e.txt', old_string: 'alpha', new_string: 'ALPHA' });
+  assert.equal(await readFile(path.join(dir, 'e.txt'), 'utf8'), 'ALPHA\nbeta\n');
+  // An edit is also a worker write, so the next part can append without another read.
+  await tools.write_file({ path: 'e.txt', content: 'gamma\n', append: true });
+  assert.equal(await readFile(path.join(dir, 'e.txt'), 'utf8'), 'ALPHA\nbeta\ngamma\n');
+});
+test('write_file schema advertises boolean append and the per-call size guidance', () => {
+  const fn = TOOL_DEFINITIONS.find((t) => t.function.name === 'write_file').function;
+  assert.equal(fn.parameters.properties.append.type, 'boolean');
+  assert.deepEqual(fn.parameters.required, ['path', 'content']);
+  assert.ok(fn.description.includes('Keep content to about 150 lines or 6 KB per call'));
+  assert.ok(fn.description.includes('calling write_file again with append true to add each next part to the end of that same file'));
 });
