@@ -116,7 +116,9 @@ for (const stop of ['local cancel', 'peer cancel', 'attempt deadline', 'round de
       if (stop.endsWith('cancel')) assert.match(await store.readArtifact(job.jobId, 'events.jsonl'), /cancel_requested/);
     } finally {
       await manager.shutdown();
-      await rm(gitDir, { recursive: true, force: true });
+      // Windows can still be closing the job's last store write when the test
+      // ends; rm retries ENOTEMPTY/EBUSY/EPERM rather than failing the teardown.
+      await rm(gitDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
   });
 }
