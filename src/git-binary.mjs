@@ -1,5 +1,5 @@
 import { accessSync, constants, realpathSync, statSync } from 'node:fs';
-import { delimiter, isAbsolute, join } from 'node:path';
+import { posix } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 /**
@@ -20,6 +20,8 @@ import { execFileSync } from 'node:child_process';
 const SHIM = '/usr/bin/git';
 const XCRUN = '/usr/bin/xcrun';
 const RESOLVE_TIMEOUT_MS = 5_000;
+// Only macOS has the shim, so its paths are POSIX whatever host runs this code.
+const { delimiter, isAbsolute, join } = posix;
 const cache = new Map();
 
 const executableFile = (path, fs) => {

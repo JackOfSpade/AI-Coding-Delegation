@@ -247,34 +247,38 @@ test('a failed repair setup reports retention of its replacement workspace', asy
 test('direct Git patch application accepts only byte buffers', () => {
   assert.throws(() => gitPatchApplier(process.cwd(), 'diff --git a/a b/a\n', { reverse: false, check: true }), /patch must be a Buffer/);
 });
-test('direct Git patch application runs no configured clean, smudge or required filter', { skip: process.platform === 'win32' }, () => {
-  const repo = makeRepo();
-  const marker = join(tmpdir(), `offload-filter-marker-${process.pid}-${Date.now()}`);
-  try {
-    write(join(repo, '.gitattributes'), 'probed.txt filter=probe\n');
-    write(join(repo, 'probed.txt'), 'one\n');
-    git(repo, ['add', '.']);
-    git(repo, ['commit', '-m', 'probe fixture']);
-    write(join(repo, 'probed.txt'), 'two\n');
-    const patch = Buffer.from(execFileSync('git', ['diff'], { cwd: repo }));
-    git(repo, ['checkout', '--', 'probed.txt']);
-    // Configured after the fixture exists, so only the applier can reach them.
-    // A required filter whose command fails would make an unhardened apply fail.
-    git(repo, ['config', 'filter.probe.clean', `sh -c 'echo clean >> "${marker}"; cat'`]);
-    git(repo, ['config', 'filter.probe.smudge', `sh -c 'echo smudge >> "${marker}"; cat'`]);
-    git(repo, ['config', 'filter.probe.required', 'true']);
-    assert.deepEqual(gitPatchApplier(repo, patch, { reverse: false, check: true }), { dryRun: true, applied: false });
-    assert.equal(readFileSync(join(repo, 'probed.txt'), 'utf8'), 'one\n');
-    assert.deepEqual(gitPatchApplier(repo, patch, { reverse: false, check: false }), { dryRun: false, applied: true });
-    assert.equal(readFileSync(join(repo, 'probed.txt'), 'utf8'), 'two\n');
-    assert.deepEqual(gitPatchApplier(repo, patch, { reverse: true, check: false }), { dryRun: false, applied: true });
-    assert.equal(readFileSync(join(repo, 'probed.txt'), 'utf8'), 'one\n');
-    assert.equal(existsSync(marker), false, 'a configured Git filter ran during patch application');
-  } finally {
-    cleanup(repo);
-    rmSync(marker, { force: true });
-  }
-});
+test(
+  'direct Git patch application runs no configured clean, smudge or required filter',
+  { skip: process.platform === 'win32' && 'the probe filters are POSIX shell commands that write a marker file' },
+  () => {
+    const repo = makeRepo();
+    const marker = join(tmpdir(), `offload-filter-marker-${process.pid}-${Date.now()}`);
+    try {
+      write(join(repo, '.gitattributes'), 'probed.txt filter=probe\n');
+      write(join(repo, 'probed.txt'), 'one\n');
+      git(repo, ['add', '.']);
+      git(repo, ['commit', '-m', 'probe fixture']);
+      write(join(repo, 'probed.txt'), 'two\n');
+      const patch = Buffer.from(execFileSync('git', ['diff'], { cwd: repo }));
+      git(repo, ['checkout', '--', 'probed.txt']);
+      // Configured after the fixture exists, so only the applier can reach them.
+      // A required filter whose command fails would make an unhardened apply fail.
+      git(repo, ['config', 'filter.probe.clean', `sh -c 'echo clean >> "${marker}"; cat'`]);
+      git(repo, ['config', 'filter.probe.smudge', `sh -c 'echo smudge >> "${marker}"; cat'`]);
+      git(repo, ['config', 'filter.probe.required', 'true']);
+      assert.deepEqual(gitPatchApplier(repo, patch, { reverse: false, check: true }), { dryRun: true, applied: false });
+      assert.equal(readFileSync(join(repo, 'probed.txt'), 'utf8'), 'one\n');
+      assert.deepEqual(gitPatchApplier(repo, patch, { reverse: false, check: false }), { dryRun: false, applied: true });
+      assert.equal(readFileSync(join(repo, 'probed.txt'), 'utf8'), 'two\n');
+      assert.deepEqual(gitPatchApplier(repo, patch, { reverse: true, check: false }), { dryRun: false, applied: true });
+      assert.equal(readFileSync(join(repo, 'probed.txt'), 'utf8'), 'one\n');
+      assert.equal(existsSync(marker), false, 'a configured Git filter ran during patch application');
+    } finally {
+      cleanup(repo);
+      rmSync(marker, { force: true });
+    }
+  },
+);
 test('async start and server verification produce a durable final report', async () => {
   const m = await manager({
     run: async (_job, api) => {

@@ -122,7 +122,13 @@ export const STRICT_SKIP_ALLOWLIST = Object.freeze(
       'retargeting a uv alias cannot add metadata or read roots for an unrecorded or unsafe installation',
       'metadata support for a venv does not allow declaring its external uv alias directly',
       'a symlinked skill copy is unreadable, never trusted as current',
+      'Codex plugin skill discovery reads real directories only and ignores other plugins',
     ].map((name) => [name, 'Windows symlink creation requires Developer Mode or elevation']),
+    ['gitBinary on this host runs the same git as PATH resolution would', 'the developer-tool git shim exists only on macOS'],
+    [
+      'direct Git patch application runs no configured clean, smudge or required filter',
+      'the probe filters are POSIX shell commands that write a marker file',
+    ],
     ...[
       'requires an available macOS sandbox',
       'requires a python3 that can create a virtualenv',

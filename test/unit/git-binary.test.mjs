@@ -92,13 +92,17 @@ test('gitBinary resolves once per environment and re-resolves a cached path that
   assert.equal(execFile.calls.length, 3, 'a vanished cached path is resolved again, not reused');
 });
 
-test('gitBinary on this host runs the same git as PATH resolution would', { skip: process.platform !== 'darwin' }, () => {
-  const env = { PATH: process.env.PATH, HOME: process.env.HOME };
-  const resolved = gitBinary(env);
-  if (resolved !== 'git') {
-    assert.ok(resolved.startsWith('/') && existsSync(resolved));
-    assert.notEqual(resolved, '/usr/bin/git');
-  }
-  const version = (bin) => execFileSync(bin, ['--version'], { encoding: 'utf8', env }).trim();
-  assert.equal(version(resolved), version('git'));
-});
+test(
+  'gitBinary on this host runs the same git as PATH resolution would',
+  { skip: process.platform !== 'darwin' && 'the developer-tool git shim exists only on macOS' },
+  () => {
+    const env = { PATH: process.env.PATH, HOME: process.env.HOME };
+    const resolved = gitBinary(env);
+    if (resolved !== 'git') {
+      assert.ok(resolved.startsWith('/') && existsSync(resolved));
+      assert.notEqual(resolved, '/usr/bin/git');
+    }
+    const version = (bin) => execFileSync(bin, ['--version'], { encoding: 'utf8', env }).trim();
+    assert.equal(version(resolved), version('git'));
+  },
+);
