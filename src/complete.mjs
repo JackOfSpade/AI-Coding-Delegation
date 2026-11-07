@@ -28,7 +28,7 @@ import { loadPricing } from './pricing-registry.mjs';
 import { priceUsage, resolveModel, validatePricingTable } from './pricing.mjs';
 import { isDeepSeekEndpoint } from './model-policy.mjs';
 import { checkedBaseUrl } from './provider/openai-chat.mjs';
-import { bestEffort, fetchAbortable, readJsonAbortable } from './provider/abort.mjs';
+import { abortable, bestEffort, fetchAbortable, readJsonAbortable } from './provider/abort.mjs';
 import { sseJson } from './provider/sse.mjs';
 import { plainObject } from './plain-object.mjs';
 import { WEB_TOOL_NAMES, builtinTool, runWebCalls, webToolPrices } from './complete-web.mjs';
@@ -66,8 +66,24 @@ const MIN_TIMEOUT_MS = 1_000;
 const MAX_TIMEOUT_MS = 1_800_000;
 const DEFAULT_TIMEOUT_MS = 600_000;
 const MODEL_CACHE_MS = 60_000;
+// A cached model list older than MODEL_CACHE_MS but younger than this is used at once and refreshed
+// in the background, so a long-lived process (`--serve`) never puts a model listing in front of a turn.
+const MODEL_CACHE_STALE_MS = 15 * 60_000;
 const LEDGER_TAIL_BYTES = 4 * 1024 * 1024;
-const REQUEST_KEYS = new Set(['version', 'route', 'messages', 'maxTokens', 'reasoning', 'timeoutMs', 'caller', 'tag', 'tools', 'toolLoop']);
+const REQUEST_KEYS = new Set([
+  'version',
+  'route',
+  'messages',
+  'maxTokens',
+  'reasoning',
+  'timeoutMs',
+  'caller',
+  'tag',
+  'tools',
+  'toolLoop',
+  'stream',
+  'id',
+]);
 
 // Host-declared tools. Offload never executes them; it returns the calls.
 const TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/;
@@ -116,6 +132,14 @@ export function validateCompleteRequest(request, { partial = false } = {}) {
   if (typeof request.route !== 'string' || !Object.hasOwn(COMPLETE_ROUTES, request.route))
     fail('invalid_request', `route must be one of ${Object.keys(COMPLETE_ROUTES).join(', ')}`);
   const out = { route: request.route };
+  if (request.stream !== undefined && typeof request.stream !== 'boolean') fail('invalid_request', 'stream must be a boolean');
+  if (request.stream === true && request.tools !== undefined) fail('invalid_request', 'stream cannot be combined with tools');
+  out.stream = request.stream === true;
+  // A caller-chosen id, echoed on every stream line and on the result (required by --serve).
+  if (request.id !== undefined) {
+    if (typeof request.id !== 'string' || !NAME.test(request.id)) fail('invalid_request', `id must match ${NAME.source}`);
+    out.id = request.id;
+  }
   const toolSpec = validateTools(request);
   if (toolSpec) Object.assign(out, { tools: toolSpec.tools, toolLoop: toolSpec.toolLoop });
   if (!partial || request.messages !== undefined) {
@@ -351,10 +375,49 @@ export function pickRouteModel(route, ids) {
   return best?.id;
 }
 
-async function listModels({ baseUrl, apiKey, fetchImpl, signal, now }) {
+/**
+ * DeepSeek's model ids, cached per base URL. A fresh entry is used as is; a stale
+ * one (up to MODEL_CACHE_STALE_MS) is used and refreshed in the background, once at a time.
+ */
+async function listModels(options) {
+  const { baseUrl, apiKey, now } = options;
   const cacheKey = baseUrl;
   const cached = modelCache.get(cacheKey);
-  if (cached && cached.apiKey === apiKey && now() - cached.at < MODEL_CACHE_MS) return cached.ids;
+  if (cached && cached.apiKey === apiKey) {
+    const age = now() - cached.at;
+    if (age < MODEL_CACHE_MS) return cached.ids;
+    if (age < MODEL_CACHE_STALE_MS) {
+      if (!cached.refreshing) {
+        cached.refreshing = true;
+        const signal = AbortSignal.timeout(30_000);
+        listDeepSeekModels({ ...options, signal })
+          .then((ids) => modelCache.set(cacheKey, { at: now(), ids, apiKey }))
+          .catch(() => {})
+          .finally(() => {
+            cached.refreshing = false;
+          });
+      }
+      return cached.ids;
+    }
+  }
+  // Concurrent calls (for example under --serve) share one listing instead of each sending one.
+  const inFlight = modelListings.get(cacheKey);
+  if (inFlight && inFlight.apiKey === apiKey) return abortable(inFlight.promise, options.signal);
+  const promise = listDeepSeekModels({ ...options, signal: AbortSignal.timeout(30_000) }).then((ids) => {
+    modelCache.set(cacheKey, { at: now(), ids, apiKey });
+    return ids;
+  });
+  const entry = { apiKey, promise };
+  modelListings.set(cacheKey, entry);
+  promise.then(
+    () => modelListings.get(cacheKey) === entry && modelListings.delete(cacheKey),
+    () => modelListings.get(cacheKey) === entry && modelListings.delete(cacheKey),
+  );
+  return abortable(promise, options.signal);
+}
+const modelListings = new Map();
+
+async function listDeepSeekModels({ baseUrl, apiKey, fetchImpl, signal }) {
   let response;
   try {
     response = await fetchAbortable(fetchImpl, `${baseUrl}/models`, {
@@ -374,9 +437,7 @@ async function listModels({ baseUrl, apiKey, fetchImpl, signal, now }) {
     if (signal.aborted) throw error;
     fail('provider_error', 'DeepSeek model list was not valid JSON', { retryable: true });
   }
-  const ids = Array.isArray(body?.data) ? body.data.map((entry) => entry?.id).filter((id) => typeof id === 'string') : [];
-  modelCache.set(cacheKey, { at: now(), ids, apiKey });
-  return ids;
+  return Array.isArray(body?.data) ? body.data.map((entry) => entry?.id).filter((id) => typeof id === 'string') : [];
 }
 
 const REQUEST_ID_HEADERS = ['x-request-id', 'x-ds-request-id', 'request-id', 'x-amzn-requestid'];
@@ -649,11 +710,40 @@ function addUsage(a, b) {
  * turn or a failure. Each model turn appends its own ledger line (and holds its own daily-cap
  * reservation), so a long call is never counted at zero and a crash loses at most one turn.
  *
- * Test seams: fetchImpl, env, config/configPath, now, ledgerPath, readKey, webRetryDelayMs.
+ * `options.onDelta(text)` receives each piece of answer text as it arrives. It must not throw; an
+ * exception from it is ignored. Every result that got that far carries, on a monotonic clock:
+ * - `overheadMs`: time inside Offload before the first provider request is sent (validation, key,
+ *   model resolution, daily cap), counted from `options.overheadFrom` (a `performance.now()` value,
+ *   for example when the CLI process started or a --serve line arrived), else from this call.
+ * - `firstTokenMs`: that send to the first answer text delta.
+ *
+ * Test seams: fetchImpl, env, config/configPath, now, monotonicNow, ledgerPath, readKey, webRetryDelayMs.
  */
 export async function complete(request, options = {}) {
   const clock = options.now ?? Date.now;
   const started = clock();
+  const monotonic = options.monotonicNow ?? (() => performance.now());
+  const startedMono = Number.isFinite(options.overheadFrom) ? options.overheadFrom : monotonic();
+  let sentAt, firstTextAt;
+  let streamedText = ''; // answer text of the turn in progress, for a cancelled or timed-out stream
+  const timing = () => ({
+    ...(sentAt !== undefined ? { overheadMs: Math.max(0, Math.round(sentAt - startedMono)) } : {}),
+    ...(firstTextAt !== undefined ? { firstTokenMs: Math.max(0, Math.round(firstTextAt - sentAt)) } : {}),
+  });
+  const onSend = () => {
+    sentAt ??= monotonic();
+    streamedText = '';
+  };
+  const onText = (text) => {
+    firstTextAt ??= monotonic();
+    streamedText += text;
+    if (options.onDelta)
+      try {
+        options.onDelta(text);
+      } catch {
+        // A caller's sink must not break the call.
+      }
+  };
   const deadline = new AbortController();
   let timer;
   let request_;
@@ -807,7 +897,17 @@ export async function complete(request, options = {}) {
       }
       turn.attempted = true;
       const reply = await runAbortable(signal, () =>
-        chat({ settings, apiKey, model: resolved, request: turnRequest, final: position?.final, fetchImpl: context.fetchImpl, signal }),
+        chat({
+          settings,
+          apiKey,
+          model: resolved,
+          request: turnRequest,
+          final: position?.final,
+          fetchImpl: context.fetchImpl,
+          signal,
+          onSend,
+          onText,
+        }),
       );
       // An alias (for example deepseek-flash) can move to a newer model between calls. Price the
       // model that answered when the table knows it; otherwise say the cost used the alias's rates.
@@ -877,6 +977,7 @@ export async function complete(request, options = {}) {
       turn.folded = true;
       return await finish({
         version: COMPLETE_CONTRACT_VERSION,
+        ...(request_.id ? { id: request_.id } : {}),
         ok: true,
         text: reply.text,
         finishReason: hostCalls.length ? 'tool_calls' : 'stop',
@@ -884,6 +985,7 @@ export async function complete(request, options = {}) {
         usage: totals.usage,
         costUsd: totals.costUsd,
         latencyMs: Math.max(0, clock() - started),
+        ...timing(),
         ...(reply.providerRequestId ? { providerRequestId: reply.providerRequestId } : {}),
         ...(pricingWarning ? { pricingWarning } : {}),
         ...(request_.toolLoop
@@ -916,6 +1018,9 @@ export async function complete(request, options = {}) {
       const costUsd = totals.costUsd + (open ? turn.chatCost + toolCost(turn) : 0);
       delete details.usage;
       delete details.costUsd;
+      // A streamed call that was cancelled or timed out reports the text already sent to the caller.
+      if (request_?.stream && (failure.code === 'cancelled' || failure.code === 'timeout') && details.text === undefined && streamedText)
+        details.text = streamedText;
       failure = new CompleteFailure(failure.code, failure.message, {
         ...details,
         ...(usage ? { usage, costUsd } : costUsd ? { costUsd } : {}),
@@ -924,7 +1029,41 @@ export async function complete(request, options = {}) {
         ...loopSummary(costUsd),
       });
     }
-    return finish(errorResult(failure, { latencyMs: Math.max(0, clock() - started) }));
+    return finish(
+      errorResult(failure, { ...(request_?.id ? { id: request_.id } : {}), latencyMs: Math.max(0, clock() - started), ...timing() }),
+    );
+  }
+}
+
+/**
+ * The streaming form of `complete()`: yields `{ type: 'delta', id?, text }` for each piece of
+ * answer text, then exactly one `{ type: 'result', ...result }` with the usual result (on success
+ * and on every failure, `cancelled` included). Cancel with `options.signal`. Never throws.
+ */
+export async function* streamComplete(request, options = {}) {
+  const queue = [];
+  let wake;
+  let done = false;
+  const push = (item) => {
+    queue.push(item);
+    wake?.();
+  };
+  const id = plainObject(request) && typeof request.id === 'string' ? request.id : undefined;
+  complete(request, { ...options, onDelta: (text) => push({ type: 'delta', ...(id ? { id } : {}), text }) }).then((result) => {
+    done = true;
+    push({ type: 'result', ...result });
+  });
+  for (;;) {
+    while (queue.length) {
+      const item = queue.shift();
+      yield item;
+      if (item.type === 'result') return;
+    }
+    if (done && !queue.length) return;
+    await new Promise((resolve) => {
+      wake = resolve;
+    });
+    wake = undefined;
   }
 }
 
@@ -1008,7 +1147,7 @@ function wireMessage(message) {
   };
 }
 
-async function chat({ settings, apiKey, model, request, final, fetchImpl, signal }) {
+async function chat({ settings, apiKey, model, request, final, fetchImpl, signal, onSend, onText }) {
   const tools = request.tools;
   // Field order is fixed so identical histories serialize identically.
   const payload = {
@@ -1031,6 +1170,7 @@ async function chat({ settings, apiKey, model, request, final, fetchImpl, signal
       : {}),
   };
   let response;
+  onSend?.();
   try {
     response = await fetchAbortable(fetchImpl, `${settings.baseUrl}/chat/completions`, {
       method: 'POST',
@@ -1064,7 +1204,10 @@ async function chat({ settings, apiKey, model, request, final, fetchImpl, signal
       if (typeof chunk.model === 'string' && chunk.model.length <= 128) echoedModel ??= chunk.model;
       const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
       // Only `content` is the answer. Without tools `reasoning_content` is dropped unread.
-      if (typeof choice?.delta?.content === 'string') text += choice.delta.content;
+      if (typeof choice?.delta?.content === 'string' && choice.delta.content) {
+        text += choice.delta.content;
+        onText?.(choice.delta.content);
+      }
       if (tools && plainObject(choice?.delta)) collectToolDelta(choice.delta);
       if (typeof choice?.finish_reason === 'string') finishReason = choice.finish_reason;
       if (chunk.usage != null) rawUsage = chunk.usage;
@@ -1169,7 +1312,12 @@ export async function completeDryRun(request, options = {}) {
       ...(request_.messages && request_.maxTokens ? { maxCostUsd: dryRunWorstCase(settings.table, model, request_, at) } : {}),
       ...(cap !== undefined ? { dailyCapUsd: cap, spentTodayUsd: await callerSpendToday(context.ledgerPath, request_.caller, at) } : {}),
       ...(request_.toolLoop && request_.messages && request_.caller ? await dryRunLoop(request_, context.ledgerPath) : {}),
-      capabilities: { tools: true, ...(webToolPrices(settings.table) ? { builtinTools: [...WEB_TOOL_NAMES] } : {}) },
+      capabilities: {
+        tools: true,
+        stream: true,
+        serve: true,
+        ...(webToolPrices(settings.table) ? { builtinTools: [...WEB_TOOL_NAMES] } : {}),
+      },
       latencyMs: clock() - started,
     };
   } catch (error) {
@@ -1261,4 +1409,10 @@ export async function deepseekBalance(options = {}) {
 export const completeExitCode = (result) => (result?.ok ? 0 : (COMPLETE_ERROR_CODES[result?.error?.code] ?? 1));
 
 // Exposed for tests only.
-export const __test = { clearModelCache: () => modelCache.clear(), capPaths };
+export const __test = {
+  clearModelCache: () => {
+    modelCache.clear();
+    modelListings.clear();
+  },
+  capPaths,
+};

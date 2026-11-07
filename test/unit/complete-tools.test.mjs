@@ -601,7 +601,7 @@ test('the worst-case estimate counts tool schemas, reasoning and arguments', asy
     );
     assert.equal(withTools.ok, true, JSON.stringify(withTools));
     assert.ok(withTools.maxCostUsd > plain.maxCostUsd + 10_000 * 0.15e-6);
-    assert.deepEqual(plain.capabilities, { tools: true, builtinTools: ['web_search', 'web_fetch'] });
+    assert.deepEqual(plain.capabilities, { tools: true, stream: true, serve: true, builtinTools: ['web_search', 'web_fetch'] });
     assert.deepEqual(withTools.toolLoop, { id: 'dry', turn: 2, maxTurns: 3, final: false, toolCalls: 1, maxToolCalls: 32, costUsd: 0 });
     assert.equal(h.chats().length, 0);
     assert.equal(h.ledger().length, 0);

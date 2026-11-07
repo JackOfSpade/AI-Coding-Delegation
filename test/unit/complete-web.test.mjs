@@ -457,7 +457,7 @@ test('web request prices come from the trusted complete table; dry run reports t
       h.options,
     );
     assert.equal(dry.ok, true, JSON.stringify(dry));
-    assert.deepEqual(dry.capabilities, { tools: true, builtinTools: ['web_search', 'web_fetch'] });
+    assert.deepEqual(dry.capabilities, { tools: true, stream: true, serve: true, builtinTools: ['web_search', 'web_fetch'] });
     assert.deepEqual(dry.pricing.webUsdPerRequest, { web_search: WEB, web_fetch: WEB });
   } finally {
     h.done();

@@ -9,6 +9,7 @@ import { doctor, doctorLive, keysSummary } from './doctor.mjs';
 import { safeErrorText as safeText } from './redact.mjs';
 import { MAX_RETROSPECTIVE_JOBS } from './retrospective.mjs';
 import { COMPLETE_CONTRACT_VERSION, complete, completeDryRun, completeExitCode, deepseekBalance } from './complete.mjs';
+import { runCompleteServe } from './complete-serve.mjs';
 
 const binPath = fileURLToPath(new URL('../bin/offload.mjs', import.meta.url));
 
@@ -49,7 +50,7 @@ const CLI_COMMANDS = Object.freeze({
     positionals: 'zero-or-one',
   },
   retrospective: { valueFlags: ['jobs', 'last', 'repoPath'], booleanFlags: [], positionals: 'zero-or-one' },
-  complete: { valueFlags: [], booleanFlags: ['dry-run'], positionals: 'none' },
+  complete: { valueFlags: [], booleanFlags: ['dry-run', 'stream', 'serve'], positionals: 'none' },
   balance: { valueFlags: [], booleanFlags: [], positionals: 'one' },
   repair: { valueFlags: ['defects', 'assertionPaths', 'repoPath'], booleanFlags: ['foreground'], positionals: 'one' },
   revert: { valueFlags: ['repoPath'], booleanFlags: ['apply'], positionals: 'one' },
@@ -226,6 +227,10 @@ function validateInvocation(command, flags, positionals) {
   const allowed = new Set([...shape.valueFlags, ...shape.booleanFlags]);
   for (const key of Object.keys(flags)) if (!allowed.has(key)) throw new Error(`unknown option --${key} for ${command}`);
   if (shape.positionals === 'none' && positionals.length) throw new Error(`${command} does not accept positional arguments`);
+  if (command === 'complete') {
+    const modes = ['dry-run', 'stream', 'serve'].filter((name) => bool(flags[name]));
+    if (modes.length > 1) throw new Error(`complete --${modes[0]} and --${modes[1]} cannot be combined`);
+  }
   if (command === 'balance') {
     if (positionals.length !== 1 || positionals[0] !== 'deepseek') throw new Error('usage: offload balance deepseek');
   } else if (shape.positionals === 'one' && positionals.length !== 1) throw new Error(`${command} requires exactly one job id`);
@@ -364,15 +369,21 @@ async function readBoundedStdin(stdin, limit) {
  * `offload complete` and `offload balance deepseek`: stateless provider calls.
  * They never construct a Core, bind a repository or start MCP. Exactly one JSON
  * result line goes to stdout; stderr never carries prompt or response text.
+ * `complete --stream` (or a request with `stream: true`) writes NDJSON instead:
+ * `{type:"delta",id?,text}` lines, then one `{type:"result",...result}` line.
+ * `complete --serve` keeps the process alive for NDJSON requests (complete-serve.mjs).
  */
 async function runCompleteCommand(command, flags, options, stdout) {
   const providerOptions = options.completeOptions ?? {};
+  const signalSource = options.signalSource || process;
+  if (command === 'complete' && bool(flags.serve))
+    return runCompleteServe({ stdin: options.stdin || process.stdin, stdout, signalSource, providerOptions });
+  let streaming = command === 'complete' && bool(flags.stream);
   const emit = (result) => {
-    stdout.write(`${JSON.stringify(result)}\n`);
+    stdout.write(`${JSON.stringify(streaming ? { type: 'result', ...result } : result)}\n`);
     return completeExitCode(result);
   };
   const controller = new AbortController();
-  const signalSource = options.signalSource || process;
   const onSignal = () => controller.abort();
   const signals = ['SIGTERM', 'SIGINT'];
   for (const name of signals) signalSource.once(name, onSignal);
@@ -396,8 +407,19 @@ async function runCompleteCommand(command, flags, options, stdout) {
     } catch {
       return emit(completeFailureResult('invalid_request', 'stdin must be one JSON request object'));
     }
-    const run = bool(flags['dry-run']) ? completeDryRun : complete;
-    return emit(await run(request, { ...providerOptions, signal: controller.signal }));
+    if (bool(flags['dry-run'])) return emit(await completeDryRun(request, { ...providerOptions, signal: controller.signal }));
+    if (request?.stream === true) streaming = true;
+    // --stream means the request streams: a cancelled result then reports the text already sent.
+    else if (streaming && request && typeof request === 'object' && !Array.isArray(request) && request.stream === undefined)
+      request = { ...request, stream: true };
+    const id = typeof request?.id === 'string' ? request.id : undefined;
+    const line = (text) => stdout.write(`${JSON.stringify({ type: 'delta', ...(id ? { id } : {}), text })}\n`);
+    // overheadMs counts from process start (performance.now() origin): Node startup, module
+    // loading, reading stdin and model listing are all paid per call in one-shot mode.
+    const overheadFrom = options.overheadFrom ?? 0;
+    return emit(
+      await complete(request, { ...providerOptions, signal: controller.signal, overheadFrom, ...(streaming ? { onDelta: line } : {}) }),
+    );
   } finally {
     for (const name of signals) signalSource.removeListener(name, onSignal);
   }

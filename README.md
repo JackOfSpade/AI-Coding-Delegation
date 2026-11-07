@@ -8,7 +8,7 @@ Offload also ships `offload complete`, a separate, stateless DeepSeek chat compl
 
 One chat completion against DeepSeek, with no worktree, agent loop, repository binding, MCP or provider fallback. A request may declare tools (see [Tools](#tools)): built-in web search and fetch, which Offload runs through DeepSeek's Search and Fetch APIs, and host tools, whose calls are returned to the caller. A host application (for example a desktop app's pipeline step) pipes one JSON request in and reads one JSON result out. Routes resolve to the newest model at call time. Costs come from Offload's trusted price table, including peak and off-peak tiers.
 
-It needs no MCP server and no MCP restart. `complete`, `complete --dry-run` and `balance deepseek` never construct Offload's core.
+It needs no MCP server and no MCP restart. `complete`, `complete --dry-run`, `complete --stream`, `complete --serve` and `balance deepseek` never construct Offload's core. For latency-sensitive callers (a live voice turn) there is a streaming mode and a warm `--serve` process; see [Low latency: streaming and warm mode](#low-latency-streaming-and-warm-mode).
 
 ### Setup
 
@@ -21,12 +21,15 @@ echo '{"route":"deepseek-flash","messages":[{"role":"user","content":"Say hi"}],
   | offload complete
 
 offload complete --dry-run < request.json   # resolve model, price tier and key; send no completion
+offload complete --stream < request.json    # NDJSON: {"type":"delta",...} lines, then {"type":"result",...}
+offload complete --serve                    # warm process: NDJSON requests on stdin, NDJSON lines on stdout
 offload balance deepseek                    # DeepSeek account balance; never spends
 ```
 
 - `offload complete` reads one JSON request from stdin (at most 16 MiB), writes exactly one JSON result line to stdout, and exits with the status in the error table below. Invalid JSON, empty input or oversized input produce an `invalid_request` result.
 - `SIGTERM` or `SIGINT` aborts the in-flight call. The result (`cancelled`) is still printed and the exit status is 17.
 - `--dry-run` takes the same JSON. Only `route` is required; `messages`, `maxTokens` and `caller` are optional and add a worst-case cost and the caller's daily-cap position.
+- `--stream`, `--serve` and `--dry-run` are mutually exclusive.
 - `offload balance deepseek` takes exactly that positional.
 - Prompt and response text is never written to stderr.
 
@@ -41,9 +44,11 @@ import { complete } from 'offload/complete';
 const { complete: run } = await import(pathToFileURL(`${os.homedir()}/.local/lib/node_modules/offload/src/complete.mjs`).href);
 
 const result = await complete(request, { signal }); // always resolves, never rejects for provider failures
+const streamed = await complete({ ...request, stream: true }, { signal, onDelta: (text) => speak(text) });
+for await (const line of streamComplete({ ...request, stream: true, id: 't1' }, { signal })) handle(line); // delta lines, then the result line
 ```
 
-Exports: `complete`, `completeDryRun`, `deepseekBalance`, `validateCompleteRequest`, `pickRouteModel`, `completeExitCode`, `COMPLETE_CONTRACT_VERSION`, `COMPLETE_ERROR_CODES`, `COMPLETE_ROUTES`, `defaultLedgerPath`, `callerSpendToday`, `toolLoopSpend`.
+Exports: `complete`, `streamComplete`, `completeDryRun`, `deepseekBalance`, `validateCompleteRequest`, `pickRouteModel`, `completeExitCode`, `COMPLETE_CONTRACT_VERSION`, `COMPLETE_ERROR_CODES`, `COMPLETE_ROUTES`, `defaultLedgerPath`, `callerSpendToday`, `toolLoopSpend`.
 
 ### Request
 
@@ -63,6 +68,8 @@ Exports: `complete`, `completeDryRun`, `deepseekBalance`, `validateCompleteReque
   "tag": "step-3", // same pattern; free label for your own accounting
   "tools": [], // optional; see Tools
   "toolLoop": {}, // required with tools, rejected without them
+  "stream": false, // optional; true streams answer text (see Low latency); cannot be combined with tools
+  "id": "turn-7", // optional caller id, same pattern as caller; echoed on stream lines and the result; required by --serve
 }
 ```
 
@@ -82,9 +89,13 @@ Success:
   "usage": { "inputTokens": 1000, "cacheHitTokens": 400, "cacheMissTokens": 600, "outputTokens": 500, "reasoningTokens": 123 },
   "costUsd": 0.0003912,
   "latencyMs": 2310,
+  "overheadMs": 41,
+  "firstTokenMs": 380,
   "providerRequestId": "optional"
 }
 ```
+
+`overheadMs` is the time spent inside Offload before the provider request is sent (validation, key, model resolution, daily cap). For a one-shot CLI call it counts from process start, so it includes Node startup, module loading and reading stdin; for an imported `complete()` it counts from the call (or from `options.overheadFrom`, a `performance.now()` value); under `--serve` it counts from the moment the request line arrived. `firstTokenMs` runs from that send to the first answer text delta, the time to the first word. Both are whole milliseconds on a monotonic clock, present on every result (streamed or not, success or failure) that got that far, and absent if nothing was sent or no text arrived. With built-in web tools they refer to the first model turn's send. `id` is echoed when the request has one.
 
 Failure:
 
@@ -98,6 +109,38 @@ Failure:
 ```
 
 A failure may also carry `text`, `finishReason`, `model`, `usage` and `costUsd` when the provider produced them (for example `truncated` keeps the partial text). `text` never contains reasoning content. `usage.reasoningTokens` is already included in `outputTokens` and is reported for information. `costUsd` is computed from the shipped price table for the model that answered, using the peak or off-peak rate in force when the call started. Dry-run and balance results are also `version`-tagged objects with `ok`.
+
+### Low latency: streaming and warm mode
+
+For a live voice path the time to the first word matters. Two independent features help, and they combine.
+
+**Streaming.** With `"stream": true` (or the CLI flag `--stream`) answer text is emitted as it arrives. The CLI then writes NDJSON instead of one JSON line:
+
+```jsonc
+{ "type": "delta", "id": "turn-7", "text": "Thanks for" }   // zero or more, in order; id only when the request has one
+{ "type": "delta", "id": "turn-7", "text": " joining." }
+{ "type": "result", "id": "turn-7", "ok": true, "text": "Thanks for joining.", "firstTokenMs": 380, "overheadMs": 41, ... } // exactly one, last
+```
+
+The final line is the usual result (success or failure) with `"type": "result"` added. The concatenated deltas equal the result `text`. Deltas never contain reasoning. Cancel mid-stream with `SIGTERM`/`SIGINT` (CLI), an `AbortSignal` (import) or a `cancel` line (`--serve`): the final line is then a `cancelled` result whose `text` is the text already streamed, exit status 17, and the turn's billed usage is ledgered as usual. A non-streamed cancellation never echoes partial text. `stream` cannot be combined with `tools`. In Node, `complete(request, { onDelta })` calls `onDelta(text)` for each delta, and `streamComplete(request, options)` is an async generator yielding the same lines as the CLI.
+
+**Warm mode.** `offload complete --serve` keeps one process alive, so a turn pays neither Node startup nor a model listing, and the HTTPS connection to DeepSeek stays open between requests (Node's built-in fetch would close an idle connection after about four seconds; `--serve` uses keep-alive agents whose idle sockets stay open until DeepSeek closes them). Each stdin line is one JSON object:
+
+| Input line                                           | Meaning                                                                                                                                                     |
+| ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `{"id":"t1", ...request}`                            | A completion: the usual request plus a required `id` (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`), unique among requests in flight. Add `"stream": true` for deltas. |
+| `{"type":"cancel","id":"t1"}`                        | Cancel that in-flight request; its result line follows as `cancelled`.                                                                                      |
+| `{"type":"warm","id":"w1","route":"deepseek-flash"}` | Resolve the route's model and open the connection ahead of a turn (for example when the call starts). A dry run: never spends.                              |
+
+| Output line                              | Meaning                                                                                                                                                                  |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `{"type":"ready","version":1,"pid":...}` | Once, first. Send requests any time; they are buffered until read.                                                                                                       |
+| `{"type":"delta","id","text"}`           | Streamed requests only.                                                                                                                                                  |
+| `{"type":"result","id",...result}`       | Exactly one per accepted completion, including `invalid_request` results for a request that failed validation.                                                           |
+| `{"type":"warm","id",...dryRunResult}`   | The answer to a `warm` line.                                                                                                                                             |
+| `{"type":"error","id"?,"message"}`       | A line that was not accepted (not JSON, no `id`, unknown `type`, duplicate in-flight `id`, unknown cancel `id`, more than 16 in flight, over 16 MiB). No result follows. |
+
+Requests run concurrently and their lines interleave; route them by `id`. Model lists are shared between concurrent requests and, once older than 60 seconds, refreshed in the background (for up to 15 minutes) rather than in front of a turn. EOF on stdin lets in-flight requests finish, then the process exits 0. `SIGTERM`/`SIGINT` cancels every in-flight request (each still gets its `cancelled` result line) and exits 17. If stdout breaks because the host died, every in-flight request is cancelled so nothing keeps streaming or spending, and the process exits 17. A process killed outright loses at most the in-flight turns' ledger lines; their daily-cap reservations are ignored and removed by the next call because the process is gone. Daily caps, the ledger and privacy rules are the same as for one-shot calls. `--dry-run` reports `capabilities.stream` and `capabilities.serve` as `true`.
 
 ### Tools
 
@@ -256,7 +299,7 @@ The CLI works the same way, one process per call. Keep tool results short and st
 | `deepseek-flash` | newest Flash: the provider-maintained alias `deepseek-flash` if listed, else the highest `deepseek-vN[.M]-flash` |
 | `deepseek-pro`   | newest Pro, resolved the same way (`deepseek-pro`, else the highest `deepseek-vN[.M]-pro`)                       |
 
-The model list is fetched from DeepSeek's `/models` endpoint and cached for 60 seconds per process. There is no provider hopping: a failure is reported, never retried elsewhere. If the newest model has no entry in the trusted price table, the call fails with `unpriced_model` before any chat request is sent. A provider-maintained alias such as `deepseek-flash` is priced from its own table entry before the call; if the reply then names a different model, `costUsd` uses that model's rates when the table knows it, and otherwise keeps the alias's rates and adds a `pricingWarning` string to the result. Pro is available only through `offload complete`; agent jobs keep the Flash-only model policy.
+The model list is fetched from DeepSeek's `/models` endpoint and cached for 60 seconds per process (then refreshed in the background for up to 15 minutes, which matters only to long-lived processes such as `--serve`). There is no provider hopping: a failure is reported, never retried elsewhere. If the newest model has no entry in the trusted price table, the call fails with `unpriced_model` before any chat request is sent. A provider-maintained alias such as `deepseek-flash` is priced from its own table entry before the call; if the reply then names a different model, `costUsd` uses that model's rates when the table knows it, and otherwise keeps the alias's rates and adds a `pricingWarning` string to the result. Pro is available only through `offload complete`; agent jobs keep the Flash-only model policy.
 
 ### Error codes and exit status
 
@@ -319,7 +362,7 @@ Before each call Offload adds the caller's spend today (from the ledger), the wo
 
 ### Dry run
 
-`offload complete --dry-run` (or `completeDryRun`) validates the request, checks the key, lists models, and reports the resolved model, whether peak pricing applies now, the per-million-token USD rates, the worst-case cost when `messages` and `maxTokens` are given, and the caller's cap and spend today. With `tools`, `messages` and `caller` it also reports the loop's `toolLoop` position (`turn`, `final`, calls used) and spend so far. Every successful dry run carries `capabilities: { "tools": true, "builtinTools": ["web_search", "web_fetch"] }`, and `pricing.webUsdPerRequest` gives the web tool prices. It sends no completion and writes no ledger line.
+`offload complete --dry-run` (or `completeDryRun`) validates the request, checks the key, lists models, and reports the resolved model, whether peak pricing applies now, the per-million-token USD rates, the worst-case cost when `messages` and `maxTokens` are given, and the caller's cap and spend today. With `tools`, `messages` and `caller` it also reports the loop's `toolLoop` position (`turn`, `final`, calls used) and spend so far. Every successful dry run carries `capabilities: { "tools": true, "stream": true, "serve": true, "builtinTools": ["web_search", "web_fetch"] }`, and `pricing.webUsdPerRequest` gives the web tool prices. It sends no completion and writes no ledger line.
 
 ### Balance
 
