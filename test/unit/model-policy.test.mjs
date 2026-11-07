@@ -176,6 +176,8 @@ test('no shipped source, skill, template, or config names a Pro model id', () =>
   // The policy module documents the spellings it blocks; everything else must not mention one.
   const offenders = files
     .filter((file) => relative(root, file) !== join('src', 'model-policy.mjs'))
+    // `offload complete` is the one sanctioned Pro path; agent jobs stay Flash-only (asserted above and in the pricing test).
+    .filter((file) => !['complete.mjs', 'pricing-registry.mjs'].includes(relative(join(root, 'src'), file)))
     .filter((file) => /deepseek[-_.]?v?\d*[-_.]?pro\b/i.test(readFileSync(file, 'utf8')))
     .map((file) => relative(root, file));
   assert.deepEqual(offenders, []);

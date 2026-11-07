@@ -107,3 +107,10 @@ test('runtime identity advertises the OpenAI credit tier as an additive capabili
   assert.equal(RUNTIME_CAPABILITIES.outputCapDiagnostic, true);
   assert.equal(identity.schemaRevision, 2, 'an additive capability does not bump the schema revision');
 });
+
+test('runtime identity advertises the review packet as an additive capability', () => {
+  const identity = runtimeIdentity();
+  assert.equal(identity.capabilities.reviewPacket, true);
+  assert.equal(RUNTIME_CAPABILITIES.reviewPacket, true);
+  assert.equal(identity.schemaRevision, 2);
+});

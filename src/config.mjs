@@ -232,7 +232,7 @@ export function parseJsonFile(filePath, label = 'config', { rejectSymlink = fals
 export function validateConfig(config) {
   if (!plainObject(config)) throw new ConfigError('Config must be a JSON object');
   assertSafeKeys(config);
-  assertAllowedKeys(config, ['providers', 'profiles', 'default', 'limits', 'verifier'], 'Config');
+  assertAllowedKeys(config, ['providers', 'profiles', 'default', 'limits', 'verifier', 'complete'], 'Config');
   for (const key of ['providers', 'profiles']) if (!plainObject(config[key])) throw new ConfigError(`Config.${key} must be an object`);
   assertSafeKeys(config.providers);
   assertSafeKeys(config.profiles);
@@ -278,6 +278,25 @@ export function validateConfig(config) {
         `Config.verifier.interpreterRoots must be at most ${MAX_INTERPRETER_ROOTS} absolute paths without ".." segments`,
         'E_CONFIG_VERIFIER',
       );
+  }
+  if (config.complete !== undefined) {
+    // `offload complete`: the DeepSeek provider it calls and optional per-caller daily USD caps.
+    if (!plainObject(config.complete)) throw new ConfigError('Config.complete must be an object', 'E_CONFIG_COMPLETE');
+    assertSafeKeys(config.complete);
+    assertAllowedKeys(config.complete, ['provider', 'dailyUsdByCaller'], 'Config.complete');
+    if (config.complete.provider !== undefined && !boundedText(config.complete.provider, MAX_NAME))
+      throw new ConfigError('Config.complete.provider must be a provider name', 'E_CONFIG_COMPLETE');
+    const caps = config.complete.dailyUsdByCaller;
+    if (caps !== undefined) {
+      if (!plainObject(caps) || Object.keys(caps).length > 64)
+        throw new ConfigError('Config.complete.dailyUsdByCaller must be an object of at most 64 callers', 'E_CONFIG_COMPLETE');
+      assertSafeKeys(caps);
+      for (const [caller, usd] of Object.entries(caps)) {
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(caller))
+          throw new ConfigError(`Config.complete.dailyUsdByCaller has an invalid caller name`, 'E_CONFIG_COMPLETE');
+        numeric(usd, `complete.dailyUsdByCaller.${caller}`, 0, 10000);
+      }
+    }
   }
   for (const [name, provider] of Object.entries(config.providers)) {
     if (

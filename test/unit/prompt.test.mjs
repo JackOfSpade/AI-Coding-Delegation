@@ -273,3 +273,23 @@ test('a write worker is told not to leave scratch files in owned paths; a report
   const report = await buildSystemPrompt({ task: 'x', mode: 'report' });
   assert.equal(report.includes(WORKER_SCRATCH_CLEANUP_RULE), false);
 });
+
+test('reviewPacket numbers the acceptance criteria and adds the packet rule only when enabled', async () => {
+  const base = { repoPath: '/not-a-repo', ownedPaths: ['src/**'], acceptanceCriteria: ['first thing', 'second thing'] };
+  const plain = await buildSystemPrompt(base);
+  assert.match(plain, /- first thing\n- second thing/);
+  assert.doesNotMatch(plain, /Review packet|reviewPacket/);
+  assert.equal(plain, await buildSystemPrompt({ ...base, reviewPacket: false }));
+  const write = await buildSystemPrompt({ ...base, reviewPacket: true });
+  assert.match(write, /Acceptance criteria:\n1\. first thing\n2\. second thing/);
+  assert.doesNotMatch(write, /- first thing/);
+  assert.match(write, /Review packet: .*acceptance criterion number \(1-2\)/);
+  assert.match(write, /verbatim quote/);
+  assert.match(write, /uncertain:/);
+  assert.match(write, /changedFiles: every file you changed/);
+  assert.doesNotMatch(write, /offload-report-inputs/);
+  const report = await buildSystemPrompt({ ...base, ownedPaths: [], mode: 'report', acceptanceCriteria: [], reviewPacket: true });
+  assert.match(report, /criterion 0 = the task/);
+  assert.match(report, /\.offload-report-inputs\//);
+  assert.doesNotMatch(report, /changedFiles: every file/);
+});

@@ -64,6 +64,7 @@ import { LocalTools, availableToolDefinitions } from './agent/tools.mjs';
 import { AgentLoop } from './agent/loop.mjs';
 import { AgentContext } from './agent/context.mjs';
 import { annotateRelevantPaths, buildSystemPrompt } from './agent/prompt.mjs';
+import { checkReviewPacket } from './review-packet.mjs';
 import { loadPricing } from './pricing-registry.mjs';
 import {
   assertModelAllowed,
@@ -546,7 +547,11 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         const loop = new AgentLoop({
           provider,
           tools,
-          toolDefinitions: availableToolDefinitions({ allowCommand: !!runCommand, readOnly: job.mode === 'report' }),
+          toolDefinitions: availableToolDefinitions({
+            allowCommand: !!runCommand,
+            readOnly: job.mode === 'report',
+            reviewPacket: job.reviewPacket === true,
+          }),
           context,
           pricing,
           model: profile.model,
@@ -571,6 +576,24 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
                   return job.ownedPaths.filter((pattern) => !changed.some((file) => matchesAny(file.path, [pattern])));
                 },
               }),
+          ...(job.reviewPacket === true
+            ? {
+                checkReviewPacket: async (args) => {
+                  let changedFiles = [];
+                  if (job.mode !== 'report') {
+                    const after = await resolvedSnapshots.create(executionPath);
+                    changedFiles = (await resolvedSnapshots.files(executionPath, job.before, after)).map((file) => file.path);
+                  }
+                  return checkReviewPacket(args.reviewPacket, {
+                    mode: job.mode,
+                    acceptanceCriteria: job.acceptanceCriteria || [],
+                    changedFiles,
+                    resolveReadable: (file) => policy.assertReadable(file),
+                    seed: job.id,
+                  });
+                },
+              }
+            : {}),
           pathAliases: failurePathAliases(executionPath, job.repoPath),
           secrets: state.store.secrets,
         });

@@ -28,6 +28,26 @@ const DEEPSEEK_2026_10_01 = deepFreeze({
   },
 });
 
+/**
+ * Used only by `offload complete` (src/complete.mjs). Agent jobs keep the
+ * Flash-only table above, so a Pro response in a job stays unpriced and
+ * unauthorized; model policy is unchanged.
+ */
+const DEEPSEEK_COMPLETE_2026_10_01 = deepFreeze({
+  ...DEEPSEEK_2026_10_01,
+  models: {
+    ...DEEPSEEK_2026_10_01.models,
+    'deepseek-v4-pro': {
+      usd_per_1m: {
+        input_cache_hit: { off_peak: 0.022, peak: 0.044 },
+        input_cache_miss: { off_peak: 0.66, peak: 1.32 },
+        output: { off_peak: 1.98, peak: 3.96 },
+      },
+    },
+  },
+  legacy_aliases: { ...DEEPSEEK_2026_10_01.legacy_aliases, 'deepseek-pro': 'deepseek-v4-pro' },
+});
+
 // Claude cache writes use the default five-minute TTL (1.25x base input).
 // Cache reads, writes and ordinary input are metered separately.
 const ANTHROPIC_SONNET_2026_10_12 = deepFreeze({
@@ -95,6 +115,7 @@ const TABLES = Object.freeze({
   'openai-2026-10-26': OPENAI_2026_10_26,
   'anthropic-2026-10-19': ANTHROPIC_2026_10_19,
   'deepseek-2026-10-01': DEEPSEEK_2026_10_01,
+  'deepseek-complete-2026-10-01': DEEPSEEK_COMPLETE_2026_10_01,
   'anthropic-sonnet-2026-10-12': ANTHROPIC_SONNET_2026_10_12,
 });
 

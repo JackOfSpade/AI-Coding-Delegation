@@ -2499,7 +2499,7 @@ test('finite budgets make no provider call when even deep provider-only elision 
 
 test('finite reservation exhaustion exposes only the cheapest numeric projection and makes no provider call', async () => {
   const context = new AgentContext(toolTranscript({ results: 10 }), { keepRecentToolResults: 0 });
-  const definitions = availableToolDefinitions({ allowCommand: true });
+  const definitions = availableToolDefinitions({ allowCommand: true, reviewPacket: true });
   const candidates = [
     { messages: context.snapshot(), projection: 'raw', elidedToolResults: 0 },
     ...[...context.providerBudgetElisionSnapshots()].map((candidate) => ({ ...candidate, projection: 'tool-elision' })),
@@ -5305,4 +5305,144 @@ test('an unlimited-budget capped turn without a large write stays no-finish and 
   assert.equal(result.failureKind, 'no-finish');
   assert.equal(finals.length, 1);
   assert.deepEqual(finals[0].outputCap, { turn: 1, steer: 'continue', recovered: false });
+});
+
+const goodPacket = {
+  requirements: [{ criterion: 0, status: 'done', evidence: 'x' }],
+  claims: [{ claim: 'c', path: 'a.txt', startLine: 1, endLine: 1, quote: 'a verbatim quote' }],
+  uncertain: ['nothing checked beyond the diff'],
+};
+const packetTools = () => new LocalTools({ repoPath: process.cwd(), ownedPaths: [] });
+const failingThenPassing = (failures) => {
+  let n = 0;
+  return async () => {
+    n++;
+    return n <= failures
+      ? { status: 'failed', defects: [`defect ${n}`], claims: 0, verifiedClaims: 0 }
+      : { status: 'passed', defects: [], claims: 0, verifiedClaims: 0 };
+  };
+};
+
+test('a failed review packet check is corrected and the corrected finish is accepted with its passing check', async () => {
+  const requests = [],
+    events = [];
+  const result = await new AgentLoop({
+    provider: scripted(
+      [
+        [call('finish', JSON.stringify({ summary: 'done', reviewPacket: goodPacket }), 'f1')],
+        [call('finish', JSON.stringify({ summary: 'done', reviewPacket: goodPacket }), 'f2')],
+      ],
+      requests,
+    ),
+    tools: packetTools(),
+    checkReviewPacket: failingThenPassing(1),
+    progress: (event) => events.push(event),
+    maxTurns: 3,
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'DONE');
+  assert.equal(result.finish.reviewPacketCheck.status, 'passed');
+  assert.deepEqual(result.finish.reviewPacket, goodPacket);
+  assert.match(requests[1].at(-1).content, /^TOOL_ERROR: review packet check failed.*defect 1/s);
+  assert.ok(events.some((event) => event.action === 'review_packet_check'));
+});
+
+test('after two review packet corrections the next finish is accepted with the failed check attached', async () => {
+  const requests = [];
+  const turns = Array.from({ length: 3 }, (_, i) => [
+    call('finish', JSON.stringify({ summary: 'done', reviewPacket: goodPacket }), `f${i}`),
+  ]);
+  const result = await new AgentLoop({
+    provider: scripted(turns, requests),
+    tools: packetTools(),
+    checkReviewPacket: failingThenPassing(99),
+    maxTurns: 5,
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'DONE');
+  assert.equal(requests.length, 3);
+  assert.equal(result.finish.reviewPacketCheck.status, 'failed');
+  assert.deepEqual(result.finish.reviewPacketCheck.defects, ['defect 3']);
+});
+
+test('a failed review packet check on the last turn is accepted rather than corrected', async () => {
+  const result = await new AgentLoop({
+    provider: scripted([[call('finish', '{"summary":"done"}', 'f1')]]),
+    tools: packetTools(),
+    checkReviewPacket: failingThenPassing(99),
+    maxTurns: 1,
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'DONE');
+  assert.equal(result.finish.reviewPacketCheck.status, 'failed');
+});
+
+test('a model cannot supply reviewPacketCheck and a loop without a checker attaches none', async () => {
+  const injected = await new AgentLoop({
+    provider: scripted([
+      [call('finish', JSON.stringify({ summary: 'done', reviewPacketCheck: { status: 'passed' } }), 'f1')],
+      [call('finish', '{"summary":"done"}', 'f2')],
+    ]),
+    tools: packetTools(),
+    maxTurns: 3,
+  }).run({ task: 'x' });
+  assert.equal(injected.status, 'DONE');
+  assert.equal(injected.finish.reviewPacketCheck, undefined);
+  assert.throws(
+    () => new AgentLoop({ provider: { chat() {} }, tools: packetTools(), checkReviewPacket: 'x' }),
+    /checkReviewPacket must be a function/,
+  );
+});
+
+test('a malformed review packet is corrected through the finish argument path', async () => {
+  const requests = [];
+  const result = await new AgentLoop({
+    provider: scripted(
+      [
+        [call('finish', JSON.stringify({ summary: 'done', reviewPacket: { requirements: [] } }), 'f1')],
+        [call('finish', JSON.stringify({ summary: 'done', reviewPacket: goodPacket }), 'f2')],
+      ],
+      requests,
+    ),
+    tools: packetTools(),
+    checkReviewPacket: failingThenPassing(0),
+    maxTurns: 3,
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'DONE');
+  assert.match(requests[1].at(-1).content, /reviewPacket\.claims must be an array/);
+});
+
+test('a loop without a checker ignores a malformed finish.reviewPacket and returns no packet', async () => {
+  const requests = [];
+  const result = await new AgentLoop({
+    provider: scripted(
+      [[call('finish', JSON.stringify({ summary: 'done', reviewPacket: { requirements: 'bad', extra: true } }), 'f1')]],
+      requests,
+    ),
+    tools: packetTools(),
+    maxTurns: 3,
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'DONE');
+  assert.equal(requests.length, 1, 'no correction round');
+  assert.equal(Object.hasOwn(result.finish, 'reviewPacket'), false);
+  assert.equal(Object.hasOwn(result.finish, 'reviewPacketCheck'), false);
+});
+
+test('a throwing review packet checker becomes a failed check, is corrected, then accepted with the failed check attached', async () => {
+  const requests = [];
+  const checker = async () => {
+    throw new Error('boom');
+  };
+  const turns = Array.from({ length: 3 }, (_, i) => [
+    call('finish', JSON.stringify({ summary: 'done', reviewPacket: goodPacket }), `f${i}`),
+  ]);
+  const result = await new AgentLoop({
+    provider: scripted(turns, requests),
+    tools: packetTools(),
+    checkReviewPacket: checker,
+    maxTurns: 5,
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'DONE');
+  assert.equal(requests.length, 3, 'two bounded corrections, then accepted');
+  assert.match(requests[1].at(-1).content, /^TOOL_ERROR: review packet check failed.*could not run the review packet check/s);
+  assert.equal(result.finish.reviewPacketCheck.status, 'failed');
+  assert.deepEqual(result.finish.reviewPacketCheck.defects, ['the server could not run the review packet check']);
+  assert.deepEqual(result.finish.reviewPacket, goodPacket);
 });

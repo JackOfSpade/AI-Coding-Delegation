@@ -2,6 +2,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { compactReport, terminalStatuses } from './report.mjs';
+import { REVIEW_PACKET_LIMITS, reviewPacketProblems } from './review-packet.mjs';
 import { auditTestAssertions } from './test-assertion-audit.mjs';
 import { escapeRegExp, matchesAny, normalizePath, pathsOverlap } from './glob.mjs';
 import { pidAlive } from './pid.mjs';
@@ -149,6 +150,8 @@ const ROUND_SCOPED_VERIFIER_STATE = Object.freeze({
   retainedDiffRecovery: undefined,
   verifyEnvironment: undefined,
   applyVerify: undefined,
+  reviewPacketEvidence: undefined,
+  reviewPacketCheck: undefined,
 });
 // A terminal `error` describes the round that just ended (a BUDGET cap, a
 // verifier-adjacent failure). A queued repair or continuation starts a new
@@ -312,6 +315,78 @@ function safeReportString(value, maxChars = MAX_REPORT_TEXT) {
   return bounded || undefined;
 }
 const safeReportText = (value) => safeReportString(value);
+// Persisted copies of the worker's review packet and the server's check. Every
+// text field goes through safeReportString; a malformed packet is not stored
+// (the check already records why).
+const packetText = (value, max) => safeReportString(value, max) ?? '';
+function boundedReviewPacket(packet) {
+  if (reviewPacketProblems(packet).length) return undefined;
+  const L = REVIEW_PACKET_LIMITS;
+  return {
+    requirements: packet.requirements.map(({ criterion, status, evidence }) => ({
+      criterion,
+      status,
+      evidence: packetText(evidence, L.evidence),
+    })),
+    claims: packet.claims.map(({ claim, path, startLine, endLine, quote }) => ({
+      claim: packetText(claim, L.claim),
+      path: packetText(path, L.path),
+      startLine,
+      endLine,
+      quote: packetText(quote, L.quote),
+    })),
+    uncertain: packet.uncertain.map((item) => packetText(item, L.note)),
+    ...(packet.decisions ? { decisions: packet.decisions.map((item) => packetText(item, L.note)) } : {}),
+    ...(packet.changedFiles
+      ? { changedFiles: packet.changedFiles.map(({ path, why }) => ({ path: packetText(path, L.path), why: packetText(why, L.why) })) }
+      : {}),
+  };
+}
+function boundedReviewPacketCheck(check) {
+  if (!check || typeof check !== 'object' || Array.isArray(check) || !['passed', 'failed'].includes(check.status)) return undefined;
+  const count = (value) => (Number.isSafeInteger(value) && value >= 0 ? value : 0);
+  const ints = (value, max) => (Array.isArray(value) ? value.filter((item) => Number.isSafeInteger(item) && item >= 0).slice(0, max) : []);
+  const strings = (value, max) =>
+    Array.isArray(value) ? value.slice(0, max).flatMap((item) => (safeReportString(item, 600) ? [safeReportString(item, 600)] : [])) : [];
+  return {
+    status: check.status,
+    claims: count(check.claims),
+    verifiedClaims: count(check.verifiedClaims),
+    missingCriteria: ints(check.missingCriteria, 100),
+    unlistedFiles: strings(check.unlistedFiles, 50),
+    spotCheck: ints(check.spotCheck, REVIEW_PACKET_LIMITS.spotCheck),
+    notDone: ints(check.notDone, 100),
+    uncertain: count(check.uncertain),
+    defects: strings(check.defects, REVIEW_PACKET_LIMITS.defects),
+  };
+}
+// `job.reviewPacket` is the request flag; the worker's packet is stored as
+// `reviewPacketEvidence`. Public views expose the packet as `reviewPacket`.
+// Nothing here changes a job's status: the primary decides what a failed or
+// missing check means.
+function publicReviewPacket(job, detail) {
+  if (job.reviewPacket !== true) return {};
+  const stored = job.reviewPacketEvidence;
+  const packet =
+    stored && Array.isArray(stored.requirements) && Array.isArray(stored.claims) && Array.isArray(stored.uncertain) ? stored : undefined;
+  const check = boundedReviewPacketCheck(job.reviewPacketCheck);
+  if (!packet && !check) return {};
+  const view = !packet
+    ? undefined
+    : detail === 'full'
+      ? packet
+      : {
+          requirementCount: packet.requirements.length,
+          claimCount: packet.claims.length,
+          uncertain: packet.uncertain,
+          notDone: packet.requirements.filter((entry) => entry.status !== 'done'),
+          spotCheckClaims: (check?.spotCheck ?? []).flatMap((index) =>
+            packet.claims[index] ? [{ index: index + 1, ...packet.claims[index] }] : [],
+          ),
+          ...(packet.changedFiles ? { changedFileCount: packet.changedFiles.length } : {}),
+        };
+  return { ...(view ? { reviewPacket: view } : {}), ...(check ? { reviewPacketCheck: check } : {}) };
+}
 // Redact the whole (bounded) message before cutting it to 1,500 bytes, so a
 // credential straddling the cut cannot survive as an unrecognizable prefix.
 const safeReportError = (value) => {
@@ -796,6 +871,7 @@ const JOB_INPUT_KEYS = [
   'maxRepairRounds',
   'budget',
   'allowNetwork',
+  'reviewPacket',
   'extraWritable',
   'repoPath',
   'denyRead',
@@ -915,6 +991,7 @@ export function validateJobRequest(input) {
   if (input.profile != null && !cleanText(input.profile, 128)) throw new Error('profile is invalid');
   if (input.denyRead != null && !validPaths(input.denyRead, false)) throw new Error('denyRead must be relative paths/globs');
   if (input.allowNetwork != null && typeof input.allowNetwork !== 'boolean') throw new Error('allowNetwork must be boolean');
+  if (input.reviewPacket != null && typeof input.reviewPacket !== 'boolean') throw new Error('reviewPacket must be boolean');
   if (input.requireSandbox != null && typeof input.requireSandbox !== 'boolean') throw new Error('requireSandbox must be boolean');
   if (input.unsafePolicyOnlyVerifier != null && typeof input.unsafePolicyOnlyVerifier !== 'boolean')
     throw new Error('unsafePolicyOnlyVerifier must be boolean');
@@ -2360,6 +2437,12 @@ export class JobManager {
                 ? safeReportString(result?.summary ?? result?.finish?.summary, 1500)
                 : boundedString(result?.summary ?? result?.finish?.summary, 1500)) ?? job.summary,
             ...(job.mode === 'report' ? { reportText: reportText ?? job.reportText } : {}),
+            ...(job.reviewPacket === true
+              ? {
+                  reviewPacketEvidence: boundedReviewPacket(result?.finish?.reviewPacket),
+                  reviewPacketCheck: boundedReviewPacketCheck(result?.finish?.reviewPacketCheck),
+                }
+              : {}),
             concerns:
               (job.mode === 'report'
                 ? safeReportList(result?.concerns ?? result?.finish?.concerns)
@@ -3266,6 +3349,7 @@ export class JobManager {
             },
           }
         : {}),
+      ...publicReviewPacket(job, detail),
       ...(job.unsafePolicyOnlyVerifier === true ? { unsafePolicyOnlyVerifier: true } : {}),
       ...(job.verifierMode === 'baseline-diff' ? { verifierMode: 'baseline-diff' } : {}),
       ...(safeVerifyBaseline(job.verify?.baseline) ? { verifyBaseline: safeVerifyBaseline(job.verify.baseline) } : {}),

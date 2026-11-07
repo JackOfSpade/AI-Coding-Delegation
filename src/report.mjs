@@ -370,6 +370,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     workspaceCleanup,
     summary,
     concerns,
+    reviewPacketLine(job),
     ...providerTransitionLines(job),
     providerFailure,
     (!lean || failureDiagnostics) && providerFinishReason,
@@ -388,6 +389,20 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     .filter(Boolean)
     .join('\n');
   return redactText(raw);
+}
+/** One-line verdict on the worker's review packet; empty unless the job requested one. */
+function reviewPacketLine(job) {
+  if (job.reviewPacket !== true) return '';
+  const check = job.reviewPacketCheck;
+  if (!check || typeof check !== 'object' || Array.isArray(check))
+    return /^(DONE|VERIFY)/.test(String(job.status || '')) ? 'Review packet: missing' : '';
+  if (check.status !== 'passed') {
+    const defects = Array.isArray(check.defects) ? check.defects : [];
+    return `Review packet: FAILED - ${scalar(defects[0] ?? 'check failed').slice(0, 300)}${defects.length > 1 ? ` (+${defects.length - 1} more)` : ''}`;
+  }
+  const spot = Array.isArray(check.spotCheck) ? check.spotCheck.filter(Number.isSafeInteger).map((index) => index + 1) : [];
+  const notDone = Array.isArray(check.notDone) ? check.notDone.length : 0;
+  return `Review packet: passed - ${scalar(check.verifiedClaims ?? 0)}/${scalar(check.claims ?? 0)} quotes verified, ${scalar(check.uncertain ?? 0)} uncertain${notDone ? `, ${notDone} not fully done` : ''}${spot.length ? `, spot-check claims ${spot.join(',')}` : ''}`;
 }
 /** Keep old expectations prominent even beside PASS; additions stay in the diff. */
 function testAssertionLines(audit, lean) {

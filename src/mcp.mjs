@@ -122,6 +122,11 @@ const startProps = {
     },
     additionalProperties: false,
   },
+  reviewPacket: {
+    type: 'boolean',
+    description:
+      'Opt in (default false) to a worker-authored review packet: per-criterion status, claims with verbatim quotes and line ranges, uncertain items and decisions (and every changed file for write jobs). The server checks quotes and coverage and returns reviewPacketCheck (plus reviewPacket) in offload_wait/offload_job output; a failed or missing check never changes job status. Number your acceptanceCriteria meaningfully: the packet answers them by number.',
+  },
   allowNetwork: { type: 'boolean', description: 'Allow worker network access only when the task genuinely requires it.' },
   extraWritable: { type: 'array', maxItems: 128, items: { type: 'string', minLength: 1, maxLength: 1_024 } },
   repoPath: {
@@ -752,6 +757,7 @@ export function createMcpServer(
             maxRepairRounds: args.maxRepairRounds,
             budget: args.budget,
             ...(args.allowNetwork !== undefined ? { allowNetwork: args.allowNetwork } : {}),
+            ...(args.reviewPacket !== undefined ? { reviewPacket: args.reviewPacket } : {}),
             ...(args.extraWritable !== undefined ? { extraWritable: args.extraWritable } : {}),
             repoPath: args.repoPath,
           },

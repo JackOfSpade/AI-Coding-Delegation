@@ -969,3 +969,33 @@ test('write_file schema advertises boolean append and the per-call size guidance
   assert.ok(fn.description.includes('Keep content to about 150 lines or 6 KB per call'));
   assert.ok(fn.description.includes('calling write_file again with append true to add each next part to the end of that same file'));
 });
+
+test('finish accepts a well-formed review packet, rejects a malformed one, and never passes reviewPacketCheck through', async () => {
+  const { tools } = await fixture();
+  const reviewPacket = {
+    requirements: [{ criterion: 0, status: 'done', evidence: 'ok' }],
+    claims: [{ claim: 'c', path: 'a.txt', startLine: 1, endLine: 1, quote: 'one two three four' }],
+    uncertain: [],
+    changedFiles: [{ path: 'a.txt', why: 'edit' }],
+  };
+  const accepted = await tools.execute('finish', { summary: 'ok', reviewPacket, reviewPacketCheck: { status: 'passed' } });
+  assert.deepEqual(accepted.finish.reviewPacket, reviewPacket);
+  assert.equal(Object.hasOwn(accepted.finish, 'reviewPacketCheck'), false);
+  assert.equal(Object.hasOwn((await tools.execute('finish', { summary: 'ok' })).finish, 'reviewPacket'), false);
+  for (const bad of [{ requirements: [] }, { ...reviewPacket, claims: [{ claim: 'c' }] }, { ...reviewPacket, extra: true }, 'packet'])
+    await assert.rejects(() => tools.execute('finish', { summary: 'ok', reviewPacket: bad }), /finish requires/);
+  const finish = TOOL_DEFINITIONS.find((tool) => tool.function.name === 'finish').function.parameters;
+  assert.equal(finish.properties.reviewPacket.additionalProperties, false);
+  assert.equal(finish.additionalProperties, false);
+  assert.equal(Object.hasOwn(finish.properties, 'reviewPacketCheck'), false);
+  assert.ok(!finish.required.includes('reviewPacket'));
+});
+
+test('availableToolDefinitions: the finish schema carries reviewPacket only when requested', () => {
+  const finishOf = (options) => availableToolDefinitions(options).find((tool) => tool.function.name === 'finish').function.parameters;
+  assert.equal(Object.hasOwn(finishOf().properties, 'reviewPacket'), false);
+  assert.equal(Object.hasOwn(finishOf({}).properties, 'reviewPacket'), false);
+  assert.equal(Object.hasOwn(finishOf({ reviewPacket: true }).properties, 'reviewPacket'), true);
+  assert.equal(finishOf({ reviewPacket: true }).properties.reviewPacket.additionalProperties, false);
+  assert.ok(Object.hasOwn(finishOf().properties, 'summary'));
+});

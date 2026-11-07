@@ -268,6 +268,7 @@ test(
         'timingBreakdown',
         'verifierInterpreter',
         'retrospective',
+        'reviewPacket',
       ])
         assert.equal(clean.health.server.capabilities[name], true, name);
       assert.equal(typeof clean.health.sandboxReason, 'string');
@@ -1150,3 +1151,57 @@ test(
     });
   },
 );
+
+test(
+  'MCP e2e: a write job with reviewPacket corrects a bad quote and offload_wait carries the passing check and the packet',
+  { skip: windowsSkip },
+  async (t) => {
+    const packet = (quote) => ({
+      requirements: [{ criterion: 1, status: 'done', evidence: 'src/a.js exports a' }],
+      claims: [{ claim: 'a is exported as 1', path: 'src/a.js', startLine: 1, endLine: 1, quote }],
+      uncertain: ['did not run any test'],
+      decisions: ['used a const export'],
+      changedFiles: [{ path: 'src/a.js', why: 'new file' }],
+    });
+    const scripts = [
+      writeFileTurn('src/a.js', 'export const a = 1;\n'),
+      turn('finish', { summary: 'done', reviewPacket: packet('export const a = 2;') }, 'finish-bad'),
+      turn('finish', { summary: 'done', reviewPacket: packet('export const a = 1;') }, 'finish-good'),
+    ];
+    await withServer(t, { scripts }, async ({ repo, open }) => {
+      const mcp = await open();
+      const started = await mcp.call('offload_start', {
+        task: 'create src/a.js',
+        ownedPaths: ['src/**'],
+        acceptanceCriteria: ['src/a.js exports a'],
+        reviewPacket: true,
+        repoPath: repo,
+      });
+      assert.ok(!started.isError, started.text);
+      const done = await settled(mcp, started.jobId, repo);
+      assert.equal(done.status, 'DONE_UNVERIFIED');
+      assert.equal(done.reviewPacketCheck.status, 'passed');
+      assert.equal(done.reviewPacketCheck.verifiedClaims, 1);
+      assert.deepEqual(done.reviewPacketCheck.defects, []);
+      assert.equal(done.reviewPacket.claimCount, 1);
+      assert.deepEqual(done.reviewPacket.uncertain, ['did not run any test']);
+      assert.ok(
+        lines(done.report).some((line) => /^Review packet: passed - 1\/1 quotes verified, 1 uncertain/.test(line)),
+        done.report,
+      );
+      const full = await mcp.call('offload_job', { jobId: started.jobId, repoPath: repo, detail: 'full' });
+      assert.equal(full.reviewPacket.claims[0].quote, 'export const a = 1;');
+    });
+  },
+);
+
+test('MCP e2e: a job that did not ask for a review packet reports none', { skip: windowsSkip }, async (t) => {
+  await withServer(t, { scripts: [finish('plain', ['a/**'])] }, async ({ repo, open }) => {
+    const mcp = await open();
+    const started = await mcp.call('offload_start', { task: 'plain', ownedPaths: ['a/**'], repoPath: repo });
+    const done = await settled(mcp, started.jobId, repo);
+    assert.equal(done.reviewPacketCheck, undefined);
+    assert.equal(done.reviewPacket, undefined);
+    assert.ok(!done.report.includes('Review packet'));
+  });
+});

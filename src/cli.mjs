@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { doctor, doctorLive, keysSummary } from './doctor.mjs';
 import { safeErrorText as safeText } from './redact.mjs';
 import { MAX_RETROSPECTIVE_JOBS } from './retrospective.mjs';
+import { COMPLETE_CONTRACT_VERSION, complete, completeDryRun, completeExitCode, deepseekBalance } from './complete.mjs';
 
 const binPath = fileURLToPath(new URL('../bin/offload.mjs', import.meta.url));
 
@@ -48,6 +49,8 @@ const CLI_COMMANDS = Object.freeze({
     positionals: 'zero-or-one',
   },
   retrospective: { valueFlags: ['jobs', 'last', 'repoPath'], booleanFlags: [], positionals: 'zero-or-one' },
+  complete: { valueFlags: [], booleanFlags: ['dry-run'], positionals: 'none' },
+  balance: { valueFlags: [], booleanFlags: [], positionals: 'one' },
   repair: { valueFlags: ['defects', 'assertionPaths', 'repoPath'], booleanFlags: ['foreground'], positionals: 'one' },
   revert: { valueFlags: ['repoPath'], booleanFlags: ['apply'], positionals: 'one' },
   cancel: { valueFlags: ['repoPath'], booleanFlags: [], positionals: 'one' },
@@ -219,11 +222,13 @@ function logWindowFlags(flags) {
 }
 function validateInvocation(command, flags, positionals) {
   const shape = Object.hasOwn(CLI_COMMANDS, command) ? CLI_COMMANDS[command] : undefined;
-  if (!shape) throw new Error('usage: offload <start|wait|job|repair|revert|cancel|retrospective|doctor|mcp>');
+  if (!shape) throw new Error('usage: offload <start|wait|job|repair|revert|cancel|retrospective|doctor|complete|balance|mcp>');
   const allowed = new Set([...shape.valueFlags, ...shape.booleanFlags]);
   for (const key of Object.keys(flags)) if (!allowed.has(key)) throw new Error(`unknown option --${key} for ${command}`);
   if (shape.positionals === 'none' && positionals.length) throw new Error(`${command} does not accept positional arguments`);
-  if (shape.positionals === 'one' && positionals.length !== 1) throw new Error(`${command} requires exactly one job id`);
+  if (command === 'balance') {
+    if (positionals.length !== 1 || positionals[0] !== 'deepseek') throw new Error('usage: offload balance deepseek');
+  } else if (shape.positionals === 'one' && positionals.length !== 1) throw new Error(`${command} requires exactly one job id`);
   if (shape.positionals === 'zero-or-one' && positionals.length > 1)
     throw new Error(`${command} accepts at most one ${command === 'job' ? 'job id' : 'argument'}`);
   // `start` deliberately accepts free-form positional task text, including
@@ -333,6 +338,70 @@ async function launchDetached(core, spawnWorker, result) {
     throw error;
   }
 }
+const MAX_COMPLETE_STDIN_BYTES = 16 * 1024 * 1024;
+const completeFailureResult = (code, message) => ({
+  version: COMPLETE_CONTRACT_VERSION,
+  ok: false,
+  error: { code, message, retryable: false },
+});
+/** Read all of stdin as UTF-8, refusing more than the bound. Never echoes the input. */
+async function readBoundedStdin(stdin, limit) {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of stdin) {
+    const buffer = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : Buffer.from(chunk);
+    total += buffer.length;
+    if (total > limit) return { error: `request exceeds ${limit} bytes` };
+    chunks.push(buffer);
+  }
+  try {
+    return { text: new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)) };
+  } catch {
+    return { error: 'request is not valid UTF-8' };
+  }
+}
+/**
+ * `offload complete` and `offload balance deepseek`: stateless provider calls.
+ * They never construct a Core, bind a repository or start MCP. Exactly one JSON
+ * result line goes to stdout; stderr never carries prompt or response text.
+ */
+async function runCompleteCommand(command, flags, options, stdout) {
+  const providerOptions = options.completeOptions ?? {};
+  const emit = (result) => {
+    stdout.write(`${JSON.stringify(result)}\n`);
+    return completeExitCode(result);
+  };
+  const controller = new AbortController();
+  const signalSource = options.signalSource || process;
+  const onSignal = () => controller.abort();
+  const signals = ['SIGTERM', 'SIGINT'];
+  for (const name of signals) signalSource.once(name, onSignal);
+  try {
+    if (command === 'balance') return emit(await deepseekBalance({ ...providerOptions, signal: controller.signal }));
+    const aborted = new Promise((resolve) => {
+      if (controller.signal.aborted) resolve('aborted');
+      else controller.signal.addEventListener('abort', () => resolve('aborted'), { once: true });
+    });
+    const stdin = options.stdin || process.stdin;
+    const input = await Promise.race([readBoundedStdin(stdin, MAX_COMPLETE_STDIN_BYTES), aborted]);
+    if (input === 'aborted') {
+      // An open stdin pipe would keep the process alive after the result is printed.
+      stdin.destroy?.();
+      return emit(completeFailureResult('cancelled', 'cancelled before the request was read'));
+    }
+    if (input.error) return emit(completeFailureResult('invalid_request', input.error));
+    let request;
+    try {
+      request = JSON.parse(input.text);
+    } catch {
+      return emit(completeFailureResult('invalid_request', 'stdin must be one JSON request object'));
+    }
+    const run = bool(flags['dry-run']) ? completeDryRun : complete;
+    return emit(await run(request, { ...providerOptions, signal: controller.signal }));
+  } finally {
+    for (const name of signals) signalSource.removeListener(name, onSignal);
+  }
+}
 export async function runCli(argv = process.argv.slice(2), options = {}) {
   const stdout = options.stdout || process.stdout;
   const stderr = options.stderr || process.stderr;
@@ -346,6 +415,7 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
     return 2;
   }
   const { command, positionals, flags } = parsed;
+  if (command === 'complete' || command === 'balance') return runCompleteCommand(command, flags, options, stdout);
   const injectedCore = Object.hasOwn(options, 'core');
   let core;
   try {

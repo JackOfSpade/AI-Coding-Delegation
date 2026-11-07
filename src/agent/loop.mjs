@@ -16,6 +16,7 @@ import { MAX_BATCH_COMMAND_SEC } from '../timing.mjs';
 import { anthropicContentMatchesAssistant, cloneAnthropicContent, validAnthropicContent } from '../anthropic-content.mjs';
 import { cloneOpenAIReasoning, validOpenAIReasoning } from '../openai-reasoning.mjs';
 import { plainObject } from '../plain-object.mjs';
+import { reviewPacketCorrection } from '../review-packet.mjs';
 import {
   LARGE_EDIT_CAPPED_REMINDER,
   LARGE_WRITE_CAPPED_REMINDER,
@@ -96,6 +97,8 @@ const FINISH_ALONE_CORRECTION =
 // Rejected finish arguments run nothing and lose nothing, so unlike a mixed turn
 // they earn a second correction before the round fails.
 const MAX_FINISH_ARGUMENT_CORRECTIONS = 2;
+// A failed review-packet check also leaves the diff intact, so it earns two corrections.
+const MAX_REVIEW_PACKET_CORRECTIONS = 2;
 const finishArgumentsCorrection = (problems) =>
   `finish arguments are invalid: ${problems.join('; ')}. Your edits are retained. Do not redo them. Fix only what is listed and call finish alone; the smallest valid call is {"summary":"Implemented the requested changes."}`;
 const NO_FINISH_REMINDER =
@@ -335,6 +338,8 @@ export class AgentLoop {
     serverVerifierConfigured = false,
     reportMode = false,
     checkOwnedPaths,
+    // function(finishArgs) -> Promise<check>; see src/review-packet.mjs.
+    checkReviewPacket,
     // `[[absolutePrefix, label], ...]` applied to the failing call recorded when
     // the loop guard trips, so a temp or home directory never reaches a report.
     pathAliases = [],
@@ -362,6 +367,9 @@ export class AgentLoop {
     if (typeof serverVerifierConfigured !== 'boolean') throw new TypeError('serverVerifierConfigured must be boolean');
     if (checkOwnedPaths !== undefined && typeof checkOwnedPaths !== 'function') throw new TypeError('checkOwnedPaths must be a function');
     this.checkOwnedPaths = checkOwnedPaths;
+    if (checkReviewPacket !== undefined && typeof checkReviewPacket !== 'function')
+      throw new TypeError('checkReviewPacket must be a function');
+    this.checkReviewPacket = checkReviewPacket;
     if (
       !Array.isArray(pathAliases) ||
       pathAliases.length > 16 ||
@@ -514,6 +522,8 @@ export class AgentLoop {
     // violation is the worker's, not a fluke, and ends the round.
     let finishProtocolRecoveryUsed = false;
     let finishArgumentCorrections = 0;
+    let reviewPacketCorrections = 0;
+    let reviewPacketCheck;
     let noFinishRecoveryUsed = false;
     // Finite non-report budgets only: what each completed request cost and
     // what the next one had to reserve, for the outlook on the reservation.
@@ -1261,7 +1271,12 @@ export class AgentLoop {
         if (new Set(calls.map((call) => call.id)).size !== calls.length)
           return responseOutcome('FAILED', turn, responseModel, { error: 'Duplicate tool call id' });
         const finishIndex = calls.findIndex((call) => call.name === 'finish');
-        if (finishIndex !== -1) parsed[finishIndex] = normalizeFinishArgs(parsed[finishIndex]);
+        if (finishIndex !== -1) {
+          parsed[finishIndex] = normalizeFinishArgs(parsed[finishIndex]);
+          // A job that did not request a review packet ignores one rather than validating it.
+          if (!this.checkReviewPacket && parsed[finishIndex] && typeof parsed[finishIndex] === 'object')
+            delete parsed[finishIndex].reviewPacket;
+        }
         const finishNotAlone = finishIndex !== -1 && calls.length !== 1;
         const finishProblems = finishIndex === -1 ? [] : finishArgumentProblems(parsed[finishIndex]);
         const finishInvalid = finishProblems.length > 0;
@@ -1315,6 +1330,31 @@ export class AgentLoop {
             await this.context.flush();
             await settleCappedImplementationRecovery();
             await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'owned_paths_completion_check' });
+            continue;
+          }
+        }
+        if (finishIndex !== -1 && this.checkReviewPacket) {
+          try {
+            reviewPacketCheck = await this.checkReviewPacket(parsed[finishIndex]);
+          } catch {
+            // The check is evidence for the reviewer, never a reason to lose the round.
+            reviewPacketCheck = { status: 'failed', defects: ['the server could not run the review packet check'] };
+          }
+          if (
+            reviewPacketCheck?.status === 'failed' &&
+            reviewPacketCorrections < MAX_REVIEW_PACKET_CORRECTIONS &&
+            turn < this.maxTurns &&
+            !budgetFinishRecovery &&
+            !reportFinalizationUsed
+          ) {
+            reviewPacketCorrections++;
+            await this.context.addBatch([
+              assistant,
+              { role: 'tool', tool_call_id: calls[finishIndex].id, name: 'finish', content: reviewPacketCorrection(reviewPacketCheck) },
+            ]);
+            await this.context.flush();
+            await settleCappedImplementationRecovery();
+            await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'review_packet_check' });
             continue;
           }
         }
@@ -1396,7 +1436,10 @@ export class AgentLoop {
             this.context.addToolResult(calls[i].id, JSON.stringify(value.finish), calls[i].name);
             await this.context.flush();
             await settleCappedImplementationRecovery();
-            return responseOutcome('DONE', turn, responseModel, { finish: value.finish, text });
+            return responseOutcome('DONE', turn, responseModel, {
+              finish: reviewPacketCheck ? { ...value.finish, reviewPacketCheck } : value.finish,
+              text,
+            });
           }
           this.context.addToolResult(calls[i].id, value, calls[i].name);
           await this.context.flush();

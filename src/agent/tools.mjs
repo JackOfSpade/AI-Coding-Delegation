@@ -9,6 +9,7 @@ import { snapshotGitEnv } from '../git-snapshot.mjs';
 import { globToRegExp, normalizePath } from '../glob.mjs';
 import { statTimestamp } from '../stat-identity.mjs';
 import { gitBinary } from '../git-binary.mjs';
+import { REVIEW_PACKET_SCHEMA, reviewPacketProblems } from '../review-packet.mjs';
 
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const MAX_READ_CAP = 256_000;
@@ -259,20 +260,33 @@ export const TOOL_DEFINITIONS = Object.freeze([
           required: ['path', 'reason'],
         },
       },
+      reviewPacket: REVIEW_PACKET_SCHEMA,
     },
     ['summary'],
   ),
 ]);
 
 /** Return the exact schemas a particular job can actually execute. */
-export function availableToolDefinitions({ allowCommand = true, readOnly = false } = {}) {
-  if (typeof allowCommand !== 'boolean' || typeof readOnly !== 'boolean') throw new TypeError('allowCommand and readOnly must be boolean');
+export function availableToolDefinitions({ allowCommand = true, readOnly = false, reviewPacket = false } = {}) {
+  if (typeof allowCommand !== 'boolean' || typeof readOnly !== 'boolean' || typeof reviewPacket !== 'boolean')
+    throw new TypeError('allowCommand, readOnly and reviewPacket must be boolean');
   return Object.freeze(
     TOOL_DEFINITIONS.filter(
       (tool) =>
         (allowCommand || tool.function.name !== 'run_command') && (!readOnly || !['edit_file', 'write_file'].includes(tool.function.name)),
-    ),
+    ).map((tool) => (reviewPacket || tool.function.name !== 'finish' ? tool : withoutReviewPacket(tool))),
   );
+}
+/** The finish schema without the opt-in reviewPacket property, for jobs that did not request one. */
+function withoutReviewPacket(tool) {
+  const { reviewPacket: _omitted, ...properties } = tool.function.parameters.properties;
+  return Object.freeze({
+    ...tool,
+    function: Object.freeze({
+      ...tool.function,
+      parameters: Object.freeze({ ...tool.function.parameters, properties: Object.freeze(properties) }),
+    }),
+  });
 }
 
 /** PathPolicy is the sole authority for lexical/canonical scope and deny rules. */
@@ -1094,7 +1108,8 @@ export class LocalTools {
         (args.report === undefined || (typeof args.report === 'string' && args.report.length <= 256_000)) &&
         list(args.concerns) &&
         list(args.testsRun) &&
-        validUntouchedPaths(args.untouchedPaths);
+        validUntouchedPaths(args.untouchedPaths) &&
+        (args.reviewPacket === undefined || reviewPacketProblems(args.reviewPacket).length === 0);
       if (!valid)
         throw new Error(
           'finish requires a 1-1500 character summary, optional 256000 character report, and up to 100 short string concerns/testsRun entries',
@@ -1106,6 +1121,7 @@ export class LocalTools {
           concerns: [...(args.concerns ?? []), ...(args.untouchedPaths ?? []).map(({ path, reason }) => `Unchanged ${path}: ${reason}`)],
           testsRun: args.testsRun ?? [],
           ...(args.untouchedPaths ? { untouchedPaths: args.untouchedPaths } : {}),
+          ...(args.reviewPacket !== undefined ? { reviewPacket: args.reviewPacket } : {}),
         },
       };
     }
@@ -1145,7 +1161,7 @@ const finishListProblem = (name, value) =>
  * the mistake and loses a correct diff to the finish protocol.
  */
 export function finishArgumentProblems(value) {
-  const { summary, report, concerns, testsRun, untouchedPaths } = value;
+  const { summary, report, concerns, testsRun, untouchedPaths, reviewPacket } = value;
   return [
     ...(typeof summary !== 'string' || summary.length === 0
       ? ['summary is required: a string of 1-1500 characters']
@@ -1158,6 +1174,7 @@ export function finishArgumentProblems(value) {
     ...finishListProblem('concerns', concerns),
     ...finishListProblem('testsRun', testsRun),
     ...(validUntouchedPaths(untouchedPaths) ? [] : ['untouchedPaths must be an array of {path, reason} objects']),
+    ...(reviewPacket === undefined ? [] : reviewPacketProblems(reviewPacket)),
   ];
 }
 /** A lone string where finish takes a list says the same thing as a list of one; only the shape is wrong. */

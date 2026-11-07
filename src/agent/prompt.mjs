@@ -32,6 +32,19 @@ export const WORKER_COMPLETION_RULE =
 const FINISH_ALONE_RULE =
   'Use finish only after every other needed tool result has returned. Its response must contain exactly one tool call: finish. Pairing finish with any other tool rejects the entire response, including its writes. Keep summary to 1-2 short sentences (at most 1500 characters); put detailed findings in report, not summary. concerns and testsRun are arrays of strings, even for one item. A minimal valid final call is finish({"summary":"Implemented the requested changes."}). Completion prose without a finish call does not finish the job.';
 
+// The reviewer reads this packet instead of re-deriving your work; the server
+// checks that every quote exists where cited and that coverage is complete.
+const reviewPacketRule = (reportMode, criteriaCount) =>
+  `Review packet: your finish call must include reviewPacket. requirements: one entry per ${
+    criteriaCount
+      ? `acceptance criterion number (1-${criteriaCount})`
+      : 'job (criterion 0 = the task, since there are no numbered criteria)'
+  }, each {criterion, status done|partial|not_done, evidence}. claims: your key findings, each {claim, path, startLine, endLine, quote} with a verbatim quote and the exact 1-based line range from a file you read${
+    reportMode ? ' (staged inputs under .offload-report-inputs/ are citable)' : ''
+  }; the server rejects a quote that is not within the cited lines. uncertain: what you are unsure of or did not check, so the reviewer looks there (use [] only if nothing). decisions: judgment calls with alternatives and reasons.${
+    reportMode ? '' : ' changedFiles: every file you changed, each {path, why}, and no file you did not change.'
+  } A failed packet check is returned to you for correction.`;
+
 export async function repoConventions(repoPath, maxChars = 12_000) {
   if (typeof repoPath !== 'string' || !repoPath) return '';
   if (!Number.isSafeInteger(maxChars) || maxChars < 0) throw new TypeError('maxChars must be a non-negative integer');
@@ -109,6 +122,8 @@ export async function buildSystemPrompt({
   // contain caller-private values, and the worker does not need its text. The
   // manager runs the focused verifier after a successful finish.
   serverVerifierConfigured = false,
+  // Opt-in: number the criteria and require finish.reviewPacket.
+  reviewPacket = false,
 } = {}) {
   const writable = [...(ownedPaths ?? []), ...(extraWritable ?? [])].filter((value) => typeof value === 'string');
   const relevant = (relevantPaths ?? []).filter((value) => typeof value === 'string' && value.length <= 1280).slice(0, MAX_RELEVANT_PATHS);
@@ -145,6 +160,7 @@ export async function buildSystemPrompt({
     !reportMode && finiteRemainingTurns
       ? `You have ${finiteRemainingTurns} model turn${finiteRemainingTurns === 1 ? '' : 's'} available. Batch independent reads and lists, then after their required reads make an allowed tool call immediately. Do not emit source code, a plan, progress update, or other narrative outside tool calls; put source only in write_file.content. Prefer read_file, list_dir, glob, and grep for ordinary inspection. When read_file returns [truncated; next offset N], continue that file with exactly offset N. ${allowCommand ? (serverVerifierConfigured ? 'The configured focused verifier runs server-side after finish, so reserve one final response containing only finish rather than rerunning or searching for tests. ' : 'Reserve run_command for focused build, test, or diagnostic work after changes. ') : ''}Prefer writing complete final file content with write_file over a write-then-edit sequence, within the per-call size rule; build a larger file with write_file append parts instead. If several new files are needed, write one complete file per tool-call response, then continue with the next file. edit_file requires a fresh read of that file, including after write_file. Reserve time for the configured verifier and the mandatory single finish call.`
       : '',
+    reviewPacket === true ? reviewPacketRule(reportMode, acceptanceCriteria.length) : '',
     reportMode
       ? `You must call finish with a concise summary and your detailed findings in its report field (up to 256000 characters), plus concerns and testsRun. ${FINISH_ALONE_RULE}`
       : `You must call finish with a concise summary, concerns, and testsRun when the task is complete. Check every owned path against the task. If the server flags untouched paths, complete the missing work or confirm each in finish.untouchedPaths with {path, reason} explaining why it needs no edit. ${FINISH_ALONE_RULE}`,
@@ -164,7 +180,9 @@ export async function buildSystemPrompt({
     inputs.length
       ? `Read-only external inputs copied into this private worktree:\n${inputs.map((input) => `- ${input.path} (${input.bytes} bytes)`).join('\n')}`
       : '',
-    acceptanceCriteria.length ? `Acceptance criteria:\n${acceptanceCriteria.map((x) => `- ${x}`).join('\n')}` : '',
+    acceptanceCriteria.length
+      ? `Acceptance criteria:\n${acceptanceCriteria.map((x, i) => (reviewPacket === true ? `${i + 1}. ${x}` : `- ${x}`)).join('\n')}`
+      : '',
     local,
     WORKER_COMPLETION_RULE,
   ]

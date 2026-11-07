@@ -76,6 +76,7 @@ test('MCP lists exact tools, initializes, pings and dispatches', async () => {
     compactPreflight: true,
     runnerScopedPreflight: true,
     outputCapDiagnostic: true,
+    reviewPacket: true,
   });
   assert.ok(
     values.some((value) => value.id === null && value.result?.tools),

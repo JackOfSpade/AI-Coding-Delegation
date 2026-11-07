@@ -31,5 +31,6 @@
   },
   "default": "sonnet",
   "limits": { "maxTurns": 80, "timeoutMinutes": 30, "maxUsd": 2 },
-  "verifier": { "interpreterRoots": [] }
+  "verifier": { "interpreterRoots": [] },
+  "complete": { "provider": "deepseek", "dailyUsdByCaller": {} }
 }
