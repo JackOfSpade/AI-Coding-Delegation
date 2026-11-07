@@ -1,7 +1,13 @@
 /**
- * `offload complete`: one stateless, tool-free DeepSeek chat completion for
- * host applications (for example a desktop app's pipeline step). There is no
- * worktree, agent loop, tool, verifier, repository binding or provider hop.
+ * `offload complete`: one stateless DeepSeek chat completion for host
+ * applications (for example a desktop app's pipeline step). There is no
+ * worktree, agent loop, verifier, repository binding or provider hop.
+ *
+ * Optional host tools: a request may declare function tools plus a `toolLoop`
+ * bound. Offload never runs a tool. A reply that calls tools is returned to the
+ * caller, who runs them and sends the next request with the results appended.
+ * Each call is still stateless: the turn and tool-call counts come from the
+ * history in the request, and the loop's spend comes from the ledger by loop id.
  *
  * Contract (stable, versioned by COMPLETE_CONTRACT_VERSION):
  * - `complete(request, { signal })` always resolves to a result object; it
@@ -60,7 +66,29 @@ const MAX_TIMEOUT_MS = 1_800_000;
 const DEFAULT_TIMEOUT_MS = 600_000;
 const MODEL_CACHE_MS = 60_000;
 const LEDGER_TAIL_BYTES = 4 * 1024 * 1024;
-const REQUEST_KEYS = new Set(['version', 'route', 'messages', 'maxTokens', 'reasoning', 'timeoutMs', 'caller', 'tag']);
+const REQUEST_KEYS = new Set(['version', 'route', 'messages', 'maxTokens', 'reasoning', 'timeoutMs', 'caller', 'tag', 'tools', 'toolLoop']);
+
+// Host-declared tools. Offload never executes them; it returns the calls.
+const TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/;
+const MAX_TOOLS = 32;
+const MAX_TOOL_DESCRIPTION_CHARS = 8_192;
+const MAX_TOOL_SCHEMA_CHARS = 65_536;
+const MAX_TOOL_CALLS_PER_MESSAGE = 64;
+const MAX_TOOL_CALL_ID_CHARS = 512;
+const MAX_TOOL_ARGUMENT_CHARS = 512_000;
+const MAX_LOOP_USD = 1_000;
+const TOOL_KEYS = new Set(['name', 'description', 'parameters']);
+const TOOL_LOOP_KEYS = new Set(['id', 'maxTurns', 'maxToolCallsPerTurn', 'maxToolCalls', 'maxUsd']);
+/** [min, max, default] for each integer toolLoop bound. */
+const TOOL_LOOP_LIMITS = Object.freeze({ maxTurns: [1, 32, 8], maxToolCallsPerTurn: [1, 32, 8], maxToolCalls: [1, 256, 32] });
+const MESSAGE_KEYS = Object.freeze({
+  plain: new Set(['role', 'content']),
+  assistant: new Set(['role', 'content', 'toolCalls', 'reasoningContent']),
+  tool: new Set(['role', 'toolCallId', 'content']),
+});
+const TOOL_CALL_KEYS = new Set(['id', 'name', 'arguments']);
+/** A non-empty string of at most `max` characters with no C0 or DEL control character. */
+const identifier = (value, max) => typeof value === 'string' && value.length > 0 && value.length <= max && !/[\x00-\x1F\x7F]/.test(value);
 
 class CompleteFailure extends Error {
   constructor(code, message, details = {}) {
@@ -87,23 +115,86 @@ export function validateCompleteRequest(request, { partial = false } = {}) {
   if (typeof request.route !== 'string' || !Object.hasOwn(COMPLETE_ROUTES, request.route))
     fail('invalid_request', `route must be one of ${Object.keys(COMPLETE_ROUTES).join(', ')}`);
   const out = { route: request.route };
+  const toolSpec = validateTools(request);
+  if (toolSpec) Object.assign(out, { tools: toolSpec.tools, toolLoop: toolSpec.toolLoop });
   if (!partial || request.messages !== undefined) {
     const { messages } = request;
     if (!Array.isArray(messages) || !messages.length || messages.length > MAX_MESSAGES)
       fail('invalid_request', `messages must be an array of 1-${MAX_MESSAGES} messages`);
-    let total = 0;
+    let total = toolSpec?.schemaChars ?? 0;
+    // Tool calls of the latest assistant message that still await a tool result.
+    let pending = new Set();
+    const seenIds = new Set();
     out.messages = messages.map((message, index) => {
-      if (!plainObject(message) || Object.keys(message).some((key) => key !== 'role' && key !== 'content'))
-        fail('invalid_request', `messages[${index}] must have only role and content`);
-      if (!['system', 'user', 'assistant'].includes(message.role))
-        fail('invalid_request', `messages[${index}].role must be system, user or assistant`);
+      const roles = toolSpec ? ['system', 'user', 'assistant', 'tool'] : ['system', 'user', 'assistant'];
+      const keys = !toolSpec
+        ? MESSAGE_KEYS.plain
+        : Object.hasOwn(MESSAGE_KEYS, message?.role)
+          ? MESSAGE_KEYS[message.role]
+          : MESSAGE_KEYS.plain;
+      if (!plainObject(message) || Object.keys(message).some((key) => !keys.has(key)))
+        fail(
+          'invalid_request',
+          toolSpec ? `messages[${index}] has a field its role does not allow` : `messages[${index}] must have only role and content`,
+        );
+      if (!roles.includes(message.role))
+        fail(
+          'invalid_request',
+          `messages[${index}].role must be ${toolSpec ? 'system, user, assistant or tool' : 'system, user or assistant'}`,
+        );
       if (typeof message.content !== 'string') fail('invalid_request', `messages[${index}].content must be a string`);
       total += message.content.length;
+      if (message.role === 'tool') {
+        if (!identifier(message.toolCallId, MAX_TOOL_CALL_ID_CHARS) || !pending.has(message.toolCallId))
+          fail('invalid_request', `messages[${index}].toolCallId must answer an unanswered call of the preceding assistant message`);
+        pending.delete(message.toolCallId);
+        return { role: 'tool', toolCallId: message.toolCallId, content: message.content };
+      }
+      if (pending.size)
+        fail('invalid_request', `messages[${index}] arrives before every tool call of the previous assistant message has a tool result`);
       // Keep the exact strings: rewriting would break DeepSeek's prefix cache.
-      return { role: message.role, content: message.content };
+      if (!toolSpec || message.role !== 'assistant') return { role: message.role, content: message.content };
+      const output = { role: 'assistant', content: message.content };
+      if (message.reasoningContent !== undefined) {
+        if (message.reasoningContent !== null && typeof message.reasoningContent !== 'string')
+          fail('invalid_request', `messages[${index}].reasoningContent must be a string or null`);
+        total += message.reasoningContent?.length ?? 0;
+        output.reasoningContent = message.reasoningContent;
+      }
+      if (message.toolCalls !== undefined) {
+        const calls = message.toolCalls;
+        if (!Array.isArray(calls) || !calls.length || calls.length > MAX_TOOL_CALLS_PER_MESSAGE)
+          fail('invalid_request', `messages[${index}].toolCalls must be an array of 1-${MAX_TOOL_CALLS_PER_MESSAGE} calls`);
+        output.toolCalls = calls.map((call, callIndex) => {
+          const where = `messages[${index}].toolCalls[${callIndex}]`;
+          if (!plainObject(call) || Object.keys(call).some((key) => !TOOL_CALL_KEYS.has(key)))
+            fail('invalid_request', `${where} must have only id, name and arguments`);
+          if (!identifier(call.id, MAX_TOOL_CALL_ID_CHARS) || seenIds.has(call.id))
+            fail('invalid_request', `${where}.id must be a unique non-empty string`);
+          if (!toolSpec.names.has(call.name)) fail('invalid_request', `${where}.name must name a declared tool`);
+          if (typeof call.arguments !== 'string' || call.arguments.length > MAX_TOOL_ARGUMENT_CHARS)
+            fail('invalid_request', `${where}.arguments must be a string of at most ${MAX_TOOL_ARGUMENT_CHARS} characters`);
+          seenIds.add(call.id);
+          total += call.arguments.length;
+          return { id: call.id, name: call.name, arguments: call.arguments };
+        });
+        pending = new Set(output.toolCalls.map((call) => call.id));
+      }
+      return output;
     });
     if (total > MAX_TOTAL_CHARS) fail('invalid_request', `messages exceed ${MAX_TOTAL_CHARS} characters`);
     if (out.messages.at(-1).role === 'assistant') fail('invalid_request', 'the last message must not be an assistant message');
+    if (pending.size) fail('invalid_request', 'every tool call of the last assistant message needs a tool result');
+    if (toolSpec) {
+      const position = loopPosition(out.messages, out.toolLoop);
+      if (position.turn > out.toolLoop.maxTurns)
+        fail('invalid_request', `the tool loop already used its ${out.toolLoop.maxTurns} turns (toolLoop.maxTurns)`);
+      if (position.toolCallsUsed > out.toolLoop.maxToolCalls)
+        fail(
+          'invalid_request',
+          `the history holds ${position.toolCallsUsed} tool calls, over toolLoop.maxToolCalls ${out.toolLoop.maxToolCalls}`,
+        );
+    }
   }
   if (!partial || request.maxTokens !== undefined) {
     if (!Number.isSafeInteger(request.maxTokens) || request.maxTokens < 1 || request.maxTokens > MAX_OUTPUT_TOKENS)
@@ -131,6 +222,89 @@ export function validateCompleteRequest(request, { partial = false } = {}) {
     out[key] = value;
   }
   return out;
+}
+
+/** Validate `tools` and `toolLoop` (both or neither). Returns undefined without tools. */
+function validateTools(request) {
+  const { tools, toolLoop } = request;
+  if (tools === undefined) {
+    if (toolLoop !== undefined) fail('invalid_request', 'toolLoop requires tools');
+    return undefined;
+  }
+  if (!Array.isArray(tools) || !tools.length || tools.length > MAX_TOOLS)
+    fail('invalid_request', `tools must be an array of 1-${MAX_TOOLS} tools`);
+  const names = new Set();
+  let schemaChars = 0;
+  const declared = tools.map((tool, index) => {
+    if (!plainObject(tool) || Object.keys(tool).some((key) => !TOOL_KEYS.has(key)))
+      fail('invalid_request', `tools[${index}] must have only name, description and parameters`);
+    if (typeof tool.name !== 'string' || !TOOL_NAME.test(tool.name))
+      fail('invalid_request', `tools[${index}].name must match ${TOOL_NAME.source}`);
+    if (names.has(tool.name)) fail('invalid_request', `tools[${index}].name ${tool.name} is declared twice`);
+    names.add(tool.name);
+    if (tool.description !== undefined && (typeof tool.description !== 'string' || tool.description.length > MAX_TOOL_DESCRIPTION_CHARS))
+      fail('invalid_request', `tools[${index}].description must be a string of at most ${MAX_TOOL_DESCRIPTION_CHARS} characters`);
+    if (!plainObject(tool.parameters) || tool.parameters.type !== 'object')
+      fail('invalid_request', `tools[${index}].parameters must be a JSON Schema object with type "object"`);
+    let schema;
+    try {
+      schema = JSON.stringify(tool.parameters);
+    } catch {
+      fail('invalid_request', `tools[${index}].parameters must be JSON-serializable`);
+    }
+    if (schema.length > MAX_TOOL_SCHEMA_CHARS)
+      fail('invalid_request', `tools[${index}].parameters exceed ${MAX_TOOL_SCHEMA_CHARS} characters of JSON`);
+    schemaChars += schema.length + tool.name.length + (tool.description?.length ?? 0);
+    // A parsed copy: the caller cannot change the schema after validation.
+    return {
+      name: tool.name,
+      ...(tool.description !== undefined ? { description: tool.description } : {}),
+      parameters: JSON.parse(schema),
+    };
+  });
+  if (!plainObject(toolLoop)) fail('invalid_request', 'tools require a toolLoop object with at least an id');
+  for (const key of Object.keys(toolLoop)) if (!TOOL_LOOP_KEYS.has(key)) fail('invalid_request', `unknown toolLoop field: ${key}`);
+  if (typeof toolLoop.id !== 'string' || !NAME.test(toolLoop.id)) fail('invalid_request', `toolLoop.id must match ${NAME.source}`);
+  const loop = { id: toolLoop.id };
+  for (const [key, [min, max, fallback]] of Object.entries(TOOL_LOOP_LIMITS)) {
+    const value = toolLoop[key] ?? fallback;
+    if (!Number.isSafeInteger(value) || value < min || value > max)
+      fail('invalid_request', `toolLoop.${key} must be an integer from ${min} to ${max}`);
+    loop[key] = value;
+  }
+  if (toolLoop.maxUsd !== undefined) {
+    if (typeof toolLoop.maxUsd !== 'number' || !Number.isFinite(toolLoop.maxUsd) || toolLoop.maxUsd <= 0 || toolLoop.maxUsd > MAX_LOOP_USD)
+      fail('invalid_request', `toolLoop.maxUsd must be a number above 0 and at most ${MAX_LOOP_USD}`);
+    loop.maxUsd = toolLoop.maxUsd;
+  }
+  return { tools: declared, toolLoop: loop, names, schemaChars };
+}
+
+/**
+ * Where a tool loop stands, from the history alone: `turn` is this call's model turn (1 + earlier
+ * assistant messages that called tools), and this turn is `final` (tools offered with
+ * tool_choice "none") when it is the last allowed turn or the tool-call budget is spent.
+ */
+function loopPosition(messages, toolLoop) {
+  let turns = 0;
+  let toolCallsUsed = 0;
+  for (const message of messages)
+    if (message.role === 'assistant' && message.toolCalls) {
+      turns++;
+      toolCallsUsed += message.toolCalls.length;
+    }
+  const turn = turns + 1;
+  const final = turn >= toolLoop.maxTurns || toolCallsUsed >= toolLoop.maxToolCalls;
+  const allowedCalls = final ? 0 : Math.min(toolLoop.maxToolCallsPerTurn, toolLoop.maxToolCalls - toolCallsUsed);
+  return { turn, toolCallsUsed, final, allowedCalls };
+}
+
+/** Recorded spend of one tool loop (all days in the ledger tail) for one caller. */
+export async function toolLoopSpend(ledgerPath, caller, loopId) {
+  let total = 0;
+  for (const entry of await readLedgerTail(ledgerPath))
+    if (entry?.caller === caller && entry.loopId === loopId && Number.isFinite(entry.costUsd)) total += entry.costUsd;
+  return total;
 }
 
 function providerSettings(config) {
@@ -245,7 +419,11 @@ function usageFrom(raw) {
 
 /** Conservative upper bound for one call: every input char a miss token, full output, current tier. */
 function worstCaseUsd(table, model, request, at) {
-  const chars = (request.messages ?? []).reduce((total, message) => total + message.content.length, 0);
+  let chars = request.tools ? JSON.stringify(request.tools).length : 0;
+  for (const message of request.messages ?? []) {
+    chars += message.content.length + (message.reasoningContent?.length ?? 0);
+    for (const call of message.toolCalls ?? []) chars += call.id.length + call.name.length + call.arguments.length;
+  }
   const usage = { inputTokens: chars, cacheHitTokens: 0, cacheMissTokens: chars, outputTokens: request.maxTokens ?? 0 };
   return priceUsage(table, model, usage, at).usd;
 }
@@ -440,7 +618,7 @@ function errorResult(error, base) {
     ...(model !== undefined ? { model } : {}),
     ...(usage !== undefined ? { usage } : {}),
     ...(costUsd !== undefined ? { costUsd } : {}),
-    ...pick(details, ['pricingWarning']),
+    ...pick(details, ['pricingWarning', 'toolLoop']),
     ...base,
   };
 }
@@ -457,7 +635,25 @@ export async function complete(request, options = {}) {
   let request_;
   let reservationPath;
   let ledger = { caller: request?.caller, tag: request?.tag, route: request?.route };
-  let context, priced;
+  let context, priced, position;
+  let loopSpent = 0;
+  // The loop summary on every tool-loop result, success or failure.
+  const loopSummary = (callCost, returnedCalls = 0, dropped = 0) =>
+    request_?.toolLoop && position
+      ? {
+          toolLoop: {
+            id: request_.toolLoop.id,
+            turn: position.turn,
+            maxTurns: request_.toolLoop.maxTurns,
+            final: position.final,
+            toolCalls: position.toolCallsUsed + returnedCalls,
+            maxToolCalls: request_.toolLoop.maxToolCalls,
+            ...(dropped ? { toolCallsDropped: dropped } : {}),
+            costUsd: loopSpent + (Number.isFinite(callCost) ? callCost : 0),
+            ...(request_.toolLoop.maxUsd !== undefined ? { maxUsd: request_.toolLoop.maxUsd } : {}),
+          },
+        }
+      : {};
   const finish = async (result) => {
     clearTimeout(timer);
     // Ledger only after a request was actually attempted (or refused by the cap).
@@ -472,6 +668,8 @@ export async function complete(request, options = {}) {
         costUsd: result.costUsd ?? 0,
         latencyMs: result.latencyMs,
         error: result.ok ? null : result.error.code,
+        // Tool-loop calls only: the loop id keys the loop's spend; counts, never tool text.
+        ...(ledger.loopId ? { loopId: ledger.loopId, turn: ledger.turn, toolCalls: result.toolCalls?.length ?? 0 } : {}),
       };
       try {
         await appendLedger(context.ledgerPath, entry);
@@ -487,6 +685,10 @@ export async function complete(request, options = {}) {
   try {
     request_ = validateCompleteRequest(request);
     ledger = { caller: request_.caller, tag: request_.tag, route: request_.route };
+    if (request_.toolLoop) {
+      position = loopPosition(request_.messages, request_.toolLoop);
+      Object.assign(ledger, { loopId: request_.toolLoop.id, turn: position.turn });
+    }
     context = resolveEnvironment(options);
     const settings = providerSettings(context.config);
     const apiKey = readApiKey(context.readKey, settings.keyRef);
@@ -498,6 +700,18 @@ export async function complete(request, options = {}) {
       request_.timeoutMs,
     );
     const at = new Date(started);
+    if (request_.toolLoop) {
+      // Turns of one loop run one after another, so the ledger alone bounds the loop. A loop cap
+      // that cannot record its spend would never bind, so it refuses before any provider traffic.
+      if (request_.toolLoop.maxUsd !== undefined) await ledgerWritable(context.ledgerPath);
+      loopSpent = await runAbortable(signal, () =>
+        toolLoopSpend(context.ledgerPath, request_.caller, request_.toolLoop.id).catch(() => {
+          // Without a cap the loop spend is only reported; with one it must be known.
+          if (request_.toolLoop.maxUsd !== undefined) fail('invalid_request', 'toolLoop.maxUsd needs a readable complete ledger');
+          return 0;
+        }),
+      );
+    }
     const model = await runAbortable(signal, () =>
       listModels({ ...settings, apiKey, fetchImpl: context.fetchImpl, signal, now: context.now }),
     );
@@ -506,6 +720,18 @@ export async function complete(request, options = {}) {
     ledger.model = resolved;
     if (!resolveModel(settings.table, resolved))
       fail('unpriced_model', `model ${resolved} has no entry in the trusted price table ${settings.pricingName}`, { model: resolved });
+    if (request_.toolLoop) {
+      const { maxUsd } = request_.toolLoop;
+      const estimate = worstCaseUsd(settings.table, resolved, request_, at);
+      if (maxUsd !== undefined && loopSpent + estimate > maxUsd) {
+        ledger.attempted = true;
+        fail(
+          'budget_cap',
+          `toolLoop.maxUsd $${maxUsd} for loop ${request_.toolLoop.id} would be exceeded (spent $${loopSpent.toFixed(4)}, this call up to $${estimate.toFixed(4)})`,
+          { model: resolved, ...loopSummary(0) },
+        );
+      }
+    }
     const cap = settings.dailyUsd[request_.caller];
     if (cap !== undefined) {
       const estimate = worstCaseUsd(settings.table, resolved, request_, at);
@@ -526,7 +752,7 @@ export async function complete(request, options = {}) {
         fail(
           'budget_cap',
           `daily cap $${cap} for caller ${request_.caller} would be exceeded (spent $${spent.toFixed(4)}, in flight $${inflight.toFixed(4)}, this call up to $${estimate.toFixed(4)})`,
-          { model: resolved },
+          { model: resolved, ...loopSummary(0) },
         );
       }
       reservationPath = reserved.path;
@@ -534,7 +760,7 @@ export async function complete(request, options = {}) {
     ledger.attempted = true;
     priced = { table: settings.table, model: resolved };
     const reply = await runAbortable(signal, () =>
-      chat({ settings, apiKey, model: resolved, request: request_, fetchImpl: context.fetchImpl, signal }),
+      chat({ settings, apiKey, model: resolved, request: request_, final: position?.final, fetchImpl: context.fetchImpl, signal }),
     );
     // An alias (for example deepseek-flash) can move to a newer model between calls. Price the
     // model that answered when the table knows it; otherwise say the cost used the alias's rates.
@@ -549,6 +775,7 @@ export async function complete(request, options = {}) {
       costUsd,
       finishReason: reply.finishReason,
       ...(pricingWarning ? { pricingWarning } : {}),
+      ...loopSummary(costUsd),
     };
     const latencyMs = Math.max(0, (options.now ?? Date.now)() - started);
     if (reply.finishReason === 'length')
@@ -570,17 +797,33 @@ export async function complete(request, options = {}) {
         { ...base, retryable: true, ...pick(reply, ['providerRequestId']) },
       );
     if (!reply.usage) fail('provider_error', 'DeepSeek returned no usage record', { ...base, ...pick(reply, ['providerRequestId']) });
+    let toolResult = {};
+    if (request_.toolLoop) {
+      const { kept, dropped } = checkedToolCalls(reply, request_, position, { ...base, ...pick(reply, ['providerRequestId']) });
+      const assistantMessage = {
+        role: 'assistant',
+        content: reply.text,
+        ...(kept.length ? { toolCalls: kept } : {}),
+        ...(reply.reasoningContent !== undefined ? { reasoningContent: reply.reasoningContent } : {}),
+      };
+      toolResult = {
+        ...(kept.length ? { toolCalls: kept } : {}),
+        assistantMessage,
+        ...loopSummary(costUsd, kept.length, dropped),
+      };
+    }
     return await finish({
       version: COMPLETE_CONTRACT_VERSION,
       ok: true,
       text: reply.text,
-      finishReason: reply.finishReason ?? 'stop',
+      finishReason: toolResult.toolCalls ? 'tool_calls' : 'stop',
       model: base.model,
       usage: reply.usage,
       costUsd,
       latencyMs,
       ...(reply.providerRequestId ? { providerRequestId: reply.providerRequestId } : {}),
       ...(pricingWarning ? { pricingWarning } : {}),
+      ...toolResult,
     });
   } catch (error) {
     let failure = error;
@@ -595,7 +838,53 @@ export async function complete(request, options = {}) {
       } catch {
         // leave cost unknown rather than guess
       }
+    if (failure instanceof CompleteFailure && !failure.details?.toolLoop && position)
+      failure.details = { ...failure.details, ...loopSummary(failure.details?.costUsd) };
     return finish(errorResult(failure, { latencyMs: Math.max(0, (options.now ?? Date.now)() - started) }));
+  }
+}
+
+/**
+ * The tool calls of a finished reply, checked against the declared tools and the loop bound.
+ * A call the model made on the final turn (tool_choice "none") or a malformed call is a
+ * retryable provider_error that still carries the billed usage in `details`.
+ */
+function checkedToolCalls(reply, request, position, details) {
+  const calls = reply.toolCalls ?? [];
+  if (reply.finishReason === 'tool_calls' && !calls.length)
+    fail('provider_error', 'DeepSeek finished with tool_calls but sent no tool call', { ...details, retryable: true });
+  if (!calls.length) return { kept: [], dropped: 0 };
+  if (position.final)
+    fail('provider_error', 'DeepSeek called a tool on the final tool-loop turn (tool_choice none)', { ...details, retryable: true });
+  // Calls past the cap are never returned or replayed, so only the kept ones are checked.
+  // A parameterless call may stream no argument text; it is returned as "{}".
+  const kept = calls.slice(0, position.allowedCalls).map((call) => ({ ...call, arguments: call.arguments || '{}' }));
+  const names = new Set(request.tools.map((tool) => tool.name));
+  const ids = new Set(request.messages.flatMap((message) => (message.toolCalls ?? []).map((call) => call.id)));
+  for (const call of kept) {
+    if (!identifier(call.id, MAX_TOOL_CALL_ID_CHARS) || ids.has(call.id))
+      fail('provider_error', 'DeepSeek returned a tool call without a usable unique id', { ...details, retryable: true });
+    ids.add(call.id);
+    if (!names.has(call.name)) fail('provider_error', 'DeepSeek called a tool that was not declared', { ...details, retryable: true });
+    let parsed;
+    try {
+      parsed = JSON.parse(call.arguments);
+    } catch {
+      // handled below
+    }
+    if (!plainObject(parsed) || call.arguments.length > MAX_TOOL_ARGUMENT_CHARS)
+      fail('provider_error', 'DeepSeek returned tool arguments that are not one JSON object', { ...details, retryable: true });
+  }
+  return { kept, dropped: calls.length - kept.length };
+}
+
+/** Open the ledger for appending (creating it), or refuse: a loop cap needs its spend recorded. */
+async function ledgerWritable(path) {
+  try {
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    await (await open(path, 'a', 0o600)).close();
+  } catch {
+    fail('invalid_request', 'toolLoop.maxUsd needs a writable complete ledger, and it cannot be opened for appending');
   }
 }
 
@@ -614,16 +903,48 @@ async function runAbortable(signal, work) {
   }
 }
 
-async function chat({ settings, apiKey, model, request, fetchImpl, signal }) {
+/** A contract message in DeepSeek's wire shape. Plain messages stay exactly `{ role, content }`. */
+function wireMessage(message) {
+  if (message.role === 'tool') return { role: 'tool', tool_call_id: message.toolCallId, content: message.content };
+  if (message.role !== 'assistant' || (message.toolCalls === undefined && message.reasoningContent === undefined))
+    return { role: message.role, content: message.content };
+  return {
+    role: 'assistant',
+    content: message.content,
+    ...(message.reasoningContent !== undefined ? { reasoning_content: message.reasoningContent } : {}),
+    ...(message.toolCalls
+      ? {
+          tool_calls: message.toolCalls.map((call) => ({
+            id: call.id,
+            type: 'function',
+            function: { name: call.name, arguments: call.arguments },
+          })),
+        }
+      : {}),
+  };
+}
+
+async function chat({ settings, apiKey, model, request, final, fetchImpl, signal }) {
+  const tools = request.tools;
   // Field order is fixed so identical histories serialize identically.
   const payload = {
     model,
-    messages: request.messages,
+    messages: tools ? request.messages.map(wireMessage) : request.messages,
     max_tokens: request.maxTokens,
     stream: true,
     stream_options: { include_usage: true },
     thinking: { type: request.reasoning.enabled ? 'enabled' : 'disabled' },
     ...(request.reasoning.enabled ? { reasoning_effort: request.reasoning.effort } : {}),
+    // The same tool list every turn keeps the prefix stable; the last turn forbids calls.
+    ...(tools
+      ? {
+          tools: tools.map(({ name, description, parameters }) => ({
+            type: 'function',
+            function: { name, ...(description !== undefined ? { description } : {}), parameters },
+          })),
+          ...(final ? { tool_choice: 'none' } : {}),
+        }
+      : {}),
   };
   let response;
   try {
@@ -642,6 +963,10 @@ async function chat({ settings, apiKey, model, request, fetchImpl, signal }) {
   const headerId = headerRequestId(response);
   let text = '';
   let finishReason, rawUsage, echoedModel, completionId;
+  // Tool loops only: reasoning must go back to DeepSeek on later turns, and calls arrive in fragments.
+  let reasoning;
+  let reasoningSeen = false;
+  const calls = new Map();
   // Partial-reply state survives an abort so a timeout can still report billed usage.
   const state = {
     get usage() {
@@ -654,8 +979,9 @@ async function chat({ settings, apiKey, model, request, fetchImpl, signal }) {
       if (typeof chunk.id === 'string' && SAFE_ID.test(chunk.id)) completionId ??= chunk.id;
       if (typeof chunk.model === 'string' && chunk.model.length <= 128) echoedModel ??= chunk.model;
       const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
-      // Only `content` is the answer; `reasoning_content` is dropped unread.
+      // Only `content` is the answer. Without tools `reasoning_content` is dropped unread.
       if (typeof choice?.delta?.content === 'string') text += choice.delta.content;
+      if (tools && plainObject(choice?.delta)) collectToolDelta(choice.delta);
       if (typeof choice?.finish_reason === 'string') finishReason = choice.finish_reason;
       if (chunk.usage != null) rawUsage = chunk.usage;
     }
@@ -666,20 +992,50 @@ async function chat({ settings, apiKey, model, request, fetchImpl, signal }) {
         error.details = { ...(usage ? { usage } : {}), ...(echoedModel ? { model: echoedModel } : {}) };
       throw error;
     }
+    const usageDetails = state.usage ? { usage: state.usage } : {};
+    if (error instanceof CompleteFailure) fail(error.code, error.message, { ...error.details, ...usageDetails });
     fail('provider_error', 'DeepSeek stream ended abnormally', {
       retryable: true,
       ...(state.usage ? { usage: state.usage } : {}),
       ...((headerId ?? completionId) ? { providerRequestId: headerId ?? completionId } : {}),
     });
   }
-  const normalizedFinish = ['stop', 'length', 'content_filter'].includes(finishReason) ? finishReason : finishReason ? 'other' : undefined;
+  const known = tools ? ['stop', 'length', 'content_filter', 'tool_calls'] : ['stop', 'length', 'content_filter'];
+  const normalizedFinish = known.includes(finishReason) ? finishReason : finishReason ? 'other' : undefined;
   return {
     text,
     finishReason: normalizedFinish,
     usage: state.usage,
     model: echoedModel,
     providerRequestId: headerId ?? completionId,
+    ...(tools
+      ? {
+          // DeepSeek sends an explicit null outside thinking mode; it is replayed as sent.
+          ...(reasoningSeen ? { reasoningContent: reasoning ?? null } : {}),
+          toolCalls: [...calls.entries()].sort(([left], [right]) => left - right).map(([, call]) => call),
+        }
+      : {}),
   };
+
+  function collectToolDelta(delta) {
+    if (Object.hasOwn(delta, 'reasoning_content')) {
+      reasoningSeen = true;
+      if (typeof delta.reasoning_content === 'string') reasoning = (reasoning ?? '') + delta.reasoning_content;
+    }
+    if (!Array.isArray(delta.tool_calls)) return;
+    for (const part of delta.tool_calls) {
+      // The first fragment of a call carries id and name; later ones only argument text.
+      if (!plainObject(part) || !Number.isSafeInteger(part.index) || part.index < 0 || part.index >= MAX_TOOL_CALLS_PER_MESSAGE)
+        fail('provider_error', 'DeepSeek sent an unusable tool call fragment', { retryable: true });
+      const call = calls.get(part.index) ?? { id: '', name: '', arguments: '' };
+      if (typeof part.id === 'string') call.id ||= part.id;
+      if (typeof part.function?.name === 'string') call.name ||= part.function.name;
+      if (typeof part.function?.arguments === 'string') call.arguments += part.function.arguments;
+      if (call.arguments.length > MAX_TOOL_ARGUMENT_CHARS)
+        fail('provider_error', 'DeepSeek tool arguments exceed the size limit', { retryable: true });
+      calls.set(part.index, call);
+    }
+  }
 }
 
 /** Resolve route, model and price, and check the key, without sending a completion. */
@@ -727,6 +1083,8 @@ export async function completeDryRun(request, options = {}) {
       },
       ...(request_.messages && request_.maxTokens ? { maxCostUsd: worstCaseUsd(settings.table, model, request_, at) } : {}),
       ...(cap !== undefined ? { dailyCapUsd: cap, spentTodayUsd: await callerSpendToday(context.ledgerPath, request_.caller, at) } : {}),
+      ...(request_.toolLoop && request_.messages && request_.caller ? await dryRunLoop(request_, context.ledgerPath) : {}),
+      capabilities: { tools: true },
       latencyMs: clock() - started,
     };
   } catch (error) {
@@ -735,6 +1093,16 @@ export async function completeDryRun(request, options = {}) {
       latencyMs: clock() - started,
     });
   }
+}
+
+/** The dry-run view of a tool loop: where the history stands and what the loop has spent. */
+async function dryRunLoop(request, ledgerPath) {
+  const { turn, final, toolCallsUsed } = loopPosition(request.messages, request.toolLoop);
+  const { id, maxTurns, maxToolCalls, maxUsd } = request.toolLoop;
+  const costUsd = await toolLoopSpend(ledgerPath, request.caller, id);
+  return {
+    toolLoop: { id, turn, maxTurns, final, toolCalls: toolCallsUsed, maxToolCalls, costUsd, ...(maxUsd !== undefined ? { maxUsd } : {}) },
+  };
 }
 
 /** fail() arguments for a balance failure: cancellation and deadline win over a provider error. */
