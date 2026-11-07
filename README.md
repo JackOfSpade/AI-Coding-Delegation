@@ -2,11 +2,11 @@
 
 Offload delegates bounded coding work from a primary agent (Claude Code, Codex) to cheaper models. It runs as an MCP server and a CLI, gives each job a private git worktree, runs a tool-using agent loop against OpenAI, Anthropic or DeepSeek, verifies the result, and hands back a reviewable diff. Routing, budgets, model policy and price tables are enforced locally.
 
-Offload also ships `offload complete`, a separate, stateless DeepSeek chat completion for host applications, with an optional bounded loop over tools the host declares and runs itself. It is documented below. See `docs/TESTING.md` for the test and release gates, and `AGENTS.md` for contributor rules.
+Offload also ships `offload complete`, a separate, stateless DeepSeek chat completion for host applications, with an optional bounded tool loop: built-in web search and fetch that Offload runs, and host tools the caller runs. It is documented below. See `docs/TESTING.md` for the test and release gates, and `AGENTS.md` for contributor rules.
 
 ## offload complete
 
-One chat completion against DeepSeek, with no worktree, agent loop, repository binding, MCP or provider fallback. Offload never runs a tool itself; a request may declare host tools whose calls are returned to the caller (see [Host tools](#host-tools)). A host application (for example a desktop app's pipeline step) pipes one JSON request in and reads one JSON result out. Routes resolve to the newest model at call time. Costs come from Offload's trusted price table, including peak and off-peak tiers.
+One chat completion against DeepSeek, with no worktree, agent loop, repository binding, MCP or provider fallback. A request may declare tools (see [Tools](#tools)): built-in web search and fetch, which Offload runs through DeepSeek's Search and Fetch APIs, and host tools, whose calls are returned to the caller. A host application (for example a desktop app's pipeline step) pipes one JSON request in and reads one JSON result out. Routes resolve to the newest model at call time. Costs come from Offload's trusted price table, including peak and off-peak tiers.
 
 It needs no MCP server and no MCP restart. `complete`, `complete --dry-run` and `balance deepseek` never construct Offload's core.
 
@@ -61,7 +61,7 @@ Exports: `complete`, `completeDryRun`, `deepseekBalance`, `validateCompleteReque
   "timeoutMs": 600000, // 1000-1800000, default 600000; covers the whole call
   "caller": "my-app", // [A-Za-z0-9][A-Za-z0-9._-]{0,63}; keys the daily cap and ledger
   "tag": "step-3", // same pattern; free label for your own accounting
-  "tools": [], // optional host tools; see Host tools
+  "tools": [], // optional; see Tools
   "toolLoop": {}, // required with tools, rejected without them
 }
 ```
@@ -99,19 +99,27 @@ Failure:
 
 A failure may also carry `text`, `finishReason`, `model`, `usage` and `costUsd` when the provider produced them (for example `truncated` keeps the partial text). `text` never contains reasoning content. `usage.reasoningTokens` is already included in `outputTokens` and is reported for information. `costUsd` is computed from the shipped price table for the model that answered, using the peak or off-peak rate in force when the call started. Dry-run and balance results are also `version`-tagged objects with `ok`.
 
-### Host tools
+### Tools
 
-DeepSeek's chat API offers no server-side web search or fetch tool (only function tools), so a task that needs the web declares its own tools and runs them itself. Offload never executes a tool and never makes a network call other than to DeepSeek. Each turn is one ordinary `offload complete` call: when the model calls tools, the result returns the calls; the caller runs them, appends the returned assistant message and one tool result per call, and sends the next request. The loop is bounded from the request history and the ledger, so it needs no server-side session.
+A request may declare tools and a `toolLoop` bound. There are two kinds, and one request may mix them:
+
+- **Built-in web tools** (`web_search`, `web_fetch`). Offload runs them itself through DeepSeek's [Search and Fetch APIs](https://api-docs.deepseek.com/guides/search), with the same API key, and keeps calling the model until it answers. A research task is one `offload complete` call.
+- **Host tools.** You declare a function and run it yourself. When the model calls one, the call returns it to you; you append the results and send the next request.
+
+DeepSeek's chat API has no server-side tool of its own (only function tools), which is why Offload runs the web tools rather than DeepSeek.
 
 ```jsonc
 {
   // ...route, messages, maxTokens, reasoning, timeoutMs, caller, tag as above
   "tools": [
     // 1-32 tools, unique names
+    { "builtin": "web_search", "count": 5 }, // count: results per search, 1-20, default 5
+    { "builtin": "web_fetch", "maxChars": 20000 }, // maxChars: page text kept, 1000-200000, default 20000
     {
-      "name": "web_search", // [A-Za-z0-9_-]{1,64}
-      "description": "Search the web; returns titles, URLs and snippets", // optional, at most 8192 characters
-      "parameters": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }, // JSON Schema, type object, at most 65536 characters of JSON
+      // a host tool
+      "name": "save_finding", // [A-Za-z0-9_-]{1,64}; must not be web_search or web_fetch when those are declared
+      "description": "Record one sourced finding", // optional, at most 8192 characters
+      "parameters": { "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] }, // JSON Schema, type object, at most 65536 characters of JSON
     },
   ],
   "toolLoop": {
@@ -119,32 +127,49 @@ DeepSeek's chat API offers no server-side web search or fetch tool (only functio
     "maxTurns": 8, // 1-32, default 8: model turns in the loop, the final answer included
     "maxToolCallsPerTurn": 8, // 1-32, default 8
     "maxToolCalls": 32, // 1-256, default 32: tool calls over the whole loop
-    "maxUsd": 0.25, // optional, above 0 and at most 1000: spend cap for this loop
+    "maxUsd": 0.25, // optional, above 0 and at most 1000: spend cap for this loop, web requests included
   },
 }
 ```
 
-With `tools`, `messages` may also carry these shapes (and only with `tools`):
+#### Built-in web tools
+
+The model sees `web_search(query)` and `web_fetch(url)`, with descriptions Offload writes. You only choose the options above.
+
+- **`web_search`** posts `{ query, count, need_content: false }` to `POST /v1/tools/search` on the provider's host. The query has at most 128 characters and supports DeepSeek's operators: `site:`, `-site:`, `"exact phrase"`, `-term`, `lang:en`, `after:YYYY-MM-DD`, `before:YYYY-MM-DD`. The model receives `{"results":[{ title, url, date?, site?, summary }]}`, where `summary` is DeepSeek's model-oriented page summary (at most 1200 characters).
+- **`web_fetch`** posts `{ url }` to `POST /v1/tools/fetch` (one absolute http or https URL without credentials). The model receives the page as Markdown, headed `# <title>` when there is one, and cut to `maxChars` with a `[cut: first N of M characters]` marker.
+- A web failure the model can work around becomes the tool result instead of failing the call. It is a JSON `{ error, message }` with `error` one of `invalid_arguments` (checked before anything is sent), `blocked` (fetch 403), `no_content` (fetch 404 or an empty page), `rate_limited` or `unavailable`. HTTP 408, 429 and 5xx and network errors are retried twice with a short backoff first.
+- A key or balance failure ends the call: HTTP 401 is `auth_failed` and 402 is `credit_exhausted`. No further web call of that turn starts.
+- Up to four web calls of one turn run at a time. Results are appended in call order.
+- **Price.** $0.75 per 1,000 requests for each tool, from Offload's trusted price table. DeepSeek bills only a successful request (HTTP 200 with results or page content), and so does Offload. Web cost is in `costUsd`, `toolLoop.costUsd`, the ledger and every cap.
+
+With only built-in tools, one call runs the whole loop. Each turn that calls only built-in tools has them run and the model goes again. The call ends when the model answers, when it calls a host tool, or when it fails. The `timeoutMs` covers every turn of the call.
+
+#### Host tools and the message history
+
+Tool turns use these message shapes, which are allowed only with `tools`:
 
 ```jsonc
-{ "role": "assistant", "content": "", "toolCalls": [{ "id": "call_1", "name": "web_search", "arguments": "{\"query\":\"...\"}" }], "reasoningContent": "..." }
-{ "role": "tool", "toolCallId": "call_1", "content": "search results as text" }
+{ "role": "assistant", "content": "", "toolCalls": [{ "id": "call_1", "name": "save_finding", "arguments": "{\"text\":\"...\"}" }], "reasoningContent": "..." }
+{ "role": "tool", "toolCallId": "call_1", "content": "saved" }
 ```
+
+Every tool-loop result carries `newMessages`: the assistant turns and built-in tool results this call produced, in order. Append them to your history unchanged. If the result is `finishReason: "tool_calls"`, also append one `tool` message per entry in `toolCalls` (the host calls only), then send the next request. A turn that called both kinds has its built-in results already in `newMessages`; you answer only the host calls.
 
 Rules checked before anything is sent (`invalid_request` otherwise):
 
 - Every `toolCalls` entry names a declared tool, has a non-empty id unique in the history and string `arguments`.
-- Every call of an assistant message gets exactly one `tool` message, right after it, before any other message. A `tool` message must answer a call of the assistant message just before it.
+- Every call of an assistant message gets exactly one `tool` message after it, before any other message. A `tool` message must answer a call of the latest assistant message.
 - The last message is `user` or `tool`, never `assistant`.
 - The history has used fewer than `maxTurns` tool-calling turns and at most `maxToolCalls` calls.
 
-Bounds, per call:
+Bounds, per model turn (a call with built-in tools may run several):
 
-- **Turn.** This call's `turn` is 1 plus the number of assistant messages with `toolCalls` in the history. The last allowed turn (`turn` = `maxTurns`), or any turn once the history already holds `maxToolCalls` calls, is `final`. A final turn still declares the tools, so the history stays valid, but sends `tool_choice: "none"`, so the model must answer. A tool call on a final turn is a retryable `provider_error`.
-- **Calls per turn.** The model may ask for more calls than allowed (`maxToolCallsPerTurn`, or fewer when `maxToolCalls` is nearly spent). Offload then returns the first allowed calls in order, drops the rest from both `toolCalls` and `assistantMessage`, and reports how many it dropped in `toolLoop.toolCallsDropped`. The model never sees the dropped calls, and they are not checked, so a malformed dropped call does not fail the turn.
-- **Cost.** Before sending, Offload sums the ledger's `costUsd` for this `caller` and `toolLoop.id` and adds this call's worst case (every input character, tool schemas, arguments and reasoning included, priced as an uncached token, plus `maxTokens`). If the total exceeds `maxUsd`, the call fails with `budget_cap` and nothing is sent. A loop with `maxUsd` needs a readable, appendable ledger; otherwise it fails with `invalid_request` before any provider traffic, because a cap whose spend cannot be recorded would never bind. The caller's daily cap still applies on top. Turns of one loop are assumed to run one after another. Do not run two turns of the same loop id at once. Use a new id for each loop.
+- **Turn.** A turn's number is 1 plus the number of assistant messages with `toolCalls` before it. The last allowed turn (`maxTurns`), or any turn once the history holds `maxToolCalls` calls, is `final`. A final turn still declares the tools, so the history stays valid, but sends `tool_choice: "none"`, so the model must answer. A tool call on a final turn is a retryable `provider_error`. So a built-in loop always ends.
+- **Calls per turn.** The model may ask for more calls than allowed (`maxToolCallsPerTurn`, or fewer when `maxToolCalls` is nearly spent). Offload keeps the first allowed calls in order, drops the rest from `toolCalls` and `newMessages`, and reports how many it dropped in `toolLoop.toolCallsDropped` (for the last turn). The model never sees the dropped calls, and they are not checked, so a malformed dropped call does not fail the turn.
+- **Cost.** Before each turn, Offload adds the loop's recorded spend (the ledger's `costUsd` for this `caller` and `toolLoop.id`), this call's spend so far, and the turn's worst case. The worst case prices every input character, tool schemas, arguments and reasoning included, as an uncached token, plus `maxTokens`, plus one web request per call the turn may make. If the total exceeds `maxUsd`, the call fails with `budget_cap` and that turn is not sent. A loop with `maxUsd` needs a readable, appendable ledger; otherwise it fails with `invalid_request` before any provider traffic, because a cap whose spend cannot be recorded would never bind. The caller's daily cap applies on top, reserved per turn. Turns of one loop are assumed to run one after another, so do not run two calls with the same loop id at once. Use a new id for each loop.
 
-A tool-calling result is an ordinary success (`ok: true`, exit 0) with `finishReason: "tool_calls"`:
+A result that needs host tools is an ordinary success (`ok: true`, exit 0) with `finishReason: "tool_calls"`:
 
 ```json
 {
@@ -152,37 +177,46 @@ A tool-calling result is an ordinary success (`ok: true`, exit 0) with `finishRe
   "ok": true,
   "text": "",
   "finishReason": "tool_calls",
-  "toolCalls": [{ "id": "call_1", "name": "web_search", "arguments": "{\"query\":\"ACME staff engineer salary\"}" }],
-  "assistantMessage": {
-    "role": "assistant",
-    "content": "",
-    "toolCalls": [{ "id": "call_1", "name": "web_search", "arguments": "{\"query\":\"ACME staff engineer salary\"}" }],
-    "reasoningContent": "..."
-  },
+  "toolCalls": [{ "id": "call_2", "name": "save_finding", "arguments": "{\"text\":\"$250k base\"}" }],
+  "newMessages": [
+    {
+      "role": "assistant",
+      "content": "",
+      "toolCalls": [{ "id": "call_1", "name": "web_search", "arguments": "{\"query\":\"ACME staff engineer salary\"}" }],
+      "reasoningContent": "..."
+    },
+    { "role": "tool", "toolCallId": "call_1", "content": "{\"results\":[...]}" },
+    {
+      "role": "assistant",
+      "content": "",
+      "toolCalls": [{ "id": "call_2", "name": "save_finding", "arguments": "{\"text\":\"$250k base\"}" }],
+      "reasoningContent": "..."
+    }
+  ],
   "toolLoop": {
     "id": "comp-research-7f3a",
-    "turn": 1,
+    "turn": 2,
     "maxTurns": 8,
     "final": false,
-    "toolCalls": 1,
+    "toolCalls": 2,
     "maxToolCalls": 32,
-    "costUsd": 0.00041,
+    "costUsd": 0.00157,
     "maxUsd": 0.25
   },
   "model": "deepseek-v4-flash",
-  "usage": { "inputTokens": 1000, "cacheHitTokens": 400, "cacheMissTokens": 600, "outputTokens": 500, "reasoningTokens": 123 },
-  "costUsd": 0.00041,
-  "latencyMs": 2310
+  "usage": { "inputTokens": 2100, "cacheHitTokens": 900, "cacheMissTokens": 1200, "outputTokens": 900, "reasoningTokens": 240 },
+  "costUsd": 0.00157,
+  "latencyMs": 9310
 }
 ```
 
-- `toolCalls` is present only when the model called tools. `arguments` is the model's JSON text, already checked to parse as one JSON object; a call that streamed no argument text is returned as `"{}"`. Parse it yourself and validate it like any untrusted input.
-- `assistantMessage` is on every tool-loop success, the final answer included. Append it unchanged. With `tools` present, DeepSeek returns HTTP 400 unless every earlier assistant turn's reasoning is sent back, so `assistantMessage.reasoningContent` carries it (or `null`, which DeepSeek sends when thinking is off). It goes only to the caller and is never written to disk. `text` still never contains reasoning, and without `tools` reasoning is still dropped unread.
-- `toolLoop.costUsd` is the loop's spend so far, this call included. `toolLoop.toolCalls` counts the loop's calls, this turn's included. `final: true` means no further tool calls are possible.
-- A turn that answers without tools ends with `finishReason: "stop"`. That is the loop's answer.
-- Failures keep the existing codes. A history over the bounds is `invalid_request`. `toolLoop.maxUsd` is `budget_cap`. A malformed call from the model is a retryable `provider_error` with the billed `usage` and `costUsd`: an undeclared tool, arguments that are not one JSON object, a missing or reused id, `tool_calls` with no call, or a call on a final turn. Failure results after validation also carry `toolLoop`.
+- `toolCalls` lists only the host calls you must answer, and is present only with `finishReason: "tool_calls"`. `arguments` is the model's JSON text, already checked to parse as one JSON object; a call that streamed no argument text is returned as `"{}"`. Parse it yourself and validate it like any untrusted input.
+- With `tools` present, DeepSeek returns HTTP 400 unless every earlier assistant turn's reasoning is sent back, so assistant messages in `newMessages` carry `reasoningContent` (or `null`, which DeepSeek sends when thinking is off). It goes only to the caller and is never written to disk. `text` still never contains reasoning, and without `tools` reasoning is still dropped unread.
+- `text`, `model` and `providerRequestId` are from the last turn. `usage` and `costUsd` add up every turn of this call, web requests included. `toolLoop.costUsd` is the loop's spend so far, this call included; `toolLoop.turn` and `final` describe the last turn; `toolLoop.toolCalls` counts the loop's calls so far.
+- `finishReason: "stop"` is the loop's answer.
+- Failures keep the existing codes. A history over the bounds is `invalid_request`. `toolLoop.maxUsd` is `budget_cap`. A malformed call from the model is a retryable `provider_error` with the billed `usage` and `costUsd`: an undeclared tool, arguments that are not one JSON object, a missing or reused id, `tool_calls` with no call, or a call on a final turn. A failure after validation carries `toolLoop`, and also `newMessages` when earlier turns of the call finished, so you can keep that progress or resume from it. `newMessages` never includes the turn that failed, so it is always a valid history to append. Web requests that turn already made, and that DeepSeek billed, still count in `costUsd`, the ledger and the caps.
 
-A minimal caller loop (Node):
+A minimal caller loop (Node). With only built-in tools the `for` loop runs once:
 
 ```js
 async function research(messages, tools) {
@@ -190,10 +224,10 @@ async function research(messages, tools) {
     route: 'deepseek-flash',
     messages,
     maxTokens: 8000,
-    timeoutMs: 300000,
+    timeoutMs: 600000,
     caller: 'my-app',
     tag: 'research',
-    tools,
+    tools, // for example [{ builtin: 'web_search' }, { builtin: 'web_fetch' }]
     toolLoop: { id: randomUUID(), maxUsd: 0.25 },
   };
   for (;;) {
@@ -205,7 +239,7 @@ async function research(messages, tools) {
       ...request,
       messages: [
         ...request.messages,
-        result.assistantMessage,
+        ...result.newMessages,
         ...result.toolCalls.map((call, i) => ({ role: 'tool', toolCallId: call.id, content: outputs[i] })),
       ],
     };
@@ -213,7 +247,7 @@ async function research(messages, tools) {
 }
 ```
 
-The CLI works the same way, one process per turn. Keep tool results short and stable. Append them only after the existing history, never rewrite it, so DeepSeek's prefix cache keeps hitting (see [Prefix-cache advice](#prefix-cache-advice)). An older Offload rejects `tools` as an unknown field (`invalid_request`). `--dry-run` reports `capabilities.tools: true` when it is supported.
+The CLI works the same way, one process per call. Keep tool results short and stable. Append them only after the existing history, never rewrite it, so DeepSeek's prefix cache keeps hitting (see [Prefix-cache advice](#prefix-cache-advice)). An older Offload rejects `tools` as an unknown field (`invalid_request`). `--dry-run` reports `capabilities.tools: true`, and `capabilities.builtinTools` lists the built-in tools, when they are supported.
 
 ### Routes and models
 
@@ -266,7 +300,7 @@ Every attempted call appends one JSON line to `$XDG_STATE_HOME/offload/complete-
 }
 ```
 
-`error` is the error code or `null`. A call with `tools` adds three fields: `loopId` (`toolLoop.id`), `turn`, and `toolCalls` (the number of calls returned to the caller). Prompt and response text, tool definitions, tool arguments, tool results and reasoning are never written to disk, logs or job records. Requests rejected before any provider traffic (`invalid_request`, `unpriced_model`, missing key) are not ledgered.
+`error` is the error code or `null`. A call with `tools` writes one line per model turn and adds `loopId` (`toolLoop.id`), `turn`, and `toolCalls` (the calls that turn kept). With built-in tools declared it also adds `webSearches` and `webFetches`, the billed web requests of that turn, whose cost is included in the line's `costUsd`; the line's `latencyMs` then covers that turn. Prompt and response text, tool definitions, tool arguments, search queries, URLs, page text, tool results and reasoning are never written to disk, logs or job records. Requests rejected before any provider traffic (`invalid_request`, `unpriced_model`, missing key) are not ledgered.
 
 ### Daily caps
 
@@ -285,7 +319,7 @@ Before each call Offload adds the caller's spend today (from the ledger), the wo
 
 ### Dry run
 
-`offload complete --dry-run` (or `completeDryRun`) validates the request, checks the key, lists models, and reports the resolved model, whether peak pricing applies now, the per-million-token USD rates, the worst-case cost when `messages` and `maxTokens` are given, and the caller's cap and spend today. With `tools`, `messages` and `caller` it also reports the loop's `toolLoop` position (`turn`, `final`, calls used) and spend so far. Every successful dry run carries `capabilities: { "tools": true }`. It sends no completion and writes no ledger line.
+`offload complete --dry-run` (or `completeDryRun`) validates the request, checks the key, lists models, and reports the resolved model, whether peak pricing applies now, the per-million-token USD rates, the worst-case cost when `messages` and `maxTokens` are given, and the caller's cap and spend today. With `tools`, `messages` and `caller` it also reports the loop's `toolLoop` position (`turn`, `final`, calls used) and spend so far. Every successful dry run carries `capabilities: { "tools": true, "builtinTools": ["web_search", "web_fetch"] }`, and `pricing.webUsdPerRequest` gives the web tool prices. It sends no completion and writes no ledger line.
 
 ### Balance
 

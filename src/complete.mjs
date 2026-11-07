@@ -31,6 +31,7 @@ import { checkedBaseUrl } from './provider/openai-chat.mjs';
 import { bestEffort, fetchAbortable, readJsonAbortable } from './provider/abort.mjs';
 import { sseJson } from './provider/sse.mjs';
 import { plainObject } from './plain-object.mjs';
+import { WEB_TOOL_NAMES, builtinTool, runWebCalls, webToolPrices } from './complete-web.mjs';
 
 export const COMPLETE_CONTRACT_VERSION = 1;
 const COMPLETE_PRICING = 'deepseek-complete-2026-10-01';
@@ -236,6 +237,14 @@ function validateTools(request) {
   const names = new Set();
   let schemaChars = 0;
   const declared = tools.map((tool, index) => {
+    if (plainObject(tool) && Object.hasOwn(tool, 'builtin')) {
+      const { tool: builtin, error } = builtinTool(tool);
+      if (error) fail('invalid_request', `tools[${index}]: ${error}`);
+      if (names.has(builtin.name)) fail('invalid_request', `tools[${index}].name ${builtin.name} is declared twice`);
+      names.add(builtin.name);
+      schemaChars += JSON.stringify(builtin.parameters).length + builtin.name.length + builtin.description.length;
+      return builtin;
+    }
     if (!plainObject(tool) || Object.keys(tool).some((key) => !TOOL_KEYS.has(key)))
       fail('invalid_request', `tools[${index}] must have only name, description and parameters`);
     if (typeof tool.name !== 'string' || !TOOL_NAME.test(tool.name))
@@ -618,25 +627,48 @@ function errorResult(error, base) {
     ...(model !== undefined ? { model } : {}),
     ...(usage !== undefined ? { usage } : {}),
     ...(costUsd !== undefined ? { costUsd } : {}),
-    ...pick(details, ['pricingWarning', 'toolLoop']),
+    ...pick(details, ['pricingWarning', 'toolLoop', 'newMessages']),
     ...base,
   };
 }
 const pick = (object, keys) => Object.fromEntries(keys.filter((key) => object[key] !== undefined).map((key) => [key, object[key]]));
 
+/** Sum two usage records (either may be undefined). */
+function addUsage(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  const keys = ['inputTokens', 'cacheHitTokens', 'cacheMissTokens', 'outputTokens', 'reasoningTokens'];
+  return Object.fromEntries(keys.map((key) => [key, (a[key] ?? 0) + (b[key] ?? 0)]));
+}
+
 /**
  * Run one completion. `options.signal` cancels (result code `cancelled`).
- * Test seams: fetchImpl, env, config/configPath, now, ledgerPath, readKey.
+ *
+ * With built-in web tools the call runs several model turns: each turn that calls only built-in
+ * tools has them run here and continues; the call ends on an answer, a host tool call, a final
+ * turn or a failure. Each model turn appends its own ledger line (and holds its own daily-cap
+ * reservation), so a long call is never counted at zero and a crash loses at most one turn.
+ *
+ * Test seams: fetchImpl, env, config/configPath, now, ledgerPath, readKey, webRetryDelayMs.
  */
 export async function complete(request, options = {}) {
-  const started = (options.now ?? Date.now)();
+  const clock = options.now ?? Date.now;
+  const started = clock();
   const deadline = new AbortController();
   let timer;
   let request_;
-  let reservationPath;
-  let ledger = { caller: request?.caller, tag: request?.tag, route: request?.route };
-  let context, priced, position;
-  let loopSpent = 0;
+  let context, settings, resolved, position, webPrices;
+  let loopSpent = 0; // the loop's recorded spend before this call
+  let ledgerWriteFailed = false;
+  let pricingWarning;
+  const totals = { usage: undefined, costUsd: 0 }; // finished turns of this call
+  const newMessages = []; // assistant turns and built-in tool results produced by this call
+  let turn; // ledger state of the model turn in progress
+  const history = () => (newMessages.length ? [...request_.messages, ...newMessages] : request_.messages);
+  // Web cost of a turn, from the requests DeepSeek has billed so far (counted as each finishes).
+  const toolCost = (state) =>
+    webPrices ? state.billed.web_search * webPrices.web_search + state.billed.web_fetch * webPrices.web_fetch : 0;
+
   // The loop summary on every tool-loop result, success or failure.
   const loopSummary = (callCost, returnedCalls = 0, dropped = 0) =>
     request_?.toolLoop && position
@@ -654,52 +686,63 @@ export async function complete(request, options = {}) {
           },
         }
       : {};
-  const finish = async (result) => {
-    clearTimeout(timer);
-    // Ledger only after a request was actually attempted (or refused by the cap).
-    if (context && ledger.attempted) {
-      const entry = {
-        ts: new Date(started).toISOString(),
-        caller: ledger.caller,
-        tag: ledger.tag,
-        route: ledger.route,
-        model: result.model ?? ledger.model ?? null,
-        usage: result.usage ?? null,
-        costUsd: result.costUsd ?? 0,
-        latencyMs: result.latencyMs,
-        error: result.ok ? null : result.error.code,
-        // Tool-loop calls only: the loop id keys the loop's spend; counts, never tool text.
-        ...(ledger.loopId ? { loopId: ledger.loopId, turn: ledger.turn, toolCalls: result.toolCalls?.length ?? 0 } : {}),
-      };
-      try {
-        await appendLedger(context.ledgerPath, entry);
-      } catch {
-        // A ledger failure must not hide the provider result from the caller.
-        result.ledgerWriteFailed = true;
-      }
+
+  /** Append the turn's ledger line (once) and release its daily-cap reservation. */
+  const recordTurn = async (error) => {
+    if (!turn?.attempted || turn.recorded) return;
+    turn.recorded = true;
+    const entry = {
+      ts: new Date(turn.started).toISOString(),
+      caller: request_.caller,
+      tag: request_.tag,
+      route: request_.route,
+      model: turn.model ?? resolved ?? null,
+      usage: turn.usage ?? null,
+      costUsd: turn.chatCost + toolCost(turn),
+      latencyMs: Math.max(0, clock() - turn.started),
+      error,
+      // Tool-loop calls only: the loop id keys the loop's spend; counts, never tool text.
+      ...(request_.toolLoop
+        ? {
+            loopId: request_.toolLoop.id,
+            turn: turn.number,
+            toolCalls: turn.toolCalls,
+            ...(webPrices ? { webSearches: turn.billed.web_search, webFetches: turn.billed.web_fetch } : {}),
+          }
+        : {}),
+    };
+    try {
+      await appendLedger(context.ledgerPath, entry);
+    } catch {
+      // A ledger failure must not hide the provider result from the caller.
+      ledgerWriteFailed = true;
     }
     // Release after the ledger line lands, so the spend is never counted zero times.
-    if (reservationPath) await rm(reservationPath, { force: true }).catch(() => {});
+    if (turn.reservation) await rm(turn.reservation, { force: true }).catch(() => {});
+  };
+  const finish = async (result) => {
+    clearTimeout(timer);
+    await recordTurn(result.ok ? null : result.error.code);
+    if (ledgerWriteFailed) result.ledgerWriteFailed = true;
     return result;
   };
+
   try {
     request_ = validateCompleteRequest(request);
-    ledger = { caller: request_.caller, tag: request_.tag, route: request_.route };
-    if (request_.toolLoop) {
-      position = loopPosition(request_.messages, request_.toolLoop);
-      Object.assign(ledger, { loopId: request_.toolLoop.id, turn: position.turn });
-    }
+    if (request_.toolLoop) position = loopPosition(request_.messages, request_.toolLoop);
     context = resolveEnvironment(options);
-    const settings = providerSettings(context.config);
+    settings = providerSettings(context.config);
+    if (request_.tools?.some((tool) => tool.builtin)) {
+      webPrices = webToolPrices(settings.table);
+      if (!webPrices) fail('unpriced_model', `the trusted price table ${settings.pricingName} has no web tool prices`);
+    }
     const apiKey = readApiKey(context.readKey, settings.keyRef);
-    const signals = [deadline.signal, ...(options.signal ? [options.signal] : [])];
-    const signal = AbortSignal.any(signals);
+    const signal = AbortSignal.any([deadline.signal, ...(options.signal ? [options.signal] : [])]);
     if (options.signal?.aborted) fail('cancelled', 'cancelled before the request was sent');
     timer = setTimeout(
       () => deadline.abort(new CompleteFailure('timeout', `no complete reply within ${request_.timeoutMs} ms`)),
       request_.timeoutMs,
     );
-    const at = new Date(started);
     if (request_.toolLoop) {
       // Turns of one loop run one after another, so the ledger alone bounds the loop. A loop cap
       // that cannot record its spend would never bind, so it refuses before any provider traffic.
@@ -712,135 +755,176 @@ export async function complete(request, options = {}) {
         }),
       );
     }
-    const model = await runAbortable(signal, () =>
+    const ids = await runAbortable(signal, () =>
       listModels({ ...settings, apiKey, fetchImpl: context.fetchImpl, signal, now: context.now }),
     );
-    const resolved = pickRouteModel(request_.route, model);
+    resolved = pickRouteModel(request_.route, ids);
     if (!resolved) fail('provider_error', `DeepSeek lists no model for route ${request_.route}`);
-    ledger.model = resolved;
     if (!resolveModel(settings.table, resolved))
       fail('unpriced_model', `model ${resolved} has no entry in the trusted price table ${settings.pricingName}`, { model: resolved });
-    if (request_.toolLoop) {
-      const { maxUsd } = request_.toolLoop;
-      const estimate = worstCaseUsd(settings.table, resolved, request_, at);
-      if (maxUsd !== undefined && loopSpent + estimate > maxUsd) {
-        ledger.attempted = true;
-        fail(
-          'budget_cap',
-          `toolLoop.maxUsd $${maxUsd} for loop ${request_.toolLoop.id} would be exceeded (spent $${loopSpent.toFixed(4)}, this call up to $${estimate.toFixed(4)})`,
-          { model: resolved, ...loopSummary(0) },
-        );
-      }
-    }
+    const maxWebPrice = webPrices ? Math.max(...Object.values(webPrices)) : 0;
     const cap = settings.dailyUsd[request_.caller];
-    if (cap !== undefined) {
-      const estimate = worstCaseUsd(settings.table, resolved, request_, at);
-      const reserved = await runAbortable(signal, () =>
-        reserveCap({
-          ledgerPath: context.ledgerPath,
-          caller: request_.caller,
-          cap,
-          estimate,
-          at,
-          timeoutMs: request_.timeoutMs,
-          signal,
-        }),
-      );
-      if (reserved.refused) {
-        const { spent, inflight } = reserved.refused;
-        ledger.attempted = true;
+
+    for (;;) {
+      const messages = history();
+      if (request_.toolLoop) position = loopPosition(messages, request_.toolLoop);
+      const turnRequest = newMessages.length ? { ...request_, messages } : request_;
+      const at = new Date(clock());
+      turn = {
+        number: position?.turn,
+        started: at.getTime(),
+        at,
+        chatCost: 0,
+        toolCalls: 0,
+        billed: { web_search: 0, web_fetch: 0 },
+      };
+      // Worst case for this turn: the chat call plus every web call it could make.
+      const estimate =
+        worstCaseUsd(settings.table, resolved, turnRequest, at) + (position && !position.final ? position.allowedCalls * maxWebPrice : 0);
+      const maxUsd = request_.toolLoop?.maxUsd;
+      if (maxUsd !== undefined && loopSpent + totals.costUsd + estimate > maxUsd) {
+        turn.attempted = true;
         fail(
           'budget_cap',
-          `daily cap $${cap} for caller ${request_.caller} would be exceeded (spent $${spent.toFixed(4)}, in flight $${inflight.toFixed(4)}, this call up to $${estimate.toFixed(4)})`,
-          { model: resolved, ...loopSummary(0) },
+          `toolLoop.maxUsd $${maxUsd} for loop ${request_.toolLoop.id} would be exceeded (spent $${(loopSpent + totals.costUsd).toFixed(4)}, this turn up to $${estimate.toFixed(4)})`,
+          { model: resolved },
         );
       }
-      reservationPath = reserved.path;
-    }
-    ledger.attempted = true;
-    priced = { table: settings.table, model: resolved };
-    const reply = await runAbortable(signal, () =>
-      chat({ settings, apiKey, model: resolved, request: request_, final: position?.final, fetchImpl: context.fetchImpl, signal }),
-    );
-    // An alias (for example deepseek-flash) can move to a newer model between calls. Price the
-    // model that answered when the table knows it; otherwise say the cost used the alias's rates.
-    const echoed = reply.model;
-    const pricedModel = echoed && resolveModel(settings.table, echoed) ? echoed : resolved;
-    const pricingWarning =
-      echoed && pricedModel !== echoed ? `model ${echoed} has no trusted price; costUsd uses the ${resolved} rates` : undefined;
-    const costUsd = reply.usage ? priceUsage(settings.table, pricedModel, reply.usage, at).usd : 0;
-    const base = {
-      model: echoed ?? resolved,
-      usage: reply.usage,
-      costUsd,
-      finishReason: reply.finishReason,
-      ...(pricingWarning ? { pricingWarning } : {}),
-      ...loopSummary(costUsd),
-    };
-    const latencyMs = Math.max(0, (options.now ?? Date.now)() - started);
-    if (reply.finishReason === 'length')
-      fail('truncated', 'the reply hit maxTokens (finish_reason length)', {
-        ...base,
-        text: reply.text,
-        ...pick(reply, ['providerRequestId']),
-      });
-    if (reply.finishReason === 'content_filter')
-      fail('refused', 'DeepSeek refused the content (finish_reason content_filter)', {
-        ...base,
-        text: reply.text,
-        ...pick(reply, ['providerRequestId']),
-      });
-    if (reply.finishReason === undefined || reply.finishReason === 'other')
-      fail(
-        'provider_error',
-        reply.finishReason === undefined ? 'DeepSeek stream ended without a finish reason' : 'DeepSeek stopped for an unsupported reason',
-        { ...base, retryable: true, ...pick(reply, ['providerRequestId']) },
+      if (cap !== undefined) {
+        const reserved = await runAbortable(signal, () =>
+          reserveCap({ ledgerPath: context.ledgerPath, caller: request_.caller, cap, estimate, at, timeoutMs: request_.timeoutMs, signal }),
+        );
+        if (reserved.refused) {
+          const { spent, inflight } = reserved.refused;
+          turn.attempted = true;
+          fail(
+            'budget_cap',
+            `daily cap $${cap} for caller ${request_.caller} would be exceeded (spent $${spent.toFixed(4)}, in flight $${inflight.toFixed(4)}, this call up to $${estimate.toFixed(4)})`,
+            { model: resolved },
+          );
+        }
+        turn.reservation = reserved.path;
+      }
+      turn.attempted = true;
+      const reply = await runAbortable(signal, () =>
+        chat({ settings, apiKey, model: resolved, request: turnRequest, final: position?.final, fetchImpl: context.fetchImpl, signal }),
       );
-    if (!reply.usage) fail('provider_error', 'DeepSeek returned no usage record', { ...base, ...pick(reply, ['providerRequestId']) });
-    let toolResult = {};
-    if (request_.toolLoop) {
-      const { kept, dropped } = checkedToolCalls(reply, request_, position, { ...base, ...pick(reply, ['providerRequestId']) });
-      const assistantMessage = {
-        role: 'assistant',
-        content: reply.text,
-        ...(kept.length ? { toolCalls: kept } : {}),
-        ...(reply.reasoningContent !== undefined ? { reasoningContent: reply.reasoningContent } : {}),
-      };
-      toolResult = {
-        ...(kept.length ? { toolCalls: kept } : {}),
-        assistantMessage,
-        ...loopSummary(costUsd, kept.length, dropped),
-      };
+      // An alias (for example deepseek-flash) can move to a newer model between calls. Price the
+      // model that answered when the table knows it; otherwise say the cost used the alias's rates.
+      const echoed = reply.model;
+      turn.pricedModel = echoed && resolveModel(settings.table, echoed) ? echoed : resolved;
+      if (echoed && turn.pricedModel !== echoed)
+        pricingWarning = `model ${echoed} has no trusted price; costUsd uses the ${resolved} rates`;
+      turn.model = echoed ?? resolved;
+      turn.usage = reply.usage;
+      turn.chatCost = reply.usage ? priceUsage(settings.table, turn.pricedModel, reply.usage, at).usd : 0;
+      const details = { model: turn.model, finishReason: reply.finishReason, ...pick(reply, ['providerRequestId']) };
+      if (reply.finishReason === 'length')
+        fail('truncated', 'the reply hit maxTokens (finish_reason length)', { ...details, text: reply.text });
+      if (reply.finishReason === 'content_filter')
+        fail('refused', 'DeepSeek refused the content (finish_reason content_filter)', { ...details, text: reply.text });
+      if (reply.finishReason === undefined || reply.finishReason === 'other')
+        fail(
+          'provider_error',
+          reply.finishReason === undefined ? 'DeepSeek stream ended without a finish reason' : 'DeepSeek stopped for an unsupported reason',
+          { ...details, retryable: true },
+        );
+      if (!reply.usage) fail('provider_error', 'DeepSeek returned no usage record', details);
+
+      let kept = [];
+      let dropped = 0;
+      let hostCalls = [];
+      if (request_.toolLoop) {
+        ({ kept, dropped } = checkedToolCalls(reply, turnRequest, position, details));
+        // The assistant turn joins newMessages only with its built-in results, so a failure
+        // mid-turn never hands back a tool-call turn that lacks its tool messages.
+        const assistantMessage = {
+          role: 'assistant',
+          content: reply.text,
+          ...(kept.length ? { toolCalls: kept } : {}),
+          ...(reply.reasoningContent !== undefined ? { reasoningContent: reply.reasoningContent } : {}),
+        };
+        turn.toolCalls = kept.length;
+        const builtins = new Set(request_.tools.filter((tool) => tool.builtin).map((tool) => tool.name));
+        const webCalls = kept.filter((call) => builtins.has(call.name));
+        hostCalls = kept.filter((call) => !builtins.has(call.name));
+        if (webCalls.length) {
+          const ran = await runAbortable(signal, () =>
+            runWebCalls(webCalls, request_.tools, {
+              baseUrl: settings.baseUrl,
+              apiKey,
+              fetchImpl: context.fetchImpl,
+              signal,
+              retryDelayMs: options.webRetryDelayMs,
+              billed: turn.billed,
+            }),
+          );
+          if (ran.fatal) fail(ran.fatal.code, ran.fatal.message, { httpStatus: ran.fatal.httpStatus, model: turn.model });
+          newMessages.push(assistantMessage);
+          for (const result of ran.results) newMessages.push({ role: 'tool', toolCallId: result.toolCallId, content: result.content });
+        } else newMessages.push(assistantMessage);
+        // Only built-in calls: their results are in the history, so the model takes another turn.
+        if (webCalls.length && !hostCalls.length) {
+          totals.usage = addUsage(totals.usage, turn.usage);
+          totals.costUsd += turn.chatCost + toolCost(turn);
+          turn.folded = true;
+          await recordTurn(null);
+          continue;
+        }
+      }
+      totals.usage = addUsage(totals.usage, turn.usage);
+      totals.costUsd += turn.chatCost + toolCost(turn);
+      turn.folded = true;
+      return await finish({
+        version: COMPLETE_CONTRACT_VERSION,
+        ok: true,
+        text: reply.text,
+        finishReason: hostCalls.length ? 'tool_calls' : 'stop',
+        model: turn.model,
+        usage: totals.usage,
+        costUsd: totals.costUsd,
+        latencyMs: Math.max(0, clock() - started),
+        ...(reply.providerRequestId ? { providerRequestId: reply.providerRequestId } : {}),
+        ...(pricingWarning ? { pricingWarning } : {}),
+        ...(request_.toolLoop
+          ? { ...(hostCalls.length ? { toolCalls: hostCalls } : {}), newMessages, ...loopSummary(totals.costUsd, kept.length, dropped) }
+          : {}),
+      });
     }
-    return await finish({
-      version: COMPLETE_CONTRACT_VERSION,
-      ok: true,
-      text: reply.text,
-      finishReason: toolResult.toolCalls ? 'tool_calls' : 'stop',
-      model: base.model,
-      usage: reply.usage,
-      costUsd,
-      latencyMs,
-      ...(reply.providerRequestId ? { providerRequestId: reply.providerRequestId } : {}),
-      ...(pricingWarning ? { pricingWarning } : {}),
-      ...toolResult,
-    });
   } catch (error) {
     let failure = error;
     if (!(failure instanceof CompleteFailure)) {
       if (options.signal?.aborted) failure = new CompleteFailure('cancelled', 'cancelled by the caller');
       else if (deadline.signal.aborted) failure = deadline.signal.reason;
     }
-    // A timeout or cancellation mid-stream can still carry billed usage.
-    if (failure instanceof CompleteFailure && failure.details?.usage && failure.details.costUsd === undefined && priced)
-      try {
-        failure.details.costUsd = priceUsage(priced.table, priced.model, failure.details.usage, new Date(started)).usd;
-      } catch {
-        // leave cost unknown rather than guess
+    if (failure instanceof CompleteFailure) {
+      const details = { ...failure.details };
+      // A timeout or cancellation mid-stream can still carry billed usage for the turn in progress.
+      if (turn && !turn.folded) {
+        if (details.usage && !turn.usage) {
+          turn.usage = details.usage;
+          try {
+            turn.chatCost = priceUsage(settings.table, turn.pricedModel ?? resolved, turn.usage, turn.at).usd;
+          } catch {
+            // leave cost unknown rather than guess
+          }
+        }
+        if (details.model && !turn.model) turn.model = details.model;
       }
-    if (failure instanceof CompleteFailure && !failure.details?.toolLoop && position)
-      failure.details = { ...failure.details, ...loopSummary(failure.details?.costUsd) };
-    return finish(errorResult(failure, { latencyMs: Math.max(0, (options.now ?? Date.now)() - started) }));
+      const open = turn && !turn.folded;
+      const usage = open ? addUsage(totals.usage, turn.usage) : totals.usage;
+      const costUsd = totals.costUsd + (open ? turn.chatCost + toolCost(turn) : 0);
+      delete details.usage;
+      delete details.costUsd;
+      failure = new CompleteFailure(failure.code, failure.message, {
+        ...details,
+        ...(usage ? { usage, costUsd } : costUsd ? { costUsd } : {}),
+        ...(newMessages.length ? { newMessages } : {}),
+        ...(pricingWarning ? { pricingWarning } : {}),
+        ...loopSummary(costUsd),
+      });
+    }
+    return finish(errorResult(failure, { latencyMs: Math.max(0, clock() - started) }));
   }
 }
 
@@ -1080,11 +1164,12 @@ export async function completeDryRun(request, options = {}) {
           inputCacheMiss: spec.usd_per_1m.input_cache_miss[tier],
           output: spec.usd_per_1m.output[tier],
         },
+        ...(webToolPrices(settings.table) ? { webUsdPerRequest: webToolPrices(settings.table) } : {}),
       },
-      ...(request_.messages && request_.maxTokens ? { maxCostUsd: worstCaseUsd(settings.table, model, request_, at) } : {}),
+      ...(request_.messages && request_.maxTokens ? { maxCostUsd: dryRunWorstCase(settings.table, model, request_, at) } : {}),
       ...(cap !== undefined ? { dailyCapUsd: cap, spentTodayUsd: await callerSpendToday(context.ledgerPath, request_.caller, at) } : {}),
       ...(request_.toolLoop && request_.messages && request_.caller ? await dryRunLoop(request_, context.ledgerPath) : {}),
-      capabilities: { tools: true },
+      capabilities: { tools: true, ...(webToolPrices(settings.table) ? { builtinTools: [...WEB_TOOL_NAMES] } : {}) },
       latencyMs: clock() - started,
     };
   } catch (error) {
@@ -1093,6 +1178,15 @@ export async function completeDryRun(request, options = {}) {
       latencyMs: clock() - started,
     });
   }
+}
+
+/** One turn's worst case as a real call computes it: chat plus every web call the turn may make. */
+function dryRunWorstCase(table, model, request, at) {
+  const chat = worstCaseUsd(table, model, request, at);
+  const prices = request.tools?.some((tool) => tool.builtin) ? webToolPrices(table) : undefined;
+  if (!prices || !request.toolLoop) return chat;
+  const { final, allowedCalls } = loopPosition(request.messages, request.toolLoop);
+  return chat + (final ? 0 : allowedCalls * Math.max(...Object.values(prices)));
 }
 
 /** The dry-run view of a tool loop: where the history stands and what the loop has spent. */

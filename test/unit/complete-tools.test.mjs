@@ -143,7 +143,7 @@ const followUp = (base, result, results = {}) => ({
   ...base,
   messages: [
     ...base.messages,
-    result.assistantMessage,
+    ...result.newMessages,
     ...result.toolCalls.map((call) => ({ role: 'tool', toolCallId: call.id, content: results[call.id] ?? `RESULT-${call.id}` })),
   ],
 });
@@ -161,7 +161,7 @@ test('a tool-calling reply returns the calls, the assistant message to replay an
     assert.equal(result.finishReason, 'tool_calls');
     assert.equal(result.text, 'Let me look.');
     assert.deepEqual(result.toolCalls, [search('call_1', 'ACME staff salary'), search('call_2', 'ACME levels')]);
-    assert.deepEqual(result.assistantMessage, {
+    assert.deepEqual(result.newMessages.at(-1), {
       role: 'assistant',
       content: 'Let me look.',
       toolCalls: result.toolCalls,
@@ -215,7 +215,7 @@ test('the next turn replays reasoning, tool calls and tool results byte-stably a
     assert.equal(second.finishReason, 'stop');
     assert.equal(second.text, '$250k base');
     assert.equal(second.toolCalls, undefined);
-    assert.deepEqual(second.assistantMessage, { role: 'assistant', content: '$250k base', reasoningContent: 'SECOND-THOUGHT' });
+    assert.deepEqual(second.newMessages.at(-1), { role: 'assistant', content: '$250k base', reasoningContent: 'SECOND-THOUGHT' });
     assert.equal(second.toolLoop.turn, 2);
     assert.equal(second.toolLoop.toolCalls, 1);
     near(second.toolLoop.costUsd, 2 * CALL_COST);
@@ -302,7 +302,7 @@ test('calls beyond the per-turn or remaining loop cap are dropped and reported',
     const perTurn = await complete(request(), h.options);
     assert.equal(perTurn.ok, true);
     assert.deepEqual(perTurn.toolCalls, four.slice(0, 3));
-    assert.deepEqual(perTurn.assistantMessage.toolCalls, four.slice(0, 3));
+    assert.deepEqual(perTurn.newMessages.at(-1).toolCalls, four.slice(0, 3));
     assert.equal(perTurn.toolLoop.toolCallsDropped, 1);
     assert.equal(h.ledger()[0].toolCalls, 3);
     // Two calls left of maxToolCalls 6 after one earlier turn of four.
@@ -433,7 +433,7 @@ test('a tool loop with thinking disabled replays the explicit null reasoning_con
   try {
     const base = request({ reasoning: { enabled: false } });
     const first = await complete(base, h.options);
-    assert.equal(first.assistantMessage.reasoningContent, null);
+    assert.equal(first.newMessages.at(-1).reasoningContent, null);
     await complete(followUp(base, first), h.options);
     const wire = JSON.parse(h.chats()[1].body);
     assert.equal(wire.messages[2].reasoning_content, null);
@@ -601,7 +601,7 @@ test('the worst-case estimate counts tool schemas, reasoning and arguments', asy
     );
     assert.equal(withTools.ok, true, JSON.stringify(withTools));
     assert.ok(withTools.maxCostUsd > plain.maxCostUsd + 10_000 * 0.15e-6);
-    assert.deepEqual(plain.capabilities, { tools: true });
+    assert.deepEqual(plain.capabilities, { tools: true, builtinTools: ['web_search', 'web_fetch'] });
     assert.deepEqual(withTools.toolLoop, { id: 'dry', turn: 2, maxTurns: 3, final: false, toolCalls: 1, maxToolCalls: 32, costUsd: 0 });
     assert.equal(h.chats().length, 0);
     assert.equal(h.ledger().length, 0);
@@ -645,7 +645,7 @@ test('without tools, reasoning is still dropped and no tool fields appear', asyn
     const result = await complete(request({ tools: undefined, toolLoop: undefined }), h.options);
     assert.equal(result.ok, true);
     assert.ok(!JSON.stringify(result).includes('THINK-SECRET'));
-    for (const key of ['toolCalls', 'assistantMessage', 'toolLoop']) assert.equal(result[key], undefined, key);
+    for (const key of ['toolCalls', 'newMessages', 'toolLoop']) assert.equal(result[key], undefined, key);
     const payload = JSON.parse(h.chats()[0].body);
     assert.equal('tools' in payload, false);
     assert.equal('tool_choice' in payload, false);
@@ -685,7 +685,7 @@ test('review fixes: a parameterless call with no argument text is returned and r
     const first = await complete(request(), h.options);
     assert.equal(first.ok, true, JSON.stringify(first));
     assert.equal(first.toolCalls[0].arguments, '{}');
-    assert.equal(first.assistantMessage.toolCalls[0].arguments, '{}');
+    assert.equal(first.newMessages.at(-1).toolCalls[0].arguments, '{}');
     await complete(followUp(request(), first), h.options);
     assert.equal(JSON.parse(h.chats()[1].body).messages[2].tool_calls[0].function.arguments, '{}');
   } finally {
@@ -771,7 +771,7 @@ test('review fixes: a reply with no reasoning_content field carries no reasoning
   try {
     const result = await complete(request(), h.options);
     assert.equal(result.ok, true);
-    assert.equal('reasoningContent' in result.assistantMessage, false);
+    assert.equal('reasoningContent' in result.newMessages.at(-1), false);
   } finally {
     h.done();
   }

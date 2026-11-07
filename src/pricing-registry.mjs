@@ -35,6 +35,12 @@ const DEEPSEEK_2026_10_01 = deepFreeze({
  */
 const DEEPSEEK_COMPLETE_2026_10_01 = deepFreeze({
   ...DEEPSEEK_2026_10_01,
+  sources: [...DEEPSEEK_2026_10_01.sources, 'https://api-docs.deepseek.com/guides/search'],
+  // Built-in web tools: billed per successful request (HTTP 200 with results or page content).
+  tool_requests: {
+    web_search: { usd_per_1k: 0.75 },
+    web_fetch: { usd_per_1k: 0.75 },
+  },
   models: {
     ...DEEPSEEK_2026_10_01.models,
     'deepseek-v4-pro': {
