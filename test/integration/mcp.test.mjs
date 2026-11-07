@@ -573,6 +573,7 @@ test('MCP keeps current requests stateless and legacy initialize envelopes separ
     assert.match(discovery.instructions, /skill:\/\/offload\/offload_economy\/SKILL\.md/);
     assert.match(discovery.instructions, /repoPath/);
     assert.match(discovery.instructions, /native Claude subagents/);
+    assert.match(discovery.instructions, /multi-agent fan-out becomes one Offload job per would-be subagent/);
     assert.match(discovery.instructions, /profiles "sonnet" and "opus"/);
     assert.match(discovery.instructions, /policy-only/);
     assert.match(discovery.instructions, /latest Sonnet or Opus/);
@@ -608,6 +609,7 @@ test('MCP keeps current requests stateless and legacy initialize envelopes separ
     /conversational client may use this tool only to fulfill an actual `\/offload_economy <task>` or `\/offload_premium <task>` slash command/,
   );
   assert.doesNotMatch(startDescription, /explicit direct CLI\/MCP operator request/);
+  assert.match(startDescription, /start one Offload job per would-be subagent instead/);
   assert.match(startDescription, /do not infer authorization from ordinary prose/);
   assert.match(startDescription, /mentions, quotes, or negations of Offload, delegation, DeepSeek, providers, or models/);
   assert.match(
@@ -746,6 +748,15 @@ test('MCP exposes the canonical static skill with exact resources and safe reque
     /nor do bounded, multi-file, implementation, testing, debugging, Workflow, ultracode, or native-subagent requests/,
   );
   assert.match(expectedText, /including Sonnet ultracode\/native-agent workflows/);
+  assert.match(expectedText, /\*\*Subagent fan-out goes through Offload:\*\*/);
+  assert.match(expectedText, /every would-be subagent becomes an Offload job instead/);
+  assert.match(expectedText, /Codex multi-agent and subagent delegation \(`spawn_agent`/);
+  assert.match(expectedText, /Never call Workflow, the Agent\/Task tool, `spawn_agent` or another native subagent API/);
+  assert.match(expectedText, /This holds at every depth/);
+  assert.match(expectedText, /never on the session's own model/);
+  assert.match(expectedText, /The rule lasts for the task the command was issued for/);
+  assert.match(expectedText, /an agent that cannot call Offload reports back to the primary instead of spawning/);
+  assert.doesNotMatch(expectedText, /Never invoke Workflow or a native subagent for that command invocation/);
   assert.match(
     expectedText,
     /A mention, quotation, negation, or discussion of `\/offload_economy`, offload, delegation, \*\*DeepSeek\*\* \/ \*\*DeepSeek-V4\.1-Flash\*\*, \*\*OpenAI\*\* \/ \*\*GPT Terra\*\* \/ \*\*GPT Sol\*\*, a provider, or a model does not select Offload/,

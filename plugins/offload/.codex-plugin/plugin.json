@@ -1,6 +1,6 @@
 {
   "name": "offload",
-  "version": "0.1.0+codex.0a1db56b63c3a2dd",
+  "version": "0.1.0+codex.be0c0f32e7da143a",
   "description": "Runs only after an explicit /offload_economy or /offload_premium slash-command invocation; ordinary prose does not invoke it.",
   "author": {
     "name": "Offload"

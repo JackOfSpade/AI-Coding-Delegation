@@ -224,6 +224,12 @@ test('installer is idempotent and removes only managed routing blocks', async ()
     /nor do bounded, multi-file, implementation, testing, debugging, Workflow, ultracode, or native-subagent requests/,
   );
   assert.match(afterFirstInstall, /including Sonnet ultracode\/native-agent workflows/);
+  assert.match(afterFirstInstall, /each would-be subagent becomes its own Offload job under the command's profile/);
+  assert.match(afterFirstInstall, /never a native subagent, at every depth/);
+  assert.match(
+    afterFirstInstall,
+    /run on the command's active route \(including DeepSeek Flash after credit fallback\), not the session's own model/,
+  );
   assert.match(afterFirstInstall, /A standalone instruction not to use native subagents does not select Offload/);
   assert.match(afterFirstInstall, /For either command invocation, end every final answer/);
   assert.match(
@@ -235,6 +241,8 @@ test('installer is idempotent and removes only managed routing blocks', async ()
   assert.match(doc, /invokes `\/offload_economy` or `\/offload_premium` as a slash command/);
   assert.match(doc, /nor do bounded, multi-file, implementation, testing, debugging, Workflow, ultracode, or native-subagent requests/);
   assert.match(doc, /A standalone instruction not to use native subagents does not select Offload/);
+  assert.match(doc, /Codex multi-agent \(`spawn_agent` and related subagent tools\)/);
+  assert.match(doc, /each would-be subagent becomes its own Offload job under the command's profile/);
   assert.match(doc, /provider or model name never routes work to Offload/);
   await install({ root, home, configHome: join(home, 'config'), clients: ['claude', 'codex', 'cursor'], uninstall: true });
   assert.doesNotMatch(await readFile(join(home, '.codex', 'AGENTS.md'), 'utf8'), /BEGIN offload/);

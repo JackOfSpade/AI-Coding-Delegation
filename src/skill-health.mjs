@@ -225,6 +225,6 @@ export function assertStartRuntimeCurrent(health, { requireCurrentSkill = true }
   throw new Error(
     `OFFLOAD START REFUSED: ${reasons.join(' and ')}. No job was created and no provider budget was spent. ${
       typeof action === 'string' && action.trim() ? action.trim() : RESTART_FALLBACK
-    } For /offload_economy or /offload_premium, stop the requested task; do not continue implementation locally or through native subagents or bypass this refusal through the CLI.`,
+    } For /offload_economy or /offload_premium, stop the requested task; do not continue implementation locally or through native subagents (Workflow, the Agent/Task tool, Codex spawn_agent) or bypass this refusal through the CLI.`,
   );
 }
