@@ -402,9 +402,12 @@ function finishProtocolLine(job) {
   return problems.length ? `finish protocol: ${problems.map((item) => scalar(item).slice(0, 200)).join('; ')}` : '';
 }
 function reportSalvagedLine(job) {
-  return reportModeOf(job) && job.reportSalvaged === true
-    ? 'report salvaged: the finish arguments were invalid; reportResult.text holds the drafted report, unreviewed'
-    : '';
+  if (!reportModeOf(job)) return '';
+  if (job.reportSalvage === 'finish-arguments')
+    return 'report salvaged: the finish arguments were invalid; reportResult.text holds the drafted report, unreviewed';
+  if (job.reportSalvage === 'plain-text')
+    return 'report salvaged: the worker ended in plain text without calling finish; reportResult.text holds its last message, unreviewed';
+  return '';
 }
 const reportModeOf = (job) => job?.mode === 'report';
 /** One-line verdict on the worker's review packet; empty unless the job requested one. */

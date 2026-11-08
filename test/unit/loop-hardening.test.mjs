@@ -4504,7 +4504,7 @@ test('a finish-protocol violation on the report finalization turn salvages a dra
   // An invalid finish that carries a report is recovered: DONE, no retry request, nothing executed.
   const salvaged = await reportFinalizationRun([call('finish', JSON.stringify({ summary: '', report: 'Drafted findings.' }))]);
   assert.equal(salvaged.result.status, 'DONE');
-  assert.equal(salvaged.result.reportSalvaged, true);
+  assert.equal(salvaged.result.reportSalvage, 'finish-arguments');
   assert.equal(salvaged.result.finish.report, 'Drafted findings.');
   assert.equal(salvaged.result.finish.summary, 'Drafted findings.');
   assert.deepEqual(salvaged.result.finishProblems, ['summary was missing or longer than 1500 characters']);
@@ -4604,7 +4604,7 @@ test('a write job finish-protocol violation on its last turn is unchanged by rep
   assert.equal(result.status, 'FAILED');
   assert.equal(result.failureKind, 'finish-protocol');
   assert.equal(result.finishProblems, undefined);
-  assert.equal(result.reportSalvaged, undefined);
+  assert.equal(result.reportSalvage, undefined);
 });
 
 test('a capped report finalization turn continues without reporting an output-cap diagnostic', async () => {
@@ -5012,6 +5012,106 @@ test('prose after a successful write gets one reminder and can still finish; onl
   }).run({ task: 'x' });
   assert.equal(unwritten.failureKind, 'no-finish');
   assert.equal(noWrite.length, 1, 'with no work to protect there is no reminder');
+});
+
+// turns: 'read' = two read_file calls, 'finish', 'stop'/'length'/'content_filter' = prose with that finish reason, or { text, stop }.
+const reportProseRun = async (turns, extra = {}) => {
+  const requests = [];
+  const progress = [];
+  const result = await new AgentLoop({
+    provider: {
+      async *chat({ messages }) {
+        requests.push(structuredClone(messages));
+        const turn = turns[requests.length - 1] ?? 'stop';
+        if (turn === 'read')
+          yield {
+            toolCalls: [call('read_file', '{"path":"a"}', `a${requests.length}`), call('read_file', '{"path":"b"}', `b${requests.length}`)],
+          };
+        else if (turn === 'finish') yield { toolCalls: [call('finish', '{"summary":"s","report":"R"}', 'f')] };
+        else {
+          const { text = 'My complete findings.', stop = typeof turn === 'string' ? turn : 'stop' } = typeof turn === 'object' ? turn : {};
+          yield { text, providerFinishReason: stop };
+        }
+        yield { usage: { inputTokens: 1, outputTokens: 1 } };
+      },
+    },
+    reportMode: true,
+    toolDefinitions: availableToolDefinitions({ readOnly: true }),
+    tools: { execute: async (name, args) => (name === 'finish' ? { finish: args } : 'file body') },
+    progress: async (event) => {
+      if (event.action) progress.push(event.action);
+    },
+    ...extra,
+  }).run({ task: 'Survey' });
+  return { result, requests, progress };
+};
+
+test('a report worker that ends in prose gets one reminder naming the review packet and can still finish', async () => {
+  const { result, requests, progress } = await reportProseRun(['read', 'stop', 'finish'], {
+    checkReviewPacket: async () => ({ status: 'passed' }),
+  });
+  assert.equal(result.status, 'DONE', JSON.stringify(result));
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[2].at(-2), { role: 'assistant', content: 'My complete findings.' });
+  assert.equal(requests[2].at(-1).role, 'user');
+  assert.match(requests[2].at(-1).content, /^No tool was called, and prose does not complete a report job\./);
+  assert.match(requests[2].at(-1).content, /, and the reviewPacket the brief requires; otherwise/);
+  assert.ok(progress.includes('provider_report_no_finish_recover'));
+  assertToolProtocol(requests[2]);
+
+  const plain = await reportProseRun(['read', 'stop', 'finish']);
+  assert.equal(plain.result.status, 'DONE');
+  assert.doesNotMatch(plain.requests[2].at(-1).content, /reviewPacket/);
+  assert.match(plain.requests[2].at(-1).content, /at most 1500 characters in summary; otherwise make the remaining read-only/);
+});
+
+test('a report worker that ends in prose twice fails no-finish with its last text kept as a plain-text salvage', async () => {
+  const { result, requests } = await reportProseRun(['read', { text: 'first draft' }, { text: 'Final prose findings.' }]);
+  assert.equal(result.status, 'FAILED');
+  assert.equal(result.failureKind, 'no-finish');
+  assert.equal(result.error, FAILURE_ERRORS['no-finish']);
+  assert.equal(result.report, 'Final prose findings.');
+  assert.equal(result.reportSalvage, 'plain-text');
+  assert.equal(requests.length, 3, 'exactly one extra request');
+
+  const clipped = await reportProseRun(['read', 'stop', { text: `${'x'.repeat(255_999)}\u{1F600}tail` }]);
+  assert.equal(clipped.result.report.length, 255_999);
+  assert.equal(clipped.result.reportSalvage, 'plain-text');
+});
+
+test('report prose on the finalization turn gets no reminder but is still salvaged', async () => {
+  const { result, requests, progress } = await reportProseRun(['read', 'stop'], { maxTurns: 2 });
+  assert.equal(result.status, 'FAILED');
+  assert.equal(result.failureKind, 'no-finish');
+  assert.equal(result.reportSalvage, 'plain-text');
+  assert.equal(result.report, 'My complete findings.');
+  assert.equal(requests.length, 2);
+  assert.ok(!progress.includes('provider_report_no_finish_recover'));
+});
+
+test('empty report prose fails without a report or salvage marker', async () => {
+  for (const text of ['', '  \n ']) {
+    const { result } = await reportProseRun(['read', { text }, { text }]);
+    assert.equal(result.status, 'FAILED');
+    assert.equal(result.failureKind, 'no-finish');
+    assert.equal(result.report, undefined);
+    assert.equal(result.reportSalvage, undefined);
+  }
+});
+
+test('report length and content_filter stops are not recovered with the no-finish reminder', async () => {
+  const filtered = await reportProseRun(['read', 'content_filter']);
+  assert.equal(filtered.result.status, 'FAILED');
+  assert.equal(filtered.result.failureKind, undefined);
+  assert.equal(filtered.result.reportSalvage, undefined);
+  assert.ok(!filtered.progress.includes('provider_report_no_finish_recover'));
+  assert.equal(filtered.requests.length, 2);
+  const capped = await reportProseRun(['read', 'length', 'length']);
+  assert.ok(!capped.progress.includes('provider_report_no_finish_recover'));
+  assert.equal(capped.result.reportSalvage, undefined);
+  assert.ok(
+    !capped.requests.some((messages) => messages.at(-1).content?.startsWith?.('No tool was called, and prose does not complete a report')),
+  );
 });
 
 test('a job on course for its reservation warns from observed spend, and tells a worker with edits to wrap up once', async () => {

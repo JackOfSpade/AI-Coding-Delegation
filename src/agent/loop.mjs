@@ -155,6 +155,11 @@ const finishArgumentsCorrection = (problems) =>
   `finish arguments are invalid: ${problems.join('; ')}. Your edits are retained. Do not redo them. Fix only what is listed and call finish alone; the smallest valid call is {"summary":"Implemented the requested changes."}`;
 const NO_FINISH_REMINDER =
   'No tool was called, and prose does not complete the job. Your edits are retained. If your in-scope work is complete, call finish as the only tool call now; otherwise make the remaining tool calls first.';
+// A report worker that ends a turn in prose has usually written its answer; one reminder
+// asks it to put that text in finish rather than losing the round.
+const reportNoFinishReminder = (reviewPacketRequired) =>
+  `No tool was called, and prose does not complete a report job. If the text you just wrote is your complete answer, call finish now as the only tool call: put that text in report (verbatim or tightened), a 1-2 sentence summary of at most 1500 characters in summary${reviewPacketRequired ? ', and the reviewPacket the brief requires' : ''}; otherwise make the remaining read-only tool calls first.`;
+const MAX_SALVAGED_REPORT_CHARS = 256000;
 const MISSING_TOOL_RECOVERY_REMINDER =
   'Do not reply with prose only. Invoke one or more allowed non-finish tools to continue, or call finish as the sole tool call if complete.';
 // A provider-controlled name never reaches a durable record or the model. The
@@ -1284,6 +1289,24 @@ export class AgentLoop {
             usageRecords === 1 &&
             providerFinishReason !== 'length' &&
             providerFinishReason !== 'content_filter';
+          const recoverReportNoFinish =
+            this.reportMode &&
+            !directWriteSucceeded &&
+            !noFinishRecoveryUsed &&
+            !cappedFinishRecoveryUsed &&
+            !budgetFinishRecovery &&
+            !reportFinalizationUsed &&
+            turn < this.maxTurns &&
+            usageRecords === 1 &&
+            providerFinishReason !== 'length' &&
+            providerFinishReason !== 'content_filter';
+          if (recoverReportNoFinish) {
+            noFinishRecoveryUsed = true;
+            await this.context.addBatch([assistant, { role: 'user', content: reportNoFinishReminder(!!this.checkReviewPacket) }]);
+            await this.context.flush();
+            await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'provider_report_no_finish_recover' });
+            continue;
+          }
           if (recoverNoFinish) {
             noFinishRecoveryUsed = true;
             await this.context.addBatch([assistant, { role: 'user', content: NO_FINISH_REMINDER }]);
@@ -1312,6 +1335,14 @@ export class AgentLoop {
             ...(providerFinishReason === 'content_filter' ? {} : { failureKind: outputCapRecoveryExhausted ? 'output-cap' : 'no-finish' }),
             error: outputCapRecoveryExhausted ? FAILURE_ERRORS['output-cap'] : FAILURE_ERRORS['no-finish'],
             text,
+            // The worker's last complete prose is kept, unreviewed, rather than lost with the spend; a cut-off or filtered stop is not.
+            ...(this.reportMode &&
+            providerFinishReason !== 'content_filter' &&
+            providerFinishReason !== 'length' &&
+            !outputCapRecoveryExhausted &&
+            text.trim()
+              ? { report: clipCodePoints(text, MAX_SALVAGED_REPORT_CHARS), reportSalvage: 'plain-text' }
+              : {}),
           });
         }
         let parsed;
@@ -1387,7 +1418,7 @@ export class AgentLoop {
               finish: reviewPacketCheck ? { ...finish, reviewPacketCheck } : finish,
               text,
               finishProblems: reportFinishProblems,
-              reportSalvaged: true,
+              reportSalvage: 'finish-arguments',
             });
           }
           return responseOutcome('FAILED', turn, responseModel, {

@@ -52,11 +52,30 @@ test('a clean verified session derives no signal and no prompt is warranted', ()
 });
 
 test('report-finish-salvaged: a DONE report job whose invalid finish was recovered, not a write job', () => {
-  const signal = only([job('a', { mode: 'report', status: 'DONE_UNVERIFIED', reportSalvaged: true })]);
+  const signal = only([job('a', { mode: 'report', status: 'DONE_UNVERIFIED', reportSalvage: 'finish-arguments' })]);
   assert.equal(signal.code, 'report-finish-salvaged');
   assert.equal(signal.attributable, true);
   assert.match(signal.evidence, /recovered a drafted report after an invalid finish call/);
-  assert.deepEqual(codes([job('b', { mode: 'write', status: 'DONE_UNVERIFIED', reportSalvaged: true })]), []);
+  assert.deepEqual(codes([job('b', { mode: 'write', status: 'DONE_UNVERIFIED', reportSalvage: 'finish-arguments' })]), []);
+});
+
+test('report-finish-salvaged also covers a plain-text salvage after no finish call', () => {
+  const all = deriveSignals([job('a', { mode: 'report', status: 'FAILED', failureKind: 'no-finish', reportSalvage: 'plain-text' })], {
+    nowMs: NOW,
+  });
+  assert.deepEqual(
+    all
+      .map((s) => s.code)
+      .filter((code) => code !== 'wasted-spend-on-failed-job')
+      .sort(),
+    ['protocol-failure-finish', 'report-finish-salvaged'],
+  );
+  assert.match(all.find((s) => s.code === 'report-finish-salvaged').evidence, /last plain-text message after no finish call/);
+  assert.ok(
+    !codes([job('b', { mode: 'report', status: 'FAILED', failureKind: 'no-finish', reportSalvage: 'bogus' })]).includes(
+      'report-finish-salvaged',
+    ),
+  );
 });
 
 test('protocol-failure-finish: a FAILED finish-protocol or no-finish round, not a loop or a pass', () => {
