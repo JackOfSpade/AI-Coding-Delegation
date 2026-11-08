@@ -404,7 +404,11 @@ function finishProtocolLine(job) {
 function reportSalvagedLine(job) {
   if (!reportModeOf(job)) return '';
   if (job.reportSalvage === 'finish-arguments')
-    return 'report salvaged: the finish arguments were invalid; reportResult.text holds the drafted report, unreviewed';
+    return `report salvaged: ${
+      Array.isArray(job.finishProblems) && job.finishProblems.includes('finish was not the only tool call')
+        ? 'the finish call was rejected'
+        : 'the finish arguments were invalid'
+    }; reportResult.text holds the drafted report, unreviewed`;
   if (job.reportSalvage === 'plain-text')
     return 'report salvaged: the worker ended in plain text without calling finish; reportResult.text holds its last message, unreviewed';
   return '';

@@ -5654,3 +5654,106 @@ test('a throwing review packet checker becomes a failed check, is corrected, the
   assert.deepEqual(result.finish.reviewPacketCheck.defects, ['the server could not run the review packet check']);
   assert.deepEqual(result.finish.reviewPacket, goodPacket);
 });
+
+// oj-20261108-a8c290d5: a reviewPacket report worker on Flash spent both of
+// its in-loop finish corrections (finish paired with grep, then invalid
+// arguments) and failed finish-protocol on its third finish with an empty
+// reportResult.text, although each rejected finish carried a long drafted report.
+const reportFinishProtocolRun = async (turns, extra = {}) => {
+  const executed = [];
+  const progress = [];
+  const result = await new AgentLoop({
+    provider: scripted(turns),
+    maxTurns: 80,
+    reportMode: true,
+    toolDefinitions: availableToolDefinitions({ readOnly: true }),
+    progress: async (event) => {
+      if (event.action) progress.push(event.action);
+    },
+    tools: {
+      execute: async (name, args) => {
+        executed.push(name);
+        return name === 'finish' ? { finish: args } : 'source text';
+      },
+    },
+    ...extra,
+  }).run({ task: 'Survey the repository' });
+  return { result, executed, progress };
+};
+const draftFinish = (report, id, summary = 'Survey findings.') => call('finish', JSON.stringify({ summary, report }), id);
+
+test('a report round that fails finish-protocol after its corrections keeps the drafted report', async () => {
+  const { result, executed, progress } = await reportFinishProtocolRun([
+    [call('read_file', '{"path":"a.js"}', 'r1')],
+    [draftFinish('First draft.', 'f1'), call('grep', '{"pattern":"x"}', 'g1')],
+    [draftFinish('Second draft.', 'f2', '')],
+    [draftFinish('Final draft.', 'f3'), call('grep', '{"pattern":"y"}', 'g3')],
+  ]);
+  assert.equal(result.status, 'DONE');
+  assert.equal(result.reportSalvage, 'finish-arguments');
+  assert.equal(result.finish.report, 'Final draft.', 'the last rejected turn wins');
+  assert.equal(result.finish.summary, 'Survey findings.');
+  assert.deepEqual(result.finishProblems, ['finish was not the only tool call']);
+  assert.match(
+    result.finish.concerns.at(-1),
+    /^Recovered the drafted report: the finish call was rejected \(finish was not the only tool call\)/,
+  );
+  assert.deepEqual(executed, ['read_file'], 'no rejected finish or paired grep ran');
+  assert.deepEqual(
+    progress.filter((action) => action.startsWith('finish_protocol') || action.startsWith('report_finish')),
+    ['finish_protocol_recover', 'finish_protocol_recover', 'report_finish_salvaged'],
+  );
+});
+
+test('a terminal finish-protocol turn without a draft falls back to the latest rejected draft', async () => {
+  const { result } = await reportFinishProtocolRun([
+    [draftFinish('Drafted earlier.', 'f1'), call('grep', '{"pattern":"x"}', 'g1')],
+    [call('finish', '{"summary":""}', 'f2')],
+    [call('finish', '{"summary":""}', 'f3')],
+    [call('finish', '{"summary":"done"}', 'f4'), call('grep', '{"pattern":"y"}', 'g4')],
+  ]);
+  assert.equal(result.status, 'DONE');
+  assert.equal(result.reportSalvage, 'finish-arguments');
+  assert.equal(result.finish.report, 'Drafted earlier.');
+  assert.deepEqual(result.finishProblems, ['finish was not the only tool call'], 'the problems of the turn the draft came from');
+});
+
+test('a review-packet report salvaged after finish-protocol records an unchecked failed packet', async () => {
+  const checked = [];
+  const { result } = await reportFinishProtocolRun(
+    [
+      [draftFinish('Draft A.', 'f1'), call('grep', '{"pattern":"x"}', 'g1')],
+      [draftFinish('Draft B.', 'f2'), call('read_file', '{"path":"a.js"}', 'r2')],
+    ],
+    { checkReviewPacket: async (args) => checked.push(args) },
+  );
+  assert.equal(result.status, 'DONE');
+  assert.equal(result.finish.report, 'Draft B.');
+  assert.deepEqual(result.finish.reviewPacketCheck, {
+    status: 'failed',
+    defects: ['finish call was rejected; review packet not checked'],
+  });
+  assert.deepEqual(checked, []);
+});
+
+test('finish-protocol still fails a report round with no draft, and a write round never salvages', async () => {
+  const empty = await reportFinishProtocolRun([
+    [call('finish', '{"summary":"done"}', 'f1'), call('grep', '{"pattern":"x"}', 'g1')],
+    [call('finish', '{"summary":"done"}', 'f2'), call('grep', '{"pattern":"y"}', 'g2')],
+  ]);
+  assert.equal(empty.result.status, 'FAILED');
+  assert.equal(empty.result.failureKind, 'finish-protocol');
+  assert.equal(empty.result.reportSalvage, undefined);
+  assert.deepEqual(empty.result.finishProblems, ['finish was not the only tool call']);
+  const write = await new AgentLoop({
+    provider: scripted([
+      [draftFinish('Not a report job.', 'f1'), call('grep', '{"pattern":"x"}', 'g1')],
+      [draftFinish('Still not.', 'f2'), call('grep', '{"pattern":"y"}', 'g2')],
+    ]),
+    tools: finishTools([]),
+  }).run({ task: 'x' });
+  assert.equal(write.status, 'FAILED');
+  assert.equal(write.failureKind, 'finish-protocol');
+  assert.equal(write.reportSalvage, undefined);
+  assert.equal(write.finishProblems, undefined);
+});

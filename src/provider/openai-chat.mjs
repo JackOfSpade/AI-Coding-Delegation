@@ -623,8 +623,24 @@ export class OpenAIChatProvider {
     if (!validModel(requestModel)) throw new ProviderError('Invalid request model');
     const modelViolation = modelPolicyViolation({ baseUrl: this.baseUrl, model: requestModel });
     if (modelViolation) throw new ProviderError(`Offload model policy: ${modelViolation}`, { kind: 'model-policy' });
-    const thinking = openai ? undefined : (requestedThinking ?? this.thinking);
-    const reasoningEffort = requestOptions.reasoning_effort ?? this.reasoningEffort;
+    // DeepSeek's thinking mode rejects (HTTP 400, "reasoning_content ... must
+    // be passed back") a transcript with an assistant tool-call turn whose
+    // reasoning_content is missing or null. A conversation that began on
+    // another route (Anthropic thinking blocks, encrypted OpenAI reasoning)
+    // and hopped here on credit exhaustion has exactly such turns, and so does
+    // a disabled-thinking DeepSeek tool call. There is no provider-issued
+    // reasoning to send back and none may be invented, so the adapter's
+    // default thinking yields to a non-thinking request for that transcript.
+    // An explicit per-request thinking choice is never overridden.
+    const unreplayableThinking =
+      !openai &&
+      requestedThinking === undefined &&
+      this.thinking?.type === 'enabled' &&
+      messages.some(
+        (message) => message?.role === 'assistant' && message.tool_calls?.length && typeof message.reasoning_content !== 'string',
+      );
+    const thinking = openai ? undefined : unreplayableThinking ? { type: 'disabled' } : (requestedThinking ?? this.thinking);
+    const reasoningEffort = requestOptions.reasoning_effort ?? (unreplayableThinking ? undefined : this.reasoningEffort);
     if (thinking?.type === 'enabled' && (options.tool_choice === 'required' || typeof options.tool_choice === 'object'))
       throw new ProviderError('Thinking mode does not support required or named tool_choice');
     const chunks = await this.#collect(

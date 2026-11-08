@@ -124,7 +124,7 @@ function fixedFinishProblems(args, alone) {
     const probe = field === 'summary' ? { summary: object.summary } : { summary: 'x', [field]: object[field] };
     return finishArgumentProblems(probe).length > 0;
   }).map(([, text]) => text);
-  return [...(alone ? [] : ['finish was not the only tool call']), ...problems].slice(0, 6);
+  return [...(alone ? [] : [FINISH_NOT_ALONE_PROBLEM]), ...problems].slice(0, 6);
 }
 /** The drafted report of the first finish call that has a usable one, or undefined. */
 function salvageableFinish(calls, parsed) {
@@ -135,6 +135,7 @@ function salvageableFinish(calls, parsed) {
   }
   return undefined;
 }
+const FINISH_NOT_ALONE_PROBLEM = 'finish was not the only tool call';
 function salvagedFinish(args, problems) {
   const firstLine = args.report.split(/\r?\n/).find((line) => line.trim().length > 0) ?? '';
   const summary = typeof args.summary === 'string' && args.summary.trim().length > 0 ? args.summary : firstLine.trim();
@@ -144,7 +145,9 @@ function salvagedFinish(args, problems) {
     report: clipSalvagedReport(args.report),
     concerns: [
       ...list(args.concerns, SALVAGE_CONCERN_LIMIT),
-      `Recovered the drafted report: the finish arguments were invalid (${problems.join('; ')}); the report is unreviewed.`,
+      `Recovered the drafted report: ${
+        problems.includes(FINISH_NOT_ALONE_PROBLEM) ? 'the finish call was rejected' : 'the finish arguments were invalid'
+      } (${problems.join('; ')}); the report is unreviewed.`,
     ],
     testsRun: list(args.testsRun, 100),
     ...(args.untouchedPaths !== undefined && validUntouchedPaths(args.untouchedPaths) ? { untouchedPaths: args.untouchedPaths } : {}),
@@ -593,6 +596,10 @@ export class AgentLoop {
     // violation is the worker's, not a fluke, and ends the round.
     let finishProtocolRecoveryUsed = false;
     let finishArgumentCorrections = 0;
+    // A report worker's most recent rejected finish that carried a usable
+    // drafted report, with the fixed problems of that turn. A round that then
+    // fails on finish-protocol keeps this draft instead of discarding it.
+    let rejectedReportFinish;
     let reviewPacketCorrections = 0;
     let reviewPacketCheck;
     let noFinishRecoveryUsed = false;
@@ -1389,6 +1396,10 @@ export class AgentLoop {
             !reportFinalizationUsed &&
             turn < this.maxTurns;
           if (recoverFinishProtocol) {
+            if (this.reportMode) {
+              const draft = salvageableFinish(calls, parsed);
+              if (draft) rejectedReportFinish = { args: draft, problems: fixedFinishProblems(draft, !finishNotAlone) };
+            }
             if (finishNotAlone) finishProtocolRecoveryUsed = true;
             else finishArgumentCorrections++;
             const correction = finishNotAlone
@@ -1405,11 +1416,15 @@ export class AgentLoop {
             await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'finish_protocol_recover' });
             continue;
           }
-          // The forced report finalization turn is the last chance: keep the drafted
-          // report of an invalid finish rather than discarding it with the spend.
-          const salvage = reportFinalizationUsed ? salvageableFinish(calls, parsed) : undefined;
-          const reportFinishProblems = reportFinalizationUsed
-            ? fixedFinishProblems(salvage ?? parsed[finishIndex], !finishNotAlone)
+          // A report round that ends here (the forced finalization turn, or a
+          // finish rejected after its in-loop corrections were spent) keeps the
+          // drafted report rather than discarding it with the spend: this
+          // turn's own draft first, else the latest rejected turn's draft.
+          const currentDraft = this.reportMode ? salvageableFinish(calls, parsed) : undefined;
+          const earlierDraft = this.reportMode && !currentDraft ? rejectedReportFinish : undefined;
+          const salvage = currentDraft ?? earlierDraft?.args;
+          const reportFinishProblems = this.reportMode
+            ? (earlierDraft?.problems ?? fixedFinishProblems(currentDraft ?? parsed[finishIndex], !finishNotAlone))
             : undefined;
           if (salvage) {
             // Nothing from the turn runs. Every call is still answered so the transcript stays valid.
@@ -1427,7 +1442,14 @@ export class AgentLoop {
             await settleCappedImplementationRecovery();
             await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'report_finish_salvaged' });
             if (this.checkReviewPacket)
-              reviewPacketCheck = { status: 'failed', defects: ['finish arguments were invalid; review packet not checked'] };
+              reviewPacketCheck = {
+                status: 'failed',
+                defects: [
+                  `${
+                    reportFinishProblems.includes(FINISH_NOT_ALONE_PROBLEM) ? 'finish call was rejected' : 'finish arguments were invalid'
+                  }; review packet not checked`,
+                ],
+              };
             return responseOutcome('DONE', turn, responseModel, {
               finish: reviewPacketCheck ? { ...finish, reviewPacketCheck } : finish,
               text,

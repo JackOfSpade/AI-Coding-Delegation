@@ -1250,6 +1250,8 @@ test('a no-id server listing does not bind its incidental cwd as a repository', 
     reportReadRetention: true,
     reportFinishSalvage: true,
     reportNoFinishRecovery: true,
+    reportFinishProtocolSalvage: true,
+    flashHopReplay: true,
   });
   assert.match(result.health.server.buildHash, /^sha256:[0-9a-f]{64}$/);
   assert.match(result.health.server.skillHash, /^sha256:[0-9a-f]{64}$/);
@@ -2966,8 +2968,24 @@ for (const scenario of ['immediate', 'mid-job', 'claude-mid-job', 'continued', '
       assert.equal(url, 'https://api.deepseek.com/chat/completions');
       flashCalls++;
       assert.doesNotMatch(JSON.stringify(body), /openai_reasoning|enc-retained/);
-      assert.deepEqual(body.thinking, { type: 'enabled' });
-      assert.equal(body.reasoning_effort, 'high');
+      // DeepSeek's own rule: thinking mode needs every assistant tool-call
+      // turn's reasoning_content back. Turns from another route (or a mock
+      // Flash tool call without reasoning) have none, so the adapter must
+      // send that transcript non-thinking; a live server answers HTTP 400.
+      const unreplayable = body.messages.some(
+        (message) => message.role === 'assistant' && message.tool_calls?.length && typeof message.reasoning_content !== 'string',
+      );
+      if (unreplayable) {
+        assert.deepEqual(body.thinking, { type: 'disabled' });
+        assert.equal('reasoning_effort' in body, false);
+      } else {
+        assert.deepEqual(body.thinking, { type: 'enabled' });
+        assert.equal(body.reasoning_effort, 'high');
+      }
+      // A retained write turn is replayed from the second Flash call, or from
+      // the first one when an earlier route already wrote.
+      const retainedWrite = ['mid-job', 'claude-mid-job', 'fallback-failed'].includes(scenario) || flashCalls > 1;
+      assert.equal(unreplayable, retainedWrite, 'a replayed write turn carries no reasoning');
       const finishing = ['mid-job', 'claude-mid-job', 'fallback-failed'].includes(scenario) || flashCalls > 1;
       if (finishing) {
         assert.ok(

@@ -1012,3 +1012,174 @@ test('Anthropic base URL validation shares the OpenAI loopback rules', () => {
   assert.throws(() => anthropicWith(async () => okEvents(), { baseUrl: 'http://api.example.test' }), /HTTPS unless/);
   assert.throws(() => anthropicWith(async () => okEvents(), { baseUrl: 'ftp://x' }), /http\(s\) URL/);
 });
+
+// oj-20261108-51be0ee2: after Terra -> Sonnet -> Flash credit hops, the first
+// Flash request carried Sonnet's tool-call turns (thinking blocks in
+// anthropic_content, no reasoning_content) with DeepSeek thinking enabled.
+// DeepSeek answers that with HTTP 400 "The `reasoning_content` in the thinking
+// mode must be passed back to the API" (reproduced live on 2026-11-07).
+test('an Anthropic -> DeepSeek credit hop mid-conversation sends a transcript DeepSeek accepts', async () => {
+  const { AgentLoop } = await import('../../src/agent/loop.mjs');
+  const { OpenAIChatProvider } = await import('../../src/provider/openai-chat.mjs');
+  const anthropicRequests = [];
+  const anthropic = new AnthropicMessagesProvider({
+    baseUrl: 'https://api.anthropic.com',
+    apiKey: 'test-key',
+    model: 'claude-sonnet-5-5',
+    retries: 0,
+    fetchImpl: async (_url, init) => {
+      anthropicRequests.push(JSON.parse(init.body));
+      if (anthropicRequests.length > 1)
+        return new Response(
+          JSON.stringify({
+            type: 'error',
+            error: { type: 'invalid_request_error', message: 'Your credit balance is too low to access the Anthropic API.' },
+          }),
+          { status: 400 },
+        );
+      return sseResponse([
+        { type: 'message_start', message: { model: 'claude-sonnet-5-5', usage: { input_tokens: 10 } } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'Read the file first.' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'sig' } },
+        { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'toolu_read', name: 'read_file' } },
+        { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"path":"a.js"}' } },
+        { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 7 } },
+        { type: 'message_stop' },
+      ]);
+    },
+  });
+  const deepseekPayloads = [];
+  const deepseek = new OpenAIChatProvider({
+    baseUrl: 'https://api.deepseek.com',
+    apiKey: 'k',
+    model: 'deepseek-flash',
+    retries: 0,
+    thinking: { type: 'enabled' },
+    reasoningEffort: 'high',
+    fetchImpl: async (_url, init) => {
+      const payload = JSON.parse(init.body);
+      deepseekPayloads.push(payload);
+      // DeepSeek's own rule: in thinking mode every assistant tool-call turn
+      // must pass its reasoning_content back (an empty string is accepted).
+      const missing = payload.messages.some(
+        (message) => message.role === 'assistant' && message.tool_calls?.length && typeof message.reasoning_content !== 'string',
+      );
+      if (payload.thinking?.type !== 'disabled' && missing)
+        return new Response(
+          JSON.stringify({
+            error: {
+              message: 'The `reasoning_content` in the thinking mode must be passed back to the API.',
+              type: 'invalid_request_error',
+            },
+          }),
+          { status: 400 },
+        );
+      const chunk = (delta) => `data: ${JSON.stringify({ model: 'deepseek-flash', choices: [{ delta }] })}\n\n`;
+      return new Response(
+        chunk({
+          content: '',
+          tool_calls: [
+            { index: 0, id: 'call_finish', type: 'function', function: { name: 'finish', arguments: '{"summary":"read a.js"}' } },
+          ],
+        }) +
+          `data: ${JSON.stringify({ model: 'deepseek-flash', choices: [{ delta: {}, finish_reason: 'tool_calls' }] })}\n\n` +
+          `data: ${JSON.stringify({ model: 'deepseek-flash', choices: [], usage: { prompt_tokens: 30, completion_tokens: 5 } })}\n\n` +
+          'data: [DONE]\n\n',
+        { status: 200 },
+      );
+    },
+  });
+  const transitions = [];
+  const provider = new CreditFallbackProvider({
+    routes: [
+      { provider: anthropic, model: 'claude-sonnet-5-5' },
+      { provider: deepseek, model: 'deepseek-flash' },
+    ],
+    onTransition: (stage) => transitions.push(stage),
+  });
+  const executed = [];
+  const result = await new AgentLoop({
+    provider,
+    model: 'claude-sonnet-5-5',
+    maxTurns: 5,
+    tools: {
+      execute: async (name, args) => {
+        executed.push(name);
+        return name === 'finish' ? { finish: { summary: args.summary, concerns: [], testsRun: [] } } : 'contents of a.js';
+      },
+    },
+  }).run({ task: 'Read a.js and finish.' });
+  assert.equal(result.status, 'DONE', result.error);
+  assert.deepEqual(transitions, [1]);
+  assert.deepEqual(executed, ['read_file', 'finish']);
+  assert.equal(anthropicRequests.length, 2, 'one tool turn on Sonnet, then the credit refusal');
+  assert.equal(deepseekPayloads.length, 1, 'the first Flash request is accepted, never retried');
+  const [payload] = deepseekPayloads;
+  const replayed = payload.messages.find((message) => message.role === 'assistant');
+  assert.deepEqual(
+    replayed.tool_calls.map((entry) => entry.id),
+    ['toolu_read'],
+  );
+  assert.equal('reasoning_content' in replayed, false, 'no reasoning is invented for the Sonnet turn');
+  assert.equal('anthropic_content' in replayed, false, 'Anthropic thinking blocks never reach DeepSeek');
+  assert.deepEqual(payload.thinking, { type: 'disabled' });
+  assert.equal('reasoning_effort' in payload, false);
+});
+
+test('DeepSeek keeps thinking when every replayed tool-call turn has reasoning, and honors an explicit choice', async () => {
+  const { OpenAIChatProvider } = await import('../../src/provider/openai-chat.mjs');
+  const payloads = [];
+  const provider = new OpenAIChatProvider({
+    baseUrl: 'https://api.deepseek.com',
+    apiKey: 'k',
+    model: 'deepseek-flash',
+    retries: 0,
+    thinking: { type: 'enabled' },
+    reasoningEffort: 'high',
+    fetchImpl: async (_url, init) => {
+      payloads.push(JSON.parse(init.body));
+      return new Response(
+        `data: ${JSON.stringify({ model: 'deepseek-flash', choices: [{ delta: { content: 'ok' } }] })}\n\n` +
+          `data: ${JSON.stringify({ model: 'deepseek-flash', choices: [], usage: { prompt_tokens: 1, completion_tokens: 1 } })}\n\n` +
+          'data: [DONE]\n\n',
+        { status: 200 },
+      );
+    },
+  });
+  const transcript = (reasoning) => [
+    { role: 'user', content: 'Read a.js.' },
+    {
+      role: 'assistant',
+      content: '',
+      ...(reasoning === undefined ? {} : { reasoning_content: reasoning }),
+      tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a.js"}' } }],
+    },
+    { role: 'tool', tool_call_id: 'c1', content: 'x' },
+  ];
+  const send = async (messages, options = {}) => {
+    for await (const _ of provider.chat({ messages, tools: [], ...options }));
+    return payloads.at(-1);
+  };
+  for (const reasoning of ['Read it.', '']) {
+    const payload = await send(transcript(reasoning));
+    assert.deepEqual(payload.thinking, { type: 'enabled' }, JSON.stringify(reasoning));
+    assert.equal(payload.reasoning_effort, 'high');
+  }
+  for (const reasoning of [undefined, null]) {
+    const payload = await send(transcript(reasoning));
+    assert.deepEqual(payload.thinking, { type: 'disabled' }, String(reasoning));
+    assert.equal('reasoning_effort' in payload, false);
+  }
+  // A plain prior answer (no tool call) needs no reasoning replay.
+  const plain = await send([
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: 'hello' },
+    { role: 'user', content: 'again' },
+  ]);
+  assert.deepEqual(plain.thinking, { type: 'enabled' });
+  // The loop's own explicit disabled-thinking request passes through unchanged.
+  const explicit = await send(transcript(undefined), { thinking: { type: 'disabled' }, reasoning_effort: 'none' });
+  assert.deepEqual(explicit.thinking, { type: 'disabled' });
+  assert.equal(explicit.reasoning_effort, 'none');
+});

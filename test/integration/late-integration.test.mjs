@@ -1224,10 +1224,7 @@ test('a salvaged report lands DONE_UNVERIFIED with its text, and a failed finish
     assert.equal(done.status, 'DONE_UNVERIFIED');
     const view = await salvaged.manager.job(jobId);
     assert.equal(view.reportResult.text, 'The drafted report body.');
-    assert.match(
-      view.report,
-      /report salvaged: the finish arguments were invalid; reportResult\.text holds the drafted report, unreviewed/,
-    );
+    assert.match(view.report, /report salvaged: the finish call was rejected; reportResult\.text holds the drafted report, unreviewed/);
     assert.equal((await salvaged.manager.store.get(jobId)).reportSalvage, 'finish-arguments');
     assert.match(view.report, /finish protocol: summary was missing or longer than 1500 characters; finish was not the only tool call/);
     assert.doesNotMatch(view.report, /hunter2hunter2|next: .*\bcontinue\b/);

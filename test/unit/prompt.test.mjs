@@ -302,3 +302,30 @@ test('the report elision rule appears once in report mode and never in write mod
     assert.equal(prompt.split('\n').filter((line) => line === WORKER_REPORT_ELISION_RULE).length, mode === 'report' ? 1 : 0, mode);
   }
 });
+
+// oj-20261108-a8c290d5: Flash batched finish with parallel grep calls until the
+// round failed; the retry whose brief said "call finish ALONE" finished cleanly.
+test('every worker prompt and the finish tool forbid adding finish to a parallel batch', async () => {
+  for (const options of [
+    { ownedPaths: ['src/**'] },
+    { mode: 'report', conventions: '' },
+    { mode: 'report', reviewPacket: true, conventions: '' },
+  ]) {
+    const prompt = await buildSystemPrompt({ conventions: '', ...options });
+    assert.match(
+      prompt,
+      /never add finish to a parallel batch: a response with finish beside grep, read_file or any other call is rejected unrun\. Send finish ALONE, in a response of its own\./,
+    );
+  }
+  for (const definitions of [
+    availableToolDefinitions({ readOnly: true }),
+    availableToolDefinitions({ allowCommand: true, reviewPacket: true }),
+  ]) {
+    const finish = definitions.find((tool) => tool.function.name === 'finish');
+    assert.match(finish.function.description, /^Call this ALONE: as the only tool call of its response/);
+    assert.match(
+      finish.function.description,
+      /Never include it in a parallel batch; pairing it with grep, read_file or any other call rejects the entire response unrun\./,
+    );
+  }
+});
