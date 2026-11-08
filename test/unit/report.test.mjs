@@ -1744,3 +1744,49 @@ test('compactReport shows the output-cap diagnostic line only for a valid diagno
   assert.deepEqual(lines({ outputCap: { turn: 'x', steer: 'continue' } }), []);
   assert.deepEqual(lines({ outputCap: { turn: 3, steer: 'write-in-parts' } }), []);
 });
+
+test('a report job shows its fixed finish problems and a salvaged report is flagged', () => {
+  const base = {
+    id: 'r1',
+    mode: 'report',
+    finishProblems: ['summary was missing or longer than 1500 characters', 'finish was not the only tool call'],
+  };
+  const salvaged = compactReport({ ...base, status: 'DONE_UNVERIFIED', reportSalvage: 'finish-arguments' });
+  assert.match(salvaged, /^finish protocol: summary was missing or longer than 1500 characters; finish was not the only tool call$/m);
+  assert.match(salvaged, /^report salvaged: the finish arguments were invalid; reportResult\.text holds the drafted report, unreviewed$/m);
+  assert.match(salvaged, /next: read reportResult/);
+  const plain = compactReport({ id: 'r2', mode: 'report', status: 'FAILED', failureKind: 'no-finish', reportSalvage: 'plain-text' });
+  assert.match(
+    plain,
+    /^report salvaged: the worker ended in plain text without calling finish; reportResult\.text holds its last message, unreviewed$/m,
+  );
+  assert.match(plain, /next: read reportResult/);
+  assert.doesNotMatch(compactReport({ id: 'r3', mode: 'report', status: 'FAILED', reportSalvage: 'bogus' }), /report salvaged/);
+  const failed = compactReport({ ...base, status: 'FAILED', failureKind: 'finish-protocol', error: FAILURE_ERRORS['finish-protocol'] });
+  assert.match(failed, /^finish protocol: /m);
+  assert.doesNotMatch(failed, /report salvaged/);
+  assert.doesNotMatch(compactReport({ id: 'w', status: 'FAILED', finishProblems: ['x'] }), /finish protocol/);
+});
+
+test('a report job with a retention warning shows the declared read set; other jobs do not', () => {
+  const sizing = (extra = {}) => ({
+    maxTurns: 80,
+    turnsSource: 'default',
+    turnPolicy: 'auto',
+    readChars: 450_000,
+    retentionChars: 400_000,
+    files: [],
+    warnings: ['declared reads (~450000 chars) exceed what a report worker can keep in context (400000 chars); split the report package'],
+    ...extra,
+  });
+  const lines = (job) =>
+    compactReport({ id: 'oj-1', ...job }, { detail: 'compact' })
+      .split('\n')
+      .filter((line) => line.startsWith('report read set:'));
+  assert.deepEqual(lines({ mode: 'report', status: 'DONE_UNVERIFIED', budgetSizing: sizing() }), [
+    'report read set: ~450000 chars declared; retention 400000 chars',
+  ]);
+  assert.equal(lines({ mode: 'write', status: 'DONE_UNVERIFIED', budgetSizing: sizing() }).length, 0);
+  assert.equal(lines({ mode: 'report', status: 'DONE_UNVERIFIED', budgetSizing: sizing({ warnings: [] }) }).length, 0);
+  assert.equal(lines({ mode: 'report', status: 'DONE_UNVERIFIED', budgetSizing: sizing({ readChars: 'x\n[REDACTED]' }) }).length, 0);
+});

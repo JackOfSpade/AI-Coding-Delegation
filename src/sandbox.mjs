@@ -312,11 +312,13 @@ export function macosProfile({
   interpreterMetadataPaths = [],
   allowNetwork = false,
   allowTempSockets = false,
+  allowGitPointerMetadata = false,
 }) {
   // Seatbelt profiles describe macOS paths even when a diagnostic fixture is
   // compiled on another host. Command execution and temp I/O remain native.
   const { basename, dirname, join, resolve, sep, isAbsolute } = posix;
   if (typeof allowTempSockets !== 'boolean') throw new TypeError('allowTempSockets must be boolean');
+  if (typeof allowGitPointerMetadata !== 'boolean') throw new TypeError('allowGitPointerMetadata must be boolean');
   if (!Array.isArray(denyRead) || denyRead.some((path) => typeof path !== 'string'))
     throw new TypeError('denyRead must be relative glob strings');
   if (!Array.isArray(denyWrite) || denyWrite.some((path) => typeof path !== 'string'))
@@ -444,6 +446,14 @@ export function macosProfile({
     ...writablePaths.map((path) => sandboxGlobFilter('allow', root, path)),
     ...write.map((path) => `(allow file-write* (subpath ${q(path)}))`),
     ...protectedGitPaths.flatMap((path) => denyPath('write', path)),
+    // Verifier-only: tools such as pytest stat() the worktree-local .git
+    // pointer while collecting. Seatbelt is last-match-wins, so this single
+    // literal metadata allow must follow every Git deny above. It covers stat
+    // of the literal <root>/.git node only: never its content, listing,
+    // children or writes. In a private worktree that node is the pointer file;
+    // for applyThenVerify in the primary checkout it is the .git directory
+    // itself, whose stat (existence, type, mtime) is all that becomes visible.
+    ...(allowGitPointerMetadata ? [`(allow file-read-metadata (literal ${q(join(root, '.git'))}))`] : []),
     // Dependencies are a read capability, including the workspace-local
     // server link used by literal CLI paths. Even a broad ** write scope may
     // not remove/retarget it or mutate dependencies through any route.
@@ -593,6 +603,7 @@ export async function runCommand(command, options = {}) {
     interpreterPaths: options.interpreterPaths || [],
     interpreterMetadataPaths: options.interpreterMetadataPaths || [],
     allowNetwork: options.allowNetwork === true,
+    allowGitPointerMetadata: options.allowGitPointerMetadata === true,
   };
   const probeProfile = options.sandbox !== false && platform === 'darwin' ? compileSandboxProfile(profileInput) : undefined;
   const canSandbox = probeProfile && (options.sandboxProbe || sandboxAvailable)(platform, probeProfile);
@@ -876,6 +887,58 @@ export async function probeVerifierTemp({
           ...common,
           note: 'the verifier sandbox could not create a temp directory under its own per-run TMPDIR',
         });
+  } finally {
+    try {
+      rm(scratch, { recursive: true, force: true });
+    } catch {}
+  }
+}
+
+const WORKER_PYTHON_NOTE =
+  'worker run_command cannot start Python in this sandbox (verifierInterpreter is verifier-only); ' +
+  'tell the worker not to run Python and run Python steps in the primary';
+const workerPython = (python, reason, extra = {}) => ({ python, reason, ...extra });
+
+/**
+ * Report whether a worker's `run_command` can start Python. Runs one fixed
+ * command through the real sandboxed `runCommand` with the same option shape
+ * the worker shell uses (no interpreterPaths, no interpreterMetadataPaths, a
+ * scratch cwd), so it reports the profile as it is and never widens it.
+ * The result holds fixed tokens only: never stderr, paths or host text.
+ */
+export async function probeWorkerPython({
+  platform = process.platform,
+  run = runCommand,
+  mkdtemp = mkdtempSync,
+  rm = rmSync,
+  tmpdir: tmp = tmpdir,
+  timeoutSec = 8,
+  runOptions = {},
+} = {}) {
+  // Policy-only hosts offer the worker no shell at all.
+  if (platform !== 'darwin') return workerPython('not-probed', 'no-worker-sandbox');
+  let scratch;
+  try {
+    scratch = mkdtemp(join(tmp(), 'offload-worker-probe-'));
+  } catch {
+    return workerPython('unknown', 'probe-failed');
+  }
+  try {
+    let result;
+    try {
+      result = await run('/usr/bin/env python3 -c "print(7)"', { ...runOptions, cwd: scratch, requireSandbox: true, timeoutSec });
+    } catch (error) {
+      if (/Required macOS sandbox is unavailable/.test(String(error?.message))) return workerPython('not-probed', 'no-worker-sandbox');
+      return workerPython('unknown', 'probe-failed');
+    }
+    if (result?.timedOut) return workerPython('unknown', 'probe-timed-out');
+    const stderr = String(result?.stderr ?? '');
+    if (result?.code === 0 && String(result?.stdout ?? '').trim() === '7') return workerPython('runs', 'python-started');
+    if (/Operation not permitted/.test(stderr) || result?.code === 126)
+      return workerPython('blocked', 'worker-profile-denies-python', { note: WORKER_PYTHON_NOTE });
+    if (result?.code === 127 || /No such file|python3: not found|command not found/.test(stderr))
+      return workerPython('missing', 'python-not-found');
+    return workerPython('unknown', 'probe-failed');
   } finally {
     try {
       rm(scratch, { recursive: true, force: true });

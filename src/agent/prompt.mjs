@@ -9,6 +9,9 @@ const MAX_RELEVANT_PATHS = 50;
 // An entry as the prompt lists it: a ":START-END" suffix, with or without the
 // annotation annotateRelevantPaths appends.
 const RANGE_ENTRY = /:\d{1,7}-\d{1,7}(?: \(read_file offset |$)/;
+// Report mode only: reads are retained, but older output can still be elided.
+export const WORKER_REPORT_ELISION_RULE =
+  'Older tool output can be replaced by an elision marker. Keep short running notes (claim, file, line) in your assistant text beside tool calls, and re-read a file only if a marker shows its output was elided.';
 // Standing instruction added to every worker brief (write and report): weak
 // tests that pass for the wrong reason are the commonest quality miss.
 export const WORKER_TEST_QUALITY_RULE = 'Assertions must be falsifiable; no substring checks that match unrelated text.';
@@ -155,7 +158,7 @@ export async function buildSystemPrompt({
     WORKER_ASSERTION_PRESERVATION_RULE,
     WORKER_VERIFIER_INTERPRETER_RULE,
     WORKER_GENERATOR_DEPENDENCY_RULE,
-    reportMode ? '' : WORKER_SCRATCH_CLEANUP_RULE,
+    reportMode ? WORKER_REPORT_ELISION_RULE : WORKER_SCRATCH_CLEANUP_RULE,
     reportMode ? '' : WORKER_INCREMENTAL_WRITE_RULE,
     !reportMode && finiteRemainingTurns
       ? `You have ${finiteRemainingTurns} model turn${finiteRemainingTurns === 1 ? '' : 's'} available. Batch independent reads and lists, then after their required reads make an allowed tool call immediately. Do not emit source code, a plan, progress update, or other narrative outside tool calls; put source only in write_file.content. Prefer read_file, list_dir, glob, and grep for ordinary inspection. When read_file returns [truncated; next offset N], continue that file with exactly offset N. ${allowCommand ? (serverVerifierConfigured ? 'The configured focused verifier runs server-side after finish, so reserve one final response containing only finish rather than rerunning or searching for tests. ' : 'Reserve run_command for focused build, test, or diagnostic work after changes. ') : ''}Prefer writing complete final file content with write_file over a write-then-edit sequence, within the per-call size rule; build a larger file with write_file append parts instead. If several new files are needed, write one complete file per tool-call response, then continue with the next file. edit_file requires a fresh read of that file, including after write_file. Reserve time for the configured verifier and the mandatory single finish call.`

@@ -67,6 +67,11 @@ const FAMILIES = Object.freeze({
     request:
       'Workers lose finished work to the finish protocol (FAILED on finish-protocol or no-finish). Harden the worker prompt, the finish tool description or the one in-loop correction so a worker that completed its edits still finishes, and keep the continue/apply path for what remains.',
   },
+  'report-finish-salvaged': {
+    attributable: true,
+    request:
+      'A report job did not finish cleanly and its text had to be recovered: either its forced finalization made an invalid finish call (harden the finish message or tool description so the summary stays within its limit and the findings go in report), or the worker kept answering in prose without calling finish after its one reminder (harden the report brief or reminder so the answer is delivered through finish).',
+  },
   'output-cap-failure': {
     attributable: true,
     request:
@@ -201,6 +206,8 @@ export function jobFacts(job, context = {}) {
         ...(failure.error ? { error: text(failure.error, 160) } : {}),
       };
   }
+  if (record.mode === 'report' && (record.reportSalvage === 'finish-arguments' || record.reportSalvage === 'plain-text'))
+    facts.reportSalvage = record.reportSalvage;
   const environment = object(record.verifyEnvironment);
   if (environment && VERIFY_ENV_KIND.test(String(environment.kind))) {
     facts.verifyEnv = { kind: environment.kind };
@@ -474,6 +481,14 @@ function jobSignals(record, facts, push, environment) {
     : DEFAULT_ATTEMPT_TIMEOUT_MS;
   const kind = facts.failureKind;
   if (kind === 'finish-protocol' || kind === 'no-finish') push('protocol-failure-finish', id, `${where} (${kind}) after ${spent}`);
+  if (facts.reportSalvage)
+    push(
+      'report-finish-salvaged',
+      id,
+      facts.reportSalvage === 'plain-text'
+        ? `${where} kept the worker's last plain-text message after no finish call; ${spent}`
+        : `${where} recovered a drafted report after an invalid finish call; ${spent}`,
+    );
   if (kind === 'output-cap') push('output-cap-failure', id, `${where} (output-cap) after ${spent}`);
   if (kind === 'tool-loop' && !facts.toolFailure)
     push('loop-without-diagnostic', id, `${where} (tool-loop) with no failing call recorded; ${spent}`);

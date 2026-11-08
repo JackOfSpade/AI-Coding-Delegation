@@ -6,6 +6,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
+  reportAgentContext,
   createCore as createRuntimeCore,
   defaultIntegrityStatePath,
   insidePath,
@@ -489,6 +490,42 @@ test('Core starts a report job without injecting write or verifier fields', asyn
     const done = await core.wait(started.jobId, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
     assert.equal(done.status, 'DONE_UNVERIFIED');
     assert.equal(done.mode, 'report');
+  } finally {
+    await core.shutdown();
+    await rm(path, { recursive: true, force: true });
+  }
+});
+test('a report job echoes its read size and retention, and warns when the declared reads cannot be retained', async () => {
+  const path = await repo('offload-core-report-retention-');
+  await mkdir(join(path, 'docs'));
+  for (const name of ['a', 'b']) await writeFile(join(path, 'docs', `${name}.md`), ('x'.repeat(99) + '\n').repeat(2_000));
+  execFileSync('git', ['-C', path, 'add', 'docs']);
+  execFileSync('git', ['-C', path, 'commit', '-qm', 'docs']);
+  const isolation = { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree };
+  const core = createCore({
+    config: { loaded, resolveKey: () => 'credential', isolation },
+    isolation,
+    worker: { run: async () => ({ status: 'DONE', report: 'analysis complete' }) },
+  });
+  try {
+    const small = await core.start({ mode: 'report', task: 'read a', relevantPaths: ['docs/a.md'], repoPath: path });
+    assert.equal(small.budgetSizing.readChars, 200_000 + 33 * 8);
+    assert.equal(small.budgetSizing.retentionChars, 248_000 + 264);
+    assert.ok(!small.budgetSizing.warnings.some((w) => /declared reads/.test(w)));
+    const wide = await core.start({
+      mode: 'report',
+      task: 'read both',
+      relevantPaths: ['docs/a.md', 'docs/b.md', 'docs/a.md:1-2000'],
+      repoPath: path,
+    });
+    assert.equal(wide.budgetSizing.retentionChars, 400_000);
+    assert.ok(wide.budgetSizing.readChars > 352_000);
+    assert.ok(
+      wide.budgetSizing.warnings.some((w) => /declared reads \(~\d+ chars\) exceed .*\(400000 chars\); split the report package/.test(w)),
+    );
+    const write = await core.start({ task: 'write', ownedPaths: ['docs/a.md'], relevantPaths: ['docs/a.md'], repoPath: path });
+    assert.equal(write.budgetSizing.readChars, undefined);
+    for (const id of [small.jobId, wide.jobId, write.jobId]) await core.wait(id, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
   } finally {
     await core.shutdown();
     await rm(path, { recursive: true, force: true });
@@ -1208,6 +1245,11 @@ test('a no-id server listing does not bind its incidental cwd as a repository', 
     runnerScopedPreflight: true,
     outputCapDiagnostic: true,
     reviewPacket: true,
+    workerShellProbe: true,
+    verifierGitPointerStat: true,
+    reportReadRetention: true,
+    reportFinishSalvage: true,
+    reportNoFinishRecovery: true,
   });
   assert.match(result.health.server.buildHash, /^sha256:[0-9a-f]{64}$/);
   assert.match(result.health.server.skillHash, /^sha256:[0-9a-f]{64}$/);
@@ -1251,6 +1293,78 @@ test('health reports the verifier temp probe verbatim, caches it for a minute, a
   const health = (await failing.job()).health;
   assert.deepEqual(health.verifierTmp, { status: 'unknown', reason: 'probe-failed', systemTmp: 'unknown', gitInit: 'unknown', note: '' });
   assert.ok(['macos', 'policy-only'].includes(health.sandbox), 'a failing probe does not fail health');
+});
+
+test('health reports the worker shell probe, caches it, and survives a failing probe', async () => {
+  const probe = { python: 'blocked', reason: 'worker-profile-denies-python', note: 'n' };
+  let calls = 0;
+  let clock = 1_000_000;
+  const core = createCore({
+    now: () => clock,
+    config: {
+      loaded,
+      probeWorkerPython: async () => {
+        calls += 1;
+        return probe;
+      },
+    },
+  });
+  const [first, concurrent] = await Promise.all([core.job(), core.job()]);
+  assert.deepEqual(first.health.workerShell, probe);
+  assert.deepEqual(concurrent.health.workerShell, probe);
+  assert.equal(calls, 1, 'concurrent health calls share one probe');
+  clock += 61_000;
+  await core.job();
+  assert.equal(calls, 2);
+
+  const failing = createCore({
+    config: {
+      loaded,
+      probeWorkerPython: async () => {
+        throw new Error('exploded at /private/secret');
+      },
+    },
+  });
+  const health = (await failing.job()).health;
+  assert.deepEqual(health.workerShell, { python: 'unknown', reason: 'probe-failed' });
+  assert.ok(['macos', 'policy-only'].includes(health.sandbox), 'a failing probe does not fail health');
+});
+
+test('start echoes workerShell for a write job in a Python repo only', async () => {
+  const probe = { python: 'blocked', reason: 'worker-profile-denies-python', note: 'n' };
+  const isolation = { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree };
+  const make = (probeWorkerPython) =>
+    createCore({
+      config: { loaded, resolveKey: () => 'credential', isolation, probeWorkerPython },
+      isolation,
+      worker: { run: async () => ({ status: 'DONE' }) },
+    });
+  const py = await repo('offload-core-worker-shell-py-');
+  await writeFile(join(py, 'pyproject.toml'), '[project]\nname = "x"\n');
+  execFileSync('git', ['-C', py, 'add', '.']);
+  execFileSync('git', ['-C', py, 'commit', '-qm', 'py']);
+  const plain = await repo('offload-core-worker-shell-js-');
+  const cores = [];
+  try {
+    const core = make(async () => probe);
+    cores.push(core);
+    const started = await core.start({ repoPath: py, task: 'write', ownedPaths: ['src/**'] });
+    assert.deepEqual(started.workerShell, probe);
+    const report = await core.start({ repoPath: py, task: 'read', mode: 'report' });
+    assert.equal(report.workerShell, undefined, 'report jobs have no run_command');
+    const js = await core.start({ repoPath: plain, task: 'write', ownedPaths: ['src/**'] });
+    assert.equal(js.workerShell, undefined, 'a non-Python repo is not nagged');
+    const failing = make(async () => {
+      throw new Error('x');
+    });
+    cores.push(failing);
+    const ok = await failing.start({ repoPath: py, task: 'write again', ownedPaths: ['docs/**'] });
+    assert.deepEqual(ok.workerShell, { python: 'unknown', reason: 'probe-failed' });
+  } finally {
+    for (const core of cores) await core.shutdown();
+    await rm(py, { recursive: true, force: true });
+    await rm(plain, { recursive: true, force: true });
+  }
 });
 
 test('a no-id listing with an explicit repository also carries the verifier temp probe', async () => {
@@ -3374,4 +3488,19 @@ test('repository health names commands a legacy config still routes Claude first
     await current.shutdown();
     await rm(path, { recursive: true, force: true });
   }
+});
+
+test('a report worker context pins reads and uses the echoed retention, else readChars, else the fallback', () => {
+  const echoed = reportAgentContext({ readChars: 112_200, retentionChars: 160_200 });
+  assert.equal(echoed.pinReads, true);
+  assert.equal(echoed.keepRecentToolResults, 16);
+  assert.equal(echoed.maxToolChars, 160_200);
+  // A stored retention outside the bounds is clamped, never trusted blindly.
+  assert.equal(reportAgentContext({ retentionChars: 9_000_000 }).maxToolChars, 400_000);
+  assert.equal(reportAgentContext({ retentionChars: 10 }).maxToolChars, 96_000);
+  // A legacy job without retentionChars sizes from readChars; with neither it takes the fallback.
+  assert.equal(reportAgentContext({ readChars: 112_200 }).maxToolChars, 160_200);
+  assert.equal(reportAgentContext(undefined).maxToolChars, 160_000);
+  assert.equal(reportAgentContext({ readChars: 'x' }).maxToolChars, 160_000);
+  assert.deepEqual(echoed.messages, [], 'a report context starts empty and is never loaded from a transcript');
 });

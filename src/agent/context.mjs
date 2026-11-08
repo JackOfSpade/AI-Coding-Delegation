@@ -15,7 +15,7 @@ import { MAX_MESSAGE_CHARS, MAX_TOOL_ARGUMENT_CHARS, MAX_TOOL_CALLS, validToolId
 export class AgentContext {
   constructor(
     messages = [],
-    { maxToolChars = 96_000, keepRecentToolResults = 8, maxTranscriptChars = 2_000_000, onAppend, onAppendBatch } = {},
+    { maxToolChars = 96_000, keepRecentToolResults = 8, maxTranscriptChars = 2_000_000, onAppend, onAppendBatch, pinReads = false } = {},
   ) {
     if (
       !Array.isArray(messages) ||
@@ -25,6 +25,7 @@ export class AgentContext {
       keepRecentToolResults < 0 ||
       !Number.isSafeInteger(maxTranscriptChars) ||
       maxTranscriptChars < 1 ||
+      typeof pinReads !== 'boolean' ||
       (onAppend !== undefined && typeof onAppend !== 'function') ||
       (onAppendBatch !== undefined && typeof onAppendBatch !== 'function')
     )
@@ -35,6 +36,7 @@ export class AgentContext {
     this.maxToolChars = maxToolChars;
     this.keepRecentToolResults = keepRecentToolResults;
     this.maxTranscriptChars = maxTranscriptChars;
+    this.pinReads = pinReads;
     this.onAppend = onAppend;
     this.onAppendBatch = onAppendBatch;
     this.pending = Promise.resolve();
@@ -85,7 +87,7 @@ export class AgentContext {
       const checked = validateTranscript([...this.messages.map((value) => cloneMessage(value, { includeElided: true })), ...inbound]);
       if (checked.trimmedIncomplete) throw new Error('Conversation transcript contains an incomplete tool-call transaction');
       const candidate = checked.messages.map((value) => cloneMessage(value, { includeElided: true }));
-      elideMessages(candidate, this.maxToolChars, this.keepRecentToolResults);
+      elideMessages(candidate, this.maxToolChars, this.keepRecentToolResults, this.pinReads);
       if (transcriptChars(candidate) > this.maxTranscriptChars) throw new Error('Conversation transcript exceeds size limit');
       const durable = candidate.slice(prior).map((value) => cloneMessage(value, { includeElided: true }));
       if (this.onAppendBatch) await this.onAppendBatch(durable.map((value) => cloneMessage(value, { includeElided: true })));
@@ -114,6 +116,7 @@ export class AgentContext {
       maxToolChars: this.maxToolChars,
       keepRecentToolResults: this.keepRecentToolResults,
       maxTranscriptChars: this.maxTranscriptChars,
+      pinReads: this.pinReads,
     });
     // Constructor recovery intentionally trims one crash-residue transaction
     // at EOF. A caller supplying a new batch is different: accepting that
@@ -135,7 +138,7 @@ export class AgentContext {
   // retention elision and the size limit without touching live state.
   #staged(extra) {
     const next = [...this.messages, ...extra].map((value) => cloneMessage(value, { includeElided: true }));
-    elideMessages(next, this.maxToolChars, this.keepRecentToolResults);
+    elideMessages(next, this.maxToolChars, this.keepRecentToolResults, this.pinReads);
     if (transcriptChars(next) > this.maxTranscriptChars) throw new Error('Conversation transcript exceeds size limit');
     return next;
   }
@@ -143,7 +146,7 @@ export class AgentContext {
     if (this.totalChars() > this.maxTranscriptChars) throw new Error('Conversation transcript exceeds size limit');
   }
   elide() {
-    elideMessages(this.messages, this.maxToolChars, this.keepRecentToolResults);
+    elideMessages(this.messages, this.maxToolChars, this.keepRecentToolResults, this.pinReads);
   }
   snapshot() {
     return this.messages.map((message) => cloneMessage(message, { includeElided: true }));
@@ -186,7 +189,10 @@ export class AgentContext {
     for (const index of ordinaryEligible) compact[index].content = toolOutputElisionMarker(compact[index].content.length);
     yield* elideProgressively(
       compact,
-      olderToolIndexes.filter((index) => !ordinaryEligible.has(index) && canElideToolResult(source[index])),
+      unpinnedFirst(
+        olderToolIndexes.filter((index) => !ordinaryEligible.has(index) && canElideToolResult(source[index])),
+        plan.pinned,
+      ),
       ordinaryEligible.size,
     );
   }
@@ -195,12 +201,16 @@ export class AgentContext {
     const protectedIndexes = newestCompleteToolTransactionIndexes(source);
     const skip = protectedIndexes ?? new Set();
     const olderToolIndexes = source.flatMap((message, index) => (message.role === 'tool' && !skip.has(index) ? [index] : []));
+    const pinned = this.pinReads ? pinnedReadIndexes(source) : new Set();
     const ordinaryEligible = new Set(
-      olderToolIndexes
-        .slice(0, Math.max(0, olderToolIndexes.length - this.keepRecentToolResults))
-        .filter((index) => canElideToolResult(source[index])),
+      unpinnedFirst(
+        olderToolIndexes
+          .slice(0, Math.max(0, olderToolIndexes.length - this.keepRecentToolResults))
+          .filter((index) => canElideToolResult(source[index])),
+        pinned,
+      ),
     );
-    return { source, protectedIndexes, olderToolIndexes, ordinaryEligible };
+    return { source, protectedIndexes, olderToolIndexes, ordinaryEligible, pinned };
   }
 }
 function* elideProgressively(compact, indexes, elidedToolResults) {
@@ -246,7 +256,45 @@ function messageChars(message) {
       ? message.reasoning_content.length + anthropicContentChars(message.anthropic_content) + openAIReasoningChars(message.openai_reasoning)
       : anthropicContentChars(message?.anthropic_content) + openAIReasoningChars(message?.openai_reasoning);
 }
-function elideMessages(messages, maxToolChars, keepRecentToolResults) {
+// Report workers cannot re-derive a declared input they never kept. A
+// successful read_file result stays until a later successful read of the same
+// path/offset/limit supersedes it. Arguments come from the paired assistant
+// call; anything malformed or unpaired is simply not pinned (never throws).
+function pinnedReadIndexes(messages) {
+  const calls = new Map();
+  for (const message of messages) {
+    if (message.role !== 'assistant' || !Array.isArray(message.tool_calls)) continue;
+    for (const call of message.tool_calls) if (typeof call?.id === 'string') calls.set(call.id, call);
+  }
+  const keyOf = (message) => {
+    try {
+      const call = calls.get(message.tool_call_id);
+      if (call?.function?.name !== 'read_file') return undefined;
+      const args = JSON.parse(call.function.arguments);
+      if (!args || typeof args !== 'object' || Array.isArray(args) || typeof args.path !== 'string') return undefined;
+      return JSON.stringify([args.path, args.offset ?? null, args.limit ?? null]);
+    } catch {
+      return undefined;
+    }
+  };
+  const pinned = new Set();
+  const seen = new Set();
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (message.role !== 'tool' || message.name !== 'read_file' || typeof message.content !== 'string') continue;
+    if (message.content.startsWith('TOOL_ERROR:')) continue;
+    const key = keyOf(message);
+    if (key === undefined) continue;
+    // Newest-first scan: an already-seen key means a newer successful read supersedes this one.
+    if (seen.has(key)) continue;
+    if (!message.elided) seen.add(key);
+    if (!message.elided) pinned.add(index);
+  }
+  return pinned;
+}
+const unpinnedFirst = (indexes, pinned) =>
+  pinned?.size ? [...indexes.filter((index) => !pinned.has(index)), ...indexes.filter((index) => pinned.has(index))] : indexes;
+function elideMessages(messages, maxToolChars, keepRecentToolResults, pinReads = false) {
   const tools = messages.map((message, index) => [message, index]).filter(([message]) => message.role === 'tool' && !message.elided);
   const protectedIndexes = newestCompleteToolTransactionIndexes(messages) ?? new Set();
   const olderTools = tools.filter(([, index]) => !protectedIndexes.has(index));
@@ -260,13 +308,23 @@ function elideMessages(messages, maxToolChars, keepRecentToolResults) {
   // results may exceed maxToolChars together, but splitting or eliding one
   // would make the preceding assistant call unreplayable. Retention applies
   // in addition to that transaction, to the newest older results.
-  for (const [message] of olderTools.slice(0, Math.max(0, olderTools.length - keepRecentToolResults))) {
-    if (chars <= target) break;
-    if (!canElideToolResult(message)) continue;
+  const eligible = olderTools.slice(0, Math.max(0, olderTools.length - keepRecentToolResults));
+  const pinned = pinReads ? pinnedReadIndexes(messages) : new Set();
+  const elide = (message) => {
     const original = message.content ?? '';
     message.content = toolOutputElisionMarker(original.length);
     message.elided = true;
     chars -= original.length - message.content.length;
+  };
+  for (const [message, index] of eligible) {
+    if (chars <= target) break;
+    if (!pinned.has(index) && canElideToolResult(message)) elide(message);
+  }
+  // Pinned reads are a last resort: only while still over the limit itself,
+  // and only down to that limit rather than half of it.
+  for (const [message, index] of eligible) {
+    if (chars <= maxToolChars) break;
+    if (pinned.has(index) && canElideToolResult(message)) elide(message);
   }
 }
 

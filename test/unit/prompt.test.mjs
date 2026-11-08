@@ -9,6 +9,7 @@ import {
   WORKER_COMPLETION_RULE,
   WORKER_GENERATOR_DEPENDENCY_RULE,
   WORKER_INCREMENTAL_WRITE_RULE,
+  WORKER_REPORT_ELISION_RULE,
   WORKER_SCRATCH_CLEANUP_RULE,
   WORKER_TEST_QUALITY_RULE,
   WORKER_VERIFIER_INTERPRETER_RULE,
@@ -292,4 +293,12 @@ test('reviewPacket numbers the acceptance criteria and adds the packet rule only
   assert.match(report, /criterion 0 = the task/);
   assert.match(report, /\.offload-report-inputs\//);
   assert.doesNotMatch(report, /changedFiles: every file/);
+});
+
+test('the report elision rule appears once in report mode and never in write mode', async () => {
+  for (const mode of ['report', 'write']) {
+    const prompt = await buildSystemPrompt({ mode, allowCommand: false, ownedPaths: ['src/**'] });
+    assert.equal(prompt.split(WORKER_REPORT_ELISION_RULE).length - 1, mode === 'report' ? 1 : 0, mode);
+    assert.equal(prompt.split('\n').filter((line) => line === WORKER_REPORT_ELISION_RULE).length, mode === 'report' ? 1 : 0, mode);
+  }
 });

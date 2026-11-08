@@ -117,15 +117,17 @@ function environmentLine(job, environmentFailure, { reportMode, primaryChecked, 
             : ' Either it is not installed in the primary checkout, it lives in a nested/workspace package outside the linked root node_modules, or the worker imported a package that does not exist (check the diff).'
           : environmentFailure.kind === 'temp-dir-denied'
             ? ' Hard-coded /tmp is not writable in the verifier; tests must use os.tmpdir()/$TMPDIR and forward the environment to child processes. For a suite with such pre-existing failures, start with verifierMode "baseline-diff".'
-            : environmentFailure.kind === 'git-config-denied'
-              ? ' A temporary Git-fixture test could not read host Git configuration in the verifier sandbox. This is an environment limitation, not a product-test failure; run that integration suite in the primary checkout.'
-              : environmentFailure.kind === 'native-module-crash'
-                ? primaryChecked
-                  ? ' The earlier native import crash remains recorded separately from the primary check.'
-                  : ' Run the import in the primary checkout to determine whether the verifier sandbox caused the crash. An accepted interpreter declaration grants read and exec; it does not prove imports work.'
-                : environmentFailure.kind === 'sandbox-dominated'
-                  ? " Most of the suite's child-process/Git fixtures cannot run in the verifier sandbox, so the runs are no evidence about the change: run that suite in the primary checkout, and give the next job a testCommand without those files."
-                  : ''
+            : environmentFailure.kind === 'git-metadata-denied'
+              ? ' pytest stat()ed the worktree .git pointer, which an older verifier sandbox denies. Rerun with --ignore=.git added to the pytest testCommand (or update Offload); this is not a code failure.'
+              : environmentFailure.kind === 'git-config-denied'
+                ? ' A temporary Git-fixture test could not read host Git configuration in the verifier sandbox. This is an environment limitation, not a product-test failure; run that integration suite in the primary checkout.'
+                : environmentFailure.kind === 'native-module-crash'
+                  ? primaryChecked
+                    ? ' The earlier native import crash remains recorded separately from the primary check.'
+                    : ' Run the import in the primary checkout to determine whether the verifier sandbox caused the crash. An accepted interpreter declaration grants read and exec; it does not prove imports work.'
+                  : environmentFailure.kind === 'sandbox-dominated'
+                    ? " Most of the suite's child-process/Git fixtures cannot run in the verifier sandbox, so the runs are no evidence about the change: run that suite in the primary checkout, and give the next job a testCommand without those files."
+                    : ''
       }${
         // An applyThenVerify run is already acting on this very advice.
         applyRunning || job.applied === true
@@ -341,6 +343,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     spendLine,
     cacheLine,
     budgetWarningLine(job),
+    reportMode && reportReadSetLine(job.budgetSizing),
     outputCapLine(job),
     ...verifierPreflightLines(job.verifierPreflight, { lean }),
     remaining,
@@ -371,6 +374,8 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     summary,
     concerns,
     reviewPacketLine(job),
+    finishProtocolLine(job),
+    reportSalvagedLine(job),
     ...providerTransitionLines(job),
     providerFailure,
     (!lean || failureDiagnostics) && providerFinishReason,
@@ -390,6 +395,21 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     .join('\n');
   return redactText(raw);
 }
+/** The fixed finish-protocol problems a report job's invalid finish call had, when the loop recorded any. */
+function finishProtocolLine(job) {
+  if (!reportModeOf(job) || !Array.isArray(job.finishProblems)) return '';
+  const problems = job.finishProblems.slice(0, 6).filter((item) => typeof item === 'string' && item);
+  return problems.length ? `finish protocol: ${problems.map((item) => scalar(item).slice(0, 200)).join('; ')}` : '';
+}
+function reportSalvagedLine(job) {
+  if (!reportModeOf(job)) return '';
+  if (job.reportSalvage === 'finish-arguments')
+    return 'report salvaged: the finish arguments were invalid; reportResult.text holds the drafted report, unreviewed';
+  if (job.reportSalvage === 'plain-text')
+    return 'report salvaged: the worker ended in plain text without calling finish; reportResult.text holds its last message, unreviewed';
+  return '';
+}
+const reportModeOf = (job) => job?.mode === 'report';
 /** One-line verdict on the worker's review packet; empty unless the job requested one. */
 function reviewPacketLine(job) {
   if (job.reviewPacket !== true) return '';
@@ -662,6 +682,14 @@ function budgetSizingLine(value) {
   if (!warnings.length || !Number.isSafeInteger(value.maxTurns)) return '';
   const recommended = Number.isSafeInteger(value.recommendedTurns) ? `; recommended ${value.recommendedTurns}` : '';
   return `turn budget: ${value.maxTurns} (${scalar(value.turnsSource)}${recommended}) - ${warnings.map((w) => scalar(w).slice(0, 400)).join(' ')}`;
+}
+/** Report jobs only: the declared read set against what the worker retains, when sizing flagged it. */
+function reportReadSetLine(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+  const { readChars, retentionChars } = value;
+  const warned = Array.isArray(value.warnings) && value.warnings.some((w) => typeof w === 'string' && /declared reads/.test(w));
+  if (!warned || ![readChars, retentionChars].every((n) => Number.isSafeInteger(n) && n >= 0)) return '';
+  return `report read set: ~${readChars} chars declared; retention ${retentionChars} chars`;
 }
 function budgetReservationLine(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return '';

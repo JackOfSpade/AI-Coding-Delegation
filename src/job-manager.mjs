@@ -65,7 +65,11 @@ import {
 import { PathPolicy } from './policy.mjs';
 import {
   buildBudgetSizing,
+  estimateReadChars,
   measureFiles,
+  REPORT_RETENTION_HEADROOM,
+  REPORT_RETENTION_MAX,
+  reportRetentionChars,
   recommendTurns,
   resolveTurnBudget,
   raiseBudgetSizing,
@@ -315,6 +319,18 @@ function safeReportString(value, maxChars = MAX_REPORT_TEXT) {
   return bounded || undefined;
 }
 const safeReportText = (value) => safeReportString(value);
+const REPORT_SALVAGE_KINDS = new Set(['finish-arguments', 'plain-text']);
+const safeReportSalvage = (value) => (REPORT_SALVAGE_KINDS.has(value) ? value : undefined);
+// Fixed finish-protocol problem texts from the loop: at most 6 short, redacted lines.
+const safeFinishProblems = (value) => {
+  const list = Array.isArray(value)
+    ? value.slice(0, 6).flatMap((item) => {
+        const text = safeReportString(item, 200);
+        return text ? [text] : [];
+      })
+    : [];
+  return list.length ? list : undefined;
+};
 // Persisted copies of the worker's review packet and the server's check. Every
 // text field goes through safeReportString; a malformed packet is not stored
 // (the check already records why).
@@ -489,8 +505,10 @@ const failureView = (job) => {
   const failureKind = safeFailureKind(job?.failureKind);
   const toolFailure = safeToolFailure(job?.toolFailure);
   const finalizationError = safeFinalizationError(job?.finalizationError);
+  const finishProblems = safeFinishProblems(job?.finishProblems);
   return {
     ...(failureKind ? { failureKind } : {}),
+    ...(finishProblems ? { finishProblems } : {}),
     ...(toolFailure ? { toolFailure } : {}),
     ...(finalizationError ? { finalizationError } : {}),
   };
@@ -2007,7 +2025,16 @@ export class JobManager {
       timeoutScalable: timeoutScalable === true,
     });
     if (!recommendation) resolved.warnings.push('turn sizing unavailable; the unscaled turn cap was used');
-    return { resolved, budgetSizing: buildBudgetSizing({ resolved, recommendation, files }) };
+    let readChars, retentionChars;
+    if (input.mode === 'report' && files) {
+      readChars = estimateReadChars(files);
+      retentionChars = reportRetentionChars(readChars);
+      if (readChars + REPORT_RETENTION_HEADROOM > REPORT_RETENTION_MAX)
+        resolved.warnings.push(
+          `declared reads (~${readChars} chars) exceed what a report worker can keep in context (${REPORT_RETENTION_MAX} chars); split the report package or narrow :START-END ranges`,
+        );
+    }
+    return { resolved, budgetSizing: buildBudgetSizing({ resolved, recommendation, files, readChars, retentionChars }) };
   }
   /** Claim a durably queued CLI job in its detached worker process. */
   async resume(id) {
@@ -2355,6 +2382,18 @@ export class JobManager {
           const invalidStatus = !allowedWorkerStatuses.has(requestedStatus);
           const reportText = safeReportText(result?.report ?? result?.finish?.report);
           const missingReport = job.mode === 'report' && requestedStatus === 'DONE' && !reportText;
+          // A report job's forced finalization finish was invalid but its drafted report was recovered.
+          const salvaged =
+            job.mode === 'report' &&
+            requestedStatus === 'DONE' &&
+            !!reportText &&
+            safeReportSalvage(result?.reportSalvage) === 'finish-arguments';
+          // A report worker that ended in prose: its last message is kept on the failed job, unreviewed.
+          const plainTextSalvaged =
+            job.mode === 'report' &&
+            requestedStatus === 'FAILED' &&
+            !!reportText &&
+            safeReportSalvage(result?.reportSalvage) === 'plain-text';
           let workerStatus = leaseLost
             ? 'FAILED'
             : controller.signal.aborted
@@ -2472,6 +2511,13 @@ export class JobManager {
             ...(providerFailure ? { providerFailure } : {}),
             ...(failureKind ? { failureKind } : {}),
             ...(toolFailure ? { toolFailure } : {}),
+            ...(job.mode === 'report' &&
+            safeFinishProblems(result?.finishProblems) &&
+            (failureKind === 'finish-protocol' || (salvaged && workerStatus === 'WORKER_DONE'))
+              ? { finishProblems: safeFinishProblems(result.finishProblems) }
+              : {}),
+            ...(salvaged && workerStatus === 'WORKER_DONE' ? { reportSalvage: 'finish-arguments' } : {}),
+            ...(plainTextSalvaged && workerStatus === 'FAILED' && failureKind === 'no-finish' ? { reportSalvage: 'plain-text' } : {}),
             ...(leaseLost
               ? { error: `lease lost: ${leaseLost}` }
               : invalidStatus || badAccounting || missingReport
@@ -3033,6 +3079,8 @@ export class JobManager {
       // A declared interpreter/virtualenv (verifierInterpreter): read and exec
       // only, for the verifier alone; never the worker's own run_command.
       ...interpreterPathsOption(job),
+      // Verifier-only: lets tools such as pytest stat() the worktree .git pointer (never read or write it).
+      allowGitPointerMetadata: true,
       requireSandbox: job.requireSandbox === true,
     };
   }
@@ -3864,7 +3912,10 @@ export class JobManager {
       throw new Error('defects must be 1-32 non-empty bounded strings');
     const repairEnteredMs = this.#nowMs();
     let job = this.validatePersisted(await this.store.get(id));
-    if (job.mode === 'report') throw new Error('report jobs are read-only and cannot be repaired; start a new report job');
+    if (job.mode === 'report')
+      throw new Error(
+        'report jobs are read-only and cannot be repaired; read reportResult (an invalid final finish call or a final plain-text answer is recovered there) or start a new report job',
+      );
     // A terminal durable state can be published just before its owning local
     // task performs final cleanup. Join that task first, then decide whether
     // a manual repair is eligible; otherwise the same request is needlessly
@@ -4421,6 +4472,7 @@ export class JobManager {
               // Read-only primary: only the per-run temp directory is writable.
               writablePaths: [],
               ...interpreterPathsOption(job),
+              allowGitPointerMetadata: true,
               requireSandbox,
               timeoutMs: plan.timeoutSec * 1000,
             });
@@ -4599,6 +4651,7 @@ export class JobManager {
         writablePaths: [join(cwd, '**')],
         readablePaths: [dirname(cwd), ...isolatedDependencyReadPaths(cwd, job.repoPath)],
         ...interpreterPathsOption(job),
+        allowGitPointerMetadata: true,
         requireSandbox,
         timeoutMs: plan.timeoutSec * 1000,
       });

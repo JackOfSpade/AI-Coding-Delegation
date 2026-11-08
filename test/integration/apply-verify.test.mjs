@@ -1247,6 +1247,7 @@ test('applyThenVerifyIn scratch runs the command in a writable private copy of t
       assert.equal(seen.options.readablePaths[0], dirname(cwd));
       assert.equal(seen.options.allowNetwork, false);
       assert.equal(seen.options.requireSandbox, true);
+      assert.equal(seen.options.allowGitPointerMetadata, true, 'pytest may stat the copy .git pointer');
       assert.equal(existsSync(cwd), false, 'the copy is removed afterwards');
       assert.equal(result.applied, true);
       assert.equal(result.applyThenVerify.outcome, 'PASSED');

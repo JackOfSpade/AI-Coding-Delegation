@@ -3,6 +3,7 @@ import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { reportRetentionChars, storedReportRetention } from './budget-sizing.mjs';
 import { LeaseManager, getGitDir } from './lease.mjs';
 import { JobStore } from './store.mjs';
 import { Runner } from './runner.mjs';
@@ -16,7 +17,7 @@ import {
   validateJobRequest,
   validateListingOptions,
 } from './job-manager.mjs';
-import { probeVerifierTemp, sandboxAvailable, sandboxStatus } from './sandbox.mjs';
+import { probeVerifierTemp, probeWorkerPython, sandboxAvailable, sandboxStatus } from './sandbox.mjs';
 import { healthIdentity, runtimeIdentity } from './identity.mjs';
 import { assertStartRuntimeCurrent, installedSkillHealth, withRestartNotice, withSkillHealth } from './skill-health.mjs';
 import {
@@ -289,6 +290,20 @@ export function gitPatchApplier(repoPath, patch, { reverse, check }) {
   if (!check) snapshotGit(repoPath, args, {}, { input: patch, output: 'buffer' });
   return { dryRun: !!check, applied: !check };
 }
+/**
+ * A report worker's context: never persisted, read_file results pinned until
+ * superseded, and retention sized to the declared read set. The echoed
+ * retentionChars wins when present, so the start response and the worker use
+ * one number; a legacy job sizes from readChars or takes the fallback.
+ */
+export function reportAgentContext(budgetSizing) {
+  return new AgentContext([], {
+    pinReads: true,
+    maxToolChars: storedReportRetention(budgetSizing?.retentionChars) ?? reportRetentionChars(budgetSizing?.readChars),
+    keepRecentToolResults: 16,
+  });
+}
+
 export function createCore({ store, runner, worker, snapshots, leases, config = {}, now, sessionStartedAt } = {}) {
   // The no-argument job list is scoped to this server session. The wall clock
   // is used on purpose (not the injectable `now`): real stores stamp real time.
@@ -514,7 +529,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         const prior = job.assertionRepair ? stored.slice(job.assertionRepair.transcriptStart) : stored;
         const context =
           job.mode === 'report'
-            ? new AgentContext()
+            ? reportAgentContext(job.budgetSizing)
             : new AgentContext(prior, { onAppend: api.appendMessage, onAppendBatch: api.appendMessages });
         const repair = `Repair these concrete defects:\n${(api.defects?.length ? api.defects : ['Continue the job and re-check the acceptance criteria.']).map((x) => `- ${x}`).join('\n')}`;
         const totalTurns = job.budget?.maxTurns ?? loaded?.config.limits.maxTurns,
@@ -706,6 +721,38 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       };
     return tempProbe.value;
   };
+  // Whether a worker's run_command can start Python: same cache and seam pattern.
+  let workerProbe;
+  const workerShellHealth = () => {
+    if (!workerProbe || nowMs() - workerProbe.at > VERIFIER_TMP_TTL_MS)
+      workerProbe = {
+        at: nowMs(),
+        value: Promise.resolve()
+          .then(() => (config.probeWorkerPython || probeWorkerPython)())
+          .catch(() => ({ python: 'unknown', reason: 'probe-failed' })),
+      };
+    return workerProbe.value;
+  };
+  // The job is already launched when start waits for this, so the wait stays
+  // short: a warm cache answers at once, and a cold probe (normally ~0.2 s)
+  // that misses the deadline only drops the echo; health still reports it.
+  const WORKER_SHELL_START_DEADLINE_MS = 1_500;
+  const workerShellForStart = async () => {
+    let timer;
+    try {
+      return await Promise.race([
+        workerShellHealth(),
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, WORKER_SHELL_START_DEADLINE_MS);
+          timer.unref?.();
+        }),
+      ]);
+    } catch {
+      return undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   const sandboxHealth = async () => {
     const status = sandboxStatus();
     const skill = skillHealth();
@@ -728,8 +775,13 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       ...(status.error ? { sandboxProbeError: status.error } : {}),
       ...(status.exitCode != null ? { sandboxProbeExitCode: status.exitCode } : {}),
       ...(status.signal ? { sandboxProbeSignal: status.signal } : {}),
-      // Whether a sandboxed verifier can create temp directories at all.
-      verifierTmp: await verifierTmpHealth(),
+      // Whether a sandboxed verifier can create temp directories at all, and
+      // whether a worker run_command can start Python (report-only). The two
+      // probes are independent, so a cold health call waits for the slower one.
+      ...(await Promise.all([verifierTmpHealth(), workerShellHealth()]).then(([verifierTmp, workerShell]) => ({
+        verifierTmp,
+        workerShell,
+      }))),
     };
   };
   // Ordered client/project hints. process.cwd() is deliberately not here: a
@@ -1201,14 +1253,20 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         startSignal.throwIfAborted();
         throw new Error('offload core is shutting down');
       }
+      if (reportMode || !pythonProjectMarkers(state.repoPath).length) return result;
+      // A write job in a Python repo learns whether its worker shell can run
+      // Python, so the brief can say so up front. Never fails start and delays
+      // it by at most WORKER_SHELL_START_DEADLINE_MS.
+      const workerShell = await workerShellForStart();
+      const withShell = workerShell ? { ...result, workerShell } : result;
       // A Python project has no JavaScript dependencies to report, so its start
       // echo carries the interpreter readiness instead of `not-applicable`.
-      if (reportMode || result.verifierDeps !== 'not-applicable' || !pythonProjectMarkers(state.repoPath).length) return result;
+      if (result.verifierDeps !== 'not-applicable') return withShell;
       const python = interpreter
         ? { status: 'ok', reason: 'interpreter-declared' }
         : verifierPythonStatus(state.repoPath, { allowlist: loaded.config.verifier?.interpreterRoots ?? [] });
       return {
-        ...result,
+        ...withShell,
         verifierDeps: python.status,
         verifierDepsReason: python.reason,
         ...(interpreter ? {} : { verifierPython: python }),
