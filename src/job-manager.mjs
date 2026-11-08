@@ -319,6 +319,8 @@ function safeReportString(value, maxChars = MAX_REPORT_TEXT) {
   return bounded || undefined;
 }
 const safeReportText = (value) => safeReportString(value);
+const REPORT_SALVAGE_KINDS = new Set(['finish-arguments', 'plain-text']);
+const safeReportSalvage = (value) => (REPORT_SALVAGE_KINDS.has(value) ? value : undefined);
 // Fixed finish-protocol problem texts from the loop: at most 6 short, redacted lines.
 const safeFinishProblems = (value) => {
   const list = Array.isArray(value)
@@ -2381,7 +2383,17 @@ export class JobManager {
           const reportText = safeReportText(result?.report ?? result?.finish?.report);
           const missingReport = job.mode === 'report' && requestedStatus === 'DONE' && !reportText;
           // A report job's forced finalization finish was invalid but its drafted report was recovered.
-          const salvaged = job.mode === 'report' && requestedStatus === 'DONE' && !!reportText && result?.reportSalvaged === true;
+          const salvaged =
+            job.mode === 'report' &&
+            requestedStatus === 'DONE' &&
+            !!reportText &&
+            safeReportSalvage(result?.reportSalvage) === 'finish-arguments';
+          // A report worker that ended in prose: its last message is kept on the failed job, unreviewed.
+          const plainTextSalvaged =
+            job.mode === 'report' &&
+            requestedStatus === 'FAILED' &&
+            !!reportText &&
+            safeReportSalvage(result?.reportSalvage) === 'plain-text';
           let workerStatus = leaseLost
             ? 'FAILED'
             : controller.signal.aborted
@@ -2504,7 +2516,8 @@ export class JobManager {
             (failureKind === 'finish-protocol' || (salvaged && workerStatus === 'WORKER_DONE'))
               ? { finishProblems: safeFinishProblems(result.finishProblems) }
               : {}),
-            ...(salvaged && workerStatus === 'WORKER_DONE' ? { reportSalvaged: true } : {}),
+            ...(salvaged && workerStatus === 'WORKER_DONE' ? { reportSalvage: 'finish-arguments' } : {}),
+            ...(plainTextSalvaged && workerStatus === 'FAILED' && failureKind === 'no-finish' ? { reportSalvage: 'plain-text' } : {}),
             ...(leaseLost
               ? { error: `lease lost: ${leaseLost}` }
               : invalidStatus || badAccounting || missingReport

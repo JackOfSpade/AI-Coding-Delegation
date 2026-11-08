@@ -1751,10 +1751,17 @@ test('a report job shows its fixed finish problems and a salvaged report is flag
     mode: 'report',
     finishProblems: ['summary was missing or longer than 1500 characters', 'finish was not the only tool call'],
   };
-  const salvaged = compactReport({ ...base, status: 'DONE_UNVERIFIED', reportSalvaged: true });
+  const salvaged = compactReport({ ...base, status: 'DONE_UNVERIFIED', reportSalvage: 'finish-arguments' });
   assert.match(salvaged, /^finish protocol: summary was missing or longer than 1500 characters; finish was not the only tool call$/m);
   assert.match(salvaged, /^report salvaged: the finish arguments were invalid; reportResult\.text holds the drafted report, unreviewed$/m);
   assert.match(salvaged, /next: read reportResult/);
+  const plain = compactReport({ id: 'r2', mode: 'report', status: 'FAILED', failureKind: 'no-finish', reportSalvage: 'plain-text' });
+  assert.match(
+    plain,
+    /^report salvaged: the worker ended in plain text without calling finish; reportResult\.text holds its last message, unreviewed$/m,
+  );
+  assert.match(plain, /next: read reportResult/);
+  assert.doesNotMatch(compactReport({ id: 'r3', mode: 'report', status: 'FAILED', reportSalvage: 'bogus' }), /report salvaged/);
   const failed = compactReport({ ...base, status: 'FAILED', failureKind: 'finish-protocol', error: FAILURE_ERRORS['finish-protocol'] });
   assert.match(failed, /^finish protocol: /m);
   assert.doesNotMatch(failed, /report salvaged/);
