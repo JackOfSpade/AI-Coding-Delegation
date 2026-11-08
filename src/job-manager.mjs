@@ -65,7 +65,11 @@ import {
 import { PathPolicy } from './policy.mjs';
 import {
   buildBudgetSizing,
+  estimateReadChars,
   measureFiles,
+  REPORT_RETENTION_HEADROOM,
+  REPORT_RETENTION_MAX,
+  reportRetentionChars,
   recommendTurns,
   resolveTurnBudget,
   raiseBudgetSizing,
@@ -2019,7 +2023,16 @@ export class JobManager {
       timeoutScalable: timeoutScalable === true,
     });
     if (!recommendation) resolved.warnings.push('turn sizing unavailable; the unscaled turn cap was used');
-    return { resolved, budgetSizing: buildBudgetSizing({ resolved, recommendation, files }) };
+    let readChars, retentionChars;
+    if (input.mode === 'report' && files) {
+      readChars = estimateReadChars(files);
+      retentionChars = reportRetentionChars(readChars);
+      if (readChars + REPORT_RETENTION_HEADROOM > REPORT_RETENTION_MAX)
+        resolved.warnings.push(
+          `declared reads (~${readChars} chars) exceed what a report worker can keep in context (${REPORT_RETENTION_MAX} chars); split the report package or narrow :START-END ranges`,
+        );
+    }
+    return { resolved, budgetSizing: buildBudgetSizing({ resolved, recommendation, files, readChars, retentionChars }) };
   }
   /** Claim a durably queued CLI job in its detached worker process. */
   async resume(id) {

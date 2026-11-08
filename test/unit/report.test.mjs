@@ -1760,3 +1760,26 @@ test('a report job shows its fixed finish problems and a salvaged report is flag
   assert.doesNotMatch(failed, /report salvaged/);
   assert.doesNotMatch(compactReport({ id: 'w', status: 'FAILED', finishProblems: ['x'] }), /finish protocol/);
 });
+
+test('a report job with a retention warning shows the declared read set; other jobs do not', () => {
+  const sizing = (extra = {}) => ({
+    maxTurns: 80,
+    turnsSource: 'default',
+    turnPolicy: 'auto',
+    readChars: 450_000,
+    retentionChars: 400_000,
+    files: [],
+    warnings: ['declared reads (~450000 chars) exceed what a report worker can keep in context (400000 chars); split the report package'],
+    ...extra,
+  });
+  const lines = (job) =>
+    compactReport({ id: 'oj-1', ...job }, { detail: 'compact' })
+      .split('\n')
+      .filter((line) => line.startsWith('report read set:'));
+  assert.deepEqual(lines({ mode: 'report', status: 'DONE_UNVERIFIED', budgetSizing: sizing() }), [
+    'report read set: ~450000 chars declared; retention 400000 chars',
+  ]);
+  assert.equal(lines({ mode: 'write', status: 'DONE_UNVERIFIED', budgetSizing: sizing() }).length, 0);
+  assert.equal(lines({ mode: 'report', status: 'DONE_UNVERIFIED', budgetSizing: sizing({ warnings: [] }) }).length, 0);
+  assert.equal(lines({ mode: 'report', status: 'DONE_UNVERIFIED', budgetSizing: sizing({ readChars: 'x\n[REDACTED]' }) }).length, 0);
+});

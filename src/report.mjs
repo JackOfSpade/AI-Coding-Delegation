@@ -343,6 +343,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     spendLine,
     cacheLine,
     budgetWarningLine(job),
+    reportMode && reportReadSetLine(job.budgetSizing),
     outputCapLine(job),
     ...verifierPreflightLines(job.verifierPreflight, { lean }),
     remaining,
@@ -678,6 +679,14 @@ function budgetSizingLine(value) {
   if (!warnings.length || !Number.isSafeInteger(value.maxTurns)) return '';
   const recommended = Number.isSafeInteger(value.recommendedTurns) ? `; recommended ${value.recommendedTurns}` : '';
   return `turn budget: ${value.maxTurns} (${scalar(value.turnsSource)}${recommended}) - ${warnings.map((w) => scalar(w).slice(0, 400)).join(' ')}`;
+}
+/** Report jobs only: the declared read set against what the worker retains, when sizing flagged it. */
+function reportReadSetLine(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+  const { readChars, retentionChars } = value;
+  const warned = Array.isArray(value.warnings) && value.warnings.some((w) => typeof w === 'string' && /declared reads/.test(w));
+  if (!warned || ![readChars, retentionChars].every((n) => Number.isSafeInteger(n) && n >= 0)) return '';
+  return `report read set: ~${readChars} chars declared; retention ${retentionChars} chars`;
 }
 function budgetReservationLine(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return '';

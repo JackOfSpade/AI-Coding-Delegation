@@ -494,6 +494,42 @@ test('Core starts a report job without injecting write or verifier fields', asyn
     await rm(path, { recursive: true, force: true });
   }
 });
+test('a report job echoes its read size and retention, and warns when the declared reads cannot be retained', async () => {
+  const path = await repo('offload-core-report-retention-');
+  await mkdir(join(path, 'docs'));
+  for (const name of ['a', 'b']) await writeFile(join(path, 'docs', `${name}.md`), ('x'.repeat(99) + '\n').repeat(2_000));
+  execFileSync('git', ['-C', path, 'add', 'docs']);
+  execFileSync('git', ['-C', path, 'commit', '-qm', 'docs']);
+  const isolation = { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree };
+  const core = createCore({
+    config: { loaded, resolveKey: () => 'credential', isolation },
+    isolation,
+    worker: { run: async () => ({ status: 'DONE', report: 'analysis complete' }) },
+  });
+  try {
+    const small = await core.start({ mode: 'report', task: 'read a', relevantPaths: ['docs/a.md'], repoPath: path });
+    assert.equal(small.budgetSizing.readChars, 200_000 + 33 * 8);
+    assert.equal(small.budgetSizing.retentionChars, 248_000 + 264);
+    assert.ok(!small.budgetSizing.warnings.some((w) => /declared reads/.test(w)));
+    const wide = await core.start({
+      mode: 'report',
+      task: 'read both',
+      relevantPaths: ['docs/a.md', 'docs/b.md', 'docs/a.md:1-2000'],
+      repoPath: path,
+    });
+    assert.equal(wide.budgetSizing.retentionChars, 400_000);
+    assert.ok(wide.budgetSizing.readChars > 352_000);
+    assert.ok(
+      wide.budgetSizing.warnings.some((w) => /declared reads \(~\d+ chars\) exceed .*\(400000 chars\); split the report package/.test(w)),
+    );
+    const write = await core.start({ task: 'write', ownedPaths: ['docs/a.md'], relevantPaths: ['docs/a.md'], repoPath: path });
+    assert.equal(write.budgetSizing.readChars, undefined);
+    for (const id of [small.jobId, wide.jobId, write.jobId]) await core.wait(id, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
+  } finally {
+    await core.shutdown();
+    await rm(path, { recursive: true, force: true });
+  }
+});
 test('a report job sizes its turn cap from the copied input bytes and echoes only the private path', async () => {
   const path = await repo('offload-core-report-sizing-');
   const scratch = await mkdtemp(join(tmpdir(), 'offload-report-sizing-input-'));
