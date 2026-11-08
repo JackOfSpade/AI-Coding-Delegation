@@ -206,7 +206,10 @@ export function jobFacts(job, context = {}) {
         ...(failure.error ? { error: text(failure.error, 160) } : {}),
       };
   }
-  if (record.mode === 'report' && (record.reportSalvage === 'finish-arguments' || record.reportSalvage === 'plain-text'))
+  if (
+    record.mode === 'report' &&
+    (record.reportSalvage === 'finish-arguments' || record.reportSalvage === 'plain-text' || record.reportSalvage === 'truncated-finish')
+  )
     facts.reportSalvage = record.reportSalvage;
   const environment = object(record.verifyEnvironment);
   if (environment && VERIFY_ENV_KIND.test(String(environment.kind))) {
@@ -487,7 +490,9 @@ function jobSignals(record, facts, push, environment) {
       id,
       facts.reportSalvage === 'plain-text'
         ? `${where} kept the worker's last plain-text message after no finish call; ${spent}`
-        : `${where} recovered a drafted report after an invalid finish call; ${spent}`,
+        : facts.reportSalvage === 'truncated-finish'
+          ? `${where} kept the drafted report of a finish call the output cap cut off; ${spent}`
+          : `${where} recovered a drafted report after an invalid finish call; ${spent}`,
     );
   if (kind === 'output-cap') push('output-cap-failure', id, `${where} (output-cap) after ${spent}`);
   if (kind === 'tool-loop' && !facts.toolFailure)

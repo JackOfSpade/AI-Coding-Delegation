@@ -23,7 +23,11 @@ function sensitiveKey(key, value) {
   );
 }
 const BEARER = /\b(Bearer)[ \t]+[A-Za-z0-9._~+\/-]+=*/gi;
-const ASSIGNMENT = /\b((?:(?:[A-Za-z_][A-Za-z0-9_]*_)?(?:TOKEN|SECRET|PASSWORD|API_KEY|KEY)|AUTHORIZATION|COOKIE))=([^\s'"`]+)/gi;
+// A bare `key` whose value opens with `{` is a JSX/template expression
+// (`<li key={item.id}>`), never a credential; redacting it corrupted the
+// source a worker read and then wrote back. Named keys (`API_KEY={...}`)
+// and every other value shape stay redacted.
+const ASSIGNMENT = /\b(?!key=\{)((?:(?:[A-Za-z_][A-Za-z0-9_]*_)?(?:TOKEN|SECRET|PASSWORD|API_KEY|KEY)|AUTHORIZATION|COOKIE))=([^\s'"`]+)/gi;
 // Bare `token`/`secret`/`password` also name ordinary source properties. Only
 // recognize those as headers at the start of a line, never inside source or
 // an encoded tool argument such as `return { token: match[1], rest };`.
@@ -147,7 +151,7 @@ export class RedactionProjector {
     const { char, start, end } = token;
     if (char === '=' && sensitiveAssignment(this.#identifier)) {
       this.#mode = 'assignment';
-      this.#redaction = { start, end };
+      this.#redaction = { start, end, bareKey: /^key$/i.test(this.#identifier) };
       this.#identifier = '';
       this.#previousWord = false;
       this.#headerTail = `${this.#headerTail}${char}`.slice(-96);
@@ -205,7 +209,7 @@ export class RedactionProjector {
       return;
     }
     if (this.#mode === 'assignment') {
-      if (!/[^\s'"`]/.test(char)) {
+      if (!/[^\s'"`]/.test(char) || (char === '{' && this.#redaction.bareKey)) {
         const pending = this.#redaction;
         this.#mode = 'normal';
         this.#redaction = undefined;

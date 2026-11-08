@@ -245,7 +245,7 @@ test('sealed transcripts retain explicit nullable assistant reasoning for provid
   }
 });
 
-test('redacted assistant reasoning is durably marked non-replayable without retaining the secret', async () => {
+test('redacted DeepSeek reasoning is withheld as empty and stays replayable without retaining the secret', async () => {
   const gitDir = tempDir();
   const secret = 'sk-abcdefghijklmnop';
   try {
@@ -262,8 +262,11 @@ test('redacted assistant reasoning is durably marked non-replayable without reta
     ]);
     const stored = await store.get(job.id);
     const transcript = await store.readMessages(job.id);
-    assert.equal(stored.transcriptReplayable, false);
-    assert.match(transcript[0].reasoning_content, /\[REDACTED\]/);
+    // DeepSeek accepts an empty reasoning_content back, so the job stays
+    // continuable instead of being blocked over a redaction.
+    assert.equal(stored.transcriptReplayable, true);
+    assert.equal(transcript[0].reasoning_content, '');
+    assert.doesNotThrow(() => new AgentContext(transcript));
     const durable = JSON.stringify({ stored, transcript });
     assert.doesNotMatch(durable, new RegExp(secret));
     assert.doesNotMatch(durable, /credential [a-z0-9_-]{12,}/i);

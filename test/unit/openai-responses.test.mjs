@@ -305,6 +305,14 @@ test('a length stop that cuts write_file yields one truncatedToolCall with the e
   assert.deepEqual(events.at(-1), { providerFinishReason: 'length' });
 });
 
+test('a length stop that cuts finish keeps its partial arguments for report salvage', async () => {
+  const partial = '{"summary":"s","report":"Finding';
+  const events = await drain(
+    provider(async () => json(lengthBody([callItem('call_f', partial, { status: 'incomplete', name: 'finish' })]))),
+  );
+  assert.deepEqual(truncatedEvents(events), [{ truncatedToolCall: { name: 'finish', chars: partial.length, partial } }]);
+});
+
 test('with two truncated calls the larger one is reported', async () => {
   const small = '{"path":"s"';
   const large = '{"path":"big.js","content":"' + 'x'.repeat(500);

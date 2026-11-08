@@ -587,6 +587,15 @@ test('Anthropic: a length stop that cuts write_file yields one truncatedToolCall
   assert.deepEqual(events.at(-1), { providerFinishReason: 'length' });
 });
 
+test('Anthropic: a length stop that cuts finish keeps its partial input for report salvage', async () => {
+  const partial = '{"summary":"s","report":"Finding';
+  const events = await collect(cappedProvider(cutStream([toolUseBlock(0, 'toolu_f', 'finish', partial)], 'max_tokens')));
+  assert.deepEqual(
+    events.filter((event) => event.truncatedToolCall),
+    [{ truncatedToolCall: { name: 'finish', chars: partial.length, partial } }],
+  );
+});
+
 test('Anthropic: with two truncated calls the larger one is reported', async () => {
   const small = '{"path":"s.js"';
   const large = '{"path":"big.js","content":"' + 'x'.repeat(500);

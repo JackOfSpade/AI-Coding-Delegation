@@ -42,6 +42,11 @@ export const RUNTIME_CAPABILITIES = Object.freeze({
   reportNoFinishRecovery: true,
   reportFinishProtocolSalvage: true,
   flashHopReplay: true,
+  routeTurnScaling: true,
+  flashReasoningWithhold: true,
+  reportFinalizeRetry: true,
+  reportTruncatedFinishSalvage: true,
+  malformedToolRecovery: true,
 });
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));

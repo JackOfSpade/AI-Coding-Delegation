@@ -8,7 +8,7 @@ import { escapeRegExp, matchesAny, normalizePath, pathsOverlap } from './glob.mj
 import { pidAlive } from './pid.mjs';
 import { parseKeyRef } from './secrets.mjs';
 import { isDeepSeekEndpoint, isOpenAIEndpoint, isSupportedProviderType, modelPolicyViolation } from './model-policy.mjs';
-import { safeProviderFailureReason } from './provider/openai-chat.mjs';
+import { isMalformedToolJsonFailure, safeProviderFailureReason } from './provider/openai-chat.mjs';
 import { diffTreeFiles, diffTrees, git as snapshotGit } from './git-snapshot.mjs';
 import { copyReportInputs, prepareReportInputsForCleanup, reportInputRoots, validateReportInputFiles } from './report-inputs.mjs';
 import { redactText, redactTokenShapes, redactedSummary, stripTerminalControls } from './redact.mjs';
@@ -73,6 +73,8 @@ import {
   recommendTurns,
   resolveTurnBudget,
   raiseBudgetSizing,
+  routeTurnMultiplier,
+  hopRaisedTurns,
   safeBudgetSizing,
   splitRelevantPath,
 } from './budget-sizing.mjs';
@@ -152,6 +154,7 @@ const ROUND_SCOPED_VERIFIER_STATE = Object.freeze({
   verify: undefined,
   workerAfter: undefined,
   retainedDiffRecovery: undefined,
+  malformedToolFinish: undefined,
   verifyEnvironment: undefined,
   applyVerify: undefined,
   reviewPacketEvidence: undefined,
@@ -319,7 +322,9 @@ function safeReportString(value, maxChars = MAX_REPORT_TEXT) {
   return bounded || undefined;
 }
 const safeReportText = (value) => safeReportString(value);
-const REPORT_SALVAGE_KINDS = new Set(['finish-arguments', 'plain-text']);
+const MALFORMED_TOOL_FINISH_CONCERN =
+  'The worker stopped on malformed tool-call JSON from the provider without calling finish; the server verifier passed, so the job finished. No summary, testsRun or review packet was reported: review the diff against the acceptance criteria.';
+const REPORT_SALVAGE_KINDS = new Set(['finish-arguments', 'plain-text', 'truncated-finish']);
 const safeReportSalvage = (value) => (REPORT_SALVAGE_KINDS.has(value) ? value : undefined);
 // Fixed finish-protocol problem texts from the loop: at most 6 short, redacted lines.
 const safeFinishProblems = (value) => {
@@ -1899,7 +1904,13 @@ export class JobManager {
           : [];
       signal?.throwIfAborted();
       const sizing = turnBudget
-        ? await this.#sizeTurnBudget({ input, turnBudget, root: workspace?.path ?? repoPath, inputManifest })
+        ? await this.#sizeTurnBudget({
+            input,
+            turnBudget,
+            root: workspace?.path ?? repoPath,
+            inputManifest,
+            routeStage: cooldown?.stage ?? 0,
+          })
         : undefined;
       signal?.throwIfAborted();
       const leaseOwnerNonce = randomUUID();
@@ -1995,7 +2006,7 @@ export class JobManager {
    * budget-sizing.mjs). Sizing is advisory: any failure falls back to the
    * unscaled cap with a warning rather than blocking the job.
    */
-  async #sizeTurnBudget({ input, turnBudget, root, inputManifest }) {
+  async #sizeTurnBudget({ input, turnBudget, root, inputManifest, routeStage = 0 }) {
     const { requested, configured, policy, timeoutScalable } = turnBudget;
     let recommendation, files;
     try {
@@ -2023,6 +2034,8 @@ export class JobManager {
       readTurns: recommendation?.readTurns,
       timeoutMinutes: input.budget?.timeoutMinutes,
       timeoutScalable: timeoutScalable === true,
+      // The route this job starts on (a credit cool-down may start it on Flash).
+      turnMultiplier: routeTurnMultiplier(executionRoutes(input.executionProfile)[routeStage]),
     });
     if (!recommendation) resolved.warnings.push('turn sizing unavailable; the unscaled turn cap was used');
     let readChars, retentionChars;
@@ -2226,6 +2239,11 @@ export class JobManager {
           let roundOutputCapSeen = safeOutputCap(job.outputCap) !== undefined;
           let budgetFinishRecoveryState = job.budgetFinishRecovery;
           let providerStageState = recordedProviderStage(job);
+          // A credit hop to a route that needs more turns raises an
+          // automatically sized cap mid-round; the post-round accounting below
+          // must judge the round against that raised cap, not the stale record.
+          let budgetState = job.budget;
+          let budgetSizingState = job.budgetSizing;
           let providerTransitionsState = Array.isArray(job.providerTransitions) ? job.providerTransitions : [];
           const workerJob =
             job.assertionRepair?.round === (job.rounds || 0) ? { ...job, ownedPaths: job.assertionRepair.paths, extraWritable: [] } : job;
@@ -2252,6 +2270,7 @@ export class JobManager {
             defects,
             progress: async (event) => {
               const progress = {};
+              let hopExtraTurns = 0;
               if (event?.action === 'provider_credit_fallback') {
                 // Monotonic and bounded by the sealed route chain: a worker can
                 // only ever advance to a route this job snapshotted at start.
@@ -2268,6 +2287,24 @@ export class JobManager {
                   progress.providerStage = requested;
                   progress.providerTransitions = providerTransitionsState;
                   progress.creditFallback = true;
+                  // An assertion-repair pass has a deliberately fixed, small
+                  // allowance; a hop never widens it.
+                  const raised =
+                    job.assertionRepair?.round === (job.rounds || 0)
+                      ? undefined
+                      : hopRaisedTurns(budgetSizingState, {
+                          currentMaxTurns: budgetState?.maxTurns,
+                          turnMultiplier: routeTurnMultiplier(executionRoutes(job.executionProfile)[requested]),
+                        });
+                  if (raised && raised.extraTurns > 0) {
+                    budgetState = { ...budgetState, maxTurns: raised.maxTurns };
+                    progress.budget = budgetState;
+                    hopExtraTurns += raised.extraTurns;
+                  }
+                  if (raised) {
+                    budgetSizingState = raised.budgetSizing;
+                    progress.budgetSizing = budgetSizingState;
+                  }
                 }
               }
               if (Object.hasOwn(event || {}, 'cappedFinishRecovery')) {
@@ -2363,6 +2400,9 @@ export class JobManager {
                 ...(transition ? { phase: transition.phase, prevPhase: transition.prevPhase, prevMs: transition.prevMs } : {}),
                 ...(clearsProviderFinishReason ? { providerFinishReason: null } : {}),
               });
+              // The worker's credit-fallback callback raises its live turn
+              // allowance by exactly what was made durable above.
+              return hopExtraTurns > 0 ? { extraTurns: hopExtraTurns } : undefined;
             },
             // Report transcripts can contain bodies returned from untrusted
             // external inputs. Custom/injected workers receive harmless no-op
@@ -2394,6 +2434,12 @@ export class JobManager {
             requestedStatus === 'FAILED' &&
             !!reportText &&
             safeReportSalvage(result?.reportSalvage) === 'plain-text';
+          // A report finish the output cap cut off with no retry left: its draft up to the cut, unreviewed.
+          const truncatedFinishSalvaged =
+            job.mode === 'report' &&
+            requestedStatus === 'FAILED' &&
+            !!reportText &&
+            safeReportSalvage(result?.reportSalvage) === 'truncated-finish';
           let workerStatus = leaseLost
             ? 'FAILED'
             : controller.signal.aborted
@@ -2441,8 +2487,8 @@ export class JobManager {
           const cumulativeCost = (job.costUsd || 0) + (result?.costUsd || 0);
           const budgetExceeded =
             !badAccounting &&
-            ((job.budget?.maxTurns != null && cumulativeTurns > job.budget.maxTurns) ||
-              (job.budget?.maxUsd != null && cumulativeCost > job.budget.maxUsd));
+            ((budgetState?.maxTurns != null && cumulativeTurns > budgetState.maxTurns) ||
+              (budgetState?.maxUsd != null && cumulativeCost > budgetState.maxUsd));
           if (badAccounting) workerStatus = 'FAILED';
           else if (budgetExceeded) workerStatus = 'BUDGET';
           const usage = badAccounting ? job.usage || {} : candidateUsage;
@@ -2503,7 +2549,7 @@ export class JobManager {
                     reported: result?.budgetCap,
                     turns: cumulativeTurns,
                     costUsd: cumulativeCost,
-                    budget: job.budget,
+                    budget: budgetState,
                   }),
                 }
               : {}),
@@ -2518,6 +2564,9 @@ export class JobManager {
               : {}),
             ...(salvaged && workerStatus === 'WORKER_DONE' ? { reportSalvage: 'finish-arguments' } : {}),
             ...(plainTextSalvaged && workerStatus === 'FAILED' && failureKind === 'no-finish' ? { reportSalvage: 'plain-text' } : {}),
+            ...(truncatedFinishSalvaged && workerStatus === 'FAILED' && failureKind === 'output-cap'
+              ? { reportSalvage: 'truncated-finish' }
+              : {}),
             ...(leaseLost
               ? { error: `lease lost: ${leaseLost}` }
               : invalidStatus || badAccounting || missingReport
@@ -2616,6 +2665,12 @@ export class JobManager {
                 audited.revertPaths.length
               ) {
                 const recoverRetained = job.transcriptReplayable === false && !continuationBlocker({ ...job, transcriptReplayable: true });
+                // A write worker whose last response was malformed tool-call
+                // JSON (after the loop's own retry) stopped without a finish
+                // call, not on a judgement of its work: a passing server
+                // verifier finishes it like a finish would. Anything else
+                // keeps the diagnostic-only FAILED outcome.
+                const promoteOnPass = !recoverRetained && isMalformedToolJsonFailure(safeProviderFailure(job.providerFailure));
                 job = await this.store.update(id, {
                   workerAfter: workspaceAfter,
                   ...(recoverRetained ? { retainedDiffRecovery: true } : {}),
@@ -2623,7 +2678,7 @@ export class JobManager {
                 await this.#pinTrees(job, { before: job.before, workerAfter: workspaceAfter });
                 await this.store.update(id, stamp('verify'));
                 try {
-                  await this._verify(job, { diagnosticOnly: !recoverRetained, recoverRetained });
+                  await this._verify(job, { diagnosticOnly: !recoverRetained && !promoteOnPass, recoverRetained, promoteOnPass });
                 } catch (error) {
                   await this.store.update(id, {
                     ...(recoverRetained ? { status: 'FINALIZING', finalStatus: 'VERIFY_FAILED', error: undefined } : {}),
@@ -3202,7 +3257,7 @@ export class JobManager {
       await this.store.event(id, { type: 'verify-phase', ...event });
     } catch {}
   }
-  async _verify(job, { diagnosticOnly = false, recoverRetained = false } = {}) {
+  async _verify(job, { diagnosticOnly = false, recoverRetained = false, promoteOnPass = false } = {}) {
     // Progress callbacks can durably advance a safety lifecycle while the
     // worker is running.  The object supplied by the caller predates those
     // callbacks, so verification must use the authenticated current record
@@ -3341,6 +3396,7 @@ export class JobManager {
     const canRepair =
       !diagnosticOnly &&
       !recoverRetained &&
+      !promoteOnPass &&
       !continuationBlocker(job) &&
       verify.verdict !== 'PASS' &&
       !environment &&
@@ -3359,17 +3415,27 @@ export class JobManager {
           : canRepair
             ? 'REPAIR_QUEUED'
             : 'VERIFY_FAILED';
+    const promoted = promoteOnPass && status === 'DONE_VERIFIED';
+    // A malformed-JSON stop whose verifier did not pass stays the diagnostic FAILED it was.
+    const diagnosticFailure = diagnosticOnly || (promoteOnPass && !promoted);
     return this.store.update(job.id, {
       status: 'FINALIZING',
-      finalStatus: diagnosticOnly ? 'FAILED' : status,
+      finalStatus: diagnosticFailure ? 'FAILED' : status,
       verify,
       ...(recoverRetained ? { error: undefined } : {}),
+      ...(promoted
+        ? {
+            error: undefined,
+            malformedToolFinish: true,
+            concerns: [...(Array.isArray(job.concerns) ? job.concerns : []), MALFORMED_TOOL_FINISH_CONCERN].slice(-100),
+          }
+        : {}),
       // Always written: a later verification must not inherit an earlier round's classification.
       verifyEnvironment: environment || undefined,
       ...(environmentObservation
         ? { verifyEnvironmentHistory: [...(job.verifyEnvironmentHistory || []), environmentObservation].slice(-16) }
         : {}),
-      ...(!diagnosticOnly && finishRecoveryUnresolved && verify.verdict !== 'PASS'
+      ...(!diagnosticFailure && finishRecoveryUnresolved && verify.verdict !== 'PASS'
         ? {
             error: cappedFinishRecoveryUnresolved
               ? 'automatic repair suppressed: unresolved capped implementation recovery; start a fresh job'

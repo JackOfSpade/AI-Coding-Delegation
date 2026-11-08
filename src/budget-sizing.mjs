@@ -1,5 +1,6 @@
 import { lstat } from 'node:fs/promises';
 import { DEFAULT_OUTPUT_CAP } from './agent/tools.mjs';
+import { OFFLOAD_DEEPSEEK_LATEST_FLASH, OFFLOAD_DEEPSEEK_MODEL, isDeepSeekEndpoint } from './model-policy.mjs';
 
 // Turn-budget sizing. The worker reads a file one read_file page at a time, so
 // the number of turns it needs is dominated by file size, not by how many
@@ -33,6 +34,25 @@ export const REPORT_RETENTION_MAX = 400_000;
 export const REPORT_RETENTION_FALLBACK = 160_000;
 /** Hard ceiling for a server-chosen cap; an explicit caller cap may go to 1000. */
 export const AUTO_TURNS_MAX = 200;
+/**
+ * Per-route multiplier on the turn recommendation. The file-size formula is
+ * calibrated on GPT/Claude workers; DeepSeek Flash takes many more, smaller
+ * steps (field session: 1.5-3.3x the recommendation, so 3x covers the worst
+ * case). Turns on Flash cost cents, so USD remains the real ceiling.
+ */
+export const FLASH_TURN_MULTIPLIER = 3;
+const MAX_TURN_MULTIPLIER = 10;
+/** The turn multiplier for one execution route (1 unless it is the DeepSeek Flash route). */
+export function routeTurnMultiplier(route) {
+  if (!route || typeof route !== 'object' || route.type !== 'openai-chat' || typeof route.baseUrl !== 'string') return 1;
+  if (route.model !== OFFLOAD_DEEPSEEK_MODEL && route.model !== OFFLOAD_DEEPSEEK_LATEST_FLASH) return 1;
+  try {
+    new URL(route.baseUrl);
+  } catch {
+    return 1; // isDeepSeekEndpoint treats an unparseable URL as restricted, not as Flash
+  }
+  return isDeepSeekEndpoint(route.baseUrl) ? FLASH_TURN_MULTIPLIER : 1;
+}
 /** Conservative seconds per worker turn (field report: 30-40 turns took about 32 minutes); only used to warn that the wall clock may run out first. */
 export const TURN_SECONDS_ESTIMATE = 45;
 /** Ceiling for a server-scaled wall-clock allowance; an explicit caller timeout may go to 1440. */
@@ -194,7 +214,13 @@ export function resolveTurnBudget({
   readTurns = 0,
   timeoutMinutes,
   timeoutScalable = false,
+  turnMultiplier = 1,
 } = {}) {
+  const multiplier = Number.isFinite(turnMultiplier) && turnMultiplier > 1 ? Math.min(turnMultiplier, MAX_TURN_MULTIPLIER) : 1;
+  const baseRecommended = recommended;
+  // The route-scaled recommendation drives the cap, its warnings and the
+  // timeout estimate alike, so a Flash job is not handed turns it cannot use.
+  if (multiplier > 1) recommended = Math.ceil(recommended * multiplier);
   const given = requested !== undefined;
   const mode = policy ?? (given ? 'fixed' : 'auto');
   const base = given ? requested : configured;
@@ -231,7 +257,49 @@ export function resolveTurnBudget({
       );
     }
   }
-  return { maxTurns, turnsSource, turnPolicy: mode, warnings, ...(scaledTimeout ? { timeoutMinutes: scaledTimeout } : {}) };
+  if (multiplier > 1 && mode === 'auto' && maxTurns > base)
+    warnings.unshift(
+      `turn recommendation scaled x${multiplier} for the DeepSeek Flash route (base ${baseRecommended}); budget.maxUsd remains the ceiling.`,
+    );
+  return {
+    maxTurns,
+    turnsSource,
+    turnPolicy: mode,
+    warnings,
+    ...(scaledTimeout ? { timeoutMinutes: scaledTimeout } : {}),
+    ...(multiplier > 1 ? { turnMultiplier: multiplier, baseRecommendedTurns: baseRecommended } : {}),
+  };
+}
+
+/**
+ * The raised turn cap when a job hops to a route that needs more turns than
+ * the one it was sized for (a credit fallback to DeepSeek Flash mid-job).
+ * Only an automatically sized cap is raised, never lowered, and never past the
+ * automatic ceiling; a caller-fixed cap is honored. Undefined: no change.
+ */
+export function hopRaisedTurns(sizing, { currentMaxTurns, turnMultiplier } = {}) {
+  const stored = safeBudgetSizing(sizing);
+  if (!stored || stored.turnPolicy !== 'auto' || !Number.isSafeInteger(currentMaxTurns)) return undefined;
+  if ((stored.initialTurnsSource ?? stored.turnsSource) === 'caller') return undefined;
+  const multiplier = Number.isFinite(turnMultiplier) && turnMultiplier > 1 ? Math.min(turnMultiplier, MAX_TURN_MULTIPLIER) : 1;
+  const previous = stored.turnMultiplier ?? 1;
+  if (multiplier <= previous) return undefined;
+  const base = stored.baseRecommendedTurns ?? stored.recommendedTurns;
+  if (!Number.isSafeInteger(base)) return undefined;
+  const recommendedTurns = Math.ceil(base * multiplier);
+  const maxTurns = Math.min(MAX_SAFE_TURNS, Math.max(currentMaxTurns, Math.min(recommendedTurns, AUTO_TURNS_MAX)));
+  const budgetSizing = safeBudgetSizing({
+    ...stored,
+    maxTurns,
+    ...(maxTurns > currentMaxTurns ? { turnsSource: 'scaled' } : {}),
+    recommendedTurns,
+    baseRecommendedTurns: base,
+    turnMultiplier: multiplier,
+    warnings: [
+      `turn recommendation scaled x${multiplier} after a credit fallback to the DeepSeek Flash route (base ${base}); budget.maxUsd remains the ceiling.`,
+    ],
+  });
+  return budgetSizing ? { maxTurns, extraTurns: maxTurns - currentMaxTurns, budgetSizing } : undefined;
 }
 
 /** The persisted/echoed record for one job: arithmetic and sanitized file names only. */
@@ -245,7 +313,13 @@ export function buildBudgetSizing({ resolved, recommendation, files = [], readCh
     initialTurnsSource: resolved.turnsSource,
     turnPolicy: resolved.turnPolicy,
     timeoutMinutes: resolved.timeoutMinutes,
-    recommendedTurns: recommendation?.recommendedTurns,
+    recommendedTurns:
+      resolved.turnMultiplier > 1 && Number.isSafeInteger(recommendation?.recommendedTurns)
+        ? Math.ceil(recommendation.recommendedTurns * resolved.turnMultiplier)
+        : recommendation?.recommendedTurns,
+    ...(resolved.turnMultiplier > 1 && Number.isSafeInteger(recommendation?.recommendedTurns)
+      ? { turnMultiplier: resolved.turnMultiplier, baseRecommendedTurns: recommendation.recommendedTurns }
+      : {}),
     readTurns: recommendation?.readTurns,
     segmentChars: READ_SEGMENT,
     fileCount: files.length,
@@ -333,6 +407,8 @@ export function safeBudgetSizing(value) {
     turnPolicy: value.turnPolicy,
     ...optional('timeoutMinutes', 1440),
     ...optional('recommendedTurns', MAX_SAFE_RECOMMENDATION),
+    ...(boundedInteger(value.turnMultiplier, MAX_TURN_MULTIPLIER) > 1 ? { turnMultiplier: value.turnMultiplier } : {}),
+    ...optional('baseRecommendedTurns', MAX_SAFE_RECOMMENDATION),
     ...optional('readTurns', MAX_SAFE_RECOMMENDATION),
     ...optional('segmentChars', MAX_SAFE_BYTES),
     ...optional('fileCount', MAX_SIZED_FILES),

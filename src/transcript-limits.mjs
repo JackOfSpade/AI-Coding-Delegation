@@ -14,5 +14,16 @@ export const validToolIdentifier = (value, max) =>
 // The largest tool call an output cap cut off, reported by provider adapters
 // (never executed) so the loop can steer its one-shot recovery away from
 // resending the same oversized call.
-export const largerTruncation = (current, name, chars) =>
-  typeof name === 'string' && name.length >= 1 && name.length <= 128 && (!current || chars > current.chars) ? { name, chars } : current;
+// A cut-off `finish` also carries its partial argument text (bounded), so a
+// report worker's drafted report can be salvaged from it; no other tool's
+// fragment is kept.
+export const largerTruncation = (current, name, chars, partial) =>
+  typeof name === 'string' && name.length >= 1 && name.length <= 128 && (!current || chars > current.chars)
+    ? {
+        name,
+        chars,
+        ...(name === 'finish' && typeof partial === 'string' && partial.length > 0
+          ? { partial: partial.slice(0, MAX_TOOL_ARGUMENT_CHARS) }
+          : {}),
+      }
+    : current;

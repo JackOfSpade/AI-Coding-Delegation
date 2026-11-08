@@ -242,7 +242,7 @@ function responseOutput(json) {
     // billed `length` response, not a malformed one: drop the unexecutable
     // fragment and let the loop's output-cap recovery see the finish reason.
     if (stop !== 'length') throw invalidResponse('Incomplete tool JSON');
-    truncatedToolCall = largerTruncation(truncatedToolCall, call.name, call.arguments.length);
+    truncatedToolCall = largerTruncation(truncatedToolCall, call.name, call.arguments.length, call.arguments);
   }
   stop ??= toolCalls.length ? 'tool_calls' : 'stop';
   return {

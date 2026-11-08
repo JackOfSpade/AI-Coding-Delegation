@@ -1252,6 +1252,11 @@ test('a no-id server listing does not bind its incidental cwd as a repository', 
     reportNoFinishRecovery: true,
     reportFinishProtocolSalvage: true,
     flashHopReplay: true,
+    routeTurnScaling: true,
+    flashReasoningWithhold: true,
+    reportFinalizeRetry: true,
+    reportTruncatedFinishSalvage: true,
+    malformedToolRecovery: true,
   });
   assert.match(result.health.server.buildHash, /^sha256:[0-9a-f]{64}$/);
   assert.match(result.health.server.skillHash, /^sha256:[0-9a-f]{64}$/);

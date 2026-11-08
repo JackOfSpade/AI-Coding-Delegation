@@ -59,6 +59,17 @@ test('report-finish-salvaged: a DONE report job whose invalid finish was recover
   assert.deepEqual(codes([job('b', { mode: 'write', status: 'DONE_UNVERIFIED', reportSalvage: 'finish-arguments' })]), []);
 });
 
+test('report-finish-salvaged also covers a finish the output cap cut off', () => {
+  const all = deriveSignals(
+    [job('a', { mode: 'report', status: 'FAILED', failureKind: 'output-cap', reportSalvage: 'truncated-finish' })],
+    { nowMs: NOW },
+  );
+  const codesFound = all.map((s) => s.code);
+  assert.ok(codesFound.includes('report-finish-salvaged'));
+  assert.ok(codesFound.includes('output-cap-failure'));
+  assert.match(all.find((s) => s.code === 'report-finish-salvaged').evidence, /drafted report of a finish call the output cap cut off/);
+});
+
 test('report-finish-salvaged also covers a plain-text salvage after no finish call', () => {
   const all = deriveSignals([job('a', { mode: 'report', status: 'FAILED', failureKind: 'no-finish', reportSalvage: 'plain-text' })], {
     nowMs: NOW,

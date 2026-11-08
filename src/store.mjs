@@ -190,6 +190,13 @@ function redactMessage(message, secrets) {
   message.openai_reasoning?.forEach((item, index) => {
     stored.openai_reasoning[index].encrypted_content = literalSecretsRedacted(item.encrypted_content, secrets);
   });
+  // DeepSeek reasoning_content is plain model text that DeepSeek accepts back
+  // as an empty string. When redaction would change it, withhold it whole
+  // rather than persist a placeholder: the secret never reaches disk, and a
+  // continuation replays an honest empty reasoning instead of the job
+  // becoming unreplayable over a false-positive match in ordinary code.
+  if (typeof message.reasoning_content === 'string' && stored.reasoning_content !== message.reasoning_content)
+    stored.reasoning_content = '';
   return stored;
 }
 function validStoredReadStat(details, cap) {
@@ -602,9 +609,8 @@ export class JobStore {
       const stored = storedMessages[index];
       return (
         message?.role === 'assistant' &&
-        ((typeof message.reasoning_content === 'string' && stored?.reasoning_content !== message.reasoning_content) ||
-          (message.anthropic_content !== undefined &&
-            JSON.stringify(stored?.anthropic_content) !== JSON.stringify(message.anthropic_content)) ||
+        ((message.anthropic_content !== undefined &&
+          JSON.stringify(stored?.anthropic_content) !== JSON.stringify(message.anthropic_content)) ||
           (message.openai_reasoning !== undefined && JSON.stringify(stored?.openai_reasoning) !== JSON.stringify(message.openai_reasoning)))
       );
     });

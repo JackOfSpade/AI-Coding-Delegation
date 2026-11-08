@@ -1773,6 +1773,23 @@ test('a report job shows its fixed finish problems and a salvaged report is flag
   );
   assert.match(plain, /next: read reportResult/);
   assert.doesNotMatch(compactReport({ id: 'r3', mode: 'report', status: 'FAILED', reportSalvage: 'bogus' }), /report salvaged/);
+  const truncated = compactReport({
+    id: 'r4',
+    mode: 'report',
+    status: 'FAILED',
+    failureKind: 'output-cap',
+    reportSalvage: 'truncated-finish',
+  });
+  assert.match(
+    truncated,
+    /^report salvaged: the finish call was cut off by the output cap; reportResult\.text holds the drafted report up to the cut, unreviewed and possibly incomplete$/m,
+  );
+  assert.match(truncated, /next: read reportResult/);
+  assert.match(
+    compactReport({ id: 'w1', status: 'DONE_VERIFIED', malformedToolFinish: true }),
+    /^worker stop: the provider ended on malformed tool-call JSON; the server verifier passed/m,
+  );
+  assert.doesNotMatch(compactReport({ id: 'w2', status: 'DONE_VERIFIED' }), /malformed tool-call JSON/);
   const failed = compactReport({ ...base, status: 'FAILED', failureKind: 'finish-protocol', error: FAILURE_ERRORS['finish-protocol'] });
   assert.match(failed, /^finish protocol: /m);
   assert.doesNotMatch(failed, /report salvaged/);

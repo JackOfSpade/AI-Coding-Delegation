@@ -4607,7 +4607,7 @@ test('a write job finish-protocol violation on its last turn is unchanged by rep
   assert.equal(result.reportSalvage, undefined);
 });
 
-test('a capped report finalization turn continues without reporting an output-cap diagnostic', async () => {
+test('a capped report finalization turn gets one finish-only retry for a shorter report', async () => {
   const rates = { peak: 1, off_peak: 1 };
   const pricing = { models: { mock: { usd_per_1m: { input_cache_hit: rates, input_cache_miss: rates, output: rates } } } };
   const findings = 'Evidence from the survey. '.repeat(4800);
@@ -4633,13 +4633,19 @@ test('a capped report finalization turn continues without reporting an output-ca
     toolDefinitions: availableToolDefinitions({ readOnly: true }),
     tools: { execute: async (name, args) => (name === 'finish' ? { finish: args } : findings) },
   }).run({ task: 'Survey the repository' });
-  // Finalization never sends the continuation: the next turn ends the round.
-  assert.equal(result.status, 'BUDGET');
-  assert.equal(result.error, 'Report finalization did not finish');
-  assert.equal(requests.length, 2);
+  // The finalization's capped response earns the one reserved retry, which
+  // asks for a shorter finish with the finish tool alone.
+  assert.equal(result.status, 'DONE');
+  assert.equal(result.finish.report, 'Saved survey findings.');
+  assert.equal(requests.length, 3);
   assert.ok(progress.some((event) => event.action === 'report_budget_finalize'));
-  assert.ok(progress.some((event) => event.action === 'provider_output_capped_continue'));
-  assert.ok(!progress.some((event) => Object.hasOwn(event, 'outputCap')));
+  assert.ok(progress.some((event) => event.action === 'report_finalize_cap_retry' && event.outputCap?.recovered === true));
+  assert.ok(!progress.some((event) => event.action === 'provider_output_capped_continue'));
+  assert.deepEqual(
+    requests[2].tools.map((tool) => tool.function.name),
+    ['finish'],
+  );
+  assert.match(requests[2].messages.at(-1).content, /cut off by the output cap/);
 });
 
 test('report uses its last allowed turn to finish even with unlimited USD', async () => {

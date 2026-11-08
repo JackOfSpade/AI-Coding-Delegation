@@ -30,7 +30,9 @@ export const validTruncatedToolCall = (value) =>
   value.name.length <= 128 &&
   Number.isSafeInteger(value.chars) &&
   value.chars >= 0 &&
-  value.chars <= MAX_TOOL_ARGUMENT_CHARS;
+  value.chars <= MAX_TOOL_ARGUMENT_CHARS &&
+  (value.partial === undefined ||
+    (value.name === 'finish' && typeof value.partial === 'string' && value.partial.length <= MAX_TOOL_ARGUMENT_CHARS));
 
 /** The steer for a capped, tool-less turn, given the advertised tool the dropped call named (if any). */
 export function outputCapSteer(truncated) {
@@ -69,9 +71,18 @@ const PARTS = `${INCREMENTAL_WRITE_BYTES / 1024} KB`;
  * `status` is the job's: advice about what may still happen is given only
  * while a round can act on it, and a finished job gets what happened.
  */
-export function outputCapAdvice(cap, status = 'RUNNING') {
+export function outputCapAdvice(cap, status = 'RUNNING', mode) {
   const safe = safeOutputCap(cap);
   if (!safe) return undefined;
+  // A report worker has no file writes and cannot be continued: its only
+  // recovery is the one shorter finish its finalization requests.
+  if (mode === 'report') {
+    const cut = `Turn ${safe.turn} hit the provider output cap${safe.tool ? ` inside ${safe.tool === 'finish' ? 'the report' : 'a'} ${safe.tool} call of about ${kb(safe.chars ?? 0)}, which was not run` : ' before any tool call ran'}.`;
+    const told = safe.recovered ? ' The worker was asked once for a shorter finish.' : ' No turn was left for a shorter finish.';
+    if (status === 'FAILED')
+      return `${cut}${told} Any drafted report up to the cut is in reportResult.text (report salvaged line); otherwise start a fresh, narrower report job.`;
+    return `${cut}${told}`;
+  }
   const article = safe.tool === 'edit_file' ? 'an' : 'a';
   const what =
     safe.steer === 'continue'
@@ -100,7 +111,7 @@ export function outputCapAdvice(cap, status = 'RUNNING') {
 /** The diagnostic a caller should see, with advice for the job's status. */
 export function outputCapView(job) {
   const safe = safeOutputCap(job?.outputCap);
-  return safe ? { ...safe, advice: outputCapAdvice(safe, job?.status) } : undefined;
+  return safe ? { ...safe, advice: outputCapAdvice(safe, job?.status, job?.mode) } : undefined;
 }
 
 export function outputCapLine(job) {

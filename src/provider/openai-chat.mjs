@@ -65,6 +65,17 @@ export class ProviderError extends Error {
   }
 }
 
+/**
+ * A complete, billed response whose streamed tool-call JSON did not parse
+ * (DeepSeek Flash emits this on large writes). Closed list of the adapters'
+ * own reason slugs: the response was not ambiguous, only malformed.
+ */
+export const MALFORMED_TOOL_JSON_REASONS = Object.freeze(
+  new Set(['incomplete_tool_json', 'incomplete_anthropic_tool_json', 'incomplete_tool_call_missing_id_or_function_name']),
+);
+export const isMalformedToolJsonFailure = (failure) =>
+  !!failure && failure.kind === 'response' && MALFORMED_TOOL_JSON_REASONS.has(failure.reason);
+
 export function providerFailure(error) {
   if (!(error instanceof ProviderError)) return undefined;
   const result = { kind: error.kind, retryable: error.retryable === true };
@@ -429,7 +440,7 @@ function* chatResponseEvents(chunks, { openai, requestModel }) {
       }
     if (complete) toolCalls.push(call);
     else if (providerFinishReason === 'length')
-      truncatedToolCall = largerTruncation(truncatedToolCall, call.name, (call.arguments || '').length);
+      truncatedToolCall = largerTruncation(truncatedToolCall, call.name, (call.arguments || '').length, call.arguments);
     // An output cap can cut a tool call mid-arguments. That is a completed,
     // billed `length` response, not a malformed one: drop the unexecutable
     // fragment and let the loop's output-cap recovery see the finish reason.

@@ -91,6 +91,23 @@ test('Chat: a length stop that cuts write_file yields one truncatedToolCall with
   assert.deepEqual(events.at(-1), { providerFinishReason: 'length' });
 });
 
+test('Chat: a length stop that cuts finish keeps its partial arguments for report salvage', async () => {
+  const partial = '{"summary":"s","report":"Finding one\\nFinding tw';
+  const events = await drain(
+    openai(async () =>
+      sse(
+        toolDelta(0, { id: 'call_f', function: { name: 'finish', arguments: partial.slice(0, 12) } }),
+        toolDelta(0, { function: { arguments: partial.slice(12) } }),
+        finishChunk('length'),
+        usageChunk,
+        '[DONE]',
+      ),
+    ),
+  );
+  assert.deepEqual(truncatedEvents(events), [{ truncatedToolCall: { name: 'finish', chars: partial.length, partial } }]);
+  assert.deepEqual(events.at(-1), { providerFinishReason: 'length' });
+});
+
 test('Chat: with two truncated calls the larger one is reported', async () => {
   const small = '{"path":"s"';
   const large = '{"path":"big.js","content":"' + 'x'.repeat(500);

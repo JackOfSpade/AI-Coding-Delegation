@@ -418,7 +418,7 @@ export class AnthropicMessagesProvider {
             // billed `length` response, not a malformed one: drop the
             // unexecutable fragment and let output-cap recovery see the reason.
             if (stop === 'length') {
-              truncatedToolCall = largerTruncation(truncatedToolCall, block.name, (block.input || '').length);
+              truncatedToolCall = largerTruncation(truncatedToolCall, block.name, (block.input || '').length, block.input);
               continue;
             }
             throw new ProviderError('Incomplete Anthropic tool JSON', { kind: 'response' });

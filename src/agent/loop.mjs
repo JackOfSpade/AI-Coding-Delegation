@@ -11,7 +11,14 @@ import {
 } from './tools.mjs';
 import { budgetNotice, budgetOutlook } from '../budget-outlook.mjs';
 import { Meter, resolveModel, samePricedModel } from '../pricing.mjs';
-import { OpenAIChatProvider, PROVIDER_FINISH_REASONS, ProviderError, providerFailure } from '../provider/openai-chat.mjs';
+import {
+  OpenAIChatProvider,
+  PROVIDER_FINISH_REASONS,
+  ProviderError,
+  isMalformedToolJsonFailure,
+  providerFailure,
+} from '../provider/openai-chat.mjs';
+import { extractPartialStringField } from '../partial-json.mjs';
 import { FAILURE_ERRORS, isWallTimeout, summarizeToolFailure, toolErrorHint } from '../failure.mjs';
 import { MAX_BATCH_COMMAND_SEC } from '../timing.mjs';
 import { anthropicContentMatchesAssistant, cloneAnthropicContent, validAnthropicContent } from '../anthropic-content.mjs';
@@ -85,6 +92,13 @@ const CAPPED_IMPLEMENTATION_RECOVERY_REMINDER = 'Continue implementation using a
 const BUDGET_FINISH_RECOVERY_MESSAGE = 'Call the finish tool now.';
 const REPORT_FINISH_MESSAGE =
   'The report budget is nearly exhausted. Stop reading now. Call finish as the sole tool call with a detailed report of findings already gathered, including uncertainties and unfinished work. Limits: summary is 1-2 sentences, at most 1500 characters; everything else goes in report, even if incomplete; concerns and testsRun are arrays of short strings.';
+// The one retry a report finalization gets when the output cap cut its finish.
+const REPORT_FINISH_SHORTER_MESSAGE =
+  'Your finish call was cut off by the output cap and was not run. Call finish again now as the sole tool call with a shorter report (at most about 8000 characters): most important findings first, no further reading, no long reasoning. summary is 1-2 sentences.';
+// A malformed tool-call response is retried this many times per run, never twice in a row.
+const MAX_MALFORMED_TOOL_JSON_RETRIES = 3;
+const MALFORMED_TOOL_JSON_NOTE =
+  'TOOL_ERROR: your last response had a tool call with invalid JSON arguments, so nothing in it was run. Send the tool call again with valid, properly escaped JSON. For a large file, write it in smaller parts (about 150 lines per call) with write_file then edit_file.';
 const SALVAGE_CONCERN_LIMIT = 99;
 const SALVAGE_PROBLEM_FIELDS = [
   ['summary', 'summary was missing or longer than 1500 characters'],
@@ -533,6 +547,16 @@ export class AgentLoop {
     await Promise.all(reads);
     return result;
   }
+  /**
+   * Raise the live turn allowance mid-run (a credit hop to a route that needs
+   * more turns). The caller has already made the raised cap durable. Bounded
+   * by the same 1000-turn ceiling as the constructor's maxTurns.
+   */
+  extendTurns(extra) {
+    if (!Number.isSafeInteger(extra) || extra < 1) return;
+    this.maxTurns = Math.min(1000, this.maxTurns + extra);
+  }
+
   async run({ system, task, messages } = {}) {
     if (messages !== undefined && !Array.isArray(messages)) throw new TypeError('messages must be an array');
     if (system !== undefined && typeof system !== 'string') throw new TypeError('system must be a string');
@@ -596,6 +620,11 @@ export class AgentLoop {
     // violation is the worker's, not a fluke, and ends the round.
     let finishProtocolRecoveryUsed = false;
     let finishArgumentCorrections = 0;
+    // Report finalization runs one turn before the cap so that a finish the
+    // output cap cuts off still has a turn for one shorter retry.
+    let reportFinalizeRetry; // undefined | 'pending' | 'used'
+    let malformedToolJsonRetries = 0;
+    let malformedToolJsonPrevious = false;
     // A report worker's most recent rejected finish that carried a usable
     // drafted report, with the fixed problems of that turn. A round that then
     // fails on finish-protocol keeps this draft instead of discarding it.
@@ -684,7 +713,30 @@ export class AgentLoop {
         ...(providerFinishReason !== undefined ? { providerFinishReason } : {}),
       };
     };
-    const outcome = (status, turn, extra = {}) => ({ status, turn, usage: totalUsage, costUsd: this.meter.usd, ...extra, ...modelMeta() });
+    // A report finish the output cap cut off, kept while its one shorter retry
+    // is pending: any exit other than a finish or a stop then keeps that draft.
+    let pendingTruncatedReport;
+    const withPendingDraft = (status, extra) =>
+      pendingTruncatedReport === undefined ||
+      status === 'DONE' ||
+      status === 'CANCELLED' ||
+      status === 'STOPPED' ||
+      extra.report !== undefined
+        ? { status, extra }
+        : {
+            status: 'FAILED',
+            extra: {
+              ...extra,
+              failureKind: 'output-cap',
+              error: FAILURE_ERRORS['output-cap'],
+              report: clipSalvagedReport(pendingTruncatedReport),
+              reportSalvage: 'truncated-finish',
+            },
+          };
+    const outcome = (rawStatus, turn, rawExtra = {}) => {
+      const { status, extra } = withPendingDraft(rawStatus, rawExtra);
+      return { status, turn, usage: totalUsage, costUsd: this.meter.usd, ...extra, ...modelMeta() };
+    };
     // responseModel is block-scoped to the turn loop, so it is passed in.
     const responseOutcome = (status, turn, model, extra = {}) =>
       outcome(status, turn, { pricingKnown: !this.meter.unknownPricing, model, ...extra });
@@ -734,8 +786,10 @@ export class AgentLoop {
         // Keep half the remaining allowance for synthesizing findings. A
         // report transcript is ephemeral, so a later continuation cannot
         // recover this reading. Spend the last logical turn on finish only.
-        if (reportFinalizationUsed)
+        if (reportFinalizationUsed && reportFinalizeRetry !== 'pending')
           return outcome('BUDGET', turn - 1, { error: 'Report finalization did not finish', budgetCap: 'reservation' });
+        const reportFinalizeRetryTurn = reportFinalizeRetry === 'pending';
+        if (reportFinalizeRetryTurn) reportFinalizeRetry = 'used';
         const reportReadReservation =
           this.reportMode && this.maxUsd !== Infinity
             ? reserveRequestBudget(
@@ -746,9 +800,11 @@ export class AgentLoop {
                 (this.maxUsd - this.meter.usd) / 2,
               )
             : undefined;
+        const lastReadTurn = this.maxTurns >= 3 ? this.maxTurns - 1 : this.maxTurns;
         const reportFinalizing =
           this.reportMode &&
-          (turn === this.maxTurns ||
+          !reportFinalizationUsed &&
+          (turn >= lastReadTurn ||
             (this.maxUsd !== Infinity && (!reportReadReservation || reportReadReservation.maxTokens < MAX_FINITE_REQUEST_OUTPUT_TOKENS)));
         if (reportFinalizing) {
           reportFinalizationUsed = true;
@@ -774,7 +830,7 @@ export class AgentLoop {
         const forcedBudgetFinishRecovery = budgetFinishRecovery && forcedFocusCapable;
         const nonThinkingDeepSeekReplay = deepSeekNonThinkingReplay && forcedFocusCapable;
         let activeToolDefinitions =
-          budgetFinishRecovery || reportFinalizing
+          budgetFinishRecovery || reportFinalizing || reportFinalizeRetryTurn
             ? this.toolDefinitions.filter((tool) => tool.function.name === 'finish')
             : this.toolDefinitions;
         let activeToolNames = new Set(activeToolDefinitions.map((tool) => tool.function.name));
@@ -923,7 +979,7 @@ export class AgentLoop {
               : (maxTokens ??
                 (forcedImplementationFocus ? Math.min(reservation.maxTokens, MAX_FINITE_REQUEST_OUTPUT_TOKENS) : reservation.maxTokens));
         }
-        if (reportReadReservation && !reportFinalizing)
+        if (reportReadReservation && !reportFinalizing && !reportFinalizeRetryTurn)
           maxTokens = Math.min(maxTokens ?? MAX_REQUEST_OUTPUT_TOKENS, reportReadReservation.maxTokens);
         try {
           // A request can spend its whole provider-attempt timeout without a
@@ -1018,7 +1074,11 @@ export class AgentLoop {
             }
             // Diagnostic only: a dropped fragment is never executed or replayed.
             if (event.truncatedToolCall !== undefined && (!truncatedToolCall || event.truncatedToolCall.chars > truncatedToolCall.chars))
-              truncatedToolCall = { name: event.truncatedToolCall.name, chars: event.truncatedToolCall.chars };
+              truncatedToolCall = {
+                name: event.truncatedToolCall.name,
+                chars: event.truncatedToolCall.chars,
+                ...(typeof event.truncatedToolCall.partial === 'string' ? { partial: event.truncatedToolCall.partial } : {}),
+              };
             // Adapters must emit one normalized, terminal tool-call event.  In
             // particular, never accept a later event that silently replaces a
             // previously authorized call list from a custom provider.
@@ -1089,6 +1149,32 @@ export class AgentLoop {
           if (deadline.signal.aborted) return outcome('TIMEOUT', turn - 1, { error: 'Agent wall clock deadline exceeded' });
           if (error instanceof ProviderError) {
             const failure = providerFailure(error);
+            // A complete, metered response whose tool-call JSON did not parse
+            // is not an ambiguous replay: nothing from it is kept or run. One
+            // fresh request on the unchanged transcript plus a fixed note
+            // costs an ordinary turn; a second malformed response in a row is
+            // terminal, as are the fail-closed finish recoveries.
+            const retryMalformedToolJson =
+              isMalformedToolJsonFailure(failure) &&
+              usageRecords === 1 &&
+              !unauthorizedResponseModel &&
+              !modelConflict &&
+              !malformedToolJsonPrevious &&
+              malformedToolJsonRetries < MAX_MALFORMED_TOOL_JSON_RETRIES &&
+              turn < this.maxTurns &&
+              !budgetFinishRecovery &&
+              cappedFinishRecoveryState !== 'consumed' &&
+              (!reportFinalizationUsed || (reportFinalizeRetry === undefined && turn < this.maxTurns));
+            if (retryMalformedToolJson) {
+              malformedToolJsonRetries++;
+              malformedToolJsonPrevious = true;
+              // A report finalization keeps its one retry turn for this.
+              if (reportFinalizationUsed) reportFinalizeRetry = 'pending';
+              this.context.add({ role: 'user', content: MALFORMED_TOOL_JSON_NOTE });
+              await this.context.flush();
+              await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'provider_malformed_tool_json_retry' });
+              continue;
+            }
             return outcome(failure?.kind === 'attempt_timeout' ? 'TIMEOUT' : 'FAILED', turn - 1, {
               pricingKnown: !this.meter.unknownPricing,
               error: error.message,
@@ -1097,6 +1183,8 @@ export class AgentLoop {
           }
           throw error;
         }
+        // This response's tool calls parsed, so a later malformed one may be retried again.
+        malformedToolJsonPrevious = false;
         if (toolCallRecords > 1)
           return responseOutcome('FAILED', turn, responseModel, { error: 'Provider yielded multiple tool-call events in one turn' });
         // Duplicate usage is never coherent, even without a configured spend
@@ -1202,6 +1290,30 @@ export class AgentLoop {
           // and trusted reminder before that next paid call; an interrupted
           // persistence window fails closed. The following request keeps the
           // normal tool schema and any existing DeepSeek non-thinking replay.
+          // A report finalization whose finish the output cap cut off gets
+          // the one turn reserved for it: the paid response is kept and a
+          // fixed request for a shorter finish follows, finish-only again.
+          if (
+            this.reportMode &&
+            reportFinalizationUsed &&
+            reportFinalizeRetry === undefined &&
+            providerFinishReason === 'length' &&
+            usageRecords === 1 &&
+            turn < this.maxTurns
+          ) {
+            reportFinalizeRetry = 'pending';
+            pendingTruncatedReport = cappedCall?.name === 'finish' ? extractPartialStringField(cappedCall.partial, 'report') : undefined;
+            await this.context.addBatch([assistant, { role: 'user', content: REPORT_FINISH_SHORTER_MESSAGE }]);
+            await this.context.flush();
+            await this.progress?.({
+              turn,
+              usage: totalUsage,
+              costUsd: this.meter.usd,
+              action: 'report_finalize_cap_retry',
+              outputCap: outputCapFor(true),
+            });
+            continue;
+          }
           const cappedFinishRecovery =
             directWriteSucceeded &&
             !cappedFinishRecoveryUsed &&
@@ -1339,10 +1451,18 @@ export class AgentLoop {
           // when no recovery turn was available (no finite budget, the last
           // turn, or the one-shot already spent): its continuation must say
           // to write in parts, not merely to call finish.
+          // A report finish cut off by the cap with no retry left still holds
+          // its drafted report up to the cut: keep that, unreviewed and
+          // incomplete, rather than lose the whole result with the spend.
+          const truncatedReport =
+            this.reportMode && providerFinishReason === 'length' && cappedCall?.name === 'finish'
+              ? extractPartialStringField(cappedCall.partial, 'report')
+              : undefined;
           const outputCapRecoveryExhausted =
-            usageRecords === 1 &&
-            providerFinishReason === 'length' &&
-            (((cappedReasoningContinuationUsed || cappedFinishRecoveryUsed) && maxTokens !== undefined) || capSteer !== 'continue');
+            truncatedReport !== undefined ||
+            (usageRecords === 1 &&
+              providerFinishReason === 'length' &&
+              (((cappedReasoningContinuationUsed || cappedFinishRecoveryUsed) && maxTokens !== undefined) || capSteer !== 'continue'));
           this.context.add(assistant);
           await this.context.flush();
           await settleCappedImplementationRecovery();
@@ -1357,13 +1477,15 @@ export class AgentLoop {
             error: outputCapRecoveryExhausted ? FAILURE_ERRORS['output-cap'] : FAILURE_ERRORS['no-finish'],
             text,
             // The worker's last complete prose is kept, unreviewed, rather than lost with the spend; a cut-off or filtered stop is not.
-            ...(this.reportMode &&
-            providerFinishReason !== 'content_filter' &&
-            providerFinishReason !== 'length' &&
-            !outputCapRecoveryExhausted &&
-            text.trim()
-              ? { report: clipSalvagedReport(text), reportSalvage: 'plain-text' }
-              : {}),
+            ...(truncatedReport !== undefined
+              ? { report: clipSalvagedReport(truncatedReport), reportSalvage: 'truncated-finish' }
+              : this.reportMode &&
+                  providerFinishReason !== 'content_filter' &&
+                  providerFinishReason !== 'length' &&
+                  !outputCapRecoveryExhausted &&
+                  text.trim()
+                ? { report: clipSalvagedReport(text), reportSalvage: 'plain-text' }
+                : {}),
           });
         }
         let parsed;

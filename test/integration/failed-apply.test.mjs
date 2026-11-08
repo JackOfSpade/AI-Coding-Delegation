@@ -813,6 +813,67 @@ test('provider failure verifies an audited retained diff before reporting withou
   }
 });
 
+test('a malformed tool-JSON stop finishes DONE_VERIFIED and integrates only when the server verifier passes', async () => {
+  // Field job 16516805: Flash ended on incomplete_tool_json after its retry;
+  // the verifier passed 11/11, yet the job was FAILED and applied by hand.
+  for (const pass of [true, false]) {
+    const h = await harness({
+      worker: async (job) => {
+        writeSrc(job, 'a.js', A_BYTES);
+        return {
+          status: 'FAILED',
+          turns: 57,
+          costUsd: 0.05,
+          providerFailure: { kind: 'response', reason: 'incomplete_tool_json', retryable: false },
+        };
+      },
+      check: (command) => ({
+        command,
+        verdict: pass ? 'PASS' : 'FAIL',
+        result: { code: pass ? 0 : 1, sandbox: 'macos', stdout: pass ? '11/11 ok' : '10/11 ok', stderr: '' },
+      }),
+    });
+    try {
+      const { id, done } = await h.begin({ testCommand: 'node check.js', budget: { maxUsd: 6 } });
+      assert.equal(h.counters.runs, 1, 'never queues a repair round');
+      assert.equal(h.counters.checks.length, 1);
+      if (pass) {
+        assert.equal(done.status, 'DONE_VERIFIED');
+        assert.equal(existsSync(join(h.repo, 'src/a.js')), true, 'integrated like a normal verified finish');
+        assert.match(done.report, /malformed tool-call JSON; the server verifier passed/);
+        const stored = await h.store.get(id);
+        assert.equal(stored.malformedToolFinish, true);
+        assert.equal(stored.error, undefined);
+        assert.ok(stored.concerns.some((concern) => /malformed tool-call JSON/.test(concern)));
+        assert.equal(stored.providerFailure.reason, 'incomplete_tool_json', 'the evidence is kept');
+      } else {
+        assert.equal(done.status, 'FAILED');
+        assert.equal(existsSync(join(h.repo, 'src/a.js')), false);
+        assert.doesNotMatch(done.report, /server verifier passed/);
+      }
+    } finally {
+      cleanup(h.repo);
+    }
+  }
+});
+
+test('other provider response failures are not promoted on a passing verifier', async () => {
+  const h = await harness({
+    worker: async (job) => {
+      writeSrc(job, 'a.js', A_BYTES);
+      return { status: 'FAILED', providerFailure: { kind: 'response', reason: 'invalid_sse_usage', retryable: false } };
+    },
+    check: (command) => ({ command, verdict: 'PASS', result: { code: 0, sandbox: 'macos', stdout: 'ok', stderr: '' } }),
+  });
+  try {
+    const { done } = await h.begin({ testCommand: 'node check.js' });
+    assert.equal(done.status, 'FAILED');
+    assert.equal(existsSync(join(h.repo, 'src/a.js')), false);
+  } finally {
+    cleanup(h.repo);
+  }
+});
+
 test('provider failure never runs a verifier on empty or out-of-scope output', async () => {
   for (const outside of [false, true]) {
     const h = await harness({
@@ -907,6 +968,52 @@ test('fixed assertion pass enforces file and USD boundaries on the worker', asyn
     } finally {
       cleanup(h.repo);
     }
+  }
+});
+
+test('a credit hop to Flash never widens a fixed assertion-repair allowance', async () => {
+  const route = (type, baseUrl, keyRef, model) => ({ type, baseUrl, keyRef, model });
+  const sonnet = route('anthropic-messages', 'https://api.anthropic.com', 'env:anthropic', 'claude-sonnet-5-5');
+  const flash = route('openai-chat', 'https://api.deepseek.com', 'env:deepseek', 'deepseek-flash');
+  const executionProfile = {
+    ...route('openai-chat', 'https://api.openai.com/v1', 'env:openai', 'gpt-6.1-terra'),
+    fallback: sonnet,
+    fallbacks: [sonnet, flash],
+  };
+  const hops = [];
+  const h = await harness({
+    check: red,
+    worker: async (job, round, api) => {
+      writeSrc(job, 'a.js', A_BYTES);
+      if (round === 1) return failedProtocol({ costUsd: 1 });
+      hops.push(await api.progress({ action: 'provider_credit_fallback', providerStage: 2, creditFallback: true }));
+      return { status: 'DONE', turns: 1, costUsd: 0.1 };
+    },
+  });
+  try {
+    const { id } = await h.begin({ budget: { maxUsd: 3 }, executionProfile });
+    // An automatically sized record that a Flash hop would otherwise scale.
+    await h.store.update(id, {
+      budgetSizing: {
+        maxTurns: 80,
+        turnsSource: 'default',
+        initialTurnsSource: 'default',
+        turnPolicy: 'auto',
+        recommendedTurns: 44,
+        files: [],
+        warnings: [],
+      },
+    });
+    await h.manager.apply(id, { apply: true, applyThenVerify: 'node check.js' });
+    await h.manager.repair(id, ['src/a.js: fix expected value'], { assertionPaths: ['src/a.js'] });
+    const fixedCap = (await h.store.get(id)).budget.maxTurns;
+    await h.settle(id);
+    assert.deepEqual(hops, [undefined], 'no extra turns reach the worker');
+    const done = await h.store.get(id);
+    assert.equal(done.budget.maxTurns, fixedCap);
+    assert.equal(done.providerStage, 2, 'the hop itself is still recorded');
+  } finally {
+    cleanup(h.repo);
   }
 });
 
@@ -1302,7 +1409,7 @@ test('a job the apply would refuse says so when it finishes, and the refusal nam
     const dry = await h.manager.apply(id);
     assert.deepEqual(dry.scratchFiles, { total: 1, paths: ['src/_tmp_edit/rep.mjs'] });
 
-    const record = await h.manager.store.get(id);
+    const record = await h.store.get(id);
     await h.manager.store.update(id, { revertFiles: [...record.revertFiles, record.revertFiles[0]] });
     const blocked = await h.manager.job(id);
     assert.match(blocked.applyBlocker, /is listed twice/);

@@ -419,6 +419,8 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         if (job.budgetFinishRecovery !== undefined && !['queued', 'consumed'].includes(job.budgetFinishRecovery))
           throw new Error('stored job has invalid budget finish recovery state');
         const execution = job.executionProfile;
+        // Assigned once the loop exists; a credit hop can only fire during its run.
+        let loop;
         // Accepted jobs contain their resolved execution and budget snapshot. A
         // detached child must not require a still-valid mutable config/repo file.
         const loaded = execution ? null : loadRepoConfig(job.repoPath);
@@ -469,7 +471,13 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           provider = new CreditFallbackProvider({
             routes,
             stage,
-            onTransition: (toStage) => api.progress({ action: 'provider_credit_fallback', providerStage: toStage, creditFallback: true }),
+            onTransition: async (toStage) => {
+              const raised = await api.progress({ action: 'provider_credit_fallback', providerStage: toStage, creditFallback: true });
+              // A hop to DeepSeek Flash raises an automatically sized turn cap;
+              // the manager made it durable before returning the increment.
+              if (loop && Number.isSafeInteger(raised?.extraTurns) && raised.extraTurns > 0 && raised.extraTurns <= 1000)
+                loop.extendTurns(raised.extraTurns);
+            },
           });
         }
         // A queued job is an immutable execution request.  In particular, do not
@@ -559,7 +567,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           };
         if (remainingTimeoutMs < 1) return { status: 'TIMEOUT', turn: 0, costUsd: 0, usage: {}, error: 'Cumulative job timeout exhausted' };
         const serverVerifierConfigured = job.mode !== 'report' && typeof job.testCommand === 'string' && job.testCommand.trim().length > 0;
-        const loop = new AgentLoop({
+        loop = new AgentLoop({
           provider,
           tools,
           toolDefinitions: availableToolDefinitions({

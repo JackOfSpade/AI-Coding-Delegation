@@ -363,6 +363,9 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     !reportMode && terminal.has(job.status) && testAssertionLines(job.testAssertionChanges, lean),
     job.retainedDiffRecovery === true &&
       'worker stop: verification attempted on retained diff after transcript redaction; provider replay and automatic repair were suppressed',
+    !reportMode &&
+      job.malformedToolFinish === true &&
+      'worker stop: the provider ended on malformed tool-call JSON; the server verifier passed on the retained diff, so the job finished without a finish call (no worker summary or testsRun)',
     baselineDiff,
     durationWarnings,
     environment,
@@ -411,6 +414,8 @@ function reportSalvagedLine(job) {
     }; reportResult.text holds the drafted report, unreviewed`;
   if (job.reportSalvage === 'plain-text')
     return 'report salvaged: the worker ended in plain text without calling finish; reportResult.text holds its last message, unreviewed';
+  if (job.reportSalvage === 'truncated-finish')
+    return 'report salvaged: the finish call was cut off by the output cap; reportResult.text holds the drafted report up to the cut, unreviewed and possibly incomplete';
   return '';
 }
 const reportModeOf = (job) => job?.mode === 'report';

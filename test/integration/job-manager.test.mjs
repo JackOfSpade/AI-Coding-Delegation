@@ -329,7 +329,7 @@ test('provider failure classification is durable and replaces an injected raw er
   assert.deepEqual(finished.providerFailure, { kind: 'attempt_timeout', attempts: 1, timeoutMs: 300_000 });
   assert.doesNotMatch(JSON.stringify(finished), /secret\.invalid|must-not-persist/i);
 });
-test('redacted durable reasoning blocks detached resume and repair before a worker can invoke a provider', async () => {
+test('redacted Anthropic thinking blocks detached resume and repair before a worker can invoke a provider', async () => {
   let runs = 0;
   const m = await manager({
     run: async (_job, api) => {
@@ -339,8 +339,11 @@ test('redacted durable reasoning blocks detached resume and repair before a work
           {
             role: 'assistant',
             content: '',
-            reasoning_content: 'credential sk-abcdefghijklmnop',
             tool_calls: [{ id: 'read-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"src/a.mjs"}' } }],
+            anthropic_content: [
+              { type: 'thinking', thinking: 'credential sk-abcdefghijklmnop', signature: 'signed-thought' },
+              { type: 'tool_use', id: 'read-1', name: 'read_file', input: '{"path":"src/a.mjs"}' },
+            ],
           },
           { role: 'tool', tool_call_id: 'read-1', content: 'READ: src/a.mjs' },
         ]);
@@ -369,8 +372,11 @@ test('redacted durable reasoning blocks detached resume and repair before a work
     {
       role: 'assistant',
       content: '',
-      reasoning_content: 'credential sk-abcdefghijklmnop',
       tool_calls: [{ id: 'read-2', type: 'function', function: { name: 'read_file', arguments: '{"path":"src/b.mjs"}' } }],
+      anthropic_content: [
+        { type: 'thinking', thinking: 'credential sk-abcdefghijklmnop', signature: 'signed-thought' },
+        { type: 'tool_use', id: 'read-2', name: 'read_file', input: '{"path":"src/b.mjs"}' },
+      ],
     },
     { role: 'tool', tool_call_id: 'read-2', content: 'READ: src/b.mjs' },
   ]);
@@ -380,6 +386,42 @@ test('redacted durable reasoning blocks detached resume and repair before a work
   assert.equal(resumed.status, 'FAILED');
   assert.match((await m.store.get(queued.jobId)).error, /reasoning is unavailable for safe provider replay/);
   assert.equal(runs, 1, 'detached resume must fail before worker/provider invocation');
+});
+test('redacted DeepSeek reasoning is withheld and keeps the job repairable', async () => {
+  // Field jobs 29eff105/579eb2c2/7d3843e9: Flash reasoning about JSX
+  // `key={...}` or `next_page_token=` was redacted and blocked every repair.
+  let runs = 0;
+  const replayed = [];
+  const m = await manager({
+    run: async (job, api) => {
+      runs += 1;
+      if (runs === 1) {
+        await api.appendMessages([
+          {
+            role: 'assistant',
+            content: '',
+            reasoning_content: 'the url has next_page_token=abc123def and credential sk-abcdefghijklmnop',
+            tool_calls: [{ id: 'read-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"src/a.mjs"}' } }],
+          },
+          { role: 'tool', tool_call_id: 'read-1', content: 'READ: src/a.mjs' },
+        ]);
+        return { status: 'FAILED', turns: 1 };
+      }
+      replayed.push(...(await m.store.readMessages(job.id)));
+      return { status: 'DONE', turns: 1, summary: 'continued' };
+    },
+  });
+  const started = await m.start({ task: 'redacted reasoning', ownedPaths: ['src/**'], repoPath: process.cwd() });
+  const failed = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
+  assert.equal(failed.status, 'FAILED');
+  const persisted = await m.store.get(started.jobId);
+  assert.equal(persisted.transcriptReplayable, true);
+  assert.doesNotMatch(JSON.stringify(persisted), /sk-abcdefghijklmnop|abc123def/);
+  await m.repair(started.jobId, ['continue safely']);
+  await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
+  assert.equal(runs, 2, 'the repair reached the worker');
+  assert.equal(replayed[0].reasoning_content, '');
+  assert.doesNotMatch(JSON.stringify(replayed), /sk-abcdefghijklmnop|abc123def|\[REDACTED\]/);
 });
 test('provider finish reasons persist as closed diagnostics and clear for repair', async () => {
   const raw = 'provider-secret-reason';
@@ -3971,6 +4013,84 @@ test('an explicit credit exhaustion starts later jobs on the next route for the 
   await settle(later.jobId);
   const fresh = Object.fromEntries((await m.job(undefined, { all: true })).jobs.map((row) => [row.jobId, row.activeRoute]));
   assert.deepEqual(fresh[later.jobId], { stage: 0, of: 3, model: 'gpt-6.1-sol' });
+});
+
+test('a Flash route scales an automatic turn cap: at a cool-down start and at a mid-job credit hop', async () => {
+  // Field session: Flash jobs stopped at 80/80 turns with cents of $3-$5 spent.
+  const route = (type, baseUrl, keyRef, model) => ({ type, baseUrl, keyRef, model });
+  const terra = route('openai-chat', 'https://api.openai.com/v1', 'env:openai', 'gpt-6.1-terra'),
+    sonnet = route('anthropic-messages', 'https://api.anthropic.com', 'env:anthropic', 'claude-sonnet-5-5'),
+    flash = route('openai-chat', 'https://api.deepseek.com', 'env:deepseek', 'deepseek-flash');
+  const executionProfile = { ...terra, fallback: sonnet, fallbacks: [sonnet, flash] };
+  const gitDir = await mkdtemp(`${tmpdir()}/offload-jobs-`);
+  const hopResults = [];
+  let hop = true;
+  let reportTurns = 0;
+  const m = new JobManager({
+    store: new JobStore({ gitDir }),
+    worker: {
+      run: async (_job, api) => {
+        if (hop) hopResults.push(await api.progress({ action: 'provider_credit_fallback', providerStage: 2, creditFallback: true }));
+        return { status: 'DONE', summary: 'ok', turns: reportTurns };
+      },
+    },
+    runner: { verify: async (command) => ({ command, verdict: 'PASS', result: { code: 0, sandbox: 'macos' } }) },
+    snapshots: { create: async () => gitId, diff: async () => 'patch' },
+    config: { repoPath: process.cwd(), git: { branch: async () => 'main', head: async () => gitId } },
+  });
+  const settle = async (jobId) => {
+    for (let i = 0; i < 300 && !['DONE_VERIFIED', 'DONE_UNVERIFIED', 'FAILED', 'BUDGET'].includes((await m.store.get(jobId)).status); i++)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    return m.store.get(jobId);
+  };
+  const start = (extra = {}) =>
+    m.start(
+      {
+        task: 'x',
+        ownedPaths: ['src/**'],
+        relevantPaths: ['src/job-manager.mjs', 'src/core.mjs'],
+        executionProfile,
+        repoPath: process.cwd(),
+        ...extra,
+        // Core always persists a complete budget (config defaults filled in).
+        budget: { maxTurns: 80, maxUsd: 5, timeoutMinutes: 30, ...extra.budget },
+      },
+      { turnBudget: { configured: 80, policy: extra.budget?.maxTurns ? 'fixed' : 'auto', requested: extra.budget?.maxTurns } },
+    );
+
+  // Mid-job hop from Terra straight to Flash: the cap rises before the
+  // worker spends on Flash, and the round is judged against the raised cap.
+  const hopped = await start();
+  const base = hopped.budgetSizing.recommendedTurns;
+  assert.equal(hopped.budgetSizing.turnMultiplier, undefined, 'a Terra start is unscaled');
+  assert.ok(base * 3 > 80, 'the sized files need more than the default once scaled');
+  const scaled = Math.min(200, base * 3);
+  reportTurns = 81;
+  const hoppedDone = await settle(hopped.jobId);
+  assert.deepEqual(hopResults, [{ extraTurns: scaled - 80 }]);
+  assert.equal(hoppedDone.budget.maxTurns, scaled);
+  assert.equal(hoppedDone.budgetSizing.maxTurns, scaled);
+  assert.equal(hoppedDone.budgetSizing.turnMultiplier, 3);
+  assert.equal(hoppedDone.budgetSizing.baseRecommendedTurns, base);
+  assert.equal(hoppedDone.status, 'DONE_UNVERIFIED', '81 turns is within the raised cap, not a BUDGET stop');
+
+  // The next job starts on Flash under the cool-down and is sized for it.
+  hop = false;
+  reportTurns = 1;
+  const cooled = await start();
+  assert.equal(cooled.providerStage, 2);
+  assert.equal(cooled.budgetSizing.turnMultiplier, 3);
+  assert.equal(cooled.budgetSizing.baseRecommendedTurns, base);
+  assert.equal(cooled.budgetSizing.recommendedTurns, base * 3);
+  assert.equal(cooled.budgetSizing.maxTurns, scaled);
+  assert.equal((await m.store.get(cooled.jobId)).budget.maxTurns, scaled);
+  await settle(cooled.jobId);
+
+  // A caller-fixed cap is honored on Flash and never raised at a hop.
+  const fixed = await start({ budget: { maxTurns: 40 } });
+  assert.equal(fixed.budgetSizing.maxTurns, 40);
+  assert.equal(fixed.budgetSizing.turnsSource, 'caller');
+  await settle(fixed.jobId);
 });
 
 test('a job whose every route but the last is cooling starts on the last; malformed or future records are ignored', async () => {
