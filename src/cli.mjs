@@ -449,7 +449,13 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
       const diagnostic = doctor({ root: fileURLToPath(new URL('..', import.meta.url)), repoPath: flags.repoPath });
       // Health for the named repository only; without --repoPath (the session hook) doctor must not bind or initialise the cwd.
       const health = (await core.job(undefined, flags.repoPath === undefined ? {} : { repoPath: flags.repoPath })).health;
-      const result = { ...diagnostic, worker: health?.worker, coreSandbox: health?.sandbox, verifierTmp: health?.verifierTmp };
+      const result = {
+        ...diagnostic,
+        worker: health?.worker,
+        coreSandbox: health?.sandbox,
+        verifierTmp: health?.verifierTmp,
+        workerShell: health?.workerShell,
+      };
       if (bool(flags.hook)) {
         stdout.write(
           `offload: node ${result.nodeOk ? 'ok' : 'bad'} · git ${result.git ? 'ok' : 'missing'} · ${keysSummary(result)} · sandbox ${result.sandbox}\n`,

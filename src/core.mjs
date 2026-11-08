@@ -16,7 +16,7 @@ import {
   validateJobRequest,
   validateListingOptions,
 } from './job-manager.mjs';
-import { probeVerifierTemp, sandboxAvailable, sandboxStatus } from './sandbox.mjs';
+import { probeVerifierTemp, probeWorkerPython, sandboxAvailable, sandboxStatus } from './sandbox.mjs';
 import { healthIdentity, runtimeIdentity } from './identity.mjs';
 import { assertStartRuntimeCurrent, installedSkillHealth, withRestartNotice, withSkillHealth } from './skill-health.mjs';
 import {
@@ -706,6 +706,35 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       };
     return tempProbe.value;
   };
+  // Whether a worker's run_command can start Python: same cache and seam pattern.
+  let workerProbe;
+  const workerShellHealth = () => {
+    if (!workerProbe || nowMs() - workerProbe.at > VERIFIER_TMP_TTL_MS)
+      workerProbe = {
+        at: nowMs(),
+        value: Promise.resolve()
+          .then(() => (config.probeWorkerPython || probeWorkerPython)())
+          .catch(() => ({ python: 'unknown', reason: 'probe-failed' })),
+      };
+    return workerProbe.value;
+  };
+  const WORKER_SHELL_START_DEADLINE_MS = 8_500;
+  const workerShellForStart = async () => {
+    let timer;
+    try {
+      return await Promise.race([
+        workerShellHealth(),
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, WORKER_SHELL_START_DEADLINE_MS);
+          timer.unref?.();
+        }),
+      ]);
+    } catch {
+      return undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   const sandboxHealth = async () => {
     const status = sandboxStatus();
     const skill = skillHealth();
@@ -730,6 +759,8 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       ...(status.signal ? { sandboxProbeSignal: status.signal } : {}),
       // Whether a sandboxed verifier can create temp directories at all.
       verifierTmp: await verifierTmpHealth(),
+      // Whether a worker run_command can start Python (report-only).
+      workerShell: await workerShellHealth(),
     };
   };
   // Ordered client/project hints. process.cwd() is deliberately not here: a
@@ -1201,14 +1232,19 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         startSignal.throwIfAborted();
         throw new Error('offload core is shutting down');
       }
+      if (reportMode || !pythonProjectMarkers(state.repoPath).length) return result;
+      // A write job in a Python repo learns whether its worker shell can run
+      // Python, so the brief can say so up front. Never fails or delays start.
+      const workerShell = await workerShellForStart();
+      const withShell = workerShell ? { ...result, workerShell } : result;
       // A Python project has no JavaScript dependencies to report, so its start
       // echo carries the interpreter readiness instead of `not-applicable`.
-      if (reportMode || result.verifierDeps !== 'not-applicable' || !pythonProjectMarkers(state.repoPath).length) return result;
+      if (result.verifierDeps !== 'not-applicable') return withShell;
       const python = interpreter
         ? { status: 'ok', reason: 'interpreter-declared' }
         : verifierPythonStatus(state.repoPath, { allowlist: loaded.config.verifier?.interpreterRoots ?? [] });
       return {
-        ...result,
+        ...withShell,
         verifierDeps: python.status,
         verifierDepsReason: python.reason,
         ...(interpreter ? {} : { verifierPython: python }),
