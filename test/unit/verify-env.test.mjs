@@ -437,6 +437,16 @@ test('a PermissionError on the worktree .git pointer is git-metadata-denied with
   assert.equal(other.kind, 'permission-denied');
   assert.match(other.detail, /outside the job's write scope/);
   assert.equal(run(`${trace(`${ws}/.git`)}\nAssertionError: assert 1 == 2`), null);
+  // A non-Python command reading .git is a test touching Git metadata, denied by design: no pytest advice.
+  const node = classifyVerifierEnvironment(
+    {
+      command: 'node --test',
+      verdict: 'FAIL',
+      result: { code: 1, stdout: '', stderr: `Error: EPERM: operation not permitted, stat '${ws}/.git'` },
+    },
+    { workspacePath: ws, writeScope: ['src/**'] },
+  );
+  assert.notEqual(node?.kind, 'git-metadata-denied');
   assert.equal(
     run("PytestCacheWarning: cache path creation failed: [Errno 1] Operation not permitted: '" + ws + "/.pytest_cache'", { code: 1 }),
     null,

@@ -97,6 +97,12 @@ export function estimateReadChars(files = []) {
   return total;
 }
 
+/** A stored retentionChars clamped to the report bounds, or undefined when absent or invalid. */
+export const storedReportRetention = (retentionChars) =>
+  Number.isSafeInteger(retentionChars) && retentionChars > 0
+    ? Math.min(REPORT_RETENTION_MAX, Math.max(REPORT_RETENTION_MIN, retentionChars))
+    : undefined;
+
 /** The chars of tool output a report worker retains for a read set of `readChars` (fallback when unknown). */
 export const reportRetentionChars = (readChars) =>
   Number.isSafeInteger(readChars) && readChars >= 0

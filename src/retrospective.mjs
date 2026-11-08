@@ -70,7 +70,7 @@ const FAMILIES = Object.freeze({
   'report-finish-salvaged': {
     attributable: true,
     request:
-      'A report job ended its forced finalization with an invalid finish call and the drafted report had to be recovered. Harden the report finish message or tool description so the worker keeps the summary within its limit and puts the findings in report.',
+      'A report job did not finish cleanly and its text had to be recovered: either its forced finalization made an invalid finish call (harden the finish message or tool description so the summary stays within its limit and the findings go in report), or the worker kept answering in prose without calling finish after its one reminder (harden the report brief or reminder so the answer is delivered through finish).',
   },
   'output-cap-failure': {
     attributable: true,

@@ -3,7 +3,7 @@ import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { reportRetentionChars } from './budget-sizing.mjs';
+import { reportRetentionChars, storedReportRetention } from './budget-sizing.mjs';
 import { LeaseManager, getGitDir } from './lease.mjs';
 import { JobStore } from './store.mjs';
 import { Runner } from './runner.mjs';
@@ -290,6 +290,20 @@ export function gitPatchApplier(repoPath, patch, { reverse, check }) {
   if (!check) snapshotGit(repoPath, args, {}, { input: patch, output: 'buffer' });
   return { dryRun: !!check, applied: !check };
 }
+/**
+ * A report worker's context: never persisted, read_file results pinned until
+ * superseded, and retention sized to the declared read set. The echoed
+ * retentionChars wins when present, so the start response and the worker use
+ * one number; a legacy job sizes from readChars or takes the fallback.
+ */
+export function reportAgentContext(budgetSizing) {
+  return new AgentContext([], {
+    pinReads: true,
+    maxToolChars: storedReportRetention(budgetSizing?.retentionChars) ?? reportRetentionChars(budgetSizing?.readChars),
+    keepRecentToolResults: 16,
+  });
+}
+
 export function createCore({ store, runner, worker, snapshots, leases, config = {}, now, sessionStartedAt } = {}) {
   // The no-argument job list is scoped to this server session. The wall clock
   // is used on purpose (not the injectable `now`): real stores stamp real time.
@@ -515,11 +529,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         const prior = job.assertionRepair ? stored.slice(job.assertionRepair.transcriptStart) : stored;
         const context =
           job.mode === 'report'
-            ? new AgentContext([], {
-                pinReads: true,
-                maxToolChars: reportRetentionChars(job.budgetSizing?.readChars),
-                keepRecentToolResults: 16,
-              })
+            ? reportAgentContext(job.budgetSizing)
             : new AgentContext(prior, { onAppend: api.appendMessage, onAppendBatch: api.appendMessages });
         const repair = `Repair these concrete defects:\n${(api.defects?.length ? api.defects : ['Continue the job and re-check the acceptance criteria.']).map((x) => `- ${x}`).join('\n')}`;
         const totalTurns = job.budget?.maxTurns ?? loaded?.config.limits.maxTurns,
@@ -723,7 +733,10 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       };
     return workerProbe.value;
   };
-  const WORKER_SHELL_START_DEADLINE_MS = 8_500;
+  // The job is already launched when start waits for this, so the wait stays
+  // short: a warm cache answers at once, and a cold probe (normally ~0.2 s)
+  // that misses the deadline only drops the echo; health still reports it.
+  const WORKER_SHELL_START_DEADLINE_MS = 1_500;
   const workerShellForStart = async () => {
     let timer;
     try {
@@ -1242,7 +1255,8 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       }
       if (reportMode || !pythonProjectMarkers(state.repoPath).length) return result;
       // A write job in a Python repo learns whether its worker shell can run
-      // Python, so the brief can say so up front. Never fails or delays start.
+      // Python, so the brief can say so up front. Never fails start and delays
+      // it by at most WORKER_SHELL_START_DEADLINE_MS.
       const workerShell = await workerShellForStart();
       const withShell = workerShell ? { ...result, workerShell } : result;
       // A Python project has no JavaScript dependencies to report, so its start

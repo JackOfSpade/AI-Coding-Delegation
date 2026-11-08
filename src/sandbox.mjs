@@ -448,8 +448,11 @@ export function macosProfile({
     ...protectedGitPaths.flatMap((path) => denyPath('write', path)),
     // Verifier-only: tools such as pytest stat() the worktree-local .git
     // pointer while collecting. Seatbelt is last-match-wins, so this single
-    // literal metadata allow must follow every Git deny above. It never covers
-    // the resolved gitDir or the common .git, content reads, or writes.
+    // literal metadata allow must follow every Git deny above. It covers stat
+    // of the literal <root>/.git node only: never its content, listing,
+    // children or writes. In a private worktree that node is the pointer file;
+    // for applyThenVerify in the primary checkout it is the .git directory
+    // itself, whose stat (existence, type, mtime) is all that becomes visible.
     ...(allowGitPointerMetadata ? [`(allow file-read-metadata (literal ${q(join(root, '.git'))}))`] : []),
     // Dependencies are a read capability, including the workspace-local
     // server link used by literal CLI paths. Even a broad ** write scope may

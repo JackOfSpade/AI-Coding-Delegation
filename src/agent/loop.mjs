@@ -101,6 +101,20 @@ const clipCodePoints = (text, max) => {
 };
 const isShortString = (item) => typeof item === 'string' && item.length <= 1000;
 /**
+ * A salvaged report clipped to MAX_SALVAGED_REPORT_CHARS characters and as many
+ * UTF-8 bytes: the manager drops (rather than truncates) a report over either
+ * bound, so multi-byte prose must be clipped here or the salvage is lost.
+ */
+const clipSalvagedReport = (text) => {
+  const clipped = clipCodePoints(text, MAX_SALVAGED_REPORT_CHARS);
+  const bytes = Buffer.from(clipped, 'utf8');
+  if (bytes.length <= MAX_SALVAGED_REPORT_CHARS) return clipped;
+  let end = MAX_SALVAGED_REPORT_CHARS;
+  // Back off to the start of the code point the byte limit cuts through.
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
+  return bytes.subarray(0, end).toString('utf8');
+};
+/**
  * Fixed, bounded texts naming which finish fields were wrong; nothing the
  * provider wrote (not even a length) can appear in them.
  */
@@ -127,7 +141,7 @@ function salvagedFinish(args, problems) {
   const list = (value, max) => (Array.isArray(value) ? value.filter(isShortString).slice(0, max) : []);
   return {
     summary: clipCodePoints(summary, 1500),
-    report: args.report,
+    report: clipSalvagedReport(args.report),
     concerns: [
       ...list(args.concerns, SALVAGE_CONCERN_LIMIT),
       `Recovered the drafted report: the finish arguments were invalid (${problems.join('; ')}); the report is unreviewed.`,
@@ -1341,7 +1355,7 @@ export class AgentLoop {
             providerFinishReason !== 'length' &&
             !outputCapRecoveryExhausted &&
             text.trim()
-              ? { report: clipCodePoints(text, MAX_SALVAGED_REPORT_CHARS), reportSalvage: 'plain-text' }
+              ? { report: clipSalvagedReport(text), reportSalvage: 'plain-text' }
               : {}),
           });
         }

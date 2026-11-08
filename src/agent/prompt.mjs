@@ -9,11 +9,11 @@ const MAX_RELEVANT_PATHS = 50;
 // An entry as the prompt lists it: a ":START-END" suffix, with or without the
 // annotation annotateRelevantPaths appends.
 const RANGE_ENTRY = /:\d{1,7}-\d{1,7}(?: \(read_file offset |$)/;
-// Standing instruction added to every worker brief (write and report): weak
-// tests that pass for the wrong reason are the commonest quality miss.
 // Report mode only: reads are retained, but older output can still be elided.
 export const WORKER_REPORT_ELISION_RULE =
   'Older tool output can be replaced by an elision marker. Keep short running notes (claim, file, line) in your assistant text beside tool calls, and re-read a file only if a marker shows its output was elided.';
+// Standing instruction added to every worker brief (write and report): weak
+// tests that pass for the wrong reason are the commonest quality miss.
 export const WORKER_TEST_QUALITY_RULE = 'Assertions must be falsifiable; no substring checks that match unrelated text.';
 export const WORKER_ASSERTION_PRESERVATION_RULE =
   'Never edit, remove, weaken, or invert an existing assertion solely to make your change pass. Preserve its original behavioral intent; if it conflicts with the requested change, leave the assertion unchanged and report the conflict in finish.concerns. An exception requires the primary to explicitly identify the incorrect assertion and specify its intended correction; a passing check alone is never authorization.';

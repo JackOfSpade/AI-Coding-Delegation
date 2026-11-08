@@ -3914,7 +3914,7 @@ export class JobManager {
     let job = this.validatePersisted(await this.store.get(id));
     if (job.mode === 'report')
       throw new Error(
-        'report jobs are read-only and cannot be repaired; read reportResult (a drafted report is recovered when its finish call was invalid) or start a new report job',
+        'report jobs are read-only and cannot be repaired; read reportResult (an invalid final finish call or a final plain-text answer is recovered there) or start a new report job',
       );
     // A terminal durable state can be published just before its owning local
     // task performs final cleanup. Join that task first, then decide whether

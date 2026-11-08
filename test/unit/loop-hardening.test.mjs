@@ -5077,6 +5077,11 @@ test('a report worker that ends in prose twice fails no-finish with its last tex
   const clipped = await reportProseRun(['read', 'stop', { text: `${'x'.repeat(255_999)}\u{1F600}tail` }]);
   assert.equal(clipped.result.report.length, 255_999);
   assert.equal(clipped.result.reportSalvage, 'plain-text');
+  // Multi-byte prose is also clipped to 256000 UTF-8 bytes, on a code point: the
+  // manager drops a report over that byte bound instead of truncating it.
+  const wide = await reportProseRun(['read', 'stop', { text: '\u65e5'.repeat(100_000) }]);
+  assert.equal(Buffer.byteLength(wide.result.report, 'utf8'), 255_999);
+  assert.equal(wide.result.report, '\u65e5'.repeat(85_333));
 });
 
 test('report prose on the finalization turn gets no reminder but is still salvaged', async () => {

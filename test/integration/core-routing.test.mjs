@@ -6,6 +6,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
+  reportAgentContext,
   createCore as createRuntimeCore,
   defaultIntegrityStatePath,
   insidePath,
@@ -1244,6 +1245,11 @@ test('a no-id server listing does not bind its incidental cwd as a repository', 
     runnerScopedPreflight: true,
     outputCapDiagnostic: true,
     reviewPacket: true,
+    workerShellProbe: true,
+    verifierGitPointerStat: true,
+    reportReadRetention: true,
+    reportFinishSalvage: true,
+    reportNoFinishRecovery: true,
   });
   assert.match(result.health.server.buildHash, /^sha256:[0-9a-f]{64}$/);
   assert.match(result.health.server.skillHash, /^sha256:[0-9a-f]{64}$/);
@@ -3482,4 +3488,19 @@ test('repository health names commands a legacy config still routes Claude first
     await current.shutdown();
     await rm(path, { recursive: true, force: true });
   }
+});
+
+test('a report worker context pins reads and uses the echoed retention, else readChars, else the fallback', () => {
+  const echoed = reportAgentContext({ readChars: 112_200, retentionChars: 160_200 });
+  assert.equal(echoed.pinReads, true);
+  assert.equal(echoed.keepRecentToolResults, 16);
+  assert.equal(echoed.maxToolChars, 160_200);
+  // A stored retention outside the bounds is clamped, never trusted blindly.
+  assert.equal(reportAgentContext({ retentionChars: 9_000_000 }).maxToolChars, 400_000);
+  assert.equal(reportAgentContext({ retentionChars: 10 }).maxToolChars, 96_000);
+  // A legacy job without retentionChars sizes from readChars; with neither it takes the fallback.
+  assert.equal(reportAgentContext({ readChars: 112_200 }).maxToolChars, 160_200);
+  assert.equal(reportAgentContext(undefined).maxToolChars, 160_000);
+  assert.equal(reportAgentContext({ readChars: 'x' }).maxToolChars, 160_000);
+  assert.deepEqual(echoed.messages, [], 'a report context starts empty and is never loaded from a transcript');
 });

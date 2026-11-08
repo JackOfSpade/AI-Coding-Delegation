@@ -256,8 +256,10 @@ export function classifyVerifierEnvironment(verify, { workspacePath, writeScope 
         kind: 'temp-dir-denied',
         detail: `a command used the system temp directory ${clip(path)}; the verifier grants only its per-run TMPDIR (use os.tmpdir() and pass process.env to child processes)`,
       };
-    // pytest stats the worktree .git pointer while collecting; an older sandbox denies even that.
-    if (!ownedByWorker && insideWorkspace && gitPointer) {
+    // pytest stats the worktree .git pointer while collecting; an older sandbox
+    // denies even that. Only a Python command gets this advice: elsewhere a .git
+    // denial is a test reading Git metadata, which the sandbox denies by design.
+    if (!ownedByWorker && insideWorkspace && gitPointer && PYTHON_COMMAND.test(testCommand)) {
       // The first denial stays the headline, as for every other kind.
       denied ??= { kind: 'git-metadata-denied', detail: GIT_POINTER_DETAIL };
       continue;

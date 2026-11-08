@@ -77,6 +77,11 @@ test('MCP lists exact tools, initializes, pings and dispatches', async () => {
     runnerScopedPreflight: true,
     outputCapDiagnostic: true,
     reviewPacket: true,
+    workerShellProbe: true,
+    verifierGitPointerStat: true,
+    reportReadRetention: true,
+    reportFinishSalvage: true,
+    reportNoFinishRecovery: true,
   });
   assert.ok(
     values.some((value) => value.id === null && value.result?.tools),
