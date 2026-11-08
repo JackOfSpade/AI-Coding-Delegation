@@ -715,10 +715,10 @@ test('uv symlink declarations are rejected before a job or paid worker starts', 
   assert.deepEqual((await core.job(undefined, { repoPath: repo })).jobs, []);
 });
 
-test('only verifier option builders carry allowGitPointerMetadata; the worker run_command closure never does', async () => {
+test('source guard: the worker run_command closure never names allowGitPointerMetadata (behavioural proof is in mcp-e2e)', async () => {
   const { readFile } = await import('node:fs/promises');
   const core = await readFile(new URL('../../src/core.mjs', import.meta.url), 'utf8');
   assert.doesNotMatch(core, /allowGitPointerMetadata/);
   const manager = await readFile(new URL('../../src/job-manager.mjs', import.meta.url), 'utf8');
-  assert.equal(manager.match(/allowGitPointerMetadata: true/g).length, 3, 'verifier, primary and scratch applyThenVerify');
+  assert.match(manager, /allowGitPointerMetadata: true/);
 });

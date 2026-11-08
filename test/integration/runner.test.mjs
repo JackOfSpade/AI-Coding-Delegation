@@ -441,19 +441,19 @@ for m in ['pytest','_pytest','pluggy','iniconfig','packaging','pygments','colora
     const command = run;
     const withOption = await runCommand(command, { ...options, allowGitPointerMetadata: true });
     assert.equal(withOption.code, 0, withOption.stdout + withOption.stderr);
-    const without = await runCommand(command, options);
-    // Whether pytest itself trips on the denied stat depends on the interpreter: some pathlib versions swallow
-    // EPERM in is_dir(). The stat itself is deterministic.
     const statPointer = 'python3 -c "import os;os.stat(\'.git\')"';
     const deniedStat = await runCommand(statPointer, options);
     assert.notEqual(deniedStat.code, 0, 'without the option the pointer stat is denied');
     assert.match(deniedStat.stderr, /PermissionError/);
     assert.equal((await runCommand(statPointer, { ...options, allowGitPointerMetadata: true })).code, 0);
-    const pathlibProbe = await runCommand('python3 -c "import pathlib;pathlib.Path(\'.git\').is_dir()"', options);
-    if (pathlibProbe.code !== 0) {
-      assert.notEqual(without.code, 0, without.stdout + without.stderr);
-      assert.match(without.stdout + without.stderr, /\.git/);
-    }
+    // Deterministic regression guard independent of pathlib's EPERM handling: a pytest test that stats the pointer.
+    await writeFile(join(dir, 'tests', 'test_stat.py'), "import os\n\ndef test_stat():\n    os.stat('.git')\n");
+    const statRun = `python3 -c "${bootstrap}sys.exit(pytest.main(['-p','no:cacheprovider','tests/test_stat.py']))"`;
+    const statWithout = await runCommand(statRun, options);
+    assert.notEqual(statWithout.code, 0, statWithout.stdout + statWithout.stderr);
+    assert.match(statWithout.stdout + statWithout.stderr, /PermissionError|Operation not permitted/);
+    const statWith = await runCommand(statRun, { ...options, allowGitPointerMetadata: true });
+    assert.equal(statWith.code, 0, statWith.stdout + statWith.stderr);
     assert.notEqual((await runCommand('cat .git', { ...options, allowGitPointerMetadata: true })).code, 0, 'content stays denied');
     assert.notEqual(
       (await runCommand('printf x > .git', { ...options, allowGitPointerMetadata: true, writablePaths: [join(dir, '**')] })).code,
