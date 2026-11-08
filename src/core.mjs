@@ -762,10 +762,13 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
       ...(status.error ? { sandboxProbeError: status.error } : {}),
       ...(status.exitCode != null ? { sandboxProbeExitCode: status.exitCode } : {}),
       ...(status.signal ? { sandboxProbeSignal: status.signal } : {}),
-      // Whether a sandboxed verifier can create temp directories at all.
-      verifierTmp: await verifierTmpHealth(),
-      // Whether a worker run_command can start Python (report-only).
-      workerShell: await workerShellHealth(),
+      // Whether a sandboxed verifier can create temp directories at all, and
+      // whether a worker run_command can start Python (report-only). The two
+      // probes are independent, so a cold health call waits for the slower one.
+      ...(await Promise.all([verifierTmpHealth(), workerShellHealth()]).then(([verifierTmp, workerShell]) => ({
+        verifierTmp,
+        workerShell,
+      }))),
     };
   };
   // Ordered client/project hints. process.cwd() is deliberately not here: a

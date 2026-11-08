@@ -258,7 +258,8 @@ export function classifyVerifierEnvironment(verify, { workspacePath, writeScope 
       };
     // pytest stats the worktree .git pointer while collecting; an older sandbox denies even that.
     if (!ownedByWorker && insideWorkspace && gitPointer) {
-      denied = { kind: 'git-metadata-denied', detail: GIT_POINTER_DETAIL };
+      // The first denial stays the headline, as for every other kind.
+      denied ??= { kind: 'git-metadata-denied', detail: GIT_POINTER_DETAIL };
       continue;
     }
     // A bare `.../bin/` (CPython's realpath of its own directory) only counts as
