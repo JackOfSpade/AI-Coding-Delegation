@@ -312,11 +312,13 @@ export function macosProfile({
   interpreterMetadataPaths = [],
   allowNetwork = false,
   allowTempSockets = false,
+  allowGitPointerMetadata = false,
 }) {
   // Seatbelt profiles describe macOS paths even when a diagnostic fixture is
   // compiled on another host. Command execution and temp I/O remain native.
   const { basename, dirname, join, resolve, sep, isAbsolute } = posix;
   if (typeof allowTempSockets !== 'boolean') throw new TypeError('allowTempSockets must be boolean');
+  if (typeof allowGitPointerMetadata !== 'boolean') throw new TypeError('allowGitPointerMetadata must be boolean');
   if (!Array.isArray(denyRead) || denyRead.some((path) => typeof path !== 'string'))
     throw new TypeError('denyRead must be relative glob strings');
   if (!Array.isArray(denyWrite) || denyWrite.some((path) => typeof path !== 'string'))
@@ -444,6 +446,11 @@ export function macosProfile({
     ...writablePaths.map((path) => sandboxGlobFilter('allow', root, path)),
     ...write.map((path) => `(allow file-write* (subpath ${q(path)}))`),
     ...protectedGitPaths.flatMap((path) => denyPath('write', path)),
+    // Verifier-only: tools such as pytest stat() the worktree-local .git
+    // pointer while collecting. Seatbelt is last-match-wins, so this single
+    // literal metadata allow must follow every Git deny above. It never covers
+    // the resolved gitDir or the common .git, content reads, or writes.
+    ...(allowGitPointerMetadata ? [`(allow file-read-metadata (literal ${q(join(root, '.git'))}))`] : []),
     // Dependencies are a read capability, including the workspace-local
     // server link used by literal CLI paths. Even a broad ** write scope may
     // not remove/retarget it or mutate dependencies through any route.
@@ -593,6 +600,7 @@ export async function runCommand(command, options = {}) {
     interpreterPaths: options.interpreterPaths || [],
     interpreterMetadataPaths: options.interpreterMetadataPaths || [],
     allowNetwork: options.allowNetwork === true,
+    allowGitPointerMetadata: options.allowGitPointerMetadata === true,
   };
   const probeProfile = options.sandbox !== false && platform === 'darwin' ? compileSandboxProfile(profileInput) : undefined;
   const canSandbox = probeProfile && (options.sandboxProbe || sandboxAvailable)(platform, probeProfile);

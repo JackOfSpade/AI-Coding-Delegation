@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { classifyVerifierEnvironment } from '../../src/verify-env.mjs';
+import { classifyVerifierEnvironment, isVerifierEnvironmentKind } from '../../src/verify-env.mjs';
 
 const failed = (stderr, extra = {}) => ({ verdict: 'FAIL', result: { code: 1, stdout: '', stderr, ...extra } });
 const scope = ['src/**', 'test/**'];
@@ -410,4 +410,35 @@ test('tsx IPC permission failure names the exact loader substitution, including 
     `${stderr}\nAssertionError [ERR_ASSERTION]: wrong value`,
   ])
     assert.doesNotMatch(classifyVerifierEnvironment(failed(text))?.detail ?? '', /node --import tsx/);
+});
+
+test('a PermissionError on the worktree .git pointer is git-metadata-denied with the exact fix', () => {
+  const ws = '/private/var/folders/x/T/offload-worktree-lhNiWm/workspace';
+  const trace = (path) =>
+    [
+      'collecting ... ',
+      '_pytest/main.py:426: in pytest_ignore_collect',
+      '    if collection_path.is_dir():',
+      '/uv/python/lib/python3.13/pathlib/_abc.py:  in is_dir',
+      '    return S_ISDIR(self.stat().st_mode)',
+      `PermissionError: [Errno 1] Operation not permitted: '${path}'`,
+      'ERROR collecting .',
+    ].join('\n');
+  const run = (stderr, extra = {}) =>
+    classifyVerifierEnvironment(
+      { command: 'python -m pytest tests/t.py', verdict: 'FAIL', result: { code: 4, stdout: '', stderr, ...extra } },
+      { workspacePath: ws, writeScope: ['src/**'] },
+    );
+  const git = run(trace(`${ws}/.git`));
+  assert.equal(git.kind, 'git-metadata-denied');
+  assert.match(git.detail, /--ignore=\.git/);
+  assert.equal(isVerifierEnvironmentKind('git-metadata-denied'), true);
+  const other = run(trace(`${ws}/data/.git`));
+  assert.equal(other.kind, 'permission-denied');
+  assert.match(other.detail, /outside the job's write scope/);
+  assert.equal(run(`${trace(`${ws}/.git`)}\nAssertionError: assert 1 == 2`), null);
+  assert.equal(
+    run("PytestCacheWarning: cache path creation failed: [Errno 1] Operation not permitted: '" + ws + "/.pytest_cache'", { code: 1 }),
+    null,
+  );
 });
