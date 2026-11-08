@@ -1253,6 +1253,78 @@ test('health reports the verifier temp probe verbatim, caches it for a minute, a
   assert.ok(['macos', 'policy-only'].includes(health.sandbox), 'a failing probe does not fail health');
 });
 
+test('health reports the worker shell probe, caches it, and survives a failing probe', async () => {
+  const probe = { python: 'blocked', reason: 'worker-profile-denies-python', note: 'n' };
+  let calls = 0;
+  let clock = 1_000_000;
+  const core = createCore({
+    now: () => clock,
+    config: {
+      loaded,
+      probeWorkerPython: async () => {
+        calls += 1;
+        return probe;
+      },
+    },
+  });
+  const [first, concurrent] = await Promise.all([core.job(), core.job()]);
+  assert.deepEqual(first.health.workerShell, probe);
+  assert.deepEqual(concurrent.health.workerShell, probe);
+  assert.equal(calls, 1, 'concurrent health calls share one probe');
+  clock += 61_000;
+  await core.job();
+  assert.equal(calls, 2);
+
+  const failing = createCore({
+    config: {
+      loaded,
+      probeWorkerPython: async () => {
+        throw new Error('exploded at /private/secret');
+      },
+    },
+  });
+  const health = (await failing.job()).health;
+  assert.deepEqual(health.workerShell, { python: 'unknown', reason: 'probe-failed' });
+  assert.ok(['macos', 'policy-only'].includes(health.sandbox), 'a failing probe does not fail health');
+});
+
+test('start echoes workerShell for a write job in a Python repo only', async () => {
+  const probe = { python: 'blocked', reason: 'worker-profile-denies-python', note: 'n' };
+  const isolation = { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree };
+  const make = (probeWorkerPython) =>
+    createCore({
+      config: { loaded, resolveKey: () => 'credential', isolation, probeWorkerPython },
+      isolation,
+      worker: { run: async () => ({ status: 'DONE' }) },
+    });
+  const py = await repo('offload-core-worker-shell-py-');
+  await writeFile(join(py, 'pyproject.toml'), '[project]\nname = "x"\n');
+  execFileSync('git', ['-C', py, 'add', '.']);
+  execFileSync('git', ['-C', py, 'commit', '-qm', 'py']);
+  const plain = await repo('offload-core-worker-shell-js-');
+  const cores = [];
+  try {
+    const core = make(async () => probe);
+    cores.push(core);
+    const started = await core.start({ repoPath: py, task: 'write', ownedPaths: ['src/**'] });
+    assert.deepEqual(started.workerShell, probe);
+    const report = await core.start({ repoPath: py, task: 'read', mode: 'report' });
+    assert.equal(report.workerShell, undefined, 'report jobs have no run_command');
+    const js = await core.start({ repoPath: plain, task: 'write', ownedPaths: ['src/**'] });
+    assert.equal(js.workerShell, undefined, 'a non-Python repo is not nagged');
+    const failing = make(async () => {
+      throw new Error('x');
+    });
+    cores.push(failing);
+    const ok = await failing.start({ repoPath: py, task: 'write again', ownedPaths: ['docs/**'] });
+    assert.deepEqual(ok.workerShell, { python: 'unknown', reason: 'probe-failed' });
+  } finally {
+    for (const core of cores) await core.shutdown();
+    await rm(py, { recursive: true, force: true });
+    await rm(plain, { recursive: true, force: true });
+  }
+});
+
 test('a no-id listing with an explicit repository also carries the verifier temp probe', async () => {
   const path = await repo('offload-core-health-tmp-');
   const probe = { status: 'unwritable', reason: 'host-tmpdir-unwritable', systemTmp: 'unknown', gitInit: 'unknown', note: 'n' };

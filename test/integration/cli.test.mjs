@@ -455,13 +455,15 @@ test('CLI maps --turnPolicy into the budget and rejects a bad value or a --budge
 test('doctor output carries the verifier temp probe from core health', async () => {
   const out = sink();
   const verifierTmp = { status: 'writable', reason: 'per-run-tmpdir-writable', systemTmp: 'denied', gitInit: 'ok', note: 'n' };
+  const workerShell = { python: 'blocked', reason: 'worker-profile-denies-python' };
   const status = await runCli(['doctor'], {
-    core: { job: async () => ({ health: { worker: true, sandbox: 'macos', verifierTmp } }) },
+    core: { job: async () => ({ health: { worker: true, sandbox: 'macos', verifierTmp, workerShell } }) },
     stdout: out.stream,
     stderr: sink().stream,
   });
   assert.equal(status, 0);
   assert.deepEqual(JSON.parse(out.get()).verifierTmp, verifierTmp);
+  assert.deepEqual(JSON.parse(out.get()).workerShell, workerShell);
 });
 test('doctor binds core health to --repoPath and never to the cwd', async () => {
   const seen = [];

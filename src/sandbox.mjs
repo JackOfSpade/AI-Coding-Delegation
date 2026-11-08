@@ -890,3 +890,55 @@ export async function probeVerifierTemp({
     } catch {}
   }
 }
+
+const WORKER_PYTHON_NOTE =
+  'worker run_command cannot start Python in this sandbox (verifierInterpreter is verifier-only); ' +
+  'tell the worker not to run Python and run Python steps in the primary';
+const workerPython = (python, reason, extra = {}) => ({ python, reason, ...extra });
+
+/**
+ * Report whether a worker's `run_command` can start Python. Runs one fixed
+ * command through the real sandboxed `runCommand` with the same option shape
+ * the worker shell uses (no interpreterPaths, no interpreterMetadataPaths, a
+ * scratch cwd), so it reports the profile as it is and never widens it.
+ * The result holds fixed tokens only: never stderr, paths or host text.
+ */
+export async function probeWorkerPython({
+  platform = process.platform,
+  run = runCommand,
+  mkdtemp = mkdtempSync,
+  rm = rmSync,
+  tmpdir: tmp = tmpdir,
+  timeoutSec = 8,
+  runOptions = {},
+} = {}) {
+  // Policy-only hosts offer the worker no shell at all.
+  if (platform !== 'darwin') return workerPython('not-probed', 'no-worker-sandbox');
+  let scratch;
+  try {
+    scratch = mkdtemp(join(tmp(), 'offload-worker-probe-'));
+  } catch {
+    return workerPython('unknown', 'probe-failed');
+  }
+  try {
+    let result;
+    try {
+      result = await run('/usr/bin/env python3 -c "print(7)"', { ...runOptions, cwd: scratch, requireSandbox: true, timeoutSec });
+    } catch (error) {
+      if (/Required macOS sandbox is unavailable/.test(String(error?.message))) return workerPython('not-probed', 'no-worker-sandbox');
+      return workerPython('unknown', 'probe-failed');
+    }
+    if (result?.timedOut) return workerPython('unknown', 'probe-timed-out');
+    const stderr = String(result?.stderr ?? '');
+    if (result?.code === 0 && String(result?.stdout ?? '').trim() === '7') return workerPython('runs', 'python-started');
+    if (/Operation not permitted/.test(stderr) || result?.code === 126)
+      return workerPython('blocked', 'worker-profile-denies-python', { note: WORKER_PYTHON_NOTE });
+    if (result?.code === 127 || /No such file|python3: not found|command not found/.test(stderr))
+      return workerPython('missing', 'python-not-found');
+    return workerPython('unknown', 'probe-failed');
+  } finally {
+    try {
+      rm(scratch, { recursive: true, force: true });
+    } catch {}
+  }
+}
