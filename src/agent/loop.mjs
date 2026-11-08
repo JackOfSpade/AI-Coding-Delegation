@@ -7,6 +7,7 @@ import {
   finishArgumentProblems,
   isReadOnlyTool,
   normalizeFinishArgs,
+  validUntouchedPaths,
 } from './tools.mjs';
 import { budgetNotice, budgetOutlook } from '../budget-outlook.mjs';
 import { Meter, resolveModel, samePricedModel } from '../pricing.mjs';
@@ -83,7 +84,58 @@ const CAPPED_IMPLEMENTATION_RECOVERY_REMINDER = 'Continue implementation using a
 // that transcript can no longer fit the remaining finite budget.
 const BUDGET_FINISH_RECOVERY_MESSAGE = 'Call the finish tool now.';
 const REPORT_FINISH_MESSAGE =
-  'The report budget is nearly exhausted. Stop reading now. Call finish as the sole tool call with a detailed report of findings already gathered, including uncertainties and unfinished work. Put the findings in report, even if incomplete.';
+  'The report budget is nearly exhausted. Stop reading now. Call finish as the sole tool call with a detailed report of findings already gathered, including uncertainties and unfinished work. Limits: summary is 1-2 sentences, at most 1500 characters; everything else goes in report, even if incomplete; concerns and testsRun are arrays of short strings.';
+const SALVAGE_CONCERN_LIMIT = 99;
+const SALVAGE_PROBLEM_FIELDS = [
+  ['summary', 'summary was missing or longer than 1500 characters'],
+  ['report', 'report was not a string of at most 256000 characters'],
+  ['concerns', 'concerns was not an array of short strings'],
+  ['testsRun', 'testsRun was not an array of short strings'],
+  ['untouchedPaths', 'untouchedPaths was malformed'],
+  ['reviewPacket', 'reviewPacket was malformed'],
+];
+const clipCodePoints = (text, max) => {
+  if (text.length <= max) return text;
+  const high = text.charCodeAt(max - 1);
+  return text.slice(0, high >= 0xd800 && high <= 0xdbff ? max - 1 : max);
+};
+const isShortString = (item) => typeof item === 'string' && item.length <= 1000;
+/**
+ * Fixed, bounded texts naming which finish fields were wrong; nothing the
+ * provider wrote (not even a length) can appear in them.
+ */
+function fixedFinishProblems(args, alone) {
+  const object = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+  const problems = SALVAGE_PROBLEM_FIELDS.filter(([field]) => {
+    const probe = field === 'summary' ? { summary: object.summary } : { summary: 'x', [field]: object[field] };
+    return finishArgumentProblems(probe).length > 0;
+  }).map(([, text]) => text);
+  return [...(alone ? [] : ['finish was not the only tool call']), ...problems].slice(0, 6);
+}
+/** The drafted report of the first finish call that has a usable one, or undefined. */
+function salvageableFinish(calls, parsed) {
+  for (let i = 0; i < calls.length; i++) {
+    if (calls[i].name !== 'finish') continue;
+    const args = normalizeFinishArgs(parsed[i] && typeof parsed[i] === 'object' && !Array.isArray(parsed[i]) ? parsed[i] : {});
+    if (typeof args.report === 'string' && args.report.trim().length > 0 && args.report.length <= 256_000) return args;
+  }
+  return undefined;
+}
+function salvagedFinish(args, problems) {
+  const firstLine = args.report.split(/\r?\n/).find((line) => line.trim().length > 0) ?? '';
+  const summary = typeof args.summary === 'string' && args.summary.trim().length > 0 ? args.summary : firstLine.trim();
+  const list = (value, max) => (Array.isArray(value) ? value.filter(isShortString).slice(0, max) : []);
+  return {
+    summary: clipCodePoints(summary, 1500),
+    report: args.report,
+    concerns: [
+      ...list(args.concerns, SALVAGE_CONCERN_LIMIT),
+      `Recovered the drafted report: the finish arguments were invalid (${problems.join('; ')}); the report is unreviewed.`,
+    ],
+    testsRun: list(args.testsRun, 100),
+    ...(args.untouchedPaths !== undefined && validUntouchedPaths(args.untouchedPaths) ? { untouchedPaths: args.untouchedPaths } : {}),
+  };
+}
 // A finish call that shares its turn with other calls, or whose arguments are
 // invalid, is never run, and neither is anything beside it: finishing is the
 // end of the job, so a turn that also mutates cannot be told apart from a
@@ -1308,10 +1360,41 @@ export class AgentLoop {
             await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'finish_protocol_recover' });
             continue;
           }
+          // The forced report finalization turn is the last chance: keep the drafted
+          // report of an invalid finish rather than discarding it with the spend.
+          const salvage = reportFinalizationUsed ? salvageableFinish(calls, parsed) : undefined;
+          const reportFinishProblems = reportFinalizationUsed
+            ? fixedFinishProblems(salvage ?? parsed[finishIndex], !finishNotAlone)
+            : undefined;
+          if (salvage) {
+            // Nothing from the turn runs. Every call is still answered so the transcript stays valid.
+            const finish = salvagedFinish(salvage, reportFinishProblems);
+            await this.context.addBatch([
+              assistant,
+              ...calls.map((call) => ({
+                role: 'tool',
+                tool_call_id: call.id,
+                name: call.name,
+                content: call.name === 'finish' ? JSON.stringify(finish) : 'TOOL_ERROR: nothing in this turn was executed',
+              })),
+            ]);
+            await this.context.flush();
+            await settleCappedImplementationRecovery();
+            await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'report_finish_salvaged' });
+            if (this.checkReviewPacket)
+              reviewPacketCheck = { status: 'failed', defects: ['finish arguments were invalid; review packet not checked'] };
+            return responseOutcome('DONE', turn, responseModel, {
+              finish: reviewPacketCheck ? { ...finish, reviewPacketCheck } : finish,
+              text,
+              finishProblems: reportFinishProblems,
+              reportSalvaged: true,
+            });
+          }
           return responseOutcome('FAILED', turn, responseModel, {
             // A worker-side cause offload_continue may resume (the work is in the workspace).
             failureKind: 'finish-protocol',
             error: FAILURE_ERRORS['finish-protocol'],
+            ...(reportFinishProblems ? { finishProblems: reportFinishProblems } : {}),
           });
         }
         // Persist only a valid assistant tool-call turn.  This ensures a repair

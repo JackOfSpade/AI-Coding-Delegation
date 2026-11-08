@@ -4465,43 +4465,146 @@ test('report reserves a finish-only turn with gathered findings before reservati
   assert.ok(result.costUsd <= 0.2);
 });
 
-test('a finish-protocol or unadvertised-tool violation on the report finalization turn fails instead of promising a retry', async () => {
+const reportFinalizationRun = async (finalizingCalls, extra = {}) => {
   const rates = { peak: 1, off_peak: 1 };
   const pricing = { models: { mock: { usd_per_1m: { input_cache_hit: rates, input_cache_miss: rates, output: rates } } } };
   const findings = 'Evidence from the survey. '.repeat(4800);
-  const run = async (finalizingCalls) => {
-    const requests = [];
-    const progress = [];
-    const result = await new AgentLoop({
-      provider: {
-        async *chat(request) {
-          requests.push(request);
-          yield { model: 'mock', toolCalls: requests.length === 1 ? [call('read_file', '{"path":"survey.txt"}')] : finalizingCalls };
-          yield { usage: { inputTokens: 100, outputTokens: 20 } };
-        },
+  const requests = [];
+  const progress = [];
+  const executed = [];
+  const result = await new AgentLoop({
+    provider: {
+      async *chat(request) {
+        requests.push(request);
+        yield { model: 'mock', toolCalls: requests.length === 1 ? [call('read_file', '{"path":"survey.txt"}')] : finalizingCalls };
+        yield { usage: { inputTokens: 100, outputTokens: 20 } };
       },
-      model: 'mock',
-      pricing,
-      maxUsd: 0.2,
-      maxTurns: 80,
-      reportMode: true,
-      progress: async (event) => {
-        if (event.action) progress.push(event.action);
+    },
+    model: 'mock',
+    pricing,
+    maxUsd: 0.2,
+    maxTurns: 80,
+    reportMode: true,
+    progress: async (event) => {
+      if (event.action) progress.push(event.action);
+    },
+    toolDefinitions: availableToolDefinitions({ readOnly: true }),
+    tools: {
+      execute: async (name, args) => {
+        if (requests.length > 1) executed.push(name);
+        return name === 'finish' ? { finish: args } : findings;
       },
-      toolDefinitions: availableToolDefinitions({ readOnly: true }),
-      tools: { execute: async (name, args) => (name === 'finish' ? { finish: args } : findings) },
-    }).run({ task: 'Survey the repository' });
-    return { result, requests, progress };
-  };
-  const invalid = await run([call('finish', '{"summary":""}')]);
+    },
+    ...extra,
+  }).run({ task: 'Survey the repository' });
+  return { result, requests, progress, executed };
+};
+
+test('a finish-protocol violation on the report finalization turn salvages a drafted report and fails without one', async () => {
+  // An invalid finish that carries a report is recovered: DONE, no retry request, nothing executed.
+  const salvaged = await reportFinalizationRun([call('finish', JSON.stringify({ summary: '', report: 'Drafted findings.' }))]);
+  assert.equal(salvaged.result.status, 'DONE');
+  assert.equal(salvaged.result.reportSalvaged, true);
+  assert.equal(salvaged.result.finish.report, 'Drafted findings.');
+  assert.equal(salvaged.result.finish.summary, 'Drafted findings.');
+  assert.deepEqual(salvaged.result.finishProblems, ['summary was missing or longer than 1500 characters']);
+  assert.match(salvaged.result.finish.concerns.at(-1), /^Recovered the drafted report: the finish arguments were invalid \(summary/);
+  assert.equal(salvaged.requests.length, 2, 'no retry request after the finalization turn');
+  assert.deepEqual(salvaged.executed, []);
+  assert.ok(salvaged.progress.includes('report_finish_salvaged'));
+  assert.ok(!salvaged.progress.includes('finish_protocol_recover'));
+  // Without a report there is nothing to recover: today's FAILED outcome, now with the problems named.
+  const invalid = await reportFinalizationRun([call('finish', '{"summary":""}')]);
   assert.equal(invalid.result.status, 'FAILED');
   assert.equal(invalid.result.failureKind, 'finish-protocol');
+  assert.deepEqual(invalid.result.finishProblems, ['summary was missing or longer than 1500 characters']);
   assert.equal(invalid.requests.length, 2, 'no retry request after the finalization turn');
   assert.ok(!invalid.progress.includes('finish_protocol_recover'));
-  const unadvertised = await run([call('read_file', '{"path":"survey.txt"}', 'second')]);
+  const unadvertised = await reportFinalizationRun([call('read_file', '{"path":"survey.txt"}', 'second')]);
   assert.equal(unadvertised.result.status, 'FAILED');
   assert.equal(unadvertised.result.error, 'Provider requested an unadvertised tool');
   assert.equal(unadvertised.requests.length, 2);
+});
+
+test('an over-long summary on the report finalization turn is clipped and the report kept', async () => {
+  const summary = `${'a'.repeat(1499)}\u{1F600}tail`;
+  const { result, requests, executed } = await reportFinalizationRun([
+    call('finish', JSON.stringify({ summary, report: 'Findings.', concerns: ['kept'], testsRun: ['npm test'] })),
+  ]);
+  assert.equal(result.status, 'DONE');
+  assert.ok(result.finish.summary.length <= 1500);
+  assert.equal(result.finish.summary, 'a'.repeat(1499), 'cut at a code-point boundary, never inside a surrogate pair');
+  assert.equal(result.finish.report, 'Findings.');
+  assert.deepEqual(result.finish.testsRun, ['npm test']);
+  assert.equal(result.finish.concerns[0], 'kept');
+  assert.match(result.finish.concerns[1], /summary was missing or longer than 1500 characters/);
+  assert.deepEqual(result.finishProblems, ['summary was missing or longer than 1500 characters']);
+  assert.ok(!JSON.stringify(result.finishProblems).includes('1501'), 'no provider-controlled length is echoed');
+  assert.equal(requests.length, 2);
+  assert.deepEqual(executed, []);
+});
+
+test('two finish calls on the report finalization turn salvage the first usable report and run nothing', async () => {
+  const { result, executed } = await reportFinalizationRun([
+    call('finish', JSON.stringify({ summary: 'No report here' }), 'one'),
+    call('finish', JSON.stringify({ summary: 'Second', report: 'Second draft.' }), 'two'),
+  ]);
+  assert.equal(result.status, 'DONE');
+  assert.equal(result.finish.report, 'Second draft.');
+  assert.equal(result.finish.summary, 'Second');
+  assert.deepEqual(result.finishProblems, ['finish was not the only tool call']);
+  assert.deepEqual(executed, []);
+});
+
+test('bad list shapes and a review packet on the finalization turn are dropped, flagged, and never echoed', async () => {
+  const secret = 'PROVIDER-SECRET-TEXT';
+  const checked = [];
+  const { result } = await reportFinalizationRun(
+    [
+      call(
+        'finish',
+        JSON.stringify({
+          summary: 'ok',
+          report: 'Findings.',
+          concerns: ['fine', 7, 'x'.repeat(1001), secret],
+          testsRun: { items: secret },
+          untouchedPaths: [{ path: secret }],
+          reviewPacket: { requirements: secret },
+        }),
+      ),
+    ],
+    { checkReviewPacket: async (args) => checked.push(args) },
+  );
+  assert.equal(result.status, 'DONE');
+  assert.deepEqual(result.finish.testsRun, []);
+  assert.equal(result.finish.untouchedPaths, undefined);
+  assert.deepEqual(result.finish.concerns.slice(0, 2), ['fine', secret]);
+  assert.equal(result.finish.reviewPacketCheck.status, 'failed');
+  assert.deepEqual(result.finish.reviewPacketCheck.defects, ['finish arguments were invalid; review packet not checked']);
+  assert.deepEqual(checked, [], 'the packet is not checked');
+  assert.equal(result.finishProblems.length, 4);
+  assert.ok(!JSON.stringify(result.finishProblems).includes(secret));
+});
+
+test('an empty or oversized drafted report on the finalization turn is not salvaged', async () => {
+  for (const report of ['   ', 'x'.repeat(256_001)]) {
+    const { result } = await reportFinalizationRun([call('finish', JSON.stringify({ summary: '', report }))]);
+    assert.equal(result.status, 'FAILED', `report of ${report.length} chars`);
+    assert.equal(result.failureKind, 'finish-protocol');
+    assert.ok(result.finishProblems.length > 0);
+  }
+});
+
+test('a write job finish-protocol violation on its last turn is unchanged by report salvage', async () => {
+  const result = await new AgentLoop({
+    provider: scripted([[call('write_file', '{"path":"x","content":"x"}', 'w'), call('finish', '{"summary":"d","report":"R"}', 'f')]]),
+    tools: finishTools([]),
+    maxTurns: 1,
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'FAILED');
+  assert.equal(result.failureKind, 'finish-protocol');
+  assert.equal(result.finishProblems, undefined);
+  assert.equal(result.reportSalvaged, undefined);
 });
 
 test('a capped report finalization turn continues without reporting an output-cap diagnostic', async () => {
