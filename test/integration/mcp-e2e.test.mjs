@@ -999,6 +999,26 @@ test(
   },
 );
 
+test(
+  "MCP e2e: a worker's own run_command cannot stat the worktree .git pointer (only the verifier may)",
+  { skip: sandboxSkip() },
+  async (t) => {
+    const scripts = [turn('run_command', { command: `node -e "require('fs').statSync('.git')"` }), finish('probed', ['src/**'])];
+    await withServer(t, { scripts }, async ({ server, repo, open }) => {
+      const mcp = await open();
+      const started = await mcp.call('offload_start', { task: 'probe git pointer', ownedPaths: ['src/**'], repoPath: repo });
+      assert.equal((await settled(mcp, started.jobId, repo)).status, 'DONE_UNVERIFIED');
+      const [probe] = server.requests
+        .at(-1)
+        .body.messages.filter((message) => message.role === 'tool')
+        .map((message) => JSON.parse(message.content));
+      assert.equal(probe.sandbox, 'macos');
+      assert.notEqual(probe.code, 0, 'the worker sandbox never receives allowGitPointerMetadata');
+      assert.match(probe.stderr, /EPERM|operation not permitted/i);
+    });
+  },
+);
+
 const OFFLOAD_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 test(

@@ -12,11 +12,14 @@ const ENVIRONMENT_KINDS = new Set([
   'permission-denied',
   'temp-dir-denied',
   'git-config-denied',
+  'git-metadata-denied',
   'native-module-crash',
   // Set by the baseline-diff verifier, never by the classifier below: the same
   // failures in both runs were the sandbox refusing the suite's fixtures.
   'sandbox-dominated',
 ]);
+const GIT_POINTER_DETAIL =
+  'the verifier sandbox denied stat of the worktree .git pointer (pytest probes it during collection); add --ignore=.git to the pytest command, or update Offload (current servers allow this stat)';
 export const isVerifierEnvironmentKind = (kind) => ENVIRONMENT_KINDS.has(kind);
 
 // A bare Node specifier that could not be resolved. Relative/absolute paths,
@@ -226,6 +229,7 @@ export function classifyVerifierEnvironment(verify, { workspacePath, writeScope 
     if (!path) continue;
     let ownedByWorker = false;
     let insideWorkspace = false;
+    let gitPointer = false;
     search: for (const candidate of spellings(path)) {
       for (const root of roots) {
         const paths = pathApi(root);
@@ -233,6 +237,7 @@ export function classifyVerifierEnvironment(verify, { workspacePath, writeScope 
         const rel = paths.relative(root, candidate);
         if (rel === '' || rel.startsWith('..') || paths.isAbsolute(rel)) continue;
         insideWorkspace = true;
+        gitPointer = rel === '.git';
         try {
           ownedByWorker = matchesAny(rel.split(paths.sep).join('/'), writeScope, { platform: paths === win32 ? 'win32' : 'linux' });
         } catch {
@@ -251,6 +256,11 @@ export function classifyVerifierEnvironment(verify, { workspacePath, writeScope 
         kind: 'temp-dir-denied',
         detail: `a command used the system temp directory ${clip(path)}; the verifier grants only its per-run TMPDIR (use os.tmpdir() and pass process.env to child processes)`,
       };
+    // pytest stats the worktree .git pointer while collecting; an older sandbox denies even that.
+    if (!ownedByWorker && insideWorkspace && gitPointer) {
+      denied = { kind: 'git-metadata-denied', detail: GIT_POINTER_DETAIL };
+      continue;
+    }
     // A bare `.../bin/` (CPython's realpath of its own directory) only counts as
     // an interpreter denial for a Python command.
     if (!ownedByWorker && !insideWorkspace && (INTERPRETER_PATH.test(path) || (/\/bin\/?$/.test(path) && PYTHON_COMMAND.test(testCommand))))

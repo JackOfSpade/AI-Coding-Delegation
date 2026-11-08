@@ -3053,6 +3053,8 @@ export class JobManager {
       // A declared interpreter/virtualenv (verifierInterpreter): read and exec
       // only, for the verifier alone; never the worker's own run_command.
       ...interpreterPathsOption(job),
+      // Verifier-only: lets tools such as pytest stat() the worktree .git pointer (never read or write it).
+      allowGitPointerMetadata: true,
       requireSandbox: job.requireSandbox === true,
     };
   }
@@ -4444,6 +4446,7 @@ export class JobManager {
               // Read-only primary: only the per-run temp directory is writable.
               writablePaths: [],
               ...interpreterPathsOption(job),
+              allowGitPointerMetadata: true,
               requireSandbox,
               timeoutMs: plan.timeoutSec * 1000,
             });
@@ -4622,6 +4625,7 @@ export class JobManager {
         writablePaths: [join(cwd, '**')],
         readablePaths: [dirname(cwd), ...isolatedDependencyReadPaths(cwd, job.repoPath)],
         ...interpreterPathsOption(job),
+        allowGitPointerMetadata: true,
         requireSandbox,
         timeoutMs: plan.timeoutSec * 1000,
       });

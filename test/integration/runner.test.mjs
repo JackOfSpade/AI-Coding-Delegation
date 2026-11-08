@@ -378,6 +378,91 @@ test(
     assert.ok(profile.indexOf(`(deny file-write* (subpath "${workspace}/.git"))`) > broadWrite);
   },
 );
+test('macOS profile allows only stat of the worktree .git pointer, after every Git deny, when asked', () => {
+  const workspace = '/private/tmp/offload-worktree-abc/workspace';
+  const commonGit = '/private/tmp/primary/.git';
+  const gitDir = `${commonGit}/worktrees/worker`;
+  const base = { repoPath: workspace, gitDir, tempPath: '/private/tmp', writablePaths: ['**'] };
+  const off = macosProfile(base);
+  assert.equal(macosProfile({ ...base, allowGitPointerMetadata: false }), off, 'false is byte-identical to omitted');
+  assert.doesNotMatch(off, /file-read-metadata \(literal "[^"]*\.git"\)/);
+  const on = macosProfile({ ...base, allowGitPointerMetadata: true });
+  const rule = `(allow file-read-metadata (literal "${workspace}/.git"))`;
+  assert.equal(on.split(rule).length - 1, 1, 'exactly one allow rule');
+  const lines = on.split('\n');
+  const at = lines.indexOf(rule);
+  assert.ok(at > 0);
+  const lastDeny = Math.max(...lines.map((line, index) => (/^\(deny file-(read|write)\*.*\.git/.test(line) ? index : -1)));
+  assert.ok(at > lastDeny, 'the allow follows every .git deny (last match wins)');
+  const gitAllows = lines.filter((line) => line.startsWith('(allow') && /\.git/.test(line));
+  assert.deepEqual(gitAllows, [rule], 'nothing is allowed for gitDir or the common .git, and never a subpath');
+  assert.equal(on.replace(`${rule}\n`, ''), off, 'the rule is the only difference');
+  for (const bad of ['yes', 1, null])
+    assert.throws(
+      () => macosProfile({ ...base, allowGitPointerMetadata: bad }),
+      (error) => error instanceof TypeError,
+    );
+});
+const pytestImportable = () => spawnSync('python3', ['-c', 'import pytest'], { stdio: 'ignore' }).status === 0;
+test(
+  'macOS sandbox lets pytest collect past the .git pointer only with allowGitPointerMetadata',
+  { skip: (!sandboxAvailable() && 'requires an available macOS sandbox') || (!pytestImportable() && 'requires python3 with pytest') },
+  async (t) => {
+    const dir = await mkdtemp(`${tmpdir()}/offload-pytest-git-`);
+    const common = await mkdtemp(`${tmpdir()}/offload-pytest-primary-`);
+    t.after(() => Promise.all([rm(dir, { recursive: true, force: true }), rm(common, { recursive: true, force: true })]));
+    const gitDir = join(common, '.git', 'worktrees', 'worker');
+    await mkdir(gitDir, { recursive: true });
+    const canonicalGitDir = await realpath(gitDir);
+    await writeFile(join(dir, '.git'), `gitdir: ${canonicalGitDir}\n`);
+    await mkdir(join(dir, 'tests'));
+    await writeFile(join(dir, 'tests', 'test_ok.py'), 'def test_ok():\n    assert True\n');
+    // Copy pytest and its pure-Python dependencies beside the repo so the sandboxed interpreter can import them
+    // wherever the host installed them (user site-packages may be unreadable), and grant read and exec on that copy.
+    const site = await mkdtemp(`${tmpdir()}/offload-pytest-site-`);
+    t.after(() => rm(site, { recursive: true, force: true }));
+    const copy = `import importlib.util as u,shutil,sys,os
+for m in ['pytest','_pytest','pluggy','iniconfig','packaging','pygments','colorama','exceptiongroup','tomli']:
+    s=u.find_spec(m)
+    if s is None: continue
+    src=os.path.dirname(s.origin) if s.submodule_search_locations else s.origin
+    dst=os.path.join(sys.argv[1], os.path.basename(src))
+    shutil.copytree(src,dst,ignore=shutil.ignore_patterns('__pycache__')) if os.path.isdir(src) else shutil.copy(src,dst)`;
+    spawnSync('python3', ['-c', copy, site]);
+    const prefix = spawnSync('python3', ['-c', 'import sys,os;print(os.path.realpath(sys.base_prefix))'], {
+      encoding: 'utf8',
+    }).stdout.trim();
+    const roots = [prefix, await realpath(site)];
+    const options = { cwd: dir, gitDir: canonicalGitDir, requireSandbox: true, interpreterPaths: roots, writablePaths: [] };
+    const bootstrap = `import sys;sys.path.insert(0, '${roots[1]}');import pytest;`;
+    const run = `python3 -c "${bootstrap}sys.exit(pytest.main(['-p','no:cacheprovider','tests/test_ok.py']))"`;
+    const importable = await runCommand(`python3 -c "${bootstrap}"`, options);
+    if (importable.code !== 0) return t.skip(`pytest is not importable inside the sandbox on this host: ${importable.stderr.slice(-200)}`);
+    const command = run;
+    const withOption = await runCommand(command, { ...options, allowGitPointerMetadata: true });
+    assert.equal(withOption.code, 0, withOption.stdout + withOption.stderr);
+    const statPointer = 'python3 -c "import os;os.stat(\'.git\')"';
+    const deniedStat = await runCommand(statPointer, options);
+    assert.notEqual(deniedStat.code, 0, 'without the option the pointer stat is denied');
+    assert.match(deniedStat.stderr, /PermissionError/);
+    assert.equal((await runCommand(statPointer, { ...options, allowGitPointerMetadata: true })).code, 0);
+    // Deterministic regression guard independent of pathlib's EPERM handling: a pytest test that stats the pointer.
+    await writeFile(join(dir, 'tests', 'test_stat.py'), "import os\n\ndef test_stat():\n    os.stat('.git')\n");
+    const statRun = `python3 -c "${bootstrap}sys.exit(pytest.main(['-p','no:cacheprovider','tests/test_stat.py']))"`;
+    const statWithout = await runCommand(statRun, options);
+    assert.notEqual(statWithout.code, 0, statWithout.stdout + statWithout.stderr);
+    assert.match(statWithout.stdout + statWithout.stderr, /PermissionError|Operation not permitted/);
+    const statWith = await runCommand(statRun, { ...options, allowGitPointerMetadata: true });
+    assert.equal(statWith.code, 0, statWith.stdout + statWith.stderr);
+    assert.notEqual((await runCommand('cat .git', { ...options, allowGitPointerMetadata: true })).code, 0, 'content stays denied');
+    assert.notEqual(
+      (await runCommand('printf x > .git', { ...options, allowGitPointerMetadata: true, writablePaths: [join(dir, '**')] })).code,
+      0,
+    );
+    assert.equal(await readFile(join(dir, '.git'), 'utf8'), `gitdir: ${canonicalGitDir}\n`);
+    assert.notEqual((await runCommand('test -e .git', options)).code, 0, 'the worker profile cannot stat the pointer');
+  },
+);
 test('Windows policy-only runner uses cmd.exe, a scrubbed profile, and taskkill for child trees', async () => {
   let invocation;
   const child = new EventEmitter();
