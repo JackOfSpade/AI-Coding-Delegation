@@ -117,15 +117,17 @@ function environmentLine(job, environmentFailure, { reportMode, primaryChecked, 
             : ' Either it is not installed in the primary checkout, it lives in a nested/workspace package outside the linked root node_modules, or the worker imported a package that does not exist (check the diff).'
           : environmentFailure.kind === 'temp-dir-denied'
             ? ' Hard-coded /tmp is not writable in the verifier; tests must use os.tmpdir()/$TMPDIR and forward the environment to child processes. For a suite with such pre-existing failures, start with verifierMode "baseline-diff".'
-            : environmentFailure.kind === 'git-config-denied'
-              ? ' A temporary Git-fixture test could not read host Git configuration in the verifier sandbox. This is an environment limitation, not a product-test failure; run that integration suite in the primary checkout.'
-              : environmentFailure.kind === 'native-module-crash'
-                ? primaryChecked
-                  ? ' The earlier native import crash remains recorded separately from the primary check.'
-                  : ' Run the import in the primary checkout to determine whether the verifier sandbox caused the crash. An accepted interpreter declaration grants read and exec; it does not prove imports work.'
-                : environmentFailure.kind === 'sandbox-dominated'
-                  ? " Most of the suite's child-process/Git fixtures cannot run in the verifier sandbox, so the runs are no evidence about the change: run that suite in the primary checkout, and give the next job a testCommand without those files."
-                  : ''
+            : environmentFailure.kind === 'git-metadata-denied'
+              ? ' pytest stat()ed the worktree .git pointer, which an older verifier sandbox denies. Rerun with --ignore=.git added to the pytest testCommand (or update Offload); this is not a code failure.'
+              : environmentFailure.kind === 'git-config-denied'
+                ? ' A temporary Git-fixture test could not read host Git configuration in the verifier sandbox. This is an environment limitation, not a product-test failure; run that integration suite in the primary checkout.'
+                : environmentFailure.kind === 'native-module-crash'
+                  ? primaryChecked
+                    ? ' The earlier native import crash remains recorded separately from the primary check.'
+                    : ' Run the import in the primary checkout to determine whether the verifier sandbox caused the crash. An accepted interpreter declaration grants read and exec; it does not prove imports work.'
+                  : environmentFailure.kind === 'sandbox-dominated'
+                    ? " Most of the suite's child-process/Git fixtures cannot run in the verifier sandbox, so the runs are no evidence about the change: run that suite in the primary checkout, and give the next job a testCommand without those files."
+                    : ''
       }${
         // An applyThenVerify run is already acting on this very advice.
         applyRunning || job.applied === true

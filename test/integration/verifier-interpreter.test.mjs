@@ -350,6 +350,7 @@ test(
     assert.deepEqual(job.verifierInterpreter, [venv]);
     assert.deepEqual([...job.verifierInterpreterRoots].sort(), roots);
     assert.deepEqual([...seen[0].options.interpreterPaths].sort(), roots, 'the verifier run receives the grant');
+    assert.equal(seen[0].options.allowGitPointerMetadata, true, 'the verifier alone may stat the .git pointer');
 
     // Without a declaration the verifier gets nothing, whatever the caller put in the roots field.
     const plain = await core.start({
@@ -593,6 +594,8 @@ test('the declared roots reach both the job verifier and applyThenVerify, and no
   assert.deepEqual(check.options.interpreterPaths, [venv]);
   assert.deepEqual(check.options.writablePaths, [], 'the primary stays read-only to applyThenVerify');
   assert.equal(check.options.allowNetwork, false);
+  assert.equal(check.options.allowGitPointerMetadata, true);
+  assert.equal(calls[0].options.allowGitPointerMetadata, true);
 });
 
 test('the MCP tools advertise verifierInterpreter and refuse it where it cannot apply', async () => {
@@ -710,4 +713,12 @@ test('uv symlink declarations are rejected before a job or paid worker starts', 
     );
   }
   assert.deepEqual((await core.job(undefined, { repoPath: repo })).jobs, []);
+});
+
+test('only verifier option builders carry allowGitPointerMetadata; the worker run_command closure never does', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const core = await readFile(new URL('../../src/core.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(core, /allowGitPointerMetadata/);
+  const manager = await readFile(new URL('../../src/job-manager.mjs', import.meta.url), 'utf8');
+  assert.equal(manager.match(/allowGitPointerMetadata: true/g).length, 3, 'verifier, primary and scratch applyThenVerify');
 });
