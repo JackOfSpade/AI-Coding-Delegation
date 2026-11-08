@@ -1150,6 +1150,70 @@ test('a report job records only the shape of a looping call and can never be con
   }
 });
 
+test('a salvaged report lands DONE_UNVERIFIED with its text, and a failed finish keeps fixed problems; neither can be continued', async () => {
+  const problems = [
+    'summary was missing or longer than 1500 characters',
+    'finish was not the only tool call',
+    `${'p'.repeat(400)} API_KEY=hunter2hunter2`,
+  ];
+  const salvagedFinish = {
+    summary: 'Drafted.',
+    report: 'The drafted report body.',
+    concerns: ['Recovered the drafted report: the finish arguments were invalid (x); the report is unreviewed.'],
+    testsRun: [],
+  };
+  const salvaged = await harness({
+    worker: async () => ({
+      status: 'DONE',
+      turn: 4,
+      costUsd: 0.01,
+      finish: salvagedFinish,
+      finishProblems: problems,
+      reportSalvaged: true,
+    }),
+    verify: pass,
+  });
+  try {
+    const { jobId } = await salvaged.manager.start({ mode: 'report', task: 'analyze', repoPath: salvaged.repo });
+    const done = await salvaged.settle(jobId);
+    assert.equal(done.status, 'DONE_UNVERIFIED');
+    const view = await salvaged.manager.job(jobId);
+    assert.equal(view.reportResult.text, 'The drafted report body.');
+    assert.match(
+      view.report,
+      /report salvaged: the finish arguments were invalid; reportResult\.text holds the drafted report, unreviewed/,
+    );
+    assert.match(view.report, /finish protocol: summary was missing or longer than 1500 characters; finish was not the only tool call/);
+    assert.doesNotMatch(view.report, /hunter2hunter2|next: .*\bcontinue\b/);
+    assert.match(view.report, /next: read reportResult/);
+    await assert.rejects(() => salvaged.manager.continue(jobId), /report jobs are read-only.*reportResult/);
+    await assert.rejects(() => salvaged.manager.repair(jobId, ['more']), /report jobs are read-only/);
+  } finally {
+    cleanup(salvaged.repo);
+  }
+  const failed = await harness({
+    worker: async () => ({
+      status: 'FAILED',
+      turn: 4,
+      costUsd: 0.01,
+      failureKind: 'finish-protocol',
+      finishProblems: problems.slice(0, 2),
+    }),
+    verify: pass,
+  });
+  try {
+    const { jobId } = await failed.manager.start({ mode: 'report', task: 'analyze', repoPath: failed.repo });
+    const done = await failed.settle(jobId);
+    assert.equal(done.status, 'FAILED');
+    assert.deepEqual(done.finishProblems, problems.slice(0, 2));
+    assert.match(done.report, /finish protocol: summary was missing or longer than 1500 characters; finish was not the only tool call/);
+    assert.doesNotMatch(done.report, /report salvaged/);
+    await assert.rejects(() => failed.manager.continue(jobId), /report jobs are read-only/);
+  } finally {
+    cleanup(failed.repo);
+  }
+});
+
 test('a repair that fails during setup leaves no continuable marker behind', async () => {
   const h = await harness({ worker: async (job) => (writeSrc(job, 'a.js'), loopResult()), verify: pass });
   try {

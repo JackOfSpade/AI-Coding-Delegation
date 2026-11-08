@@ -51,6 +51,14 @@ test('a clean verified session derives no signal and no prompt is warranted', ()
   assert.equal(result.jobs[0].id, ID('a'));
 });
 
+test('report-finish-salvaged: a DONE report job whose invalid finish was recovered, not a write job', () => {
+  const signal = only([job('a', { mode: 'report', status: 'DONE_UNVERIFIED', reportSalvaged: true })]);
+  assert.equal(signal.code, 'report-finish-salvaged');
+  assert.equal(signal.attributable, true);
+  assert.match(signal.evidence, /recovered a drafted report after an invalid finish call/);
+  assert.deepEqual(codes([job('b', { mode: 'write', status: 'DONE_UNVERIFIED', reportSalvaged: true })]), []);
+});
+
 test('protocol-failure-finish: a FAILED finish-protocol or no-finish round, not a loop or a pass', () => {
   for (const failureKind of ['finish-protocol', 'no-finish']) {
     const signal = only([job('a', { status: 'FAILED', failureKind, files: [{ path: 'a.js' }] })]);

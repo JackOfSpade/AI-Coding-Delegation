@@ -315,6 +315,16 @@ function safeReportString(value, maxChars = MAX_REPORT_TEXT) {
   return bounded || undefined;
 }
 const safeReportText = (value) => safeReportString(value);
+// Fixed finish-protocol problem texts from the loop: at most 6 short, redacted lines.
+const safeFinishProblems = (value) => {
+  const list = Array.isArray(value)
+    ? value.slice(0, 6).flatMap((item) => {
+        const text = safeReportString(item, 200);
+        return text ? [text] : [];
+      })
+    : [];
+  return list.length ? list : undefined;
+};
 // Persisted copies of the worker's review packet and the server's check. Every
 // text field goes through safeReportString; a malformed packet is not stored
 // (the check already records why).
@@ -489,8 +499,10 @@ const failureView = (job) => {
   const failureKind = safeFailureKind(job?.failureKind);
   const toolFailure = safeToolFailure(job?.toolFailure);
   const finalizationError = safeFinalizationError(job?.finalizationError);
+  const finishProblems = safeFinishProblems(job?.finishProblems);
   return {
     ...(failureKind ? { failureKind } : {}),
+    ...(finishProblems ? { finishProblems } : {}),
     ...(toolFailure ? { toolFailure } : {}),
     ...(finalizationError ? { finalizationError } : {}),
   };
@@ -2355,6 +2367,8 @@ export class JobManager {
           const invalidStatus = !allowedWorkerStatuses.has(requestedStatus);
           const reportText = safeReportText(result?.report ?? result?.finish?.report);
           const missingReport = job.mode === 'report' && requestedStatus === 'DONE' && !reportText;
+          // A report job's forced finalization finish was invalid but its drafted report was recovered.
+          const salvaged = job.mode === 'report' && requestedStatus === 'DONE' && !!reportText && result?.reportSalvaged === true;
           let workerStatus = leaseLost
             ? 'FAILED'
             : controller.signal.aborted
@@ -2472,6 +2486,12 @@ export class JobManager {
             ...(providerFailure ? { providerFailure } : {}),
             ...(failureKind ? { failureKind } : {}),
             ...(toolFailure ? { toolFailure } : {}),
+            ...(job.mode === 'report' &&
+            safeFinishProblems(result?.finishProblems) &&
+            (failureKind === 'finish-protocol' || (salvaged && workerStatus === 'WORKER_DONE'))
+              ? { finishProblems: safeFinishProblems(result.finishProblems) }
+              : {}),
+            ...(salvaged && workerStatus === 'WORKER_DONE' ? { reportSalvaged: true } : {}),
             ...(leaseLost
               ? { error: `lease lost: ${leaseLost}` }
               : invalidStatus || badAccounting || missingReport
@@ -3864,7 +3884,10 @@ export class JobManager {
       throw new Error('defects must be 1-32 non-empty bounded strings');
     const repairEnteredMs = this.#nowMs();
     let job = this.validatePersisted(await this.store.get(id));
-    if (job.mode === 'report') throw new Error('report jobs are read-only and cannot be repaired; start a new report job');
+    if (job.mode === 'report')
+      throw new Error(
+        'report jobs are read-only and cannot be repaired; read reportResult (a drafted report is recovered when its finish call was invalid) or start a new report job',
+      );
     // A terminal durable state can be published just before its owning local
     // task performs final cleanup. Join that task first, then decide whether
     // a manual repair is eligible; otherwise the same request is needlessly

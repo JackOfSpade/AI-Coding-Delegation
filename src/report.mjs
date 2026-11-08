@@ -371,6 +371,8 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     summary,
     concerns,
     reviewPacketLine(job),
+    finishProtocolLine(job),
+    reportSalvagedLine(job),
     ...providerTransitionLines(job),
     providerFailure,
     (!lean || failureDiagnostics) && providerFinishReason,
@@ -390,6 +392,18 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     .join('\n');
   return redactText(raw);
 }
+/** The fixed finish-protocol problems a report job's invalid finish call had, when the loop recorded any. */
+function finishProtocolLine(job) {
+  if (!reportModeOf(job) || !Array.isArray(job.finishProblems)) return '';
+  const problems = job.finishProblems.slice(0, 6).filter((item) => typeof item === 'string' && item);
+  return problems.length ? `finish protocol: ${problems.map((item) => scalar(item).slice(0, 200)).join('; ')}` : '';
+}
+function reportSalvagedLine(job) {
+  return reportModeOf(job) && job.reportSalvaged === true
+    ? 'report salvaged: the finish arguments were invalid; reportResult.text holds the drafted report, unreviewed'
+    : '';
+}
+const reportModeOf = (job) => job?.mode === 'report';
 /** One-line verdict on the worker's review packet; empty unless the job requested one. */
 function reviewPacketLine(job) {
   if (job.reviewPacket !== true) return '';

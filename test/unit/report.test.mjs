@@ -1744,3 +1744,19 @@ test('compactReport shows the output-cap diagnostic line only for a valid diagno
   assert.deepEqual(lines({ outputCap: { turn: 'x', steer: 'continue' } }), []);
   assert.deepEqual(lines({ outputCap: { turn: 3, steer: 'write-in-parts' } }), []);
 });
+
+test('a report job shows its fixed finish problems and a salvaged report is flagged', () => {
+  const base = {
+    id: 'r1',
+    mode: 'report',
+    finishProblems: ['summary was missing or longer than 1500 characters', 'finish was not the only tool call'],
+  };
+  const salvaged = compactReport({ ...base, status: 'DONE_UNVERIFIED', reportSalvaged: true });
+  assert.match(salvaged, /^finish protocol: summary was missing or longer than 1500 characters; finish was not the only tool call$/m);
+  assert.match(salvaged, /^report salvaged: the finish arguments were invalid; reportResult\.text holds the drafted report, unreviewed$/m);
+  assert.match(salvaged, /next: read reportResult/);
+  const failed = compactReport({ ...base, status: 'FAILED', failureKind: 'finish-protocol', error: FAILURE_ERRORS['finish-protocol'] });
+  assert.match(failed, /^finish protocol: /m);
+  assert.doesNotMatch(failed, /report salvaged/);
+  assert.doesNotMatch(compactReport({ id: 'w', status: 'FAILED', finishProblems: ['x'] }), /finish protocol/);
+});
