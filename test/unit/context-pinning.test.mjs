@@ -64,13 +64,35 @@ test('when the limit sits between reads and reads plus greps, only greps are eli
 
 test('a later read of the same path, offset and limit supersedes the older one; a different offset does not', async () => {
   const context = new AgentContext([], { pinReads: true, maxToolChars: 70_000, keepRecentToolResults: 0 });
-  await turn(context, [readCall('a', 'x.md')], [20_000]);
-  await turn(context, [readCall('b', 'y.md', { offset: 0 })], [20_000]);
-  await turn(context, [readCall('c', 'x.md')], [20_000]);
-  await turn(context, [readCall('d', 'y.md', { offset: 5 })], [20_000]);
+  await turn(context, [readCall('x', 'x.md')], [20_000]);
+  await turn(context, [readCall('y-old', 'y.md', { offset: 0 })], [20_000]);
+  await turn(context, [readCall('z', 'z.md')], [20_000]);
+  await turn(context, [readCall('y-new', 'y.md', { offset: 0 })], [20_000]);
   const byId = Object.fromEntries(tools(context).map((m) => [m.tool_call_id, m]));
-  assert.equal(byId.a.elided, true, 'the superseded read goes first');
-  assert.ok(!byId.b.elided && !byId.c.elided && !byId.d.elided);
+  assert.equal(byId['y-old'].elided, true, 'the superseded read goes first although it is not the oldest');
+  assert.ok(!byId.x.elided && !byId.z.elided && !byId['y-new'].elided, 'older pinned reads survive');
+  // A different offset is a different read: nothing is superseded, so the oldest goes.
+  const other = new AgentContext([], { pinReads: true, maxToolChars: 70_000, keepRecentToolResults: 0 });
+  await turn(other, [readCall('x', 'x.md')], [20_000]);
+  await turn(other, [readCall('y-old', 'y.md', { offset: 0 })], [20_000]);
+  await turn(other, [readCall('z', 'z.md')], [20_000]);
+  await turn(other, [readCall('y-new', 'y.md', { offset: 5 })], [20_000]);
+  const otherById = Object.fromEntries(tools(other).map((m) => [m.tool_call_id, m]));
+  assert.equal(otherById.x.elided, true, 'without supersede the oldest read is the last-resort victim');
+  assert.ok(!otherById['y-old'].elided);
+});
+
+test('provider projections elide a superseded read before older pinned reads', async () => {
+  const context = new AgentContext([], { pinReads: true, maxToolChars: 1_000_000, keepRecentToolResults: 0 });
+  await turn(context, [readCall('x', 'x.md')], [20_000]);
+  await turn(context, [readCall('y-old', 'y.md')], [20_000]);
+  await turn(context, [readCall('z', 'z.md')], [20_000]);
+  await turn(context, [readCall('y-new', 'y.md')], [20_000]);
+  const first = [...context.providerBudgetElisionSnapshots()][0].messages.filter((m) => MARKER.test(m.content ?? ''));
+  assert.deepEqual(
+    first.map((m) => m.tool_call_id),
+    ['y-old'],
+  );
 });
 
 test('pinned reads are elided oldest-first only as a last resort', async () => {
