@@ -3,6 +3,7 @@ import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { reportRetentionChars } from './budget-sizing.mjs';
 import { LeaseManager, getGitDir } from './lease.mjs';
 import { JobStore } from './store.mjs';
 import { Runner } from './runner.mjs';
@@ -514,7 +515,11 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         const prior = job.assertionRepair ? stored.slice(job.assertionRepair.transcriptStart) : stored;
         const context =
           job.mode === 'report'
-            ? new AgentContext()
+            ? new AgentContext([], {
+                pinReads: true,
+                maxToolChars: reportRetentionChars(job.budgetSizing?.readChars),
+                keepRecentToolResults: 16,
+              })
             : new AgentContext(prior, { onAppend: api.appendMessage, onAppendBatch: api.appendMessages });
         const repair = `Repair these concrete defects:\n${(api.defects?.length ? api.defects : ['Continue the job and re-check the acceptance criteria.']).map((x) => `- ${x}`).join('\n')}`;
         const totalTurns = job.budget?.maxTurns ?? loaded?.config.limits.maxTurns,

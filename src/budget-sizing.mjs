@@ -23,6 +23,14 @@ export const TURN_WRITE_PER_PATH = 2;
 export const TURN_HEADROOM = 1.25;
 /** Average source line length used to turn a :START-END range into bytes. */
 export const LINE_BYTES_ESTIMATE = 80;
+/** Average characters per line for a ranged read, used only to size report retention (readSegments keeps LINE_BYTES_ESTIMATE). */
+export const RANGE_CHARS_PER_LINE_ESTIMATE = 200;
+/** Headroom above the declared reads for grep/list output and the brief, and the retention bounds for a report worker. */
+export const REPORT_RETENTION_HEADROOM = 48_000;
+export const REPORT_RETENTION_MIN = 96_000;
+export const REPORT_RETENTION_MAX = 400_000;
+/** Retention assumed for a stored record that predates readChars. */
+export const REPORT_RETENTION_FALLBACK = 160_000;
 /** Hard ceiling for a server-chosen cap; an explicit caller cap may go to 1000. */
 export const AUTO_TURNS_MAX = 200;
 /** Conservative seconds per worker turn (field report: 30-40 turns took about 32 minutes); only used to warn that the wall clock may run out first. */
@@ -68,6 +76,32 @@ export function readSegments(bytes, range) {
   if (!range) return whole;
   return Math.min(whole, 1 + Math.ceil(((range.end - range.start + 1) * LINE_BYTES_ESTIMATE) / PAGE_PAYLOAD));
 }
+
+/**
+ * Characters of read_file output a worker needs to hold the declared read set:
+ * a whole file is its bytes (capped like the sizing itself) plus a ~33 character
+ * marker per page, a ranged entry is estimated per line, and a staged report
+ * input is its manifest bytes (it arrives as a whole file). Arithmetic on stat
+ * results only.
+ */
+export function estimateReadChars(files = []) {
+  const marker = 33;
+  let total = 0;
+  for (const file of files) {
+    if (!Number.isSafeInteger(file?.bytes) || file.bytes < 0) continue;
+    const range = file.range;
+    if (range && Number.isSafeInteger(range.start) && Number.isSafeInteger(range.end) && range.end >= range.start)
+      total += Math.min(file.bytes, (range.end - range.start + 1) * RANGE_CHARS_PER_LINE_ESTIMATE);
+    else total += Math.min(file.bytes, MAX_SIZED_BYTES) + Math.max(0, Math.ceil(file.bytes / PAGE_PAYLOAD) - 1) * marker;
+  }
+  return total;
+}
+
+/** The chars of tool output a report worker retains for a read set of `readChars` (fallback when unknown). */
+export const reportRetentionChars = (readChars) =>
+  Number.isSafeInteger(readChars) && readChars >= 0
+    ? Math.min(REPORT_RETENTION_MAX, Math.max(REPORT_RETENTION_MIN, readChars + REPORT_RETENTION_HEADROOM))
+    : REPORT_RETENTION_FALLBACK;
 
 /**
  * Stat the files a worker will likely read. Paths go through the same
@@ -195,7 +229,7 @@ export function resolveTurnBudget({
 }
 
 /** The persisted/echoed record for one job: arithmetic and sanitized file names only. */
-export function buildBudgetSizing({ resolved, recommendation, files = [] }) {
+export function buildBudgetSizing({ resolved, recommendation, files = [], readChars, retentionChars }) {
   return safeBudgetSizing({
     maxTurns: resolved.maxTurns,
     turnsSource: resolved.turnsSource,
@@ -216,6 +250,8 @@ export function buildBudgetSizing({ resolved, recommendation, files = [] }) {
       readTurns: readSegments(file.bytes, file.range),
       ranged: !!file.range,
     })),
+    ...(readChars !== undefined ? { readChars } : {}),
+    ...(retentionChars !== undefined ? { retentionChars } : {}),
     warnings: resolved.warnings,
   });
 }
@@ -295,6 +331,8 @@ export function safeBudgetSizing(value) {
     ...optional('segmentChars', MAX_SAFE_BYTES),
     ...optional('fileCount', MAX_SIZED_FILES),
     ...optional('totalBytes', MAX_SAFE_BYTES),
+    ...optional('readChars', MAX_SAFE_BYTES),
+    ...optional('retentionChars', REPORT_RETENTION_MAX),
     files,
     warnings,
   };
