@@ -1,7 +1,7 @@
 /** Dependency-free, scrubbed command execution with best-effort OS sandboxing. */
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
-import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve, relative, isAbsolute, posix } from 'node:path';
 import { normalizePath } from './glob.mjs';
@@ -313,12 +313,14 @@ export function macosProfile({
   allowNetwork = false,
   allowTempSockets = false,
   allowGitPointerMetadata = false,
+  allowRootMetadata = false,
 }) {
   // Seatbelt profiles describe macOS paths even when a diagnostic fixture is
   // compiled on another host. Command execution and temp I/O remain native.
   const { basename, dirname, join, resolve, sep, isAbsolute } = posix;
   if (typeof allowTempSockets !== 'boolean') throw new TypeError('allowTempSockets must be boolean');
   if (typeof allowGitPointerMetadata !== 'boolean') throw new TypeError('allowGitPointerMetadata must be boolean');
+  if (typeof allowRootMetadata !== 'boolean') throw new TypeError('allowRootMetadata must be boolean');
   if (!Array.isArray(denyRead) || denyRead.some((path) => typeof path !== 'string'))
     throw new TypeError('denyRead must be relative glob strings');
   if (!Array.isArray(denyWrite) || denyWrite.some((path) => typeof path !== 'string'))
@@ -387,11 +389,15 @@ export function macosProfile({
     dirname(MACOS_SHELL_SELECTOR),
   ].filter(Boolean))
     for (const parent of sandboxTraversalAncestors(path, dirname)) traversalMetadata.add(parent);
-  // CPython resolves its own executable with realpath(3), which stats every
-  // component starting at `/`: without the exact root node an interpreter dies
-  // at startup ("realpath: ...: Operation not permitted"), even a system one.
-  // This is metadata of the single directory node, never its contents.
-  if (resolvedInterpreter.length) traversalMetadata.add(sep);
+  // Stat of the root directory node itself: metadata of that one node, never
+  // its contents, and less than the `file-read-data (literal "/")` listing every
+  // profile already grants. CPython's realpath(3) stats each component from
+  // `/` (a declared interpreter otherwise dies at startup), and verifier code
+  // that walks a path's ancestors up to `/` checking owner and mode (Offload's
+  // own job store does) fails on the last step without it. Verifier-only
+  // (allowRootMetadata): in the worker profile its absence is what keeps system
+  // Python from starting, which the worker shell contract relies on.
+  if (resolvedInterpreter.length || allowRootMetadata) traversalMetadata.add(sep);
   const read = [
     root,
     '/System',
@@ -604,6 +610,7 @@ export async function runCommand(command, options = {}) {
     interpreterMetadataPaths: options.interpreterMetadataPaths || [],
     allowNetwork: options.allowNetwork === true,
     allowGitPointerMetadata: options.allowGitPointerMetadata === true,
+    allowRootMetadata: options.allowRootMetadata === true,
   };
   const probeProfile = options.sandbox !== false && platform === 'darwin' ? compileSandboxProfile(profileInput) : undefined;
   const canSandbox = probeProfile && (options.sandboxProbe || sandboxAvailable)(platform, probeProfile);
@@ -796,7 +803,49 @@ export async function runCommand(command, options = {}) {
       command,
     };
   } finally {
-    if (dir) await rm(dir, { recursive: true, force: true });
+    if (dir) await removeRunDirectory(dir);
+  }
+}
+
+/**
+ * Remove a per-run temp directory without ever replacing the command's result.
+ * A command may leave a read-only directory in it (a suite that copies inputs
+ * read-only, `chmod -w` fixtures), and unlinking needs write permission on the
+ * parent: restore owner rwx on this tree's own directories, without following
+ * symlinks, then retry once. A directory that still cannot be removed is left
+ * for the OS temp cleaner; it holds only that run's disposable files.
+ */
+export async function removeRunDirectory(
+  dir,
+  { remove = rm, lstat: lstatFn = lstat, readdir: readdirFn = readdir, chmod: chmodFn = chmod } = {},
+) {
+  try {
+    await remove(dir, { recursive: true, force: true });
+    return true;
+  } catch {}
+  const restore = async (path) => {
+    let details;
+    try {
+      details = await lstatFn(path);
+    } catch {
+      return;
+    }
+    if (!details.isDirectory() || details.isSymbolicLink()) return;
+    try {
+      await chmodFn(path, (details.mode & 0o7777) | 0o700);
+    } catch {}
+    let entries = [];
+    try {
+      entries = await readdirFn(path);
+    } catch {}
+    for (const entry of entries) await restore(join(path, entry));
+  };
+  await restore(dir);
+  try {
+    await remove(dir, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
   }
 }
 

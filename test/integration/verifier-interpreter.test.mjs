@@ -47,10 +47,21 @@ async function scratch(t) {
   return root;
 }
 
-test('macOS profile grants a declared interpreter root read and exec, never write, and only then exposes the root node', () => {
+test('macOS profile grants a declared interpreter root read and exec, never write; the root node is stat-able only for an interpreter or a verifier', () => {
   const plain = macosProfile({ repoPath: '/repo' });
-  assert.ok(!plain.includes('(allow file-read-metadata (literal "/"))'), 'a profile with no declared interpreter is unchanged');
+  // The worker profile stays as it was: without root metadata system Python cannot start there.
+  assert.ok(!plain.includes('(allow file-read-metadata (literal "/"))'), 'a worker profile cannot stat the root node');
   assert.ok(!plain.includes('process-exec'));
+  const verifier = macosProfile({ repoPath: '/repo', allowRootMetadata: true });
+  assert.ok(verifier.includes('(allow file-read-metadata (literal "/"))'), 'a verifier can stat the root node');
+  assert.ok(!verifier.includes('(subpath "/")'), 'nothing under the root is granted through the root');
+  assert.equal(
+    verifier.replace('(allow file-read-metadata (literal "/"))\n', ''),
+    plain,
+    'the root node is the only difference from the worker profile',
+  );
+  assert.equal(macosProfile({ repoPath: '/repo', allowRootMetadata: false }), plain, 'false is byte-identical to omitted');
+  assert.throws(() => macosProfile({ repoPath: '/repo', allowRootMetadata: 'yes' }), /allowRootMetadata must be boolean/);
 
   const profile = macosProfile({ repoPath: '/repo', writablePaths: ['src/**'], interpreterPaths: ['/Users/me/.venv', '/opt/py/3.99'] });
   for (const root of ['/Users/me/.venv', '/opt/py/3.99']) {
@@ -351,6 +362,7 @@ test(
     assert.deepEqual([...job.verifierInterpreterRoots].sort(), roots);
     assert.deepEqual([...seen[0].options.interpreterPaths].sort(), roots, 'the verifier run receives the grant');
     assert.equal(seen[0].options.allowGitPointerMetadata, true, 'the verifier alone may stat the .git pointer');
+    assert.equal(seen[0].options.allowRootMetadata, true, 'the verifier alone may stat the root node');
 
     // Without a declaration the verifier gets nothing, whatever the caller put in the roots field.
     const plain = await core.start({
@@ -596,6 +608,8 @@ test('the declared roots reach both the job verifier and applyThenVerify, and no
   assert.equal(check.options.allowNetwork, false);
   assert.equal(check.options.allowGitPointerMetadata, true);
   assert.equal(calls[0].options.allowGitPointerMetadata, true);
+  assert.equal(check.options.allowRootMetadata, true);
+  assert.equal(calls[0].options.allowRootMetadata, true);
 });
 
 test('the MCP tools advertise verifierInterpreter and refuse it where it cannot apply', async () => {
@@ -719,6 +733,8 @@ test('source guard: the worker run_command closure never names allowGitPointerMe
   const { readFile } = await import('node:fs/promises');
   const core = await readFile(new URL('../../src/core.mjs', import.meta.url), 'utf8');
   assert.doesNotMatch(core, /allowGitPointerMetadata/);
+  assert.doesNotMatch(core, /allowRootMetadata/);
   const manager = await readFile(new URL('../../src/job-manager.mjs', import.meta.url), 'utf8');
   assert.match(manager, /allowGitPointerMetadata: true/);
+  assert.equal((manager.match(/allowRootMetadata: true/g) || []).length, 3, 'the job verifier and both applyThenVerify paths');
 });

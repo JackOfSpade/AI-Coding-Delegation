@@ -13,6 +13,7 @@ import {
   terminateWindowsTree,
   sandboxToolEnv,
   probeVerifierTemp,
+  removeRunDirectory,
 } from '../../src/sandbox.mjs';
 import { globToRegExp } from '../../src/glob.mjs';
 import { Runner } from '../../src/runner.mjs';
@@ -1402,6 +1403,99 @@ test(
       await new Promise((resolve) => unix.close(resolve));
       await new Promise((resolve) => tcp.close(resolve));
       await rm(outside, { recursive: true, force: true });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'the real verifier sandbox lets a command stat the root node, so an ancestor walk can end at `/`; the worker profile does not, and both hide what lies below it',
+  { skip: !sandboxAvailable() && MACOS_SANDBOX_SKIP_REASON },
+  async () => {
+    const cwd = await realpath(await mkdtemp(join(tmpdir(), 'offload-root-stat-')));
+    try {
+      const probe = [
+        "const fs = require('fs');",
+        "const stat = (p) => { try { fs.lstatSync(p); return 'ok'; } catch (e) { return e.code; } };",
+        "const read = (p) => { try { fs.readFileSync(p); return 'ok'; } catch (e) { return e.code; } };",
+        "console.log(JSON.stringify({ root: stat('/'), passwdStat: stat('/etc/passwd'), passwdRead: read('/etc/passwd') }));",
+      ].join(' ');
+      const verifier = await runCommand(`node -e ${JSON.stringify(probe)}`, {
+        cwd,
+        requireSandbox: true,
+        timeoutSec: 30,
+        allowRootMetadata: true,
+      });
+      assert.equal(verifier.code, 0, verifier.stderr);
+      assert.deepEqual(JSON.parse(verifier.stdout.trim()), { root: 'ok', passwdStat: 'EPERM', passwdRead: 'EPERM' });
+      const worker = await runCommand(`node -e ${JSON.stringify(probe)}`, { cwd, requireSandbox: true, timeoutSec: 30 });
+      assert.equal(worker.code, 0, worker.stderr);
+      assert.deepEqual(JSON.parse(worker.stdout.trim()), { root: 'EPERM', passwdStat: 'EPERM', passwdRead: 'EPERM' });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test('a per-run directory a command left read-only is still removed, and a symlink out of it is never followed', async (t) => {
+  if (process.platform === 'win32') return t.skip('POSIX permissions');
+  const base = await realpath(await mkdtemp(join(tmpdir(), 'offload-run-cleanup-')));
+  const outside = join(base, 'outside');
+  const run = join(base, 'run');
+  try {
+    await mkdir(outside);
+    await writeFile(join(outside, 'keep.txt'), 'keep\n');
+    await mkdir(join(run, 'inputs', 'nested'), { recursive: true });
+    await writeFile(join(run, 'inputs', 'nested', 'input-01'), 'data\n');
+    await symlink(outside, join(run, 'inputs', 'link'));
+    const { chmod, stat } = await import('node:fs/promises');
+    await chmod(outside, 0o500);
+    await chmod(join(run, 'inputs', 'nested'), 0o500);
+    await chmod(join(run, 'inputs'), 0o500);
+    // The plain removal fails exactly as in the verifier: EACCES on a read-only parent.
+    await assert.rejects(() => rm(run, { recursive: true, force: true }), { code: 'EACCES' });
+    assert.equal(await removeRunDirectory(run), true);
+    assert.equal(existsSync(run), false);
+    assert.equal((await stat(outside)).mode & 0o777, 0o500, 'the symlinked directory outside the run was not chmodded');
+    assert.equal(await readFile(join(outside, 'keep.txt'), 'utf8'), 'keep\n', 'nothing outside the run was removed');
+    await chmod(outside, 0o700);
+  } finally {
+    await rm(base, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('a cleanup that keeps failing reports false instead of throwing', async () => {
+  const calls = [];
+  const removed = await removeRunDirectory('/nonexistent/offload-run', {
+    remove: async () => {
+      calls.push('rm');
+      throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+    },
+    lstat: async () => {
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    },
+  });
+  assert.equal(removed, false);
+  assert.deepEqual(calls, ['rm', 'rm'], 'one retry after restoring permissions, then it gives up');
+});
+
+test(
+  'the real sandbox returns a command result even when the command left a read-only directory in its TMPDIR',
+  { skip: !sandboxAvailable() && MACOS_SANDBOX_SKIP_REASON },
+  async () => {
+    const cwd = await realpath(await mkdtemp(join(tmpdir(), 'offload-ro-tmp-')));
+    try {
+      const result = await runCommand(
+        'mkdir -p "$TMPDIR/inputs" && echo x > "$TMPDIR/inputs/a" && chmod 500 "$TMPDIR/inputs" && echo done',
+        {
+          cwd,
+          requireSandbox: true,
+          timeoutSec: 30,
+        },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(result.stdout.trim(), 'done');
+    } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   },

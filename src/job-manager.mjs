@@ -3205,6 +3205,7 @@ export class JobManager {
       ...interpreterPathsOption(job),
       // Verifier-only: lets tools such as pytest stat() the worktree .git pointer (never read or write it).
       allowGitPointerMetadata: true,
+      allowRootMetadata: true,
       requireSandbox: job.requireSandbox === true,
     };
   }
@@ -4660,6 +4661,7 @@ export class JobManager {
               writablePaths: [],
               ...interpreterPathsOption(job),
               allowGitPointerMetadata: true,
+              allowRootMetadata: true,
               requireSandbox,
               timeoutMs: plan.timeoutSec * 1000,
             });
@@ -4839,6 +4841,7 @@ export class JobManager {
         readablePaths: [dirname(cwd), ...isolatedDependencyReadPaths(cwd, job.repoPath)],
         ...interpreterPathsOption(job),
         allowGitPointerMetadata: true,
+        allowRootMetadata: true,
         requireSandbox,
         timeoutMs: plan.timeoutSec * 1000,
       });
