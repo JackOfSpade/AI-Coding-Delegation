@@ -9,6 +9,8 @@ import {
   FAILURE_ERRORS,
   FAILURE_KINDS,
   continuableFailure,
+  applyBlocker,
+  cancelledRepairApplyRefusal,
   failedApplyRefusal,
   failureContinueDefect,
   loopedAgain,
@@ -513,6 +515,61 @@ test('failedApplyRefusal names the exact reason for every record it must refuse'
     failedApplyRefusal(applyable({ scopeViolations: ['1', '2', '3', '4', '5', '6', '7'] })),
     /\(1, 2, 3, 4, 5, \.\.\.\)/,
     'the list is bounded',
+  );
+});
+
+const repairCancelled = (overrides = {}) => ({
+  id: 'oj-cancelled',
+  status: 'CANCELLED',
+  mode: 'write',
+  before: 'a'.repeat(40),
+  workspaceAfter: 'b'.repeat(40),
+  scopeViolations: [],
+  verifierMutations: [],
+  revertFiles: ['src/a.js'],
+  rounds: 1,
+  patchRound: 1,
+  repairBase: {
+    round: 0,
+    auto: true,
+    workspaceAfter: 'b'.repeat(40),
+    patchRound: 0,
+    files: ['src/a.js'],
+    revertFiles: ['src/a.js'],
+    verify: { command: 'npm test', verdict: 'FAIL', result: { code: 1, stdout: 'AssertionError: boom' } },
+  },
+  ...overrides,
+});
+
+test('cancelledRepairApplyRefusal accepts only the unchanged round-0 diff of a cancelled automatic repair', () => {
+  assert.equal(cancelledRepairApplyRefusal(repairCancelled()), undefined);
+  const refused = [
+    [{ status: 'FAILED' }, /only a job CANCELLED during its automatic repair/],
+    [{ status: 'DONE_VERIFIED' }, /only a job CANCELLED during its automatic repair/],
+    [{ mode: 'report' }, /report jobs never integrate/],
+    [{ repairBase: undefined }, /no reviewed round-N diff was kept/],
+    [{ repairBase: { ...repairCancelled().repairBase, auto: false } }, /no reviewed round-N diff was kept/],
+    [{ repairBase: { ...repairCancelled().repairBase, workspaceAfter: undefined } }, /no reviewed round-N diff was kept/],
+    [{ workspaceAfter: 'c'.repeat(40) }, /changed the diff after round 0, so it is not the reviewed round-0 diff/],
+    [{ scopeViolations: ['src/other.js'] }, /scope or verifier-authorship violations/],
+    [{ verifierMutations: ['src/other.js'] }, /scope or verifier-authorship violations/],
+    [{ applied: true }, /already integrated/],
+    [{ revertFiles: [] }, /no in-scope changes to apply/],
+    [{ before: 'not-a-tree' }, /no result snapshot was recorded/],
+  ];
+  for (const [change, expected] of refused)
+    assert.match(cancelledRepairApplyRefusal(repairCancelled(change)) ?? 'ACCEPTED', expected, JSON.stringify(change));
+  for (const nothing of [null, undefined, 'job', [], 7]) assert.match(cancelledRepairApplyRefusal(nothing), /no job record/);
+});
+
+test('applyBlocker advertises apply for a cancelled-repair job only while its round-0 diff stands', () => {
+  assert.equal(applyBlocker(repairCancelled()), undefined);
+  assert.match(applyBlocker(repairCancelled({ workspaceAfter: 'c'.repeat(40) })), /changed the diff after round 0/);
+  assert.equal(applyBlocker(repairCancelled({ repairBase: undefined })), undefined, 'a plain CANCELLED job never gets an apply line');
+  assert.equal(
+    applyBlocker(repairCancelled({ repairBase: { ...repairCancelled().repairBase, auto: false } })),
+    undefined,
+    'a manual repair keeps no round-N baseline to advertise',
   );
 });
 

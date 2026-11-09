@@ -1176,6 +1176,20 @@ test('the verifier temp probe reports each outcome as a bounded, path-free summa
   assert.equal(denied.result.status, 'unwritable');
   assert.equal(denied.result.reason, 'per-run-tmpdir-denied');
   assert.equal(denied.result.gitInit, 'failed');
+  assert.equal(denied.result.gitStep, undefined, 'no step token was printed, so none is reported');
+  assert.match(call.script, /commit -q --allow-empty/, 'the probe builds a committed fixture, not just an empty init');
+  assert.match(call.script, /rev-parse --show-toplevel/, 'and asks for its root the way fixture helpers do');
+  assert.equal(writable.result.gitStep, undefined, 'a passing fixture names no failed step');
+  for (const step of ['tmpdir', 'init', 'commit', 'rev-parse']) {
+    const failed = await probeWith({ run: async () => probeOutput(`tmpdir=ok\nsystem-tmp=denied\ngit-init=failed\ngit-step=${step}\n`) });
+    assert.deepEqual([failed.result.gitInit, failed.result.gitStep], ['failed', step]);
+  }
+  const forgedStep = await probeWith({
+    run: async () => probeOutput('tmpdir=ok\nsystem-tmp=denied\ngit-init=failed\ngit-step=/private/secret\n'),
+  });
+  assert.equal(forgedStep.result.gitStep, undefined, 'only the fixed step vocabulary is reported');
+  const okWithStep = await probeWith({ run: async () => probeOutput('tmpdir=ok\nsystem-tmp=denied\ngit-init=ok\ngit-step=commit\n') });
+  assert.equal(okWithStep.result.gitStep, undefined, 'a step is reported only beside a failed fixture');
 
   const regressed = await probeWith({ run: async () => probeOutput('tmpdir=ok\nsystem-tmp=writable\ngit-init=ok\n') });
   assert.equal(regressed.result.status, 'writable');

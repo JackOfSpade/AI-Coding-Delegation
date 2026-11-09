@@ -107,6 +107,19 @@ test('a temporary Git fixture blocked from host configuration is an environment 
   );
 });
 
+test('the Git reason JobManager.start now carries lets an xcode-select denial classify as an environment failure', () => {
+  // What a suite driving JobManager inside the verifier printed before the git
+  // environment fix: the shim fell back to xcode-select, which the sandbox denies.
+  const carried = classifyVerifierEnvironment(
+    failed(
+      "Error: repoPath must be inside a git working tree (git rev-parse failed: xcode-select: error: unable to read data link at '/var/select/developer_dir', expected symbolic link (Operation not permitted))",
+    ),
+  );
+  assert.equal(carried?.kind, 'git-config-denied');
+  // The old message hid the reason, so the same failure was a repairable code failure.
+  assert.equal(classifyVerifierEnvironment(failed('Error: repoPath must be inside a git working tree')), null);
+});
+
 test("permission denied counts only outside the job's write scope, in either spelling of the worktree", () => {
   const workspace = realpathSync(mkdtempSync(join(tmpdir(), 'offload-venv-')));
   try {

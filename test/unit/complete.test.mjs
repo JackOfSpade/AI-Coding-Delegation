@@ -631,6 +631,9 @@ test('daily cap: separate OS processes share reservations, so parallel calls can
       const config = ${JSON.stringify(withCaps({ 'test-app': 0.1 }))};
       const result = await complete(${JSON.stringify(request({ maxTokens: 100_000 }))}, {
         fetchImpl, config, ledgerPath: ${JSON.stringify(h.ledgerPath)}, readKey: () => 'sk-test',
+        // Pinned like the in-process harness: prices are time-tiered, and at peak
+        // one 100k-token worst case alone exceeds the cap, so no call would pass.
+        now: () => ${OFF_PEAK},
       });
       process.stdout.write(JSON.stringify({ ok: result.ok, code: result.error?.code }));
     `;

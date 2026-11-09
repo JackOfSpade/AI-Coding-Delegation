@@ -197,24 +197,22 @@ export const isWallTimeout = (reason) => reason?.code === WALL_TIMEOUT_CODE;
 /**
  * Statuses whose diff is kept un-integrated and may be applied by the primary
  * with its own evidence. A FAILED job joins them only through
- * `failedApplyRefusal`, never by status alone; CANCELLED never does (the
- * primary stopped it on purpose).
+ * `failedApplyRefusal`, never by status alone; CANCELLED only through
+ * `cancelledRepairApplyRefusal`, for a repair round the server queued and the
+ * primary cancelled over a failure the verifier blamed on the environment.
  */
 export const APPLY_ELIGIBLE_STATUSES = Object.freeze(['VERIFY_ENV_FAILED', 'VERIFY_FAILED', 'BUDGET', 'TIMEOUT']);
 
 const GIT_OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 
 /**
- * The single gate shared by `JobManager.apply()` (which enforces it) and the
- * report (which advertises `apply` only when it would pass), for a job whose
- * status is FAILED. Returns why its retained diff must not be offered to
- * `offload_apply`, or undefined when it may be. Any failure cause qualifies (a
- * finish-protocol or loop stop is no verdict on a diff the scope audit passed),
- * but only when everything below holds; the manager adds the I/O half, binding
- * the stored `revert.diff` to the recorded snapshots, and every conflict,
- * lease, branch/HEAD and index check of the other apply statuses still runs.
+ * The checks every late apply shares: nothing about the job may be
+ * outstanding, and its capture must describe a whole, reviewable diff that the
+ * scope audit let through. Returns why the retained diff must not be offered to
+ * `offload_apply`, or undefined when these checks pass; each gate below adds
+ * its own status and round-identity conditions on top.
  */
-export function failedApplyRefusal(job) {
+function lateApplyRefusal(job) {
   if (!job || typeof job !== 'object' || Array.isArray(job)) return 'no job record';
   if (job.mode === 'report') return 'report jobs never integrate into the primary checkout';
   if (job.applied === true) return 'its diff is already integrated (offload_revert undoes it)';
@@ -246,6 +244,22 @@ export function failedApplyRefusal(job) {
     return 'it has no in-scope changes to apply (its retained diff is empty); start a fresh job with a better brief';
   const pathsProblem = revertPathsProblem(job.revertFiles);
   if (pathsProblem) return pathsProblem;
+  return undefined;
+}
+
+/**
+ * The gate `JobManager.apply()` enforces and the report advertises `apply` with
+ * for a job whose status is FAILED. Returns why its retained diff must not be
+ * offered to `offload_apply`, or undefined when it may be. Any failure cause
+ * qualifies (a finish-protocol or loop stop is no verdict on a diff the scope
+ * audit passed), but only when the shared checks pass and the capture belongs
+ * to the final round; the manager adds the I/O half, binding the stored
+ * `revert.diff` to the recorded snapshots, and every conflict, lease,
+ * branch/HEAD and index check of the other apply statuses still runs.
+ */
+export function failedApplyRefusal(job) {
+  const shared = lateApplyRefusal(job);
+  if (shared) return shared;
   // The capture is stamped with the round that made it. A failure after a
   // repair or continuation that never reached its own capture would otherwise
   // leave an earlier round's diff looking like the failed round's.
@@ -256,11 +270,40 @@ export function failedApplyRefusal(job) {
 }
 
 /**
+ * The one exception to "a CANCELLED job is never applied": the server queued an
+ * automatic repair round on its own, the primary cancelled that round because
+ * the verifier failure was not the diff's fault, and the repair left the diff
+ * exactly as the primary reviewed it in round N. `repairBase` keeps that round's
+ * verify result and tree id because ROUND_SCOPED_VERIFIER_STATE resets the live
+ * ones, and a content-identical tree keeps the same id. Returns the reason it is
+ * refused, or undefined when the round-N diff may be applied.
+ */
+export function cancelledRepairApplyRefusal(job) {
+  if (!job || typeof job !== 'object' || Array.isArray(job)) return 'no job record';
+  // A job the primary cancelled on purpose keeps its diff unless the cancel
+  // hit a repair round the server started by itself.
+  if (job.status !== 'CANCELLED')
+    return `only a job CANCELLED during its automatic repair is applied this way, not a ${job.status ?? 'non-terminal'} one`;
+  const shared = lateApplyRefusal(job);
+  if (shared) return shared;
+  const base = job.repairBase && typeof job.repairBase === 'object' && !Array.isArray(job.repairBase) ? job.repairBase : undefined;
+  if (base?.auto !== true || !Number.isSafeInteger(base.round) || !GIT_OBJECT_ID.test(base.workspaceAfter ?? ''))
+    return 'it was not cancelled during an automatic repair, so no reviewed round-N diff was kept; start a fresh job';
+  if (job.workspaceAfter !== base.workspaceAfter)
+    return `the cancelled repair round changed the diff after round ${base.round}, so it is not the reviewed round-${base.round} diff; start a fresh job`;
+  return undefined;
+}
+
+/**
  * Why a finished job with changes could not be applied, from the same check the
  * apply itself makes, so the report and job view cannot promise what it refuses.
  */
 export function applyBlocker(job) {
   if (!job || job.mode === 'report' || job.applied === true || job.revertedAt) return undefined;
+  // A job cancelled during an automatic repair is offered only through its own
+  // gate; when that gate refuses it (usually because the repair round changed
+  // the diff) the report says why instead of silently dropping the apply offer.
+  if (job.status === 'CANCELLED') return job.repairBase?.auto === true ? cancelledRepairApplyRefusal(job) : undefined;
   if (job.status !== 'FAILED' && !APPLY_ELIGIBLE_STATUSES.includes(job.status)) return undefined;
   if (!Array.isArray(job.files) || !job.files.length || !Array.isArray(job.revertFiles)) return undefined;
   return revertPathsProblem(job.revertFiles);

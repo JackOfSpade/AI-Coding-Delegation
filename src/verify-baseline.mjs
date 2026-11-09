@@ -597,6 +597,19 @@ export const sizeExpectedMs = (bytes, msPerKiB = DEFAULT_EXPECTED_MS_PER_KIB) =>
   Number.isFinite(bytes) && bytes > 0 && Number.isFinite(msPerKiB) && msPerKiB > 0 ? Math.round((bytes / 1024) * msPerKiB) : 0;
 
 /**
+ * The rule shared by both environment-dominated decisions: the run's own
+ * summary says at least as many tests failed (or were cancelled) as passed,
+ * and a sandbox denial is the detail of at least half of the failures that
+ * printed one. A suite whose tests mostly ran is real evidence, whatever a few
+ * of its fixtures could not do.
+ */
+const dominatedRun = (run) =>
+  Number.isSafeInteger(run.summaryPassed) &&
+  (run.summaryFailed ?? run.total) + (run.summaryCancelled ?? 0) >= run.summaryPassed &&
+  run.detailedFailures > 0 &&
+  run.deniedFailures >= Math.ceil(run.detailedFailures * DENIAL_SHARE);
+
+/**
  * A "no new failures" decision proves nothing when the same failures in both
  * runs are the sandbox refusing the suite's fixtures (child processes, Git
  * metadata): the tests never reached the code the worker changed. Such a
@@ -616,11 +629,6 @@ export function environmentDominated(
   const base = parsedOf(baseline);
   const res = parsedOf(result);
   if (!res.total || res.total !== base.total || decision.preexisting !== res.total) return undefined;
-  const dominatedRun = (run) =>
-    Number.isSafeInteger(run.summaryPassed) &&
-    (run.summaryFailed ?? run.total) + (run.summaryCancelled ?? 0) >= run.summaryPassed &&
-    run.detailedFailures > 0 &&
-    run.deniedFailures >= Math.ceil(run.detailedFailures * DENIAL_SHARE);
   if (!dominatedRun(base) || !dominatedRun(res)) return undefined;
   if (!(expectedMs > 0 && minFraction > 0)) return undefined;
   const limit = expectedMs * minFraction;
@@ -631,6 +639,52 @@ export function environmentDominated(
     fixed: 0,
     expectedMs: Math.round(expectedMs),
   });
+}
+
+// Corroborations that say the run never got to exercise the suite, as opposed
+// to the suite genuinely failing.
+const PREFLIGHT_DENIAL_CODES = new Set(['child-process', 'process-inspection']);
+const CORROBORATION_FAST = 'a run far shorter than the tested files suggest';
+const CORROBORATION_WARNING = 'a duration warning against earlier runs';
+const CORROBORATION_PREFLIGHT = 'the start-time preflight child-process/process-inspection warning';
+
+/**
+ * The standard-mode counterpart of `environmentDominated`: one failed verifier
+ * run whose failures are mostly the sandbox refusing the suite's fixtures, and
+ * whose result the summary says is not better than that, proves nothing about
+ * the worker's change. It is only classified when a corroboration says the run
+ * never got to test the code: it finished far faster than the files the
+ * testCommand names suggest, an earlier run warns about its duration, or the
+ * start-time preflight warned about child processes / process inspection.
+ * Returns undefined when any part fails or the run is otherwise unusable.
+ */
+export function singleRunEnvironmentDominated(
+  run,
+  { durationMs, expectedMs, minFraction = DEFAULT_MIN_DURATION_FRACTION, fastRun = false, preflightWarnings = [] } = {},
+) {
+  if (run?.sandboxed !== true || run.timedOut || run.cancelled || run.truncated) return undefined;
+  if (typeof run.code !== 'number' || !Number.isFinite(run.code) || run.code === 0) return undefined;
+  const parsed = parsedOf(run);
+  if (!dominatedRun(parsed)) return undefined;
+  const corroborations = [];
+  if (
+    Number.isFinite(expectedMs) &&
+    expectedMs > 0 &&
+    Number.isFinite(minFraction) &&
+    minFraction > 0 &&
+    Number.isFinite(durationMs) &&
+    durationMs < expectedMs * minFraction
+  )
+    corroborations.push(CORROBORATION_FAST);
+  if (fastRun === true) corroborations.push(CORROBORATION_WARNING);
+  if ((Array.isArray(preflightWarnings) ? preflightWarnings : []).some((warning) => PREFLIGHT_DENIAL_CODES.has(warning?.code)))
+    corroborations.push(CORROBORATION_PREFLIGHT);
+  if (!corroborations.length) return undefined;
+  const by = corroborations.length === 1 ? corroborations[0] : `${corroborations.slice(0, -1).join(', ')} and ${corroborations.at(-1)}`;
+  return {
+    kind: 'sandbox-dominated',
+    detail: `${finiteCount(parsed.deniedFailures)} of ${finiteCount(parsed.detailedFailures)} failing test(s) printed a sandbox denial as their error (spawn EPERM, Operation not permitted, unreadable .git) and no more tests passed (${finiteCount(parsed.summaryPassed)}) than failed; corroborated by ${by}. A repair round cannot change what the sandbox denies: run the suite in the primary checkout.`,
+  };
 }
 // What a run's summary and failure details showed, for the job record.
 const runEvidence = (parsed) => ({

@@ -4165,3 +4165,107 @@ test('start, wait and job responses carry a compact verifier preflight unless de
   assert.equal(cancelled.report.split('\n').filter((line) => line.startsWith('verifier advisory:')).length, 1);
   assert.ok(cancelled.report.length < (await m.job(started.jobId, { detail: 'full' })).report.length);
 });
+
+test('a repoPath that git cannot resolve names git’s own reason, so a sandbox denial is told apart from "not a repository"', async () => {
+  const denied = await manager({ run: async () => ({ status: 'DONE' }) });
+  denied.config.repoRoot = async () => {
+    throw new Error(
+      "git rev-parse failed: xcode-select: error: unable to read data link at '/var/select/developer_dir', expected symbolic link (Operation not permitted)",
+    );
+  };
+  await assert.rejects(
+    () => denied.start({ task: 'x', ownedPaths: ['src/**'] }),
+    /^Error: repoPath must be inside a git working tree \(git rev-parse failed: xcode-select: error: unable to read data link .*\(Operation not permitted\)\)$/,
+  );
+  const plain = await mkdtemp(`${tmpdir()}/offload-not-a-repo-`);
+  try {
+    const outside = await manager({ run: async () => ({ status: 'DONE' }) });
+    await assert.rejects(
+      () => outside.start({ task: 'x', ownedPaths: ['src/**'], repoPath: plain }),
+      /^Error: repoPath must be inside a git working tree \(git rev-parse failed: .*not a git repository/i,
+    );
+  } finally {
+    rmSync(plain, { recursive: true, force: true });
+  }
+});
+
+test('a repair round that fails before its launch claim ends FAILED with the reason instead of staying QUEUED forever', async () => {
+  const repo = makeRepo();
+  const gitDir = await mkdtemp(`${tmpdir()}/offload-unclaimed-`);
+  let runs = 0;
+  const m = new JobManager({
+    store: new JobStore({ gitDir }),
+    snapshots: gitSnapshots(),
+    worker: {
+      run: async (job) => {
+        runs += 1;
+        write(join(job.workspacePath, 'src', 'new.txt'), `round ${runs}\n`);
+        return { status: 'DONE' };
+      },
+    },
+    // A failing verifier makes the server queue the repair round itself.
+    runner: {
+      verify: async (command) => ({
+        command,
+        verdict: 'FAIL',
+        result: {
+          code: 1,
+          sandbox: 'macos',
+          stdout: 'not ok 1 - adds\nAssertionError [ERR_ASSERTION]: expected 1 to equal 2\n',
+          stderr: '',
+        },
+      }),
+    },
+    config: {
+      repoPath: repo,
+      git: { branch: async (path) => git(path, ['branch', '--show-current']), head: async (path) => git(path, ['rev-parse', 'HEAD']) },
+      applyPatch: gitPatchApplier,
+      isolation: { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree },
+    },
+  });
+  // The incident: a persisted field of the requeued record no longer validated,
+  // so the repair launch threw before claiming it.
+  const validate = m.validatePersisted.bind(m);
+  m.validatePersisted = (job) => {
+    if (job?.status === 'QUEUED' && job.rounds === 1) throw new Error('stored job has invalid automatic repair baseline metadata');
+    return validate(job);
+  };
+  try {
+    const started = await m.start({ task: 'add a file', ownedPaths: ['src/**'], repoPath: repo, testCommand: 'node --test' });
+    const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
+    assert.equal(done.status, 'FAILED');
+    assert.equal(runs, 1, 'the repair worker never ran');
+    const job = await m.store.get(started.jobId);
+    assert.equal(job.rounds, 1);
+    assert.equal(
+      job.error,
+      'worker launch failed before it could claim the job: stored job has invalid automatic repair baseline metadata',
+    );
+    assert.ok(job.finishedAt, 'the terminal status was published');
+    // The lease it held for the repair was released: the same paths can start again.
+    m.validatePersisted = validate;
+    const next = await m.start({ task: 'again', ownedPaths: ['src/**'], repoPath: repo });
+    assert.equal((await m.wait(next.jobId, { timeoutSec: TERMINAL_WAIT_SEC })).status, 'DONE_UNVERIFIED');
+  } finally {
+    cleanup(repo);
+  }
+});
+
+test('a launch that lost its claim to another lifecycle stays silent and never touches that record', async () => {
+  const m = await manager({ run: async () => ({ status: 'DONE' }) });
+  const record = await m.store.create({
+    task: 'x',
+    ownedPaths: ['src/**'],
+    repoPath: process.cwd(),
+    status: 'QUEUED',
+    leaseOwnerNonce: 'theirs',
+  });
+  // What this launch observed is already stale: another owner moved the record on.
+  const stale = { ...record, leaseOwnerNonce: 'mine' };
+  await m._launch(record.id, 'start', undefined, stale);
+  await m.running.get(record.id)?.catch(() => {});
+  const after = await m.store.get(record.id);
+  assert.equal(after.status, 'QUEUED');
+  assert.equal(after.leaseOwnerNonce, 'theirs');
+  assert.equal(after.error, undefined);
+});

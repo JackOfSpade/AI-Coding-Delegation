@@ -9,6 +9,7 @@ import {
   APPLY_ELIGIBLE_STATUSES,
   continuableFailure,
   applyBlocker,
+  cancelledRepairApplyRefusal,
   failedApplyRefusal,
   retryableTranscriptFailure,
   safeFailureKind,
@@ -84,8 +85,14 @@ function nextActionLines(job, { reportMode, violations, files, continuationReaso
   ) {
     nextActions.push(!capStop && budgetSpent ? 'continue (extraTurns/extraUsd needed: the cumulative budget is spent)' : 'continue');
   }
-  // A FAILED job only through the gate offload_apply enforces on its retained diff.
-  const appliable = !applyBlocker(job) && (APPLY_ELIGIBLE.has(job.status) || (job.status === 'FAILED' && !failedApplyRefusal(job)));
+  // A FAILED job only through the gate offload_apply enforces on its retained
+  // diff, and a CANCELLED one only through the cancelled-repair gate: a job
+  // cancelled during an automatic repair keeps its reviewed round-N diff.
+  const appliable =
+    !applyBlocker(job) &&
+    (APPLY_ELIGIBLE.has(job.status) ||
+      (job.status === 'FAILED' && !failedApplyRefusal(job)) ||
+      (job.status === 'CANCELLED' && !cancelledRepairApplyRefusal(job)));
   const verifiedNoFinish =
     !reportMode &&
     job.status === 'FAILED' &&
@@ -247,22 +254,23 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     Array.isArray(job.discardedEphemeralOutputs) && job.discardedEphemeralOutputs.length
       ? `discarded ephemeral outputs: ${job.discardedEphemeralOutputs.slice(0, 200).map(scalar).join(', ')}`
       : '';
-  const verifierDiagnostic = [job.verify?.result?.stdout, job.verify?.result?.stderr].filter(Boolean).join('\n');
-  // A passing run's output is noise to a reviewer; a failing run's tail is the
-  // evidence. The compact view keeps only the failure tail, and keeps it short.
-  const showDiagnostic = verifierDiagnostic && (!lean || job.verify?.verdict !== 'PASS');
   const baseline = job.verify?.baseline && typeof job.verify.baseline === 'object' ? job.verify.baseline : undefined;
-  // A PASS reached by the baseline-diff verifier means "no new failures", not a
-  // green suite: the result's own non-zero exit stays visible beside it.
-  const viaBaseline =
-    baseline?.status === 'compared' && job.verify?.verdict === 'PASS'
-      ? ` via baseline-diff: ${scalar(baseline.preexisting ?? 0)} pre-existing failure(s) tolerated, ${scalar(baseline.newFailureCount ?? 0)} new`
-      : baseline?.status === 'inconclusive' && baseline.reason === 'environment-dominated'
-        ? ` · baseline-diff INCONCLUSIVE (environment-dominated): ${scalar(baseline.preexisting ?? 0)} identical failure(s) in both runs, ${scalar(baseline.result?.deniedFailures ?? 0)} of ${scalar(baseline.result?.detailedFailures ?? 0)} of them sandbox denials, so the comparison says nothing about the change`
-        : '';
+  // Round-scoped verifier state is reset when an automatic repair is queued, so
+  // a job cancelled during that repair keeps its round-N result only here.
+  const repairBase = job.repairBase && typeof job.repairBase === 'object' && !Array.isArray(job.repairBase) ? job.repairBase : undefined;
+  const repairRound = Number.isSafeInteger(repairBase?.round) ? repairBase.round : 0;
+  const repairBaseVerify = !job.verify && repairBase?.verify && typeof repairBase.verify === 'object' ? repairBase.verify : undefined;
+  // The round's verdict decides what a reviewer may apply, so it must survive
+  // the reset that cleared the live copy.
   const verify = job.verify
-    ? `verify: \`${scalar(job.verify.command || '')}\` ${scalar(job.verify.verdict || 'UNVERIFIED')}${job.verify.result?.code != null ? ` (exit ${scalar(job.verify.result.code)})` : ''}${viaBaseline}${job.verify.result?.sandbox ? ` · sandbox: ${scalar(job.verify.result.sandbox)}` : ''}${showDiagnostic ? `\n${verifierOutput(verifierDiagnostic, lean ? 20 : 40)}` : ''}`
-    : 'verify: not run';
+    ? `verify: ${verifierSummary(job.verify, lean)}`
+    : repairBaseVerify
+      ? `verify (round ${repairRound}, before the automatic repair${job.status === 'CANCELLED' ? ' that was cancelled' : ''}): ${verifierSummary(repairBaseVerify, lean)}`
+      : 'verify: not run';
+  const verifierEnvironment =
+    !job.verify && repairBase?.verifyEnvironment && isVerifierEnvironmentKind(repairBase.verifyEnvironment.kind)
+      ? `verifier environment (round ${repairRound}): ${scalar(repairBase.verifyEnvironment.detail || repairBase.verifyEnvironment.kind)}`
+      : '';
   const baselineDiff = !reportMode && baseline ? baselineLines(baseline, lean) : '';
   const durationWarnings = !reportMode ? durationWarningLines(job.verify?.durationWarnings) : '';
   // The command is still running (or being reverted): the diff is in the
@@ -279,7 +287,11 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
   const environment = environmentLine(job, environmentFailure, { reportMode, primaryChecked, applyRunning });
   const appliedUnverified =
     job.appliedUnverified && typeof job.appliedUnverified === 'object'
-      ? `applied WITHOUT server verification (was ${scalar(job.appliedUnverified.previousStatus || 'unknown')}${originalFailure(job.appliedUnverified.failure)}); primary's own check: ${scalar(job.appliedUnverified.verifiedBy || (job.appliedUnverified.applyThenVerify ? 'applyThenVerify (below)' : 'not recorded')).slice(0, 400)}`
+      ? `applied WITHOUT server verification (was ${scalar(job.appliedUnverified.previousStatus || 'unknown')}${originalFailure(job.appliedUnverified.failure)}); primary's own check: ${scalar(job.appliedUnverified.verifiedBy || (job.appliedUnverified.applyThenVerify ? 'applyThenVerify (below)' : 'not recorded')).slice(0, 400)}${
+          job.appliedUnverified.previousStatus === 'CANCELLED' && repairBase?.auto === true
+            ? ` · the applied diff is round ${repairRound}'s pre-repair diff, kept while the automatic repair round the primary cancelled changed nothing`
+            : ''
+        }`
       : '';
   const applyVerify = !reportMode ? applyVerifyLines(job.applyVerify, lean) : '';
   const summary = job.summary ? `worker summary: ${scalar(job.summary).slice(0, lean ? 300 : 1500)}` : '';
@@ -369,6 +381,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     baselineDiff,
     durationWarnings,
     environment,
+    verifierEnvironment,
     appliedUnverified,
     applyVerify,
     limitation,
@@ -397,6 +410,27 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     .filter(Boolean)
     .join('\n');
   return redactText(raw);
+}
+/**
+ * The verify line's body: command, verdict, exit status, baseline note, the
+ * sandbox that ran it, and (for a failing run) the failure tail. Shared so a
+ * pre-repair line reads exactly like a live one.
+ */
+function verifierSummary(verify, lean) {
+  const diagnostic = [verify?.result?.stdout, verify?.result?.stderr].filter(Boolean).join('\n');
+  // A passing run's output is noise to a reviewer; a failing run's tail is the
+  // evidence. The compact view keeps only the failure tail, and keeps it short.
+  const showDiagnostic = diagnostic && (!lean || verify?.verdict !== 'PASS');
+  const baseline = verify?.baseline && typeof verify.baseline === 'object' ? verify.baseline : undefined;
+  // A PASS reached by the baseline-diff verifier means "no new failures", not a
+  // green suite: the result's own non-zero exit stays visible beside it.
+  const viaBaseline =
+    baseline?.status === 'compared' && verify?.verdict === 'PASS'
+      ? ` via baseline-diff: ${scalar(baseline.preexisting ?? 0)} pre-existing failure(s) tolerated, ${scalar(baseline.newFailureCount ?? 0)} new`
+      : baseline?.status === 'inconclusive' && baseline.reason === 'environment-dominated'
+        ? ` · baseline-diff INCONCLUSIVE (environment-dominated): ${scalar(baseline.preexisting ?? 0)} identical failure(s) in both runs, ${scalar(baseline.result?.deniedFailures ?? 0)} of ${scalar(baseline.result?.detailedFailures ?? 0)} of them sandbox denials, so the comparison says nothing about the change`
+        : '';
+  return `\`${scalar(verify.command || '')}\` ${scalar(verify.verdict || 'UNVERIFIED')}${verify.result?.code != null ? ` (exit ${scalar(verify.result.code)})` : ''}${viaBaseline}${verify.result?.sandbox ? ` · sandbox: ${scalar(verify.result.sandbox)}` : ''}${showDiagnostic ? `\n${verifierOutput(diagnostic, lean ? 20 : 40)}` : ''}`;
 }
 /** The fixed finish-protocol problems a report job's invalid finish call had, when the loop recorded any. */
 function finishProtocolLine(job) {

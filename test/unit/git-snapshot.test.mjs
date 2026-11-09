@@ -115,6 +115,29 @@ test('snapshots neutralize repository filters and Git subprocesses do not inheri
     cleanup(repo);
   }
 });
+test('the snapshot environment keeps the developer directory and the verifier sandbox config switches, and nothing else Git-related', () => {
+  // The verifier sandbox sets exactly these three; without DEVELOPER_DIR the
+  // /usr/bin/git shim asks xcode-select, which the sandbox denies.
+  const env = snapshotGitEnv({
+    PATH: '/bin',
+    DEVELOPER_DIR: '/Library/Developer/CommandLineTools',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_ATTR_NOSYSTEM: '1',
+    GIT_DIR: '/elsewhere/.git',
+    GIT_CONFIG_GLOBAL: '/evil/config',
+    GIT_EXEC_PATH: '/evil/bin',
+  });
+  assert.deepEqual(env, {
+    PATH: '/bin',
+    DEVELOPER_DIR: '/Library/Developer/CommandLineTools',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_ATTR_NOSYSTEM: '1',
+    GIT_TERMINAL_PROMPT: '0',
+  });
+  // Only the value that removes a configuration source is kept.
+  const other = snapshotGitEnv({ PATH: '/bin', GIT_CONFIG_NOSYSTEM: '0', GIT_ATTR_NOSYSTEM: 'yes' });
+  assert.deepEqual(other, { PATH: '/bin', GIT_TERMINAL_PROMPT: '0' });
+});
 test('a filter-enumeration failure stops Git before a snapshot command can run', () => {
   const repo = makeRepo();
   try {

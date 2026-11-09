@@ -1135,3 +1135,112 @@ test('Core records Config.verifier thresholds on write jobs as server-derived se
     cleanup(repo);
   }
 });
+
+/**
+ * A standard-mode verifier run cannot compare against a snapshot, so the only
+ * evidence that its failures are the sandbox and not the change is the run
+ * itself: denial-dominated failures plus a corroboration that it never got to
+ * test the code. No repair round can change what the sandbox denies.
+ */
+test('standard mode: denial-dominated failures at 40ms on a 60 KiB suite end VERIFY_ENV_FAILED with no repair round', async () => {
+  const h = await harness({ repo: withSuite(), verify: () => denied(70, 40, { passing: 11 }) });
+  try {
+    const started = await start(h, { testCommand: SUITE, verifierMode: 'standard' });
+    const done = await h.m.wait(started.jobId, { timeoutSec: TIMEOUT_SEC });
+    assert.equal(done.status, 'VERIFY_ENV_FAILED');
+    const job = await h.m.store.get(started.jobId);
+    assert.equal(job.verify.verdict, 'FAIL');
+    assert.equal(job.verify.baseline, undefined, 'no snapshot comparison is recorded in standard mode');
+    assert.equal(job.verifyEnvironment.kind, 'sandbox-dominated');
+    assert.match(job.verifyEnvironment.detail, /^70 of 70 failing test\(s\) printed a sandbox denial as their error/);
+    assert.match(job.verifyEnvironment.detail, /corroborated by a run far shorter than the tested files suggest\./);
+    assert.equal(h.workers.length, 1, 'no repair round is spent');
+    assert.equal(h.calls.length, 1, 'and no baseline run either');
+    assert.equal(done.verifyEnvironment.kind, 'sandbox-dominated');
+    assert.match(done.report, /verifier environment: 70 of 70 failing test\(s\)/);
+  } finally {
+    h.finish();
+  }
+});
+
+// A suite that probes the host's processes, as the incident's node --test did.
+const CHILD_PROCESS_SOURCE = `import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+export const identity = () => promisify(execFile)('ps', ['-p', String(process.pid), '-o', 'lstart']);
+// fixture
+${'x'.repeat(60 * 1024)}
+`;
+const withChildProcessSuite = () => {
+  const repo = makeRepo();
+  write(join(repo, 'test', 'suite.test.mjs'), CHILD_PROCESS_SOURCE);
+  return repo;
+};
+
+test('standard mode: a slow denial-dominated run that the start-time preflight flagged for child processes still ends VERIFY_ENV_FAILED', async () => {
+  const h = await harness({ repo: withChildProcessSuite(), verify: () => denied(70, 600_000, { passing: 11 }) });
+  try {
+    const started = await start(h, { testCommand: SUITE, verifierMode: 'standard' });
+    const done = await h.m.wait(started.jobId, { timeoutSec: TIMEOUT_SEC });
+    const job = await h.m.store.get(started.jobId);
+    assert.equal(job.verify.result.durationMs, 600_000, 'the run was not fast');
+    assert.equal(
+      (job.verifierPreflight?.warnings ?? []).some((warning) => warning.code === 'child-process'),
+      true,
+      'the start-time preflight warned about the suite spawning child processes',
+    );
+    assert.equal(done.status, 'VERIFY_ENV_FAILED');
+    assert.equal(job.verifyEnvironment.kind, 'sandbox-dominated');
+    assert.match(job.verifyEnvironment.detail, /corroborated by the start-time preflight child-process\/process-inspection warning\./);
+    assert.doesNotMatch(job.verifyEnvironment.detail, /far shorter|duration warning/);
+    assert.equal(h.workers.length, 1, 'no repair round is spent');
+    assert.match(done.report, /verifier environment/);
+  } finally {
+    h.finish();
+  }
+});
+
+// Ordinary test failures: the details are assertions, not sandbox denials.
+const ASSERTION_OUTPUT = `✖ adds (1ms)
+✔ subtracts (1ms)
+ℹ tests 2
+ℹ pass 1
+ℹ fail 1
+
+✖ failing tests:
+
+test at test/suite.test.mjs:3:1
+✖ adds (1ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  3 !== 4
+`;
+const assertionFailure = () => ({
+  command: 'verify',
+  verdict: 'FAIL',
+  result: { code: 1, sandbox: 'macos', durationMs: 40, stdout: ASSERTION_OUTPUT, stderr: '' },
+});
+
+test('standard mode: ordinary assertion failures are still repaired', async () => {
+  let verifyCalls = 0;
+  const h = await harness({
+    repo: withSuite(),
+    verify: () => {
+      verifyCalls += 1;
+      return verifyCalls === 1 ? assertionFailure() : spec([], 0);
+    },
+  });
+  try {
+    const started = await start(h, { testCommand: SUITE, verifierMode: 'standard' });
+    const done = await h.m.wait(started.jobId, { timeoutSec: TIMEOUT_SEC });
+    assert.equal(verifyCalls, 2);
+    assert.equal(h.workers.length, 2, 'one repair round');
+    assert.equal(done.status, 'DONE_VERIFIED');
+    const job = await h.m.store.get(started.jobId);
+    assert.equal(job.verifyEnvironment, undefined);
+    assert.match(h.workers[1].defects[0], /^Verifier failed:/);
+    assert.match(h.workers[1].defects[0], /AssertionError/);
+    assert.doesNotMatch(done.report, /sandbox-dominated|verifier environment/);
+  } finally {
+    h.finish();
+  }
+});

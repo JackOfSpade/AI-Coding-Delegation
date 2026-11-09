@@ -9,8 +9,17 @@ import { gitBinary } from './git-binary.mjs';
 
 const GIT_TIMEOUT_MS = 30_000;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
+// DEVELOPER_DIR only tells Apple's /usr/bin/git shim which developer directory
+// to run; without it the shim asks xcode-select, which reads
+// /var/select/developer_dir. The verifier sandbox denies that path and sets
+// DEVELOPER_DIR instead, so dropping it here made every Offload git call made
+// inside a verifier (a test suite that drives JobManager) fail before running.
 const SNAPSHOT_ENV_ALLOW =
-  /^(?:PATH|LANG|LC_[A-Z0-9_]*|TERM|TZ|HOME|XDG_CONFIG_HOME|SYSTEMROOT|COMSPEC|PATHEXT|USERPROFILE|HOMEDRIVE|HOMEPATH|APPDATA|LOCALAPPDATA)$/i;
+  /^(?:PATH|LANG|LC_[A-Z0-9_]*|TERM|TZ|HOME|XDG_CONFIG_HOME|SYSTEMROOT|COMSPEC|PATHEXT|USERPROFILE|HOMEDRIVE|HOMEPATH|APPDATA|LOCALAPPDATA|DEVELOPER_DIR)$/i;
+// The only ambient Git variables kept: each removes a configuration source and
+// can never redirect config, hooks, the worktree or a transport. The verifier
+// sandbox sets both because it denies /etc.
+const GIT_ENV_KEEP = new Set(['GIT_CONFIG_NOSYSTEM', 'GIT_ATTR_NOSYSTEM']);
 const CREDENTIAL_ENV = /(?:^|_)(?:api[_-]?key|token|secret|password|authorization|credential)(?:$|_)/i;
 // Exact argument shapes that only touch refs, config and the object store. They
 // never load the index or read working-tree content, so Git has no path to a
@@ -142,12 +151,14 @@ export function snapshotGitEnv(source = process.env) {
   // misconfigured filter did execute, inheriting the host process environment
   // would otherwise turn a Git plumbing call into a credential disclosure.
   for (const [key, value] of Object.entries(source)) {
-    if (!CREDENTIAL_ENV.test(key) && SNAPSHOT_ENV_ALLOW.test(key)) env[key] = value;
+    if (CREDENTIAL_ENV.test(key)) continue;
+    if (SNAPSHOT_ENV_ALLOW.test(key)) env[key] = value;
+    else if (GIT_ENV_KEEP.has(key) && value === '1') env[key] = value;
   }
   // Ambient Git variables can redirect config, hooks, worktree, or transport.
   // Deliberate per-call variables (notably the temporary index) are restored
   // only through extraEnv below.
-  for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
+  for (const key of Object.keys(env)) if (key.startsWith('GIT_') && !GIT_ENV_KEEP.has(key)) delete env[key];
   env.GIT_TERMINAL_PROMPT = '0';
   return env;
 }

@@ -803,7 +803,16 @@ export async function runCommand(command, options = {}) {
 const TEMP_PROBE_SCRIPT = [
   'd=$(mktemp -d "${TMPDIR:-/nonexistent}/offload-probe.XXXXXX" 2>/dev/null) && echo tmpdir=ok || echo tmpdir=denied',
   's=$(mktemp -d /tmp/offload-probe.XXXXXX 2>/dev/null) && { rmdir "$s"; echo system-tmp=writable; } || echo system-tmp=denied',
-  'if [ -n "$d" ] && git init -q "$d/g" >/dev/null 2>&1; then echo git-init=ok; else echo git-init=failed; fi',
+  // A bare `git init` succeeding said nothing about the fixtures suites build:
+  // they commit and then ask `rev-parse --show-toplevel` for the repository
+  // root. Exercise that whole sequence and name the step that failed.
+  [
+    'if [ -z "$d" ]; then echo git-init=failed; echo git-step=tmpdir',
+    'elif ! git init -q "$d/g" >/dev/null 2>&1; then echo git-init=failed; echo git-step=init',
+    'elif ! git -C "$d/g" -c user.name=offload-probe -c user.email=probe@offload.invalid commit -q --allow-empty -m probe >/dev/null 2>&1; then echo git-init=failed; echo git-step=commit',
+    'elif [ -z "$(git -C "$d/g" rev-parse --show-toplevel 2>/dev/null)" ]; then echo git-init=failed; echo git-step=rev-parse',
+    'else echo git-init=ok; fi',
+  ].join('\n'),
 ].join('\n');
 const probeKey = (stdout, key, values) => {
   for (const line of String(stdout).split(/\r?\n/)) {
@@ -834,7 +843,8 @@ const tempProbe = (status, reason, extra = {}) => ({
  * On macOS this runs a tiny script through the real sandboxed `runCommand`
  * path (same profile, same environment): it creates a directory under the
  * per-run TMPDIR, checks that a hard-coded /tmp is still denied (the expected,
- * safe answer), and runs `git init` there. Without a macOS sandbox it can only
+ * safe answer), and builds a git fixture there (init, commit, rev-parse
+ * --show-toplevel; `gitStep` names the step that failed). Without a macOS sandbox it can only
  * check the host's os.tmpdir(). The result is bounded and never carries a path: an `error` is an errno name or a fixed label.
  */
 export async function probeVerifierTemp({
@@ -873,9 +883,11 @@ export async function probeVerifierTemp({
       return tempProbe('unknown', 'probe-failed', { error: Number.isInteger(result?.code) ? `exit-${result.code}` : 'no-output' });
     const systemTmp = probeKey(result?.stdout, 'system-tmp', ['writable', 'denied']) ?? 'unknown';
     const gitInit = probeKey(result?.stdout, 'git-init', ['ok', 'failed']) ?? 'unknown';
+    const gitStep = gitInit === 'failed' ? probeKey(result?.stdout, 'git-step', ['tmpdir', 'init', 'commit', 'rev-parse']) : undefined;
     const common = {
       systemTmp,
       gitInit,
+      ...(gitStep ? { gitStep } : {}),
       ...(systemTmp === 'writable' ? { warning: 'system temp is writable inside the verifier; the sandbox profile has regressed' } : {}),
     };
     return tmpdirState === 'ok'

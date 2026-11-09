@@ -633,7 +633,20 @@ test('keep-alive fetch refuses redirects', async () => {
 
 // ---- process death: a real `--serve` process over real sockets ----
 
-/** Spawn a serve process whose DeepSeek traffic goes to the loopback server through the keep-alive fetch. */
+// Every serve process a test spawns, so a failed assertion cannot leave one
+// alive: its open stdin would keep this file's event loop running until the
+// suite's own timeout instead of reporting the failure.
+const spawnedServes = new Set();
+test.afterEach(() => {
+  for (const child of spawnedServes) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  spawnedServes.clear();
+});
+
+/**
+ * Spawn a serve process whose DeepSeek traffic goes to the loopback server through the keep-alive fetch.
+ * Its clock is pinned off-peak: DeepSeek prices are time-tiered, so a cap sized to one call's worst case
+ * would otherwise admit the call or refuse it depending on the hour the suite runs.
+ */
 function spawnServe(serverUrl, ledgerPath, caps = {}) {
   const src = (path) => JSON.stringify(new URL(`../../src/${path}`, import.meta.url).href);
   const config = { ...CONFIG, complete: { dailyUsdByCaller: caps } };
@@ -643,11 +656,12 @@ function spawnServe(serverUrl, ledgerPath, caps = {}) {
     const pool = createKeepAliveFetch();
     const fetchImpl = (url, init) => pool(String(url).replace('https://api.deepseek.com', ${JSON.stringify(serverUrl)}), init);
     process.exitCode = await runCli(['complete', '--serve'], {
-      completeOptions: { fetchImpl, config: ${JSON.stringify(config)}, readKey: () => 'sk-test', ledgerPath: ${JSON.stringify(ledgerPath)} },
+      completeOptions: { fetchImpl, config: ${JSON.stringify(config)}, readKey: () => 'sk-test', ledgerPath: ${JSON.stringify(ledgerPath)}, now: () => ${OFF_PEAK} },
     });
     pool.close();
   `;
   const child = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['pipe', 'pipe', 'inherit'] });
+  spawnedServes.add(child);
   const lines = [];
   let buffered = '';
   child.stdout.on('data', (chunk) => {
@@ -707,6 +721,7 @@ test('process death: a SIGKILLed serve process drops its provider stream and its
       config: { ...CONFIG, complete: { dailyUsdByCaller: { voice: 0.0001 } } },
       readKey: () => 'sk-test',
       ledgerPath,
+      now: () => OFF_PEAK,
       fetchImpl: async (url) =>
         new URL(url).pathname === '/models'
           ? new Response(JSON.stringify({ data: [{ id: 'deepseek-v4-flash' }] }))

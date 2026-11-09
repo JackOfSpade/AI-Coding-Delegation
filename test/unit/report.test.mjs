@@ -1818,3 +1818,56 @@ test('a report job with a retention warning shows the declared read set; other j
   assert.equal(lines({ mode: 'report', status: 'DONE_UNVERIFIED', budgetSizing: sizing({ warnings: [] }) }).length, 0);
   assert.equal(lines({ mode: 'report', status: 'DONE_UNVERIFIED', budgetSizing: sizing({ readChars: 'x\n[REDACTED]' }) }).length, 0);
 });
+
+const cancelledRepairJob = (overrides = {}) => ({
+  id: 'oj-cancelled',
+  status: 'CANCELLED',
+  mode: 'write',
+  before: 'a'.repeat(40),
+  workspaceAfter: 'b'.repeat(40),
+  scopeViolations: [],
+  verifierMutations: [],
+  files: ['src/new.txt'],
+  revertFiles: ['src/new.txt'],
+  rounds: 1,
+  patchRound: 1,
+  repairBase: {
+    round: 0,
+    auto: true,
+    workspaceAfter: 'b'.repeat(40),
+    patchRound: 0,
+    files: ['src/new.txt'],
+    revertFiles: ['src/new.txt'],
+    verify: {
+      command: 'node --test',
+      verdict: 'FAIL',
+      result: { code: 1, stdout: 'not ok 1 - adds\nAssertionError [ERR_ASSERTION]: expected 1 to equal 2' },
+    },
+    verifyEnvironment: { kind: 'missing-package', detail: 'xcodebuild is not installed' },
+  },
+  ...overrides,
+});
+
+test('a job cancelled during its automatic repair keeps the round-0 verify line and still offers apply', () => {
+  const report = compactReport(cancelledRepairJob(), { detail: 'compact' });
+  assert.match(report, /verify \(round 0, before the automatic repair that was cancelled\): `node --test` FAIL \(exit 1\)/);
+  assert.match(report, /AssertionError \[ERR_ASSERTION\]: expected 1 to equal 2/);
+  assert.doesNotMatch(report, /verify: not run/);
+  assert.match(report, /verifier environment \(round 0\): xcodebuild is not installed/);
+  assert.match(report, /next: (?:.* · )?apply \(after your own check\)/);
+});
+
+test('a CANCELLED job without a repair baseline still says verify: not run and never advertises apply', () => {
+  const report = compactReport(cancelledRepairJob({ repairBase: undefined }), { detail: 'compact' });
+  assert.match(report, /^verify: not run$/m);
+  assert.doesNotMatch(report, /before the automatic repair/);
+  assert.doesNotMatch(report, /apply \(after your own check\)/);
+  assert.doesNotMatch(report, /verifier environment \(round/);
+});
+
+test('a cancelled repair whose round-1 worker changed the diff reports the round-0 verify line but blocks apply', () => {
+  const report = compactReport(cancelledRepairJob({ workspaceAfter: 'c'.repeat(40) }), { detail: 'compact' });
+  assert.match(report, /verify \(round 0, before the automatic repair that was cancelled\): `node --test` FAIL \(exit 1\)/);
+  assert.match(report, /apply: BLOCKED: the cancelled repair round changed the diff after round 0, so it is not the reviewed round-0 diff/);
+  assert.doesNotMatch(report, /apply \(after your own check\)/);
+});

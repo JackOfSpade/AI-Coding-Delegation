@@ -21,6 +21,7 @@ import {
   LOCAL_TRANSCRIPT_CORRUPTION,
   continuableFailure,
   applyBlocker,
+  cancelledRepairApplyRefusal,
   failedApplyRefusal,
   failureContinueDefect,
   isWallTimeout,
@@ -89,6 +90,7 @@ import {
   environmentDominated,
   outputWasTruncated,
   repairDefectText,
+  singleRunEnvironmentDominated,
   sizeExpectedMs,
 } from './verify-baseline.mjs';
 
@@ -174,6 +176,17 @@ const ROUND_SCOPED_ERROR_STATE = Object.freeze({
   toolFailure: undefined,
   finalizationError: undefined,
 });
+// `repairBase` is persisted metadata, so a corrupted record must fail loudly
+// rather than steer a report line or an apply.
+function validRepairBase(base) {
+  if (!base || typeof base !== 'object' || Array.isArray(base)) return false;
+  if (!Number.isSafeInteger(base.round) || base.round < 0 || base.auto !== true) return false;
+  if (!validGitObjectId(base.workspaceAfter)) return false;
+  if (base.patchRound !== undefined && !Number.isSafeInteger(base.patchRound)) return false;
+  if (base.verify !== undefined && (!base.verify || typeof base.verify !== 'object' || Array.isArray(base.verify))) return false;
+  if (base.verifyEnvironment !== undefined && (!base.verifyEnvironment || typeof base.verifyEnvironment !== 'object')) return false;
+  return true;
+}
 const APPLY_ELIGIBLE = new Set(APPLY_ELIGIBLE_STATUSES);
 const MIN_VERIFIED_BY = 8,
   MAX_VERIFIED_BY = 1000;
@@ -1192,6 +1205,29 @@ export class JobManager {
   /** Keep a terminal state private until this owner's lease/workspace cleanup
    * attempt is durably recorded. Recovery can retry a retained workspace from
    * FINALIZING, whereas publishing first makes callers race cleanup. */
+  /**
+   * A launch that failed before its conditional claim. Only a record still
+   * queued with exactly the recovery identity this launch observed is failed;
+   * anything else belongs to whoever changed it. The raw record is used on
+   * purpose: the failure may be that it no longer validates.
+   */
+  async #failUnclaimedLaunch(id, expectedJob, error) {
+    const observed = expectedJob && typeof expectedJob === 'object' ? expectedJob : await this.store.get(id);
+    if (!observed || !QUEUED_STATUSES.has(observed.status)) return null;
+    const current = await this.store.get(id);
+    if (!this.#sameRecoveryIdentity(observed, current)) return null;
+    const reason = String(error?.message ?? error ?? 'unknown error')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 500);
+    return this.#finishOwnedTerminal(
+      { ...current, id },
+      'FAILED',
+      { error: `worker launch failed before it could claim the job: ${reason}`, activity: undefined },
+      undefined,
+      { expectedIdentity: this.#recoveryIdentity(observed) },
+    );
+  }
   async #finishOwnedTerminal(job, status, extra = {}, releaseOwnerNonce, { requireLeaseRelease = false, expectedIdentity } = {}) {
     let staged = job;
     let stageError;
@@ -1673,6 +1709,8 @@ export class JobManager {
       throw new Error('stored job has invalid capped implementation recovery state');
     if (job.budgetFinishRecovery !== undefined && !BUDGET_FINISH_RECOVERY_STATES.has(job.budgetFinishRecovery))
       throw new Error('stored job has invalid budget finish recovery state');
+    if (job.repairBase !== undefined && !validRepairBase(job.repairBase))
+      throw new Error('stored job has invalid automatic repair baseline metadata');
     // A configured Core store authenticates the entire durable record before
     // any of its endpoint, credential-reference, policy, budget, or lifecycle
     // fields can be consumed.  Plain injected stores intentionally remain
@@ -1802,8 +1840,15 @@ export class JobManager {
     try {
       repoPath = this.config.repoRoot ? await this.config.repoRoot(repoPath) : git(repoPath, ['rev-parse', '--show-toplevel']);
       repoPath = (realpathSync.native || realpathSync)(resolve(repoPath));
-    } catch {
-      throw new Error('repoPath must be inside a git working tree');
+    } catch (error) {
+      // Keep Git's own reason: "not a git repository" and an xcode-select or
+      // sandbox denial read the same otherwise, and the verifier classifier
+      // can only call the second an environment failure if it sees it.
+      const reason = String(error?.message ?? '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 400);
+      throw new Error(`repoPath must be inside a git working tree${reason ? ` (${reason})` : ''}`);
     }
     signal?.throwIfAborted();
     if (this.repoPath && !sameWorktreePath(repoPath, this.repoPath)) throw new Error('repoPath does not match this manager');
@@ -3009,6 +3054,22 @@ export class JobManager {
                 // This marker suppresses duplicate scheduling for the completed
                 // round only. Clear it before the next round so another failed
                 // verifier can consume the remaining authorized repair budget.
+                // The round being replaced keeps its verifier result and tree id
+                // here: ROUND_SCOPED_VERIFIER_STATE clears the live copies just
+                // below, and a report or a late apply must still be able to show
+                // what round N verified and prove the diff did not move after it.
+                const repairRound = current.rounds || 0;
+                const repairBase =
+                  validGitObjectId(current.workspaceAfter) && current.patchRound === repairRound
+                    ? {
+                        round: repairRound,
+                        auto: true,
+                        workspaceAfter: current.workspaceAfter,
+                        patchRound: current.patchRound,
+                        verify: current.verify,
+                        ...(current.verifyEnvironment ? { verifyEnvironment: current.verifyEnvironment } : {}),
+                      }
+                    : undefined;
                 const requeue = {
                   status: 'QUEUED',
                   rounds: (current.rounds || 0) + 1,
@@ -3022,6 +3083,7 @@ export class JobManager {
                   outputCap: undefined,
                   roundQueue: this.#roundQueue(this.#nowMs()),
                   activity: undefined,
+                  repairBase,
                   ...ROUND_SCOPED_VERIFIER_STATE,
                   ...ROUND_SCOPED_ERROR_STATE,
                 };
@@ -3070,6 +3132,13 @@ export class JobManager {
         // recovery while reading a marker or persisted record; releasing or
         // finalizing from this path would interfere with that winner.
         if (!launchClaimed) {
+          // A lost claim is expected and stays silent. A deterministic failure
+          // before the claim (a persisted field that no longer validates, a
+          // store error) is different: nobody else will ever claim that
+          // record, so it would sit QUEUED forever with no error. Finish it
+          // only through the same conditional identity check the claim uses,
+          // so a record another lifecycle has taken over is never touched.
+          await this.#failUnclaimedLaunch(id, expectedJob, initialError).catch(() => {});
           unregister();
           return;
         }
@@ -3373,6 +3442,33 @@ export class JobManager {
       (verify.verdict !== 'PASS' && !sandboxRequirementFailed
         ? classifyVerifierEnvironment(verify, { workspacePath: job.workspacePath ? executionPath : undefined, writeScope: writeScope(job) })
         : null);
+    // In the standard mode no snapshot run exists to compare against, and a
+    // `spawn EPERM` line names no path, so the classifier never sees the one
+    // incident this must catch: the sandbox refusing the suite's own fixtures.
+    // A run whose failures are mostly denials, with no more passes than
+    // failures and a corroboration that it never got to test the code, is an
+    // environment failure: a repair round cannot change what the sandbox
+    // denies. The more specific classification above always wins.
+    if (!environment && !baselineMode && verify.verdict !== 'PASS' && sandboxed && !sandboxRequirementFailed) {
+      try {
+        const collector = createFailureCollector({
+          roots: this.#collectorRoots(executionPath),
+          stopsEarly: commandStopsEarly(job.testCommand),
+        });
+        const run = this.#parsedRun(verify, collector);
+        environment =
+          singleRunEnvironmentDominated(run, {
+            durationMs: verify.result?.durationMs,
+            expectedMs: sizeExpectedMs(job.verifierPreflight?.commandBytes, job.verifierDuration?.msPerKiB ?? DEFAULT_EXPECTED_MS_PER_KIB),
+            minFraction: job.verifierDuration?.minFraction ?? DEFAULT_MIN_DURATION_FRACTION,
+            fastRun: Array.isArray(verify.durationWarnings) && verify.durationWarnings.length > 0,
+            preflightWarnings: job.verifierPreflight?.warnings,
+          }) ?? null;
+      } catch {
+        // A parse failure proves nothing: leave the run to the ordinary paths.
+        environment = null;
+      }
+    }
     // The same environmental noise in the untouched snapshot is not what made
     // the new failures: the worker can still fix those.
     const baselineEnvironment = baselineRun?.environment;
@@ -4038,6 +4134,10 @@ export class JobManager {
         roundQueue: this.#roundQueue(repairEnteredMs),
         activity: undefined,
         finishedAt: undefined,
+        // A repair the primary asked for is not the automatic repair whose diff
+        // may still be applied after a cancel; the report falls back to
+        // "verify: not run" for it as before.
+        repairBase: undefined,
         autoRepairScheduled: false,
         leaseOwnerNonce,
         handoffState: launch ? 'LOCAL' : 'PARENT_QUEUED',
@@ -4222,7 +4322,7 @@ export class JobManager {
   async #assertRetainedPatch(job, paths) {
     const unverifiable = (why) =>
       new Error(
-        `this FAILED job's retained diff cannot be verified against its recorded snapshots (${why}); nothing was applied. Start a fresh job, or review the diff and apply it by hand`,
+        `this ${job.status} job's retained diff cannot be verified against its recorded snapshots (${why}); nothing was applied. Start a fresh job, or review the diff and apply it by hand`,
       );
     if (typeof this.snapshots?.diff !== 'function' || typeof this.store.readArtifactBytes !== 'function')
       throw unverifiable('no snapshot differ or artifact reader is available');
@@ -4274,17 +4374,34 @@ export class JobManager {
       await this.store.writeArtifact(id, 'report.md', this.report(job));
     }
     // A FAILED job qualifies only through the gate the report shares, whatever
-    // made it fail (see failedApplyRefusal); CANCELLED never does.
+    // made it fail (see failedApplyRefusal). A CANCELLED job is normally never
+    // applied; the one exception is a repair round the server queued by itself
+    // and the primary cancelled while the reviewed round-N diff was unchanged.
+    let cancelledDuringRepair;
     if (job.status === 'FAILED') {
       const refusal = failedApplyRefusal(job);
       if (refusal) throw new Error(`a FAILED job cannot be applied this way: ${refusal}`);
+    } else if (job.status === 'CANCELLED') {
+      const refusal = cancelledRepairApplyRefusal(job);
+      if (refusal)
+        throw new Error(
+          `a ${job.status} job cannot be applied this way; eligible: ${[...APPLY_ELIGIBLE].join(', ')}, or FAILED with an intact in-scope diff (a verified or unverified-success job integrates automatically; a CANCELLED job was stopped on purpose): ${refusal}`,
+        );
+      cancelledDuringRepair = { round: job.repairBase.round };
     } else if (!APPLY_ELIGIBLE.has(job.status))
       throw new Error(
         `a ${job.status} job cannot be applied this way; eligible: ${[...APPLY_ELIGIBLE].join(', ')}, or FAILED with an intact in-scope diff (a verified or unverified-success job integrates automatically; a CANCELLED job was stopped on purpose)`,
       );
     if (job.scopeViolations?.length || job.verifierMutations?.length)
       throw new Error('a job with scope or verifier-authorship violations is never applied; start a fresh job');
-    if (await this.store.cancelRequested?.(id)) throw new Error('job was cancelled');
+    // The job-level cancel marker is what ended the cancelled repair round. For
+    // an apply from that job it is stale history, so a real apply clears it once,
+    // before the lease and any applyThenVerify run: a later offload_cancel writes
+    // a fresh marker, which still stops the verification and its revert. A dry
+    // run clears nothing, so the marker still ends a real apply if it arrives first.
+    if (cancelledDuringRepair) {
+      if (apply) await this.store.clearCancel?.(id);
+    } else if (await this.store.cancelRequested?.(id)) throw new Error('job was cancelled');
     const integrateRecorded = this.config.isolation?.integrateRecorded;
     if (!this.isolated || !job.workspacePath || typeof integrateRecorded !== 'function')
       throw new Error('late integration is unavailable for this job (it did not run in an isolated worktree)');
@@ -4297,7 +4414,10 @@ export class JobManager {
     // Origin of the applied diff: only a FAILED job needs it spelled out, as it
     // is the one whose worker did not end cleanly.
     const failure = job.status === 'FAILED' ? this.#failureOrigin(job) : undefined;
-    if (job.status === 'FAILED') await this.#assertRetainedPatch(job, paths);
+    // Both late applies prove the stored patch is the recorded one: FAILED
+    // because nothing else vouches for the diff, a cancelled-repair because the
+    // round-N verdict it keeps was made on the tree that is about to land.
+    if (job.status === 'FAILED' || cancelledDuringRepair) await this.#assertRetainedPatch(job, paths);
     const currentBranch = await this.#branch(job.repoPath);
     const currentHead = await this.#head(job.repoPath);
     if (currentBranch !== job.branch || currentHead !== job.head)
@@ -4326,6 +4446,7 @@ export class JobManager {
         applied: false,
         files: (preview.files || []).map((file) => file.path),
         fromStatus: job.status,
+        ...(cancelledDuringRepair ? { cancelledDuringRepair } : {}),
         ...(scratchFiles(job) ? { scratchFiles: scratchFiles(job) } : {}),
         ...(failure ? { failure } : {}),
         ...(plan

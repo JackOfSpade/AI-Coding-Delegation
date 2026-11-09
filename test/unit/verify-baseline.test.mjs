@@ -9,6 +9,7 @@ import {
   describeBaseline,
   environmentDominated,
   repairDefectText,
+  singleRunEnvironmentDominated,
   sizeExpectedMs,
 } from '../../src/verify-baseline.mjs';
 
@@ -1181,4 +1182,153 @@ test('a go package whose import path starts with digits is still a go summary', 
   const parsed = runOf('--- FAIL: TestA (0.00s)\nFAIL\nok  \t163.com/num\t0.011s\n').parsed;
   assert.equal(parsed.format, 'go');
   assert.equal(parsed.complete, true);
+});
+
+// --- singleRunEnvironmentDominated: the standard-mode environment decision ---
+
+/** `node --test` output for `denied` sandbox-refused tests, `assertions` real test failures and `passing` tests. */
+const deniedOutput = ({ denied = 0, assertions = 0, passing = 0 } = {}) => {
+  const entries = [
+    ...Array.from({ length: denied }, (_, index) => ({
+      name: index % 2 ? `fixture repo ${index}` : `spawns worker ${index}`,
+      detail:
+        index % 2
+          ? '  Error: fatal: not a git repository (or any of the parent directories): .git'
+          : "  Error: spawn git EPERM\n    code: 'EPERM',",
+    })),
+    ...Array.from({ length: assertions }, (_, index) => ({
+      name: `asserts value ${index}`,
+      detail: '  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n  \n  1 !== 2',
+    })),
+  ];
+  return [
+    ...entries.map(({ name }) => `✖ ${name} (1ms)`),
+    ...Array.from({ length: passing }, (_, index) => `✔ passes ${index} (1ms)`),
+    `ℹ tests ${entries.length + passing}`,
+    `ℹ pass ${passing}`,
+    `ℹ fail ${entries.length}`,
+    '',
+    '✖ failing tests:',
+    '',
+    ...entries.flatMap(({ name, detail }, index) => [`test at test/suite.test.mjs:${index + 3}:1`, `✖ ${name} (1ms)`, detail, '']),
+  ].join('\n');
+};
+// A #parsedRun result: what the collector parsed plus the run's own fields.
+const deniedRun = (options = {}, overrides = {}) => {
+  const collector = createFailureCollector();
+  collector.push(deniedOutput(options));
+  return {
+    code: 1,
+    sandboxed: true,
+    timedOut: false,
+    cancelled: false,
+    truncated: false,
+    parsed: collector.finish(),
+    ...overrides,
+  };
+};
+// A run far shorter than the 60 KiB test file (12 s at the default 200 ms/KiB) suggests.
+const FAST = { durationMs: 40, expectedMs: 12_000 };
+const CHILD_PROCESS_PREFLIGHT = [{ code: 'child-process', path: 'test/suite.test.mjs' }];
+
+test('denial-dominated failures are sandbox-dominated with only the start-time preflight warning', () => {
+  const decision = singleRunEnvironmentDominated(deniedRun({ denied: 70, passing: 11 }), {
+    durationMs: 600_000,
+    expectedMs: 12_000,
+    preflightWarnings: CHILD_PROCESS_PREFLIGHT,
+  });
+  assert.equal(decision.kind, 'sandbox-dominated');
+  assert.match(decision.detail, /^70 of 70 failing test\(s\) printed a sandbox denial as their error/);
+  assert.match(decision.detail, /and no more tests passed \(11\) than failed/);
+  assert.match(
+    decision.detail,
+    /corroborated by the start-time preflight child-process\/process-inspection warning\. A repair round cannot change/,
+  );
+  assert.doesNotMatch(decision.detail, /far shorter|duration warning/);
+
+  const inspection = singleRunEnvironmentDominated(deniedRun({ denied: 70, passing: 11 }), {
+    durationMs: 600_000,
+    expectedMs: 12_000,
+    preflightWarnings: [{ code: 'process-inspection', path: 'test/suite.test.mjs' }],
+  });
+  assert.equal(inspection.kind, 'sandbox-dominated');
+});
+
+test('an implausibly fast run alone corroborates denial-dominated failures', () => {
+  const decision = singleRunEnvironmentDominated(deniedRun({ denied: 70, passing: 11 }), { ...FAST, preflightWarnings: [] });
+  assert.equal(decision.kind, 'sandbox-dominated');
+  assert.match(decision.detail, /corroborated by a run far shorter than the tested files suggest\./);
+  assert.doesNotMatch(decision.detail, /duration warning|preflight/);
+});
+
+test('a duration warning alone corroborates denial-dominated failures', () => {
+  const decision = singleRunEnvironmentDominated(deniedRun({ denied: 70, passing: 11 }), {
+    durationMs: 600_000,
+    expectedMs: 12_000,
+    fastRun: true,
+  });
+  assert.equal(decision.kind, 'sandbox-dominated');
+  assert.match(decision.detail, /corroborated by a duration warning against earlier runs\./);
+  assert.doesNotMatch(decision.detail, /far shorter|preflight/);
+});
+
+test('denial-dominated failures with no corroboration are not environment-dominated', () => {
+  assert.equal(
+    singleRunEnvironmentDominated(deniedRun({ denied: 70, passing: 11 }), { durationMs: 600_000, expectedMs: 12_000 }),
+    undefined,
+  );
+  assert.equal(singleRunEnvironmentDominated(deniedRun({ denied: 70, passing: 11 })), undefined);
+  // A run that finished as slowly as the files suggest, with no warning.
+  const slow = singleRunEnvironmentDominated(deniedRun({ denied: 70, passing: 11 }), {
+    durationMs: 600_000,
+    expectedMs: 12_000,
+    fastRun: false,
+    preflightWarnings: [],
+  });
+  assert.equal(slow, undefined);
+  // No sized test file to be fast against.
+  assert.equal(singleRunEnvironmentDominated(deniedRun({ denied: 70, passing: 11 }), { ...FAST, expectedMs: 0 }), undefined);
+  // A preflight warning about something else is not a corroboration.
+  assert.equal(
+    singleRunEnvironmentDominated(deniedRun({ denied: 70, passing: 11 }), {
+      durationMs: 600_000,
+      expectedMs: 12_000,
+      preflightWarnings: [{ code: 'system-temp', path: 'test/suite.test.mjs' }],
+    }),
+    undefined,
+  );
+});
+
+test('a run with more passes than failures is not environment-dominated', () => {
+  const run = deniedRun({ denied: 2, passing: 200 });
+  assert.equal(run.parsed.summaryPassed, 200);
+  assert.equal(run.parsed.detailedFailures, 2);
+  assert.equal(singleRunEnvironmentDominated(run, { ...FAST, fastRun: true, preflightWarnings: CHILD_PROCESS_PREFLIGHT }), undefined);
+});
+
+test('failures whose details are AssertionErrors are not sandbox denials', () => {
+  const run = deniedRun({ denied: 2, assertions: 70, passing: 11 });
+  assert.equal(run.parsed.detailedFailures, 72);
+  assert.equal(run.parsed.deniedFailures, 2);
+  assert.equal(singleRunEnvironmentDominated(run, { ...FAST, fastRun: true, preflightWarnings: CHILD_PROCESS_PREFLIGHT }), undefined);
+});
+
+test('a denied run that did not finish, was not sandboxed, or exited 0 is never environment-dominated', () => {
+  const corroborations = { ...FAST, fastRun: true, preflightWarnings: CHILD_PROCESS_PREFLIGHT };
+  assert.equal(singleRunEnvironmentDominated(deniedRun({ denied: 70, passing: 11 }), corroborations).kind, 'sandbox-dominated');
+  for (const overrides of [
+    { truncated: true },
+    { timedOut: true },
+    { cancelled: true },
+    { sandboxed: false },
+    { code: 0 },
+    { code: null },
+    { code: '1' },
+  ]) {
+    assert.equal(
+      singleRunEnvironmentDominated(deniedRun({ denied: 70, passing: 11 }, overrides), corroborations),
+      undefined,
+      `not environment-dominated with ${JSON.stringify(overrides)}`,
+    );
+  }
 });
