@@ -564,6 +564,8 @@ test('a BUDGET stop records which cap tripped with the spend so far and publishe
     assert.equal(done.status, 'BUDGET', name);
     assert.deepEqual((await m.store.get(started.jobId)).budgetStop, stop, name);
     assert.deepEqual(done.budgetStop, stop, name);
+    // A terminal wait carries the cumulative cost (`offload wait --until-terminal` prints it).
+    assert.equal(done.costUsd, result.costUsd, name);
     assert.deepEqual(budgetStopLines(done.report), [line], name);
     const events = (await m.store.readArtifact(started.jobId, 'events.jsonl'))
       .trim()

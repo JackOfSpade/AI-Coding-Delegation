@@ -2,7 +2,7 @@
 /** Idempotent, reversible client-routing installer. It never overwrites unmanaged content. */
 import { lstat, link, mkdir, open, readdir, rename, rm, rmdir, writeFile } from 'node:fs/promises';
 import { constants, realpathSync } from 'node:fs';
-import { basename, dirname, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
@@ -21,6 +21,7 @@ import { doctor, keysSummary, routeKeyTargets } from './src/doctor.mjs';
 import { resolveClientPaths } from './src/client-paths.mjs';
 import { sameBigintFileStat } from './src/stat-identity.mjs';
 import { runtimeIdentityFor } from './src/identity.mjs';
+import { isOffloadSourceCheckout, recordSourceRoot } from './src/maintainer-root.mjs';
 import {
   COMMAND_SKILL_NAMES as commandSkillNames,
   LEGACY_SKILL_NAMES as legacySkillNames,
@@ -119,6 +120,14 @@ export function parseInstallerArgs(argv) {
       parsed.approvalMode = approvalMode;
       continue;
     }
+    if (value === '--source-root' || value.startsWith('--source-root=')) {
+      once('--source-root');
+      const sourceRoot = value === '--source-root' ? argv[++index] : value.slice('--source-root='.length);
+      if (!sourceRoot || sourceRoot.startsWith('-') || !isAbsolute(sourceRoot))
+        throw new Error('--source-root requires the absolute path of the Offload source checkout');
+      parsed.sourceRoot = sourceRoot;
+      continue;
+    }
     if (value.startsWith('-')) throw new Error(`unknown installer option: ${value}`);
     throw new Error(`unexpected installer argument: ${value}`);
   }
@@ -133,6 +142,7 @@ export function parseInstallerArgs(argv) {
   }
   if (parsed.uninstall && parsed.skipKey) throw new Error('--skip-key cannot be used with --uninstall');
   if (parsed.uninstall && parsed.approvalMode !== undefined) throw new Error('--approval-mode cannot be used with --uninstall');
+  if (parsed.uninstall && parsed.sourceRoot !== undefined) throw new Error('--source-root cannot be used with --uninstall');
   return parsed;
 }
 const exists = async (p) => {
@@ -1667,15 +1677,26 @@ export async function install({
   replaceKey = false,
   keyProvider,
   approvalMode,
+  // Where this packed copy came from, for maintainer prompts (src/maintainer-root.mjs). An explicit
+  // sourceRoot must be an Offload git checkout; `cwd` (passed only by the CLI) is used when it is one.
+  sourceRoot,
+  cwd,
 } = {}) {
   if (Number(process.versions.node.split('.')[0]) < 20) throw new Error('Node.js 20 or newer is required');
   if (approvalMode !== undefined && !['prompt', 'approve'].includes(approvalMode))
     throw new Error('approvalMode must be prompt or approve');
   if (uninstall && approvalMode !== undefined) throw new Error('approvalMode cannot be used with uninstall');
+  if (uninstall && sourceRoot !== undefined) throw new Error('sourceRoot cannot be used with uninstall');
   const clientPaths = resolveClientPaths({ home, env, platform });
   home = clientPaths.home;
   configHome ||= env.XDG_CONFIG_HOME || (platform === 'win32' ? env.APPDATA || join(home, 'AppData', 'Roaming') : join(home, '.config'));
   root = resolve(root);
+  // Refuse a bad explicit source before any client file changes; recording happens after a successful install.
+  if (
+    sourceRoot !== undefined &&
+    !(typeof sourceRoot === 'string' && isAbsolute(sourceRoot) && isOffloadSourceCheckout(resolve(sourceRoot)))
+  )
+    throw new Error('--source-root must be an absolute path to an Offload git checkout (.git, install.mjs, package.json name "offload")');
   // A normal packaged install has every runtime artifact and can record an
   // exact identity for the next update. Keep the public API tolerant of the
   // deliberately partial fixture roots used by embedders and migration tests;
@@ -2068,6 +2089,8 @@ export async function install({
           'Restart Claude Code or the MCP client to load the updated Offload server and skill. The installer does not kill live processes.',
       }
     : { required: false };
+  const source =
+    uninstall || (sourceRoot === undefined && cwd === undefined) ? undefined : recordSourceRoot({ packageRoot: root, sourceRoot, cwd });
   return {
     changed,
     backups,
@@ -2079,6 +2102,7 @@ export async function install({
     plugin,
     claudeMcp,
     ...(installedRuntime ? { runtime: installedRuntime } : {}),
+    ...(source ? { source } : {}),
     restart,
   };
 }
@@ -2119,6 +2143,8 @@ if (isMainModule()) {
       replaceKey: args.replaceKey,
       keyProvider: args.keyProvider,
       approvalMode: args.approvalMode,
+      sourceRoot: args.sourceRoot,
+      cwd: process.cwd(),
     });
     const checked = doctor({ root: here });
     console.log(JSON.stringify({ ...result, doctor: checked }, null, 2));

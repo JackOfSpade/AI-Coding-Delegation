@@ -378,6 +378,9 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     !reportMode &&
       job.malformedToolFinish === true &&
       'worker stop: the provider ended on malformed tool-call JSON; the server verifier passed on the retained diff, so the job finished without a finish call (no worker summary or testsRun)',
+    !reportMode &&
+      ['finish-protocol', 'no-finish'].includes(job.verifiedWithoutFinish) &&
+      `worker stop: ${job.verifiedWithoutFinish === 'no-finish' ? 'the worker ended without calling finish' : 'the worker kept pairing finish with other tool calls'}; the server verifier passed on the retained diff, so the job finished without a finish call (no worker summary or testsRun)`,
     baselineDiff,
     durationWarnings,
     environment,

@@ -6,6 +6,7 @@ import {
   constants,
   cp,
   link,
+  lstat,
   mkdtemp as createTempDirectory,
   mkdir,
   readFile,
@@ -18,7 +19,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import {
   install as rawInstall,
   isMainModule,
@@ -31,6 +32,7 @@ import {
 } from '../../install.mjs';
 import { EventEmitter } from 'node:events';
 import { doctor } from '../../src/doctor.mjs';
+import { resolveMaintainerRoot } from '../../src/maintainer-root.mjs';
 // Every temp home and product directory is removed once this file's tests finish.
 const createdDirectories = [];
 const mkdtemp = async (prefix) => {
@@ -143,6 +145,10 @@ test('installer CLI grammar rejects dangerous typos before any install mutation 
     ['--approval-mode=unsafe'],
     ['--doctor-hook', '--skip-key'],
     ['unexpected-positional'],
+    ['--source-root'],
+    ['--source-root=relative/offload'],
+    ['--source-root=/a', '--source-root=/b'],
+    ['--uninstall', '--source-root=/opt/offload'],
   ])
     assert.throws(
       () => parseInstallerArgs(args),
@@ -2662,4 +2668,28 @@ test('the session banner warns while a config still routes the commands Claude f
   } finally {
     await rm(configHome, { recursive: true, force: true });
   }
+});
+
+test('installer records the source checkout of a packed install and refuses a bad --source-root before any change', async () => {
+  assert.equal(parseInstallerArgs(['--source-root=/opt/offload']).sourceRoot, '/opt/offload');
+  assert.equal(parseInstallerArgs(['--source-root', '/opt/offload']).sourceRoot, '/opt/offload');
+  // A packed copy of this checkout: every installer artifact, no .git.
+  const packedRoot = await mkdtemp(`${tmpdir()}/offload-packed-`);
+  await cp(process.cwd(), packedRoot, { recursive: true, filter: (path) => !/[\\/](\.git|node_modules|coverage|artifacts)$/.test(path) });
+  const source = realpathSync(process.cwd());
+  const home = await mkdtemp(`${tmpdir()}/offload-home-`);
+  const options = { root: packedRoot, home, configHome: join(home, 'config'), clients: ['claude'] };
+
+  // Not an Offload checkout: refused before the Claude memory file is created.
+  await assert.rejects(install({ ...options, sourceRoot: home }), /--source-root must be/);
+  await assert.rejects(lstat(join(home, '.claude', 'CLAUDE.md')), { code: 'ENOENT' });
+
+  const installed = await install({ ...options, sourceRoot: source });
+  assert.deepEqual(installed.source, { sourceRoot: source, path: join(packedRoot, '.offload-source.json') });
+  assert.equal(JSON.parse(await readFile(join(packedRoot, '.offload-source.json'), 'utf8')).sourceRoot, source);
+  assert.equal(resolveMaintainerRoot({ packageRoot: packedRoot }), source);
+
+  // An embedder that passes neither sourceRoot nor cwd records nothing.
+  const quiet = await install({ ...options });
+  assert.equal(quiet.source, undefined);
 });

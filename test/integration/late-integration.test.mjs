@@ -938,10 +938,13 @@ test('no-finish, output-cap and finish-protocol FAILED rounds are continuable an
     ],
   };
   for (const [kind, [error, text]] of Object.entries(kinds)) {
+    // A passing verifier on the stopped round would finish no-finish and finish-protocol
+    // jobs outright (verifiedWithoutFinish), so that round's diagnostic check fails here.
+    let first = true;
     const h = await harness({
       worker: async (job, run) =>
         run === 1 ? (writeSrc(job, 'a.js'), { status: 'FAILED', failureKind: kind, error, turns: 2 }) : { status: 'DONE', turns: 1 },
-      verify: pass,
+      verify: () => (first ? ((first = false), codeFail()) : pass()),
     });
     try {
       const { jobId } = await h.manager.start(failedJob(h.repo));

@@ -1019,7 +1019,8 @@ test('a credit hop to Flash never widens a fixed assertion-repair allowance', as
 
 test('finish-protocol and no-finish stops verify retained in-scope work before reporting and preserve continuation/apply', async () => {
   for (const kind of ['finish-protocol', 'no-finish']) {
-    for (const pass of [false, true]) {
+    // A passing verifier now finishes the job (next test); a failing one keeps every recovery path.
+    for (const pass of [false]) {
       const h = await harness({
         worker: async (job, run, { appendMessages }) => {
           const input = JSON.stringify({ path: 'src/a.js', content: 'return { token: match[1], rest };' });
@@ -1069,6 +1070,59 @@ test('finish-protocol and no-finish stops verify retained in-scope work before r
         cleanup(h.repo);
       }
     }
+  }
+});
+
+test('a finish-protocol or no-finish stop whose server verifier passes finishes DONE_VERIFIED and integrates like a finish', async () => {
+  // Field job dde49bf4: Flash kept pairing finish with other calls for 96 turns while
+  // its edits were complete and 26/26 tests passed; the primary had to apply it by hand.
+  for (const kind of ['finish-protocol', 'no-finish']) {
+    const h = await harness({
+      worker: async (job) => {
+        writeSrc(job, 'a.js', A_BYTES);
+        return failedProtocol({ failureKind: kind, toolFailure: undefined });
+      },
+      check: green,
+    });
+    try {
+      const { id, done } = await h.begin({ testCommand: 'node check.js' });
+      assert.equal(done.status, 'DONE_VERIFIED', kind);
+      assert.equal(h.counters.checks.length, 1);
+      assert.equal(h.counters.runs, 1, 'never queues a repair round');
+      assert.equal(await readFile(join(h.repo, 'src/a.js'), 'utf8'), A_BYTES, 'integrated like a normal verified finish');
+      assert.match(
+        done.report,
+        kind === 'no-finish'
+          ? /^worker stop: the worker ended without calling finish; the server verifier passed on the retained diff/m
+          : /^worker stop: the worker kept pairing finish with other tool calls; the server verifier passed on the retained diff/m,
+      );
+      assert.doesNotMatch(done.report, /apply recommended with offload_apply/);
+      const stored = await h.store.get(id);
+      assert.equal(stored.verifiedWithoutFinish, kind);
+      assert.equal(stored.failureKind, undefined);
+      assert.equal(stored.error, undefined);
+      assert.equal(stored.malformedToolFinish, undefined);
+      assert.equal(stored.concerns.filter((concern) => /No summary, testsRun or review packet was reported/.test(concern)).length, 1);
+    } finally {
+      cleanup(h.repo);
+    }
+  }
+});
+
+test('a tool-loop stop is not promoted on a passing verifier', async () => {
+  const h = await harness({
+    worker: async (job) => {
+      writeSrc(job, 'a.js', A_BYTES);
+      return failedProtocol({ failureKind: 'tool-loop' });
+    },
+    check: green,
+  });
+  try {
+    const { done } = await h.begin({ testCommand: 'node check.js' });
+    assert.equal(done.status, 'FAILED');
+    assert.equal(existsSync(join(h.repo, 'src/a.js')), false);
+  } finally {
+    cleanup(h.repo);
   }
 });
 

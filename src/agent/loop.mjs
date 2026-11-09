@@ -177,6 +177,11 @@ function salvagedFinish(args, problems) {
 // text (names, arguments) never appears in either.
 const FINISH_ALONE_CORRECTION =
   'TOOL_ERROR: finish must be the only tool call in its turn; nothing in this turn was executed. The prior implementation may already be complete. On your next response, either call finish alone if no actual work remains, or make only the non-finish calls needed for remaining work; after their results, call finish alone in a later response. Do not repeat or pair a rejected call with finish.';
+// The Flash-route correction when the next request offers only finish.
+const FINISH_ONLY_CORRECTION =
+  'TOOL_ERROR: finish must be the only tool call in its turn; nothing in this turn was executed. Your next response may call only finish: call finish alone now with your summary, and list anything left undone in concerns.';
+// A rejected turn with one of these never ran it, so the next turn keeps every tool.
+const FINISH_ONLY_BLOCKING_TOOLS = new Set(['write_file', 'edit_file']);
 // Rejected finish arguments run nothing and lose nothing, so unlike a mixed turn
 // they earn a second correction before the round fails.
 const MAX_FINISH_ARGUMENT_CORRECTIONS = 2;
@@ -619,6 +624,11 @@ export class AgentLoop {
     // One finish-protocol correction per run (so per round of a job): a second
     // violation is the worker's, not a fluke, and ends the round.
     let finishProtocolRecoveryUsed = false;
+    // DeepSeek Flash tends to keep pairing finish with reads or tests after the
+    // work is done. After that first rejection its next request offers only
+    // finish, unless the rejected turn carried a write: that write never ran,
+    // and a finish-only turn would make the worker drop it.
+    let finishOnlyTurnPending = false;
     let finishArgumentCorrections = 0;
     // Report finalization runs one turn before the cap so that a finish the
     // output cap cuts off still has a turn for one shorter retry.
@@ -833,6 +843,10 @@ export class AgentLoop {
           budgetFinishRecovery || reportFinalizing || reportFinalizeRetryTurn
             ? this.toolDefinitions.filter((tool) => tool.function.name === 'finish')
             : this.toolDefinitions;
+        if (finishOnlyTurnPending) {
+          finishOnlyTurnPending = false;
+          activeToolDefinitions = this.toolDefinitions.filter((tool) => tool.function.name === 'finish');
+        }
         let activeToolNames = new Set(activeToolDefinitions.map((tool) => tool.function.name));
         // DeepSeek rejects required/named tool selection while thinking is
         // enabled. Its official route explicitly advertises this capability,
@@ -1522,10 +1536,12 @@ export class AgentLoop {
               const draft = salvageableFinish(calls, parsed);
               if (draft) rejectedReportFinish = { args: draft, problems: fixedFinishProblems(draft, !finishNotAlone) };
             }
+            const finishOnlyNext = finishNotAlone && forcedFocusCapable && !calls.some((call) => FINISH_ONLY_BLOCKING_TOOLS.has(call.name));
             if (finishNotAlone) finishProtocolRecoveryUsed = true;
             else finishArgumentCorrections++;
+            if (finishOnlyNext) finishOnlyTurnPending = true;
             const correction = finishNotAlone
-              ? `${FINISH_ALONE_CORRECTION}${finishInvalid ? `; also, ${finishArgumentsCorrection(finishProblems)}` : ''}`
+              ? `${finishOnlyNext ? FINISH_ONLY_CORRECTION : FINISH_ALONE_CORRECTION}${finishInvalid ? `; also, ${finishArgumentsCorrection(finishProblems)}` : ''}`
               : `TOOL_ERROR: ${finishArgumentsCorrection(finishProblems)}; nothing in this turn was executed`;
             // One atomic, durable batch: a crash can never leave an assistant
             // tool_call without its result.

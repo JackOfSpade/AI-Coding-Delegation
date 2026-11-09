@@ -216,6 +216,63 @@ test('a finish mixed with a read-only call after a successful write is corrected
     await rm(dir, { recursive: true, force: true });
   }
 });
+const FINISH_ONLY =
+  'TOOL_ERROR: finish must be the only tool call in its turn; nothing in this turn was executed. Your next response may call only finish: call finish alone now with your summary, and list anything left undone in concerns.';
+// Each request's offered tool names and its last tool result, on the official DeepSeek Flash route.
+const flashFinishRun = async (firstTurn, secondTurn) => {
+  const turns = [firstTurn, secondTurn];
+  const offered = [];
+  const lastResults = [];
+  const invoked = [];
+  const provider = officialDeepSeekProvider(async function* ({ messages, tools }) {
+    offered.push(tools.map((tool) => tool.function.name));
+    lastResults.push(messages.at(-1)?.role === 'tool' ? messages.at(-1).content : undefined);
+    yield { toolCalls: turns.shift() };
+  });
+  const result = await new AgentLoop({ provider, model: 'deepseek-flash', tools: finishTools(invoked) }).run({ task: 'x' });
+  return { result, offered, lastResults, invoked };
+};
+test('on DeepSeek Flash a finish paired with a read is corrected once and the next request offers only finish', async () => {
+  const { result, offered, lastResults, invoked } = await flashFinishRun(
+    [call('read_file', '{"path":"a"}', 'r'), call('finish', '{"summary":"done"}', 'f')],
+    [call('finish', '{"summary":"done"}', 'f2')],
+  );
+  assert.equal(result.status, 'DONE');
+  assert.deepEqual(invoked, ['finish']);
+  assert.equal(offered.length, 2);
+  assert.ok(offered[0].includes('read_file') && offered[0].includes('finish'), 'the first request offers the full tool set');
+  assert.deepEqual(offered[1], ['finish']);
+  assert.equal(lastResults[1], FINISH_ONLY);
+});
+test('on DeepSeek Flash a finish paired with a write keeps every tool, since the write never ran', async () => {
+  const { result, offered, lastResults } = await flashFinishRun(
+    [call('write_file', '{"path":"a","content":"x"}', 'w'), call('finish', '{"summary":"done"}', 'f')],
+    [call('finish', '{"summary":"done"}', 'f2')],
+  );
+  assert.equal(result.status, 'DONE');
+  assert.deepEqual(offered[1], offered[0]);
+  assert.ok(offered[1].includes('write_file'));
+  assert.equal(lastResults[1], FINISH_ALONE);
+});
+test('off the DeepSeek route a finish paired with a read keeps every tool on the corrected turn', async () => {
+  const offered = [];
+  const turns = [
+    [call('read_file', '{"path":"a"}', 'r'), call('finish', '{"summary":"done"}', 'f')],
+    [call('finish', '{"summary":"done"}', 'f2')],
+  ];
+  const result = await new AgentLoop({
+    provider: {
+      async *chat({ tools }) {
+        offered.push(tools.map((tool) => tool.function.name));
+        yield { toolCalls: turns.shift() };
+      },
+    },
+    tools: finishTools([]),
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'DONE');
+  assert.deepEqual(offered[1], offered[0]);
+  assert.ok(offered[1].includes('read_file'));
+});
 test('a second finish-protocol violation fails after exactly one correction and persists only the corrected turn', async () => {
   const invoked = [];
   const requests = [];

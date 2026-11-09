@@ -12,4 +12,6 @@
 
 ## Checks
 
+When a CLI command or another caller consumes Core or JobManager results, at least one test must exercise the real manager's result shape, not only a hand-built fake. A fake that invents a field hides its absence: `offload wait --until-terminal` first shipped a `cost=` field read from a `costUsd` that terminal wait results did not carry.
+
 Before finishing a change, run `npm run static`, `npm run lint`, `npm run format:check`, and `npm test`. `npm run release:check` runs the full release gate.

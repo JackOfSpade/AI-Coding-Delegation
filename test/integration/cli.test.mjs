@@ -665,3 +665,146 @@ test('doctor --hook prints the per-route keys line', async () => {
   assert.match(out.get(), /· keys (ok|missing(: [a-z, ]+)?) · sandbox /);
   assert.doesNotMatch(out.get(), /· key (ok|missing) ·/);
 });
+test('offload wait --until-terminal blocks until every job is terminal and prints one compact line per job in order', async () => {
+  const out = sink(),
+    err = sink();
+  const polled = [];
+  const options = [];
+  const printedWhileWaiting = [];
+  const status = await runCli(['wait', 'oj-a', 'oj-b', '--until-terminal'], {
+    core: {
+      wait: async (id, opts) => {
+        printedWhileWaiting.push(out.get());
+        polled.push(id);
+        options.push(opts);
+        if (id === 'oj-a' && polled.filter((value) => value === 'oj-a').length <= 2)
+          return { done: false, status: 'RUNNING', progress: { status: 'RUNNING' } };
+        if (id === 'oj-a') return { done: true, status: 'DONE_VERIFIED', costUsd: 0.5 };
+        return { done: true, status: 'FAILED', costUsd: null, failureKind: 'tool-loop' };
+      },
+    },
+    stdout: out.stream,
+    stderr: err.stream,
+  });
+  assert.equal(status, 0);
+  assert.equal(out.get(), 'oj-a DONE_VERIFIED cost=$0.5000\noj-b FAILED failureKind=tool-loop\n');
+  assert.equal(err.get(), '');
+  assert.deepEqual(printedWhileWaiting, ['', '', '', ''], 'nothing is printed while waiting');
+  assert.deepEqual(polled, ['oj-a', 'oj-b', 'oj-a', 'oj-a'], 'a finished job is never polled again');
+  assert.ok(options.every((value) => value.detail === 'compact'));
+  assert.ok(options.every((value) => value.timeoutSec <= 55 && value.timeoutSec >= 0));
+});
+test('offload wait --until-terminal exits 3 and marks a job timeout once the deadline passes', async () => {
+  const out = sink(),
+    err = sink();
+  let clock = 0;
+  const status = await runCli(['wait', 'oj-a', 'oj-b', '--until-terminal', '--timeout-min', '1'], {
+    core: {
+      wait: async (id) => (id === 'oj-a' ? { done: true, status: 'DONE_VERIFIED', costUsd: 0.5 } : { done: false, status: 'RUNNING' }),
+    },
+    now: () => (clock += 20_000),
+    stdout: out.stream,
+    stderr: err.stream,
+  });
+  assert.equal(status, 3);
+  assert.equal(out.get(), 'oj-a DONE_VERIFIED cost=$0.5000\noj-b RUNNING timeout\n');
+  assert.equal(err.get(), '');
+});
+test('offload wait --until-terminal rejects invalid invocations before constructing Core', async () => {
+  const invalid = [
+    [['wait', 'oj-a', '--timeout-min', '5'], /--timeout-min requires --until-terminal/],
+    [['wait', 'oj-a', '--until-terminal', '--timeout-min', '0'], /option --timeout-min must be a finite number/],
+    [['wait', 'oj-a', '--until-terminal', '--timeout-min', '1441'], /option --timeout-min must be a finite number/],
+    [['wait', 'oj-a', 'oj-a', '--until-terminal'], /job ids must be distinct/],
+    [['wait', ...Array.from({ length: 17 }, (_, index) => `oj-${index}`), '--until-terminal'], /accepts 1-16 job ids/],
+    [['wait', 'oj-a', 'bad id', '--until-terminal'], /requires valid job ids/],
+    [['wait', 'oj-a', '--until-terminal', '--timeoutSec', '5'], /--timeoutSec cannot be combined with --until-terminal/],
+    [['wait', 'oj-a', '--until-terminal', '--detail', 'full'], /--detail cannot be combined with --until-terminal/],
+    [['wait', 'oj-a', 'oj-b'], /requires exactly one job id/],
+    [['wait', '--until-terminal'], /accepts 1-16 job ids/],
+  ];
+  for (const [argv, message] of invalid) {
+    const out = sink(),
+      err = sink();
+    let constructions = 0;
+    const code = await runCli(argv, {
+      createCore: () => {
+        constructions += 1;
+        throw new Error('must not construct core');
+      },
+      stdout: out.stream,
+      stderr: err.stream,
+    });
+    assert.equal(code, 2, argv.join(' '));
+    assert.equal(constructions, 0, argv.join(' '));
+    assert.equal(out.get(), '');
+    assert.match(err.get(), message, argv.join(' '));
+  }
+  // A spelled false value is the old single-id behavior, not a new mode.
+  assert.deepEqual(parseArgs(['wait', 'oj-a', '--until-terminal=false']).flags, { 'until-terminal': 'false' });
+});
+test('offload wait --until-terminal stops on an aborted signal with interrupted lines and exit 130', async () => {
+  const out = sink(),
+    err = sink();
+  const controller = new AbortController();
+  const polled = [];
+  const status = await runCli(['wait', 'oj-a', 'oj-b', '--until-terminal'], {
+    core: {
+      wait: async (id) => {
+        polled.push(id);
+        if (id === 'oj-a') return { done: true, status: 'DONE_VERIFIED' };
+        controller.abort();
+        return { done: false, status: 'RUNNING', progress: { status: 'RUNNING' } };
+      },
+    },
+    signal: controller.signal,
+    stdout: out.stream,
+    stderr: err.stream,
+  });
+  assert.equal(status, 130);
+  assert.equal(out.get(), 'oj-a DONE_VERIFIED\noj-b RUNNING interrupted\n');
+  assert.equal(err.get(), '');
+  assert.deepEqual(polled, ['oj-a', 'oj-b']);
+});
+test('offload wait --until-terminal turns a process signal into interrupted lines, exit 130, and removes its listeners', async () => {
+  const out = sink(),
+    err = sink();
+  const source = new EventEmitter();
+  const signals = ['SIGTERM', 'SIGINT', 'SIGHUP'];
+  const counts = () => signals.map((name) => source.listenerCount(name));
+  assert.deepEqual(counts(), [0, 0, 0]);
+  const status = await runCli(['wait', 'oj-a', '--until-terminal'], {
+    createCore: () => ({
+      wait: async () => {
+        source.emit('SIGTERM');
+        return { done: false, status: 'RUNNING' };
+      },
+    }),
+    signalSource: source,
+    stdout: out.stream,
+    stderr: err.stream,
+  });
+  assert.equal(status, 130);
+  assert.equal(out.get(), 'oj-a RUNNING interrupted\n');
+  assert.equal(err.get(), '');
+  assert.deepEqual(counts(), [0, 0, 0]);
+});
+test('offload wait <id> without --until-terminal keeps the full-detail JSON result', async () => {
+  const out = sink();
+  let seen;
+  const status = await runCli(['wait', 'oj-a'], {
+    core: {
+      wait: async (id, opts) => {
+        seen = [id, opts];
+        return { done: true, status: 'DONE_VERIFIED' };
+      },
+    },
+    stdout: out.stream,
+    stderr: sink().stream,
+  });
+  assert.equal(status, 0);
+  assert.equal(seen[0], 'oj-a');
+  assert.equal(seen[1].detail, 'full');
+  assert.equal(seen[1].timeoutSec, undefined);
+  assert.deepEqual(JSON.parse(out.get()), { done: true, status: 'DONE_VERIFIED' });
+});

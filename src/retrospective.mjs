@@ -755,7 +755,8 @@ export function maintainerPromptSkeleton(digest, { maintainerRoot, secrets = [] 
   const root = safeRoot(maintainerRoot);
   const header =
     `Improve Offload based on one real session (repo: ${digest.project?.repo ?? 'unknown'}, profile ${digest.project?.profile ?? 'unknown'}).` +
-    `\n${root ? `The Offload checkout to change is ${root}.` : 'The Offload checkout path was not available to the server; name it here.'}`;
+    // An unknown checkout is omitted rather than guessed: a packed install is never a path to change.
+    (root ? `\nThe Offload checkout to change is ${root}.` : '');
   const requests = [];
   for (const signal of attributable) {
     const family = familyOf(signal.code);

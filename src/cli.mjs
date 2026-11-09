@@ -43,7 +43,11 @@ const CLI_COMMANDS = Object.freeze({
     booleanFlags: ['allowNetwork', 'foreground', 'unsafe-policy-only-verifier', 'accept-verifier-blockers'],
     positionals: 'task',
   },
-  wait: { valueFlags: ['timeoutSec', 'repoPath', 'detail'], booleanFlags: [], positionals: 'one' },
+  wait: {
+    valueFlags: ['timeoutSec', 'repoPath', 'detail', 'timeout-min'],
+    booleanFlags: ['until-terminal'],
+    positionals: 'one',
+  },
   job: {
     valueFlags: ['include', 'repoPath', 'detail', 'tail', 'limit', 'maxJobs', 'verifierInterpreter', 'verifierImports'],
     booleanFlags: ['all'],
@@ -187,6 +191,12 @@ function startRequest(flags, positionals) {
 function validateDecodedInvocation(command, flags, positionals) {
   validateExplicitRepoPath(flags.repoPath);
   if (command === 'worker' && flags.repoPath === undefined) throw new Error('worker --repoPath is required');
+  if (command === 'wait' && bool(flags['until-terminal'])) {
+    // Every id is checked before Core exists, so an unknown id can never turn a
+    // background wait into a paid or side-effecting call.
+    if (!positionals.length || !positionals.every(validJobId)) throw new Error('wait --until-terminal requires valid job ids');
+    if (new Set(positionals).size !== positionals.length) throw new Error('wait --until-terminal job ids must be distinct');
+  }
   if (['worker', 'wait', 'repair', 'revert', 'cancel'].includes(command) && !validJobId(positionals[0]))
     throw new Error('valid job id is required');
   if (command === 'job' && positionals[0] != null && !validJobId(positionals[0])) throw new Error('invalid job id');
@@ -226,6 +236,11 @@ function validateInvocation(command, flags, positionals) {
   if (!shape) throw new Error('usage: offload <start|wait|job|repair|revert|cancel|retrospective|doctor|complete|balance|mcp>');
   const allowed = new Set([...shape.valueFlags, ...shape.booleanFlags]);
   for (const key of Object.keys(flags)) if (!allowed.has(key)) throw new Error(`unknown option --${key} for ${command}`);
+  // `--until-terminal` is the only wait mode that takes several ids; the plain
+  // `offload wait <id>` form keeps its single-id contract unchanged.
+  const untilTerminal = command === 'wait' && bool(flags['until-terminal']);
+  if (untilTerminal && (positionals.length < 1 || positionals.length > MAX_WAIT_JOBS))
+    throw new Error(`wait --until-terminal accepts 1-${MAX_WAIT_JOBS} job ids`);
   if (shape.positionals === 'none' && positionals.length) throw new Error(`${command} does not accept positional arguments`);
   if (command === 'complete') {
     const modes = ['dry-run', 'stream', 'serve'].filter((name) => bool(flags[name]));
@@ -233,7 +248,8 @@ function validateInvocation(command, flags, positionals) {
   }
   if (command === 'balance') {
     if (positionals.length !== 1 || positionals[0] !== 'deepseek') throw new Error('usage: offload balance deepseek');
-  } else if (shape.positionals === 'one' && positionals.length !== 1) throw new Error(`${command} requires exactly one job id`);
+  } else if (shape.positionals === 'one' && positionals.length !== 1 && !untilTerminal)
+    throw new Error(`${command} requires exactly one job id`);
   if (shape.positionals === 'zero-or-one' && positionals.length > 1)
     throw new Error(`${command} accepts at most one ${command === 'job' ? 'job id' : 'argument'}`);
   // `start` deliberately accepts free-form positional task text, including
@@ -259,7 +275,16 @@ function validateInvocation(command, flags, positionals) {
     if (flags.maxRepairRounds !== undefined)
       finiteNumber(flags.maxRepairRounds, 'maxRepairRounds', { integer: true, minimum: 0, maximum: 4 });
   }
-  if (command === 'wait' && flags.timeoutSec !== undefined) finiteNumber(flags.timeoutSec, 'timeoutSec', { minimum: 0 });
+  if (command === 'wait' && untilTerminal) {
+    // The single-call options belong to plain `offload wait`, which passes them
+    // straight to core.wait; --until-terminal owns its own compact polling loop.
+    if (flags.timeoutSec !== undefined) throw new Error('wait --timeoutSec cannot be combined with --until-terminal');
+    if (flags.detail !== undefined) throw new Error('wait --detail cannot be combined with --until-terminal');
+    if (flags['timeout-min'] !== undefined) finiteNumber(flags['timeout-min'], 'timeout-min', { minimum: 1, maximum: 1440 });
+  } else if (command === 'wait') {
+    if (flags.timeoutSec !== undefined) finiteNumber(flags.timeoutSec, 'timeoutSec', { minimum: 0 });
+    if (flags['timeout-min'] !== undefined) throw new Error('wait --timeout-min requires --until-terminal');
+  }
   if (command === 'retrospective') {
     const history = positionals[0];
     if (history !== undefined && !['list', 'export'].includes(history)) throw new Error('retrospective accepts only list or export');
@@ -424,6 +449,96 @@ async function runCompleteCommand(command, flags, options, stdout) {
     for (const name of signals) signalSource.removeListener(name, onSignal);
   }
 }
+const MAX_WAIT_JOBS = 16,
+  MAX_WAIT_LINE = 200,
+  WAIT_SIGNALS = ['SIGTERM', 'SIGINT', 'SIGHUP'];
+/**
+ * One line per job for `wait --until-terminal`: `<jobId> <STATUS>` plus the
+ * cost/failureKind fields the last result carries, then an optional marker.
+ * Control characters are stripped and the line is clipped so a background
+ * task's output stays bounded however many jobs it waits on.
+ */
+function waitLine(jobId, status, result, marker) {
+  const fields = [String(jobId), String(status || 'UNKNOWN')];
+  const cost = result?.costUsd;
+  // A job that never reported usage has costUsd null/undefined: print nothing
+  // rather than an invented `$0.0000`.
+  if (cost !== null && cost !== undefined && Number.isFinite(Number(cost))) fields.push(`cost=$${Number(cost).toFixed(4)}`);
+  if (result?.failureKind) fields.push(`failureKind=${safeText(String(result.failureKind))}`);
+  if (marker) fields.push(marker);
+  return fields
+    .join(' ')
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .slice(0, MAX_WAIT_LINE);
+}
+/**
+ * Block until every listed job is terminal by cycling `core.wait`, which is the
+ * only primitive that already blocks; nothing is written while waiting. A job
+ * that reports `done` leaves the rotation, so it is never polled again.
+ * Exit codes: 0 every job terminal, 3 the deadline passed with a job unfinished,
+ * 130 a signal stopped the wait (unfinished jobs report `interrupted`).
+ */
+async function waitUntilTerminal(core, ids, { timeoutMin = 60, repoPath, signal, now = Date.now } = {}) {
+  const deadline = now() + timeoutMin * 60_000;
+  const latest = new Map();
+  const pending = [...ids];
+  const abortedToken = Symbol('aborted');
+  let wake;
+  const aborted = new Promise((resolve) => (wake = () => resolve(abortedToken)));
+  const onAbort = () => wake();
+  if (signal) {
+    if (signal.aborted) wake();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+  let interrupted = false;
+  try {
+    while (pending.length) {
+      if (signal?.aborted) {
+        interrupted = true;
+        break;
+      }
+      const remaining = (deadline - now()) / 1000;
+      if (remaining <= 0) break;
+      const id = pending.shift();
+      // While siblings are still pending a short call lets a job that finished
+      // first be noticed; the last job still waits up to the MCP cap of 55s.
+      const call = core.wait(id, {
+        timeoutSec: Math.max(0, Math.min(remaining, pending.length ? 10 : 55)),
+        repoPath,
+        detail: 'compact',
+        signal,
+      });
+      let result;
+      try {
+        result = await Promise.race([call, aborted]);
+      } catch (error) {
+        // core.wait rejects with "request cancelled" once its signal aborts; that
+        // is this wait's own stop, not a failed job.
+        if (!signal?.aborted) throw error;
+        interrupted = true;
+        break;
+      }
+      if (result === abortedToken) {
+        interrupted = true;
+        break;
+      }
+      latest.set(id, result);
+      if (!result?.done) pending.push(id);
+    }
+  } finally {
+    signal?.removeEventListener?.('abort', onAbort);
+  }
+  const marker = interrupted ? 'interrupted' : 'timeout';
+  const lines = ids.map((id) => {
+    const result = latest.get(id);
+    const status = result?.status ?? result?.progress?.status;
+    if (result?.done) return waitLine(id, status, result);
+    // Unfinished at the deadline or the interrupt: keep the last known status
+    // and end the line with the marker.
+    return waitLine(id, status ?? marker, result, status ? marker : undefined);
+  });
+  return { lines, code: interrupted ? 130 : pending.length ? 3 : 0 };
+}
 export async function runCli(argv = process.argv.slice(2), options = {}) {
   const stdout = options.stdout || process.stdout;
   const stderr = options.stderr || process.stderr;
@@ -520,6 +635,28 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
         await launchDetached(core, spawnWorker, result);
       }
     } else if (command === 'wait') {
+      if (bool(flags['until-terminal'])) {
+        // A tracked background task: process signals must end the wait cleanly,
+        // so they abort an internal controller. An injected core (tests) or an
+        // injected options.signal must never install process listeners.
+        const signalSource = options.signalSource || process;
+        const internal = new AbortController();
+        const signal = injectedCore ? options.signal : internal.signal;
+        const onSignal = () => internal.abort();
+        if (!injectedCore) for (const name of WAIT_SIGNALS) signalSource.once(name, onSignal);
+        try {
+          const { lines, code } = await waitUntilTerminal(core, positionals, {
+            ...(flags['timeout-min'] === undefined ? {} : { timeoutMin: Number(flags['timeout-min']) }),
+            repoPath: flags.repoPath,
+            signal,
+            ...(options.now ? { now: options.now } : {}),
+          });
+          for (const line of lines) stdout.write(`${line}\n`);
+          return code;
+        } finally {
+          if (!injectedCore) for (const name of WAIT_SIGNALS) signalSource.removeListener(name, onSignal);
+        }
+      }
       result = await core.wait(positionals[0], {
         timeoutSec: flags.timeoutSec == null ? undefined : Number(flags.timeoutSec),
         repoPath: flags.repoPath,

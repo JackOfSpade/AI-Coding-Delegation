@@ -84,12 +84,14 @@ import { matchesAny } from './glob.mjs';
 import { insidePath } from './path-containment.mjs';
 import { terminalStatuses } from './report.mjs';
 import { assertVerifierCommand } from './verifier-command.mjs';
+import { resolveMaintainerRoot } from './maintainer-root.mjs';
 
 // Repository discovery must not pass provider credentials, ambient Git
 // redirects, filters, hooks, or fsmonitor helpers to a repository command.
 const command = (repo, args) => snapshotGit(repo, args).trim();
 const MAX_PRICING_BYTES = MAX_TEXT_FILE_BYTES;
-// The Offload checkout this server runs from: the one a maintainer prompt names.
+// The package this server runs from. A maintainer prompt names it only when it is a git checkout; a packed
+// install names the source checkout its installer recorded instead (src/maintainer-root.mjs).
 const PACKAGE_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 // The configured verifier duration thresholds a job records at start; undefined keeps the defaults.
 const verifierDurationConfig = (verifier) => {
@@ -1554,7 +1556,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         health,
         nowMs: nowMs(),
         scope: ids ? 'jobs' : opts.last !== undefined ? 'recent' : 'session',
-        maintainerRoot: config.maintainerRoot || PACKAGE_ROOT,
+        maintainerRoot: resolveMaintainerRoot({ configured: config.maintainerRoot, packageRoot: PACKAGE_ROOT }),
         secrets: resolved.flatMap(({ source }) => source.secrets),
         omittedJobs:
           opts.last !== undefined ? 0 : resolved.reduce((total, { source }) => total + source.omitted, 0) + jobs.length - shown.length,

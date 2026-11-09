@@ -157,6 +157,7 @@ const ROUND_SCOPED_VERIFIER_STATE = Object.freeze({
   workerAfter: undefined,
   retainedDiffRecovery: undefined,
   malformedToolFinish: undefined,
+  verifiedWithoutFinish: undefined,
   verifyEnvironment: undefined,
   applyVerify: undefined,
   reviewPacketEvidence: undefined,
@@ -337,6 +338,14 @@ function safeReportString(value, maxChars = MAX_REPORT_TEXT) {
 const safeReportText = (value) => safeReportString(value);
 const MALFORMED_TOOL_FINISH_CONCERN =
   'The worker stopped on malformed tool-call JSON from the provider without calling finish; the server verifier passed, so the job finished. No summary, testsRun or review packet was reported: review the diff against the acceptance criteria.';
+// Worker-side stops a passing server verifier may finish (besides malformed tool-call JSON).
+const PROMOTABLE_WORKER_STOPS = new Set(['finish-protocol', 'no-finish']);
+const VERIFIED_WITHOUT_FINISH_CONCERNS = Object.freeze({
+  'finish-protocol':
+    'The worker never made a valid finish call (it kept pairing finish with other tool calls); the server verifier passed, so the job finished. No summary, testsRun or review packet was reported: review the diff against the acceptance criteria.',
+  'no-finish':
+    'The worker ended without calling finish; the server verifier passed, so the job finished. No summary, testsRun or review packet was reported: review the diff against the acceptance criteria.',
+});
 const REPORT_SALVAGE_KINDS = new Set(['finish-arguments', 'plain-text', 'truncated-finish']);
 const safeReportSalvage = (value) => (REPORT_SALVAGE_KINDS.has(value) ? value : undefined);
 // Fixed finish-protocol problem texts from the loop: at most 6 short, redacted lines.
@@ -2710,12 +2719,19 @@ export class JobManager {
                 audited.revertPaths.length
               ) {
                 const recoverRetained = job.transcriptReplayable === false && !continuationBlocker({ ...job, transcriptReplayable: true });
-                // A write worker whose last response was malformed tool-call
-                // JSON (after the loop's own retry) stopped without a finish
-                // call, not on a judgement of its work: a passing server
-                // verifier finishes it like a finish would. Anything else
-                // keeps the diagnostic-only FAILED outcome.
-                const promoteOnPass = !recoverRetained && isMalformedToolJsonFailure(safeProviderFailure(job.providerFailure));
+                // A write worker that stopped without a usable finish call
+                // (malformed tool-call JSON after the loop's own retry, finish
+                // paired with other calls past its correction, or no finish
+                // at all) stopped on protocol, not on a judgement of its work:
+                // a passing server verifier finishes it like a finish would.
+                // Anything else keeps the diagnostic-only FAILED outcome.
+                const promoteOnPass = recoverRetained
+                  ? false
+                  : isMalformedToolJsonFailure(safeProviderFailure(job.providerFailure))
+                    ? 'malformed-tool-json'
+                    : PROMOTABLE_WORKER_STOPS.has(safeFailureKind(job.failureKind))
+                      ? safeFailureKind(job.failureKind)
+                      : false;
                 job = await this.store.update(id, {
                   workerAfter: workspaceAfter,
                   ...(recoverRetained ? { retainedDiffRecovery: true } : {}),
@@ -3521,11 +3537,20 @@ export class JobManager {
       verify,
       ...(recoverRetained ? { error: undefined } : {}),
       ...(promoted
-        ? {
-            error: undefined,
-            malformedToolFinish: true,
-            concerns: [...(Array.isArray(job.concerns) ? job.concerns : []), MALFORMED_TOOL_FINISH_CONCERN].slice(-100),
-          }
+        ? promoteOnPass === 'malformed-tool-json'
+          ? {
+              error: undefined,
+              malformedToolFinish: true,
+              concerns: [...(Array.isArray(job.concerns) ? job.concerns : []), MALFORMED_TOOL_FINISH_CONCERN].slice(-100),
+            }
+          : {
+              // The stop is resolved: its failure kind and call no longer describe the job.
+              error: undefined,
+              failureKind: undefined,
+              toolFailure: undefined,
+              verifiedWithoutFinish: promoteOnPass,
+              concerns: [...(Array.isArray(job.concerns) ? job.concerns : []), VERIFIED_WITHOUT_FINISH_CONCERNS[promoteOnPass]].slice(-100),
+            }
         : {}),
       // Always written: a later verification must not inherit an earlier round's classification.
       verifyEnvironment: environment || undefined,
@@ -3655,6 +3680,9 @@ export class JobManager {
       const timing = detail === 'full' ? sanitizeTiming(job.timing) : undefined;
       return {
         ...this.public(job, { detail }),
+        // Cumulative spend, as the job list reports it (null when unknown), so a
+        // caller such as `offload wait --until-terminal` needs no report parsing.
+        costUsd: costOf(job),
         report: await this.#interactiveReport(job, { detail }),
         done: true,
         ...(timing ? { timing } : {}),

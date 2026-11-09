@@ -1790,6 +1790,15 @@ test('a report job shows its fixed finish problems and a salvaged report is flag
     /^worker stop: the provider ended on malformed tool-call JSON; the server verifier passed/m,
   );
   assert.doesNotMatch(compactReport({ id: 'w2', status: 'DONE_VERIFIED' }), /malformed tool-call JSON/);
+  assert.match(
+    compactReport({ id: 'w3', status: 'DONE_VERIFIED', verifiedWithoutFinish: 'finish-protocol' }),
+    /^worker stop: the worker kept pairing finish with other tool calls; the server verifier passed on the retained diff, so the job finished without a finish call \(no worker summary or testsRun\)$/m,
+  );
+  assert.match(
+    compactReport({ id: 'w4', status: 'DONE_VERIFIED', verifiedWithoutFinish: 'no-finish' }),
+    /^worker stop: the worker ended without calling finish; the server verifier passed/m,
+  );
+  assert.doesNotMatch(compactReport({ id: 'w5', status: 'DONE_VERIFIED', verifiedWithoutFinish: 'tool-loop' }), /^worker stop:/m);
   const failed = compactReport({ ...base, status: 'FAILED', failureKind: 'finish-protocol', error: FAILURE_ERRORS['finish-protocol'] });
   assert.match(failed, /^finish protocol: /m);
   assert.doesNotMatch(failed, /report salvaged/);
