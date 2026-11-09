@@ -116,7 +116,7 @@ const startProps = {
       turnPolicy: {
         enum: ['auto', 'fixed'],
         description:
-          'auto (default when maxTurns is omitted): the server scales the turn cap to the size of relevantPaths/ownedPaths files, never below the configured default and up to 200 (the recommendation is scaled x3 when the job runs on the DeepSeek Flash route, including after a mid-job credit hop); with an explicit maxTurns it makes that value a floor. fixed (default when maxTurns is given): the cap is honored exactly; maxUsd remains the ceiling.',
+          'auto (default when maxTurns is omitted): the server scales the turn cap to the size of relevantPaths/ownedPaths files, never below the configured default and up to 200 (the recommendation is scaled x3 when the job runs on the DeepSeek Flash route, including after a mid-job credit hop, and on that route the cap may pass 200, up to 600, as far as maxUsd covers at ~$0.01 per turn; an owned test file not listed in relevantPaths is sized as an extension, not a whole read); with an explicit maxTurns it makes that value a floor. fixed (default when maxTurns is given): the cap is honored exactly; maxUsd remains the ceiling.',
       },
       timeoutMinutes: { type: 'number', minimum: 1, maximum: 1_440 },
     },

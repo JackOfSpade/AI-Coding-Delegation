@@ -18,6 +18,16 @@ export const TURN_BASE_WRITE = 6;
 export const TURN_BASE_REPORT = 2;
 /** A few list_dir/glob/grep turns before the first read. */
 export const TURN_EXPLORE = 4;
+/**
+ * Pages an owned test file is expected to cost when the worker only extends it
+ * (owned, never named in relevantPaths): the head for imports and helpers, one
+ * neighbouring case to copy, and the tail to append to. Such files are rarely
+ * read whole; list the file in relevantPaths to have it sized as a whole read.
+ */
+export const EXTEND_READ_PAGES = 3;
+const TEST_FILE = /(^|\/)(__tests__|tests?|spec)\/|\.(test|spec)\.[^/]+$|(^|\/)test_[^/]+\.py$|_test\.[^/]+$/;
+/** Whether a repository-relative path names a test file by common conventions. */
+export const isTestPath = (file) => typeof file === 'string' && TEST_FILE.test(file);
 /** One write plus one fix-up per owned entry. */
 export const TURN_WRITE_PER_PATH = 2;
 /** Multiplier applied to the raw estimate. */
@@ -42,6 +52,31 @@ export const AUTO_TURNS_MAX = 200;
  */
 export const FLASH_TURN_MULTIPLIER = 3;
 const MAX_TURN_MULTIPLIER = 10;
+/**
+ * Conservative USD per worker turn on the DeepSeek Flash route, used only to
+ * decide whether a job's maxUsd leaves room for more than AUTO_TURNS_MAX turns.
+ * Field data: 200 Flash turns spent $0.24 ($0.0012/turn); this assumes ~8x that.
+ */
+export const FLASH_TURN_USD_ESTIMATE = 0.01;
+/**
+ * Hard ceiling for a USD-headroom-raised automatic cap. A cap goes above
+ * AUTO_TURNS_MAX only on a route with a known per-turn cost estimate, and only
+ * as far as maxUsd / that estimate allows; maxUsd stays the real ceiling.
+ */
+export const AUTO_TURNS_HEADROOM_MAX = 600;
+/** The conservative per-turn USD estimate for one route, or undefined when it has none (only DeepSeek Flash has one). */
+export function routeTurnUsdEstimate(route) {
+  return routeTurnMultiplier(route) > 1 ? FLASH_TURN_USD_ESTIMATE : undefined;
+}
+/**
+ * The automatic turn ceiling for a job: AUTO_TURNS_MAX, raised toward
+ * AUTO_TURNS_HEADROOM_MAX when the route has a per-turn USD estimate and
+ * maxUsd covers that many turns at the estimate.
+ */
+export function autoTurnCeiling({ maxUsd, turnUsdEstimate } = {}) {
+  if (!(Number.isFinite(maxUsd) && maxUsd > 0) || !(Number.isFinite(turnUsdEstimate) && turnUsdEstimate > 0)) return AUTO_TURNS_MAX;
+  return Math.min(AUTO_TURNS_HEADROOM_MAX, Math.max(AUTO_TURNS_MAX, Math.floor(maxUsd / turnUsdEstimate)));
+}
 /** The turn multiplier for one execution route (1 unless it is the DeepSeek Flash route). */
 export function routeTurnMultiplier(route) {
   if (!route || typeof route !== 'object' || route.type !== 'openai-chat' || typeof route.baseUrl !== 'string') return 1;
@@ -91,8 +126,9 @@ export function splitRelevantPath(entry) {
 }
 
 /** Reads needed to scan `bytes`; a range bounds it (one window read fingerprints the whole file for edit_file). */
-export function readSegments(bytes, range) {
+export function readSegments(bytes, range, { extendOnly = false } = {}) {
   const whole = Math.max(1, Math.ceil(bytes / PAGE_PAYLOAD));
+  if (extendOnly && !range) return Math.min(whole, EXTEND_READ_PAGES);
   if (!range) return whole;
   return Math.min(whole, 1 + Math.ceil(((range.end - range.start + 1) * LINE_BYTES_ESTIMATE) / PAGE_PAYLOAD));
 }
@@ -143,7 +179,7 @@ export async function measureFiles({ policy, relevantPaths = [], ownedPaths = []
     if (split.invalid || typeof split.path !== 'string' || GLOB_CHARACTERS.test(split.path)) return;
     const previous = candidates.get(split.path);
     if (!previous) {
-      candidates.set(split.path, { range: split.range, whole: ranged && !split.range });
+      candidates.set(split.path, { range: split.range, whole: ranged && !split.range, ownedOnly: !ranged });
       return;
     }
     // A range narrows the read, but a plain relevantPaths entry is an explicit
@@ -163,13 +199,21 @@ export async function measureFiles({ policy, relevantPaths = [], ownedPaths = []
   for (const entry of relevantPaths) add(entry, true);
   for (const entry of ownedPaths) add(entry, false);
   const files = [];
-  for (const [file, { range }] of candidates) {
+  for (const [file, { range, ownedOnly }] of candidates) {
     if (files.length >= MAX_SIZED_FILES) break;
     try {
       const canonical = policy.assertReadable(file);
       const details = await lstat(canonical);
       if (!details.isFile() || details.isSymbolicLink()) continue;
-      files.push({ path: file, bytes: Math.min(details.size, MAX_SIZED_BYTES), ...(range ? { range } : {}) });
+      // An owned test file the brief never lists as a read is one the worker
+      // extends: it reads the head and tail, not the whole file.
+      const extendOnly = ownedOnly && !range && isTestPath(file);
+      files.push({
+        path: file,
+        bytes: Math.min(details.size, MAX_SIZED_BYTES),
+        ...(range ? { range } : {}),
+        ...(extendOnly ? { extendOnly } : {}),
+      });
     } catch {
       /* denied, missing, or unreadable paths simply are not sized */
     }
@@ -185,7 +229,7 @@ export async function measureFiles({ policy, relevantPaths = [], ownedPaths = []
 /** Turns the worker likely needs: base + explore + reads + per-owned-path writes, with headroom. */
 export function recommendTurns({ files = [], ownedCount = 0, mode = 'write' } = {}) {
   const report = mode === 'report';
-  const readTurns = files.reduce((sum, file) => sum + readSegments(file.bytes, file.range), 0);
+  const readTurns = files.reduce((sum, file) => sum + readSegments(file.bytes, file.range, { extendOnly: file.extendOnly === true }), 0);
   const writeTurns = report ? 0 : TURN_WRITE_PER_PATH * Math.min(ownedCount, MAX_OWNED_ENTRIES_COUNTED);
   const rawTurns = (report ? TURN_BASE_REPORT : TURN_BASE_WRITE + TURN_EXPLORE) + readTurns + writeTurns;
   return { rawTurns, recommendedTurns: Math.ceil(rawTurns * TURN_HEADROOM), readTurns };
@@ -215,6 +259,8 @@ export function resolveTurnBudget({
   timeoutMinutes,
   timeoutScalable = false,
   turnMultiplier = 1,
+  maxUsd,
+  turnUsdEstimate,
 } = {}) {
   const multiplier = Number.isFinite(turnMultiplier) && turnMultiplier > 1 ? Math.min(turnMultiplier, MAX_TURN_MULTIPLIER) : 1;
   const baseRecommended = recommended;
@@ -224,14 +270,17 @@ export function resolveTurnBudget({
   const given = requested !== undefined;
   const mode = policy ?? (given ? 'fixed' : 'auto');
   const base = given ? requested : configured;
-  const scaled = mode === 'auto' ? Math.max(base, Math.min(recommended, AUTO_TURNS_MAX)) : base;
+  // A route with a known per-turn cost (Flash) may go past AUTO_TURNS_MAX when
+  // maxUsd covers it, so a cheap job is not stranded one step before finish.
+  const ceiling = autoTurnCeiling({ maxUsd, turnUsdEstimate });
+  const scaled = mode === 'auto' ? Math.max(base, Math.min(recommended, ceiling)) : base;
   const maxTurns = Math.min(scaled, MAX_SAFE_TURNS);
   const turnsSource = maxTurns !== base ? (given ? 'raised' : 'scaled') : given ? 'caller' : 'default';
   const warnings = [];
   if (maxTurns < recommended) {
     warnings.push(
       mode === 'auto'
-        ? `recommended ${recommended} turns exceeds the automatic ceiling ${AUTO_TURNS_MAX}; split the package, add :START-END line ranges to relevantPaths, or continue with extraTurns after a BUDGET stop.`
+        ? `recommended ${recommended} turns exceeds the automatic ceiling ${ceiling}; split the package, add :START-END line ranges to relevantPaths, or continue with extraTurns after a BUDGET stop.`
         : `maxTurns ${maxTurns} is below the recommended ${recommended} (reading the sized files needs about ${readTurns} turns at ${READ_SEGMENT}-character read_file segments). The cap is honored. ${given ? 'Omit maxTurns or pass' : 'Pass'} budget.turnPolicy:"auto" to let the server scale it, and use budget.maxUsd as the ceiling.`,
     );
   }
@@ -257,6 +306,10 @@ export function resolveTurnBudget({
       );
     }
   }
+  if (mode === 'auto' && maxTurns > AUTO_TURNS_MAX && maxTurns > base)
+    warnings.unshift(
+      `turn cap raised past the automatic ceiling ${AUTO_TURNS_MAX} to ${maxTurns}: budget.maxUsd ${maxUsd} covers about ${Math.floor(maxUsd / turnUsdEstimate)} turns at ~$${turnUsdEstimate} each on this route; maxUsd remains the ceiling.`,
+    );
   if (multiplier > 1 && mode === 'auto' && maxTurns > base)
     warnings.unshift(
       `turn recommendation scaled x${multiplier} for the DeepSeek Flash route (base ${baseRecommended}); budget.maxUsd remains the ceiling.`,
@@ -277,7 +330,7 @@ export function resolveTurnBudget({
  * Only an automatically sized cap is raised, never lowered, and never past the
  * automatic ceiling; a caller-fixed cap is honored. Undefined: no change.
  */
-export function hopRaisedTurns(sizing, { currentMaxTurns, turnMultiplier } = {}) {
+export function hopRaisedTurns(sizing, { currentMaxTurns, turnMultiplier, maxUsd, turnUsdEstimate } = {}) {
   const stored = safeBudgetSizing(sizing);
   if (!stored || stored.turnPolicy !== 'auto' || !Number.isSafeInteger(currentMaxTurns)) return undefined;
   if ((stored.initialTurnsSource ?? stored.turnsSource) === 'caller') return undefined;
@@ -287,7 +340,8 @@ export function hopRaisedTurns(sizing, { currentMaxTurns, turnMultiplier } = {})
   const base = stored.baseRecommendedTurns ?? stored.recommendedTurns;
   if (!Number.isSafeInteger(base)) return undefined;
   const recommendedTurns = Math.ceil(base * multiplier);
-  const maxTurns = Math.min(MAX_SAFE_TURNS, Math.max(currentMaxTurns, Math.min(recommendedTurns, AUTO_TURNS_MAX)));
+  const ceiling = autoTurnCeiling({ maxUsd, turnUsdEstimate });
+  const maxTurns = Math.min(MAX_SAFE_TURNS, Math.max(currentMaxTurns, Math.min(recommendedTurns, ceiling)));
   const budgetSizing = safeBudgetSizing({
     ...stored,
     maxTurns,
@@ -327,8 +381,9 @@ export function buildBudgetSizing({ resolved, recommendation, files = [], readCh
     files: files.map((file) => ({
       path: file.path,
       bytes: file.bytes,
-      readTurns: readSegments(file.bytes, file.range),
+      readTurns: readSegments(file.bytes, file.range, { extendOnly: file.extendOnly === true }),
       ranged: !!file.range,
+      ...(file.extendOnly === true ? { extendOnly: true } : {}),
     })),
     ...(readChars !== undefined ? { readChars } : {}),
     ...(retentionChars !== undefined ? { retentionChars } : {}),
@@ -382,7 +437,7 @@ export function safeBudgetSizing(value) {
             bytes = boundedInteger(file?.bytes, MAX_SAFE_BYTES),
             readTurns = boundedInteger(file?.readTurns, MAX_SAFE_RECOMMENDATION);
           return path !== undefined && bytes !== undefined && readTurns !== undefined && typeof file.ranged === 'boolean'
-            ? [{ path, bytes, readTurns, ranged: file.ranged }]
+            ? [{ path, bytes, readTurns, ranged: file.ranged, ...(file.extendOnly === true ? { extendOnly: true } : {}) }]
             : [];
         })
         .sort((a, b) => b.bytes - a.bytes)

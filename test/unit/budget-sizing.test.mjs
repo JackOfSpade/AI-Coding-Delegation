@@ -7,16 +7,23 @@ import { LocalTools } from '../../src/agent/tools.mjs';
 import { PathPolicy } from '../../src/policy.mjs';
 import {
   AUTO_TIMEOUT_MAX_MINUTES,
+  AUTO_TURNS_HEADROOM_MAX,
   AUTO_TURNS_MAX,
+  EXTEND_READ_PAGES,
+  FLASH_TURN_USD_ESTIMATE,
   LINE_BYTES_ESTIMATE,
   MAX_SIZED_BYTES,
   READ_SEGMENT,
+  autoTurnCeiling,
   buildBudgetSizing,
+  hopRaisedTurns,
+  isTestPath,
   measureFiles,
   raiseBudgetSizing,
   readSegments,
   recommendTurns,
   resolveTurnBudget,
+  routeTurnUsdEstimate,
   safeBudgetSizing,
   splitRelevantPath,
   TURN_SECONDS_ESTIMATE,
@@ -324,4 +331,113 @@ test('raiseBudgetSizing follows a continuation: new cap, raised source, warning 
 
   assert.equal(raiseBudgetSizing(undefined, 60), undefined);
   assert.equal(raiseBudgetSizing({ maxTurns: 'x' }, 60), undefined);
+});
+
+// ---- infinite-canvas 2026-11-09: cheap Flash jobs stranded at the 200-turn ceiling ----
+
+const FLASH_ROUTE = { type: 'openai-chat', baseUrl: 'https://api.deepseek.com', model: 'deepseek-flash' };
+
+test('only the Flash route has a per-turn USD estimate, and maxUsd lifts the automatic ceiling only that far', () => {
+  assert.equal(routeTurnUsdEstimate(FLASH_ROUTE), FLASH_TURN_USD_ESTIMATE);
+  assert.equal(
+    routeTurnUsdEstimate({ type: 'anthropic-messages', baseUrl: 'https://api.anthropic.com', model: 'claude-sonnet-5-5' }),
+    undefined,
+  );
+  assert.equal(routeTurnUsdEstimate(undefined), undefined);
+  assert.equal(autoTurnCeiling({ maxUsd: 4, turnUsdEstimate: 0.01 }), 400);
+  assert.equal(autoTurnCeiling({ maxUsd: 1, turnUsdEstimate: 0.01 }), AUTO_TURNS_MAX, 'never below the old ceiling');
+  assert.equal(autoTurnCeiling({ maxUsd: 1_000, turnUsdEstimate: 0.01 }), AUTO_TURNS_HEADROOM_MAX);
+  assert.equal(autoTurnCeiling({ maxUsd: 4 }), AUTO_TURNS_MAX, 'no estimate, no raise');
+  assert.equal(autoTurnCeiling({ turnUsdEstimate: 0.01 }), AUTO_TURNS_MAX, 'no maxUsd, no raise');
+  assert.equal(autoTurnCeiling({ maxUsd: Number.NaN, turnUsdEstimate: 0.01 }), AUTO_TURNS_MAX);
+});
+
+test('a Flash recommendation past 200 gets its turns when maxUsd has headroom (field job: 285 recommended, $0.24 of $4 spent)', () => {
+  const flash = { configured: 80, recommended: 95, turnMultiplier: 3, turnUsdEstimate: FLASH_TURN_USD_ESTIMATE };
+  const roomy = resolveTurnBudget({ ...flash, maxUsd: 4 });
+  assert.equal(roomy.maxTurns, 285);
+  assert.equal(roomy.turnsSource, 'scaled');
+  assert.ok(
+    roomy.warnings.some((warning) => /raised past the automatic ceiling 200 to 285: budget.maxUsd 4 covers about 400 turns/.test(warning)),
+  );
+  assert.ok(!roomy.warnings.some((warning) => /exceeds the automatic ceiling/.test(warning)));
+  // Bounded by what maxUsd covers at the estimate, and still warned about.
+  const partial = resolveTurnBudget({ ...flash, maxUsd: 2.5 });
+  assert.equal(partial.maxTurns, 250);
+  assert.ok(partial.warnings.some((warning) => /recommended 285 turns exceeds the automatic ceiling 250/.test(warning)));
+  // Small budgets, non-Flash routes and caller-fixed caps keep the old behavior.
+  assert.equal(resolveTurnBudget({ ...flash, maxUsd: 1 }).maxTurns, AUTO_TURNS_MAX);
+  assert.equal(resolveTurnBudget({ configured: 80, recommended: 300, maxUsd: 4 }).maxTurns, AUTO_TURNS_MAX);
+  assert.equal(resolveTurnBudget({ ...flash, maxUsd: 4, requested: 120 }).maxTurns, 120);
+  assert.equal(resolveTurnBudget({ ...flash, maxUsd: 4, requested: 120, policy: 'auto' }).maxTurns, 285);
+  // The hard ceiling holds however large the budget.
+  assert.equal(resolveTurnBudget({ ...flash, recommended: 400, maxUsd: 100 }).maxTurns, AUTO_TURNS_HEADROOM_MAX);
+  const sizing = buildBudgetSizing({ resolved: roomy, recommendation: { recommendedTurns: 95, readTurns: 60 }, files: [] });
+  assert.equal(sizing.maxTurns, 285);
+  assert.deepEqual(safeBudgetSizing(sizing), sizing);
+});
+
+test('a credit hop to Flash raises past 200 when maxUsd has headroom, never past it without', () => {
+  const sizing = buildBudgetSizing({
+    resolved: resolveTurnBudget({ configured: 80, recommended: 95 }),
+    recommendation: { recommendedTurns: 95, readTurns: 60 },
+    files: [],
+  });
+  const hop = (maxUsd) =>
+    hopRaisedTurns(sizing, { currentMaxTurns: 95, turnMultiplier: 3, maxUsd, turnUsdEstimate: FLASH_TURN_USD_ESTIMATE });
+  assert.equal(hop(4).maxTurns, 285);
+  assert.equal(hop(4).extraTurns, 190);
+  assert.equal(hop(1).maxTurns, AUTO_TURNS_MAX);
+  assert.equal(hopRaisedTurns(sizing, { currentMaxTurns: 95, turnMultiplier: 3 }).maxTurns, AUTO_TURNS_MAX);
+});
+
+test('isTestPath recognises common test-file conventions and nothing else', () => {
+  for (const file of [
+    'test/unit/a.test.mjs',
+    'tests/foo.py',
+    'src/__tests__/x.js',
+    'src/canvas.test.ts',
+    'src/canvas.spec.tsx',
+    'pkg/test_canvas.py',
+    'pkg/canvas_test.go',
+    'spec/models/user_spec.rb',
+  ])
+    assert.equal(isTestPath(file), true, file);
+  for (const file of ['src/canvas.ts', 'src/testing.ts', 'src/contest/a.js', 'latest.js', 'README.md', undefined])
+    assert.equal(isTestPath(file), false, String(file));
+});
+
+test('an owned test file never declared as a read is sized as an extension, not a whole read', async () => {
+  const { dir, policy } = await repo();
+  const big = 441_000;
+  await mkdir(path.join(dir, 'test'), { recursive: true });
+  await mkdir(path.join(dir, 'src'), { recursive: true });
+  for (const name of ['test/owned.test.js', 'test/read.test.js', 'test/ranged.test.js', 'src/owned.js'])
+    await writeFile(path.join(dir, name), asciiFile(big));
+  const files = await measureFiles({
+    policy,
+    relevantPaths: ['test/read.test.js', 'test/ranged.test.js:1-50'],
+    ownedPaths: ['test/owned.test.js', 'test/read.test.js', 'test/ranged.test.js', 'src/owned.js'],
+  });
+  const byPath = Object.fromEntries(files.map((file) => [file.path, file]));
+  assert.equal(byPath['test/owned.test.js'].extendOnly, true);
+  assert.equal(byPath['test/read.test.js'].extendOnly, undefined, 'a relevantPaths entry asks for a whole read');
+  assert.equal(byPath['test/ranged.test.js'].extendOnly, undefined, 'a range already bounds the read');
+  assert.equal(byPath['src/owned.js'].extendOnly, undefined, 'only test files are discounted');
+  const whole = readSegments(big);
+  assert.ok(whole > EXTEND_READ_PAGES);
+  assert.equal(readSegments(big, undefined, { extendOnly: true }), EXTEND_READ_PAGES);
+  assert.equal(readSegments(1_000, undefined, { extendOnly: true }), 1, 'a small file is still one page');
+  const discounted = recommendTurns({ files: [byPath['test/owned.test.js']], ownedCount: 1 });
+  const full = recommendTurns({ files: [{ path: 'test/owned.test.js', bytes: big }], ownedCount: 1 });
+  assert.equal(full.readTurns - discounted.readTurns, whole - EXTEND_READ_PAGES);
+  const sizing = buildBudgetSizing({
+    resolved: resolveTurnBudget({ configured: 80, recommended: discounted.recommendedTurns }),
+    recommendation: discounted,
+    files: [byPath['test/owned.test.js']],
+  });
+  assert.deepEqual(sizing.files, [
+    { path: 'test/owned.test.js', bytes: big, readTurns: EXTEND_READ_PAGES, ranged: false, extendOnly: true },
+  ]);
+  assert.deepEqual(safeBudgetSizing(sizing), sizing);
 });

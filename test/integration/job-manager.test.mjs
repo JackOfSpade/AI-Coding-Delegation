@@ -4095,6 +4095,78 @@ test('a Flash route scales an automatic turn cap: at a cool-down start and at a 
   await settle(fixed.jobId);
 });
 
+test('a Flash job whose scaled recommendation passes 200 gets the turns its maxUsd covers; an extend-only owned test file is not sized whole', async () => {
+  // Field job oj-...f22326e1: recommended 285 on Flash, capped at 200, stopped
+  // BUDGET at $0.24 of $4.00 with a complete diff. A 441 KB owned test file the
+  // brief only extended inflated the read estimate.
+  const route = (type, baseUrl, keyRef, model) => ({ type, baseUrl, keyRef, model });
+  const terra = route('openai-chat', 'https://api.openai.com/v1', 'env:openai', 'gpt-6.1-terra'),
+    flash = route('openai-chat', 'https://api.deepseek.com', 'env:deepseek', 'deepseek-flash');
+  const repo = makeRepo();
+  const line = 'x'.repeat(79) + '\n';
+  write(join(repo, 'src', 'big.js'), line.repeat(15_000)); // 1.2 MB, read whole
+  write(join(repo, 'test', 'big.test.js'), line.repeat(5_520)); // ~441 KB, owned only
+  const gitDir = await mkdtemp(`${tmpdir()}/offload-jobs-`);
+  let hop = false;
+  const hopResults = [];
+  const m = new JobManager({
+    store: new JobStore({ gitDir }),
+    worker: {
+      run: async (_job, api) => {
+        if (hop) hopResults.push(await api.progress({ action: 'provider_credit_fallback', providerStage: 1, creditFallback: true }));
+        return { status: 'DONE', summary: 'ok', turns: 1 };
+      },
+    },
+    runner: { verify: async (command) => ({ command, verdict: 'PASS', result: { code: 0, sandbox: 'macos' } }) },
+    snapshots: { create: async () => gitId, diff: async () => 'patch' },
+    config: { repoPath: repo, git: { branch: async () => 'main', head: async () => gitId } },
+  });
+  const start = (executionProfile, maxUsd) =>
+    m.start(
+      {
+        task: 'extend the tests',
+        ownedPaths: ['src/big.js', 'test/big.test.js'],
+        relevantPaths: ['src/big.js'],
+        executionProfile,
+        repoPath: repo,
+        budget: { maxTurns: 80, maxUsd, timeoutMinutes: 30 },
+      },
+      { turnBudget: { configured: 80, policy: 'auto' } },
+    );
+  try {
+    const roomy = await start(flash, 4);
+    const sizing = roomy.budgetSizing;
+    const testFile = sizing.files.find((file) => file.path === 'test/big.test.js');
+    assert.equal(testFile.extendOnly, true);
+    assert.equal(testFile.readTurns, 3, 'head, one neighbouring case and tail, not ~19 pages');
+    assert.equal(sizing.files.find((file) => file.path === 'src/big.js').extendOnly, undefined);
+    assert.ok(sizing.recommendedTurns > 200, `scaled recommendation ${sizing.recommendedTurns} passes the 200 ceiling`);
+    assert.equal(sizing.maxTurns, sizing.recommendedTurns, '$4 covers it, so the cap rises to the recommendation');
+    assert.equal((await m.store.get(roomy.jobId)).budget.maxTurns, sizing.recommendedTurns);
+    assert.ok(sizing.warnings.some((warning) => /raised past the automatic ceiling 200/.test(warning)));
+    await m.wait(roomy.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
+
+    // A small maxUsd keeps the old ceiling.
+    const tight = await start(flash, 1);
+    assert.equal(tight.budgetSizing.maxTurns, 200);
+    assert.ok(tight.budgetSizing.warnings.some((warning) => /exceeds the automatic ceiling 200/.test(warning)));
+    await m.wait(tight.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
+
+    // A Terra start is never raised past 200 by maxUsd; a mid-job hop to Flash is.
+    hop = true;
+    const hopped = await start({ ...terra, fallback: flash, fallbacks: [flash] }, 4);
+    assert.equal(hopped.budgetSizing.turnMultiplier, undefined);
+    assert.ok(hopped.budgetSizing.maxTurns <= 200);
+    const done = await m.wait(hopped.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
+    const stored = await m.store.get(done.jobId);
+    assert.equal(stored.budgetSizing.maxTurns, sizing.recommendedTurns);
+    assert.equal(stored.budget.maxTurns, sizing.recommendedTurns);
+    assert.deepEqual(hopResults, [{ extraTurns: sizing.recommendedTurns - hopped.budgetSizing.maxTurns }]);
+  } finally {
+    cleanup(repo);
+  }
+});
+
 test('a job whose every route but the last is cooling starts on the last; malformed or future records are ignored', async () => {
   const route = (provider) => ({
     type: 'openai-chat',

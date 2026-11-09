@@ -75,6 +75,7 @@ import {
   resolveTurnBudget,
   raiseBudgetSizing,
   routeTurnMultiplier,
+  routeTurnUsdEstimate,
   hopRaisedTurns,
   safeBudgetSizing,
   splitRelevantPath,
@@ -2090,6 +2091,9 @@ export class JobManager {
       timeoutScalable: timeoutScalable === true,
       // The route this job starts on (a credit cool-down may start it on Flash).
       turnMultiplier: routeTurnMultiplier(executionRoutes(input.executionProfile)[routeStage]),
+      // maxUsd may lift the automatic ceiling on a route with a known per-turn cost.
+      maxUsd: input.budget?.maxUsd,
+      turnUsdEstimate: routeTurnUsdEstimate(executionRoutes(input.executionProfile)[routeStage]),
     });
     if (!recommendation) resolved.warnings.push('turn sizing unavailable; the unscaled turn cap was used');
     let readChars, retentionChars;
@@ -2349,6 +2353,8 @@ export class JobManager {
                       : hopRaisedTurns(budgetSizingState, {
                           currentMaxTurns: budgetState?.maxTurns,
                           turnMultiplier: routeTurnMultiplier(executionRoutes(job.executionProfile)[requested]),
+                          maxUsd: budgetState?.maxUsd,
+                          turnUsdEstimate: routeTurnUsdEstimate(executionRoutes(job.executionProfile)[requested]),
                         });
                   if (raised && raised.extraTurns > 0) {
                     budgetState = { ...budgetState, maxTurns: raised.maxTurns };
