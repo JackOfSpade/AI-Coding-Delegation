@@ -14,6 +14,8 @@ const ENVIRONMENT_KINDS = new Set([
   'git-config-denied',
   'git-metadata-denied',
   'native-module-crash',
+  // A test bound a local TCP port and the verifier sandbox denied the bind.
+  'loopback-denied',
   // Set by the baseline-diff verifier, never by the classifier below: the same
   // failures in both runs were the sandbox refusing the suite's fixtures.
   'sandbox-dominated',
@@ -27,6 +29,12 @@ export const isVerifierEnvironmentKind = (kind) => ENVIRONMENT_KINDS.has(kind);
 // or project aliases and are deliberately not matched.
 const MISSING_PACKAGE = /Cannot find (?:package|module) '((?![./#~]|@\/|file:|node:)[^'\s]{1,214})'/;
 const COMMAND_NOT_FOUND = /(?:^|\n)[^\n]*?(?:sh|bash|zsh|dash): (?:line \d+: )?([^\s:'"]{1,100}): (?:command )?not found\b/i;
+// Node reports a denied bind as `listen EPERM: operation not permitted 127.0.0.1`
+// (or `bind EACCES`); a native abort can follow before any test reports.
+const LOOPBACK_BIND_DENIED = /\b(?:listen|bind)\s+(?:EPERM|EACCES)\b[^\n]{0,160}/i;
+const NATIVE_ABORT_BIND = /\buv_(?:tcp_)?(?:bind|listen)\b|Assertion[^\n]{0,160}\b(?:uv_tcp|tcp_wrap|listen|bind)\b/i;
+const LOOPBACK_DETAIL =
+  'a test bound a local TCP port (server.listen / net.createServer) and the verifier sandbox denies bind (EPERM), which can abort Node before any assertion runs; this is not a code failure and a repair round cannot change it. Run those suites in the primary checkout, give the next job a testCommand without them, or enable verifier.allowLoopback in the Offload config';
 const NO_EXECUTABLE = /could not determine executable to run/i;
 const ASSERTION_FAILURE = /\bAssertionError\b|\bERR_ASSERTION\b/;
 // Git fixture helpers commonly shell out to the system Git binary. The
@@ -204,6 +212,11 @@ export function classifyVerifierEnvironment(verify, { workspacePath, writeScope 
   // Wrappers (npm test) and older jobs can still reach this startup failure.
   const tsxEnvironment = tsxIpcEnvironment(verify);
   if (tsxEnvironment) return tsxEnvironment;
+  // A bind denial that aborted the process leaves no assertion to mask it; one
+  // that did not is only environmental when no test reported a real assertion.
+  const aborted = result.code === 134 || result.signal === 'SIGABRT';
+  if (aborted ? LOOPBACK_BIND_DENIED.test(text) || NATIVE_ABORT_BIND.test(text) : !assertionFailure && LOOPBACK_BIND_DENIED.test(text))
+    return { kind: 'loopback-denied', detail: LOOPBACK_DETAIL };
   if (!assertionFailure && GIT_SYSTEM_CONFIG_DENIED.test(text))
     return {
       kind: 'git-config-denied',

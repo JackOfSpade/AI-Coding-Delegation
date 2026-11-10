@@ -1398,3 +1398,32 @@ test('the reported local transcript failure continues from preserved work with a
     cleanup(h.repo);
   }
 });
+
+test('a denied loopback bind (listen EPERM, native abort) ends VERIFY_ENV_FAILED loopback-denied with no repair round', async () => {
+  const h = await harness({
+    worker: async (job) => {
+      writeSrc(job, 'a.js', 'export const a = 1;\n');
+      return { status: 'DONE', turns: 2, costUsd: 0.02 };
+    },
+    verify: () => ({
+      command: 'node --test test/http.test.mjs',
+      verdict: 'FAIL',
+      result: { code: 134, signal: 'SIGABRT', stderr: 'Error: listen EPERM: operation not permitted 127.0.0.1\n', sandbox: 'macos' },
+    }),
+  });
+  try {
+    const { started, done } = await startEnvJob(h, { maxRepairRounds: 2 });
+    assert.equal(done.status, 'VERIFY_ENV_FAILED');
+    assert.equal(done.verifyEnvironment.kind, 'loopback-denied');
+    const job = await h.manager.store.get(started.jobId);
+    assert.equal(job.verifyEnvironment.kind, 'loopback-denied');
+    assert.equal(h.counters.runs, 1, 'the worker is not run again');
+    assert.equal(h.counters.verifies, 1);
+    assert.equal(job.rounds ?? 0, 0);
+    assert.doesNotMatch(done.report, /next: .*\brepair\b/);
+    assert.match(done.report, /verifier\.allowLoopback/);
+    assert.match(done.report, /no repair round was spent/);
+  } finally {
+    cleanup(h.repo);
+  }
+});

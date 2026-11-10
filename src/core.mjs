@@ -101,6 +101,13 @@ const verifierDurationConfig = (verifier) => {
   };
   return Object.keys(value).length ? value : undefined;
 };
+// Appended to every repair brief: a worker that cannot make a check pass in the
+// verifier sandbox must not rewrite existing fixtures to hide the denial.
+export const REPAIR_FIXTURE_NOTE =
+  'Do not restructure, skip, or weaken pre-existing test files or fixtures to work around a verifier sandbox denial (EPERM, Operation not permitted, a failed listen/bind, a denied child process or temp path). Leave them as they are and list the denial under concerns in your finish report; the primary will run those suites outside the sandbox.';
+/** The task text of a repair round: the defects, then the standing fixture note. */
+export const repairBrief = (defects) =>
+  `Repair these concrete defects:\n${(defects?.length ? defects : ['Continue the job and re-check the acceptance criteria.']).map((x) => `- ${x}`).join('\n')}\n\n${REPAIR_FIXTURE_NOTE}`;
 const parentHandoff = (job) => job?.status === 'QUEUED' && job.handoffState === 'PARENT_QUEUED';
 const handoffIdentity = (job) => ({
   status: job?.status,
@@ -541,7 +548,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           job.mode === 'report'
             ? reportAgentContext(job.budgetSizing)
             : new AgentContext(prior, { onAppend: api.appendMessage, onAppendBatch: api.appendMessages });
-        const repair = `Repair these concrete defects:\n${(api.defects?.length ? api.defects : ['Continue the job and re-check the acceptance criteria.']).map((x) => `- ${x}`).join('\n')}`;
+        const repair = repairBrief(api.defects);
         const totalTurns = job.budget?.maxTurns ?? loaded?.config.limits.maxTurns,
           totalUsd = job.budget?.maxUsd ?? loaded?.config.limits.maxUsd;
         const remainingTurns = totalTurns - (job.turns || 0),
@@ -1230,6 +1237,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           verifierInterpreterRoots: interpreter?.roots,
           // Server configuration only: a caller cannot loosen the thresholds.
           verifierDuration: reportMode ? undefined : verifierDurationConfig(loaded.config.verifier),
+          verifierLoopback: !reportMode && loaded.config.verifier?.allowLoopback === true ? true : undefined,
           sandboxMode: sandboxAvailable() ? 'macos' : 'policy-only',
           configuredModel: model,
           executionProfile,

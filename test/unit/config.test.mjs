@@ -445,3 +445,10 @@ test('limits.creditCooldownMinutes is optional, 0 to 1440 minutes', () => {
   for (const minutes of [-1, 1441, '30', Number.NaN])
     assert.throws(() => validateConfig({ ...base, limits: { ...base.limits, creditCooldownMinutes: minutes } }), /creditCooldownMinutes/);
 });
+
+test('verifier.allowLoopback is an optional boolean', () => {
+  const withVerifier = (verifier) => deepMerge(DEFAULT_CONFIG, { verifier });
+  assert.equal(validateConfig(withVerifier({ allowLoopback: true })).verifier.allowLoopback, true);
+  assert.equal(validateConfig(withVerifier({})).verifier.allowLoopback, undefined);
+  assert.throws(() => validateConfig(withVerifier({ allowLoopback: 'yes' })), /verifier\.allowLoopback must be boolean/);
+});

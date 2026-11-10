@@ -930,6 +930,7 @@ const JOB_INPUT_KEYS = [
   'verifierMode',
   'verifierTimeoutSec',
   'verifierDuration',
+  'verifierLoopback',
   'verifierInterpreter',
   'verifierInterpreterRoots',
 ];
@@ -1056,6 +1057,7 @@ export function validateJobRequest(input) {
     throw new Error('verifierTimeoutSec must be an integer from 5 to 1800');
   if (input.verifierDuration != null && !validVerifierDuration(input.verifierDuration))
     throw new Error('verifierDuration must be { minFraction: 0-1, msPerKiB: 0-100000 }');
+  if (input.verifierLoopback != null && typeof input.verifierLoopback !== 'boolean') throw new Error('verifierLoopback must be boolean');
   // The baseline run exists to tolerate failures a snapshot already had, which
   // is only meaningful under a real sandbox and an authenticated private copy.
   if (input.verifierMode === 'baseline-diff' && input.unsafePolicyOnlyVerifier === true)
@@ -3211,6 +3213,7 @@ export class JobManager {
       gitDir: await this.#gitDir(executionPath),
       signal: this.controllers.get(job.id)?.signal,
       allowNetwork: !!job.allowNetwork,
+      allowLoopback: job.verifierLoopback === true,
       denyRead: job.denyRead || [],
       writablePaths: writeScope(job).map((p) => join(executionPath, p)),
       // A verifier of an isolated job can only traverse the authenticated

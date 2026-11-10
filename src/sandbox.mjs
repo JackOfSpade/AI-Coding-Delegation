@@ -312,6 +312,7 @@ export function macosProfile({
   interpreterMetadataPaths = [],
   allowNetwork = false,
   allowTempSockets = false,
+  allowLoopback = false,
   allowGitPointerMetadata = false,
   allowRootMetadata = false,
 }) {
@@ -319,6 +320,7 @@ export function macosProfile({
   // compiled on another host. Command execution and temp I/O remain native.
   const { basename, dirname, join, resolve, sep, isAbsolute } = posix;
   if (typeof allowTempSockets !== 'boolean') throw new TypeError('allowTempSockets must be boolean');
+  if (typeof allowLoopback !== 'boolean') throw new TypeError('allowLoopback must be boolean');
   if (typeof allowGitPointerMetadata !== 'boolean') throw new TypeError('allowGitPointerMetadata must be boolean');
   if (typeof allowRootMetadata !== 'boolean') throw new TypeError('allowRootMetadata must be boolean');
   if (!Array.isArray(denyRead) || denyRead.some((path) => typeof path !== 'string'))
@@ -476,6 +478,16 @@ export function macosProfile({
           `(allow network-outbound (remote unix-socket (subpath ${q(resolvedTemp)})))`,
         ]
       : []),
+    // Verifier opt-in (verifier.allowLoopback): local TCP/UDP on the loopback
+    // interface only, so suites that start an HTTP server on 127.0.0.1 can run.
+    // `localhost:*` never matches a routable address, so there is no egress.
+    ...(allowLoopback
+      ? [
+          '(allow network-bind (local ip "localhost:*"))',
+          '(allow network-inbound (local ip "localhost:*"))',
+          '(allow network-outbound (remote ip "localhost:*"))',
+        ]
+      : []),
     ...(allowNetwork ? ['(allow network*)'] : []),
   ].join('\n');
 }
@@ -609,6 +621,7 @@ export async function runCommand(command, options = {}) {
     interpreterPaths: options.interpreterPaths || [],
     interpreterMetadataPaths: options.interpreterMetadataPaths || [],
     allowNetwork: options.allowNetwork === true,
+    allowLoopback: options.allowLoopback === true,
     allowGitPointerMetadata: options.allowGitPointerMetadata === true,
     allowRootMetadata: options.allowRootMetadata === true,
   };

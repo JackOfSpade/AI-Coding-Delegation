@@ -856,3 +856,14 @@ test('a join segment bound to a literal places the write, so a real denial still
     [['build/p-XXXXXX', 'build/p-**']],
   );
 });
+
+test('verifier preflight warns about tests that open a TCP listener so the testCommand can be narrowed', (t) => {
+  const { root, write } = fixture(t);
+  write('package.json', JSON.stringify({ scripts: { test: 'node --test "test/*.test.mjs"' } }));
+  write('test/http.test.mjs', "import http from 'node:http';\nconst server = http.createServer(() => {});\nserver.listen(0, '127.0.0.1');");
+  write('test/pure.test.mjs', "import assert from 'node:assert';\nassert.equal(1, 1);");
+  const result = preflightVerifier({ repoPath: root, testCommand: 'npm test' });
+  assert.deepEqual(result.warnings, [{ code: 'loopback-listen', path: 'test/http.test.mjs' }]);
+  const lines = verifierPreflightLines(result).join('\n');
+  assert.match(lines, /TCP listener.*verifier\.allowLoopback.*narrow testCommand/);
+});

@@ -594,6 +594,14 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedP
       )
     )
       warn('native-import', path);
+    // A test that opens a TCP listener: the verifier sandbox denies bind unless
+    // verifier.allowLoopback is on, and under Node the EPERM can abort the run.
+    if (
+      /\b(?:createServer|createSecureServer)\s*\(|\b(?:app|server|srv|httpServer|httpsServer|fastify)\.listen\s*\(|\bHTTPServer\s*\(|\bsocket\.bind\s*\(/.test(
+        text,
+      )
+    )
+      warn('loopback-listen', path);
     if (/(?:^|[\s'"`=])\/(?:private\/)?(?:tmp(?:\/|\b)|var\/folders(?:\/|\b))/m.test(text)) warn('system-temp', path);
     if (/\bchild_process\b|\b(?:execFile(?:Sync)?|spawn(?:Sync)?)\s*\(|\bsubprocess\b|\bos\.(?:system|popen)\s*\(/.test(text))
       warn('child-process', path);
@@ -1124,6 +1132,8 @@ export function verifierPreflightLines(value, { lean = false } = {}) {
       'native Python imports may crash inside the verifier sandbox even with an accepted interpreter declaration; probe the dependencies with health verifierInterpreter + verifierImports before spending, and compare failures in the primary',
     'system-temp': 'hard-coded system temp path may fail with EPERM; use TMPDIR / os.tmpdir() / tempfile',
     'child-process': 'child-process use may fail with spawn EPERM under verifier restrictions; check in the primary before spending',
+    'loopback-listen':
+      'test opens a TCP listener (server.listen / createServer); the verifier sandbox denies bind unless verifier.allowLoopback is enabled, and the EPERM can abort Node before any assertion runs; narrow testCommand to exclude these files and check them in the primary before spending',
     'process-inspection':
       'ps / process identity inspection may be denied even when exec is permitted; use an injectable identity probe or verify in the primary',
   };

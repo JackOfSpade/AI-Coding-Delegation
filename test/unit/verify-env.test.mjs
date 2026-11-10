@@ -465,3 +465,24 @@ test('a PermissionError on the worktree .git pointer is git-metadata-denied with
     null,
   );
 });
+
+test('a denied loopback bind is a loopback-denied environment failure, aborted or not, unless a real assertion failed', () => {
+  const denied = 'Error: listen EPERM: operation not permitted 127.0.0.1\n    at Server.setupListenHandle [as _listen2] (node:net:1908:21)';
+  const plain = classifyVerifierEnvironment(failed(denied));
+  assert.equal(plain.kind, 'loopback-denied');
+  assert.match(plain.detail, /verifier\.allowLoopback/);
+  assert.equal(isVerifierEnvironmentKind('loopback-denied'), true);
+  assert.equal(classifyVerifierEnvironment(failed('Error: bind EACCES 127.0.0.1:0')).kind, 'loopback-denied');
+  // A native abort before any test reported counts even when assertion text appears elsewhere in the output.
+  const aborted = classifyVerifierEnvironment(
+    failed(`AssertionError noise from an earlier file\n${denied}`, { code: 134, signal: 'SIGABRT' }),
+  );
+  assert.equal(aborted.kind, 'loopback-denied');
+  assert.equal(
+    classifyVerifierEnvironment(failed('Assertion failed: (uv_tcp_bind(&tcp, addr, 0) == 0)', { code: null, signal: 'SIGABRT' })).kind,
+    'loopback-denied',
+  );
+  // A real assertion failure with a logged denial is still a code failure; an unrelated abort is not a bind denial.
+  assert.equal(classifyVerifierEnvironment(failed(`${denied}\nAssertionError [ERR_ASSERTION]: expected 1 to equal 2`)), null);
+  assert.equal(classifyVerifierEnvironment(failed('Aborted: heap out of memory', { code: 134, signal: 'SIGABRT' })), null);
+});

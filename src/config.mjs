@@ -252,7 +252,7 @@ export function validateConfig(config) {
   if (config.verifier !== undefined) {
     if (!plainObject(config.verifier)) throw new ConfigError('Config.verifier must be an object');
     assertSafeKeys(config.verifier);
-    assertAllowedKeys(config.verifier, ['interpreterRoots', 'minDurationFraction', 'expectedMsPerKiB'], 'Config.verifier');
+    assertAllowedKeys(config.verifier, ['interpreterRoots', 'minDurationFraction', 'expectedMsPerKiB', 'allowLoopback'], 'Config.verifier');
     // A verifier run under this share of its expected duration is reported as
     // suspiciously fast (0 turns the warning off). The expected duration is a
     // recent passing run of the same command, the untouched-snapshot run, or,
@@ -261,6 +261,10 @@ export function validateConfig(config) {
     if (config.verifier.minDurationFraction !== undefined)
       numeric(config.verifier.minDurationFraction, 'verifier.minDurationFraction', 0, 1);
     if (config.verifier.expectedMsPerKiB !== undefined) numeric(config.verifier.expectedMsPerKiB, 'verifier.expectedMsPerKiB', 0, 100_000);
+    // Opt-in: let sandboxed verifier runs bind and connect on the loopback
+    // interface only (never any other network), for suites with local HTTP tests.
+    if (config.verifier.allowLoopback !== undefined && typeof config.verifier.allowLoopback !== 'boolean')
+      throw new ConfigError('verifier.allowLoopback must be boolean');
     const roots = config.verifier.interpreterRoots;
     // An allowlist of directories a caller may declare as `verifierInterpreter`
     // (a virtualenv or interpreter the sandbox may then read and execute). Empty

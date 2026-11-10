@@ -1880,3 +1880,21 @@ test('a cancelled repair whose round-1 worker changed the diff reports the round
   assert.match(report, /apply: BLOCKED: the cancelled repair round changed the diff after round 0, so it is not the reviewed round-0 diff/);
   assert.doesNotMatch(report, /apply \(after your own check\)/);
 });
+
+test('a loopback-denied environment failure points at the primary and forbids rewriting fixtures, with no repair', () => {
+  const report = compactReport({
+    id: 'oj-loopback',
+    status: 'VERIFY_ENV_FAILED',
+    workspacePath: '/w',
+    files: [{ path: 'src/a.js', status: 'M' }],
+    verifyEnvironment: { kind: 'loopback-denied', detail: 'a test bound a local TCP port and the verifier sandbox denies bind (EPERM)' },
+    verify: { command: 'npm test', verdict: 'FAIL', result: { code: 1, sandbox: 'macos' } },
+  });
+  assert.match(report, /verifier environment: a test bound a local TCP port/);
+  assert.match(report, /verifier\.allowLoopback.*primary checkout.*do not have the worker rewrite the existing server fixtures/);
+  assert.match(report, /no repair round was spent/);
+  assert.doesNotMatch(
+    report.split('\n').find((line) => line.startsWith('next:')),
+    /repair/,
+  );
+});

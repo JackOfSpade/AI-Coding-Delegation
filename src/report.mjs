@@ -132,9 +132,11 @@ function environmentLine(job, environmentFailure, { reportMode, primaryChecked, 
                   ? primaryChecked
                     ? ' The earlier native import crash remains recorded separately from the primary check.'
                     : ' Run the import in the primary checkout to determine whether the verifier sandbox caused the crash. An accepted interpreter declaration grants read and exec; it does not prove imports work.'
-                  : environmentFailure.kind === 'sandbox-dominated'
-                    ? " Most of the suite's child-process/Git fixtures cannot run in the verifier sandbox, so the runs are no evidence about the change: run that suite in the primary checkout, and give the next job a testCommand without those files."
-                    : ''
+                  : environmentFailure.kind === 'loopback-denied'
+                    ? ' A test bound a local TCP port, which the verifier sandbox denies unless verifier.allowLoopback is enabled in the Offload config. Run those suites in the primary checkout and give the next job a testCommand without them; do not have the worker rewrite the existing server fixtures.'
+                    : environmentFailure.kind === 'sandbox-dominated'
+                      ? " Most of the suite's child-process/Git fixtures cannot run in the verifier sandbox, so the runs are no evidence about the change: run that suite in the primary checkout, and give the next job a testCommand without those files."
+                      : ''
       }${
         // An applyThenVerify run is already acting on this very advice.
         applyRunning || job.applied === true
