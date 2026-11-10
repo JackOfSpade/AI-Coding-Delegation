@@ -1876,6 +1876,7 @@ export class JobManager {
       testCommand: input.testCommand,
       denyRead: input.denyRead,
       writeScope: [...input.ownedPaths, ...(input.extraWritable || [])],
+      ownedPaths: input.ownedPaths,
     });
     // One lazily memoized scan of the store serves every consumer within this call.
     let storedJobs;

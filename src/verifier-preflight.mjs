@@ -519,7 +519,7 @@ function writeFindings(text, file, { repoPath, writeScope }) {
  * literal command paths, package scripts and local imports; dynamic imports,
  * runner config and external packages require a real primary check. Returns
  * the public result plus the import graph and command words narrowing needs. */
-function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
+function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedPaths }) {
   const policy = new PathPolicy({ repoPath, ownedPaths: [], denyRead });
   const candidates = [];
   let entries = 0,
@@ -773,23 +773,62 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
   // trusted only when every file its selected suites reach was read.
   const selectedSuites = new Set();
   const scopeUnavailable = [];
+  const missingArguments = [];
+  // A runner argument the worker will create (inside ownedPaths) names a suite
+  // that does not exist yet: pending, so the rest of its folder is unselected.
+  const owned = (ownedPaths ?? []).filter((entry) => typeof entry === 'string');
+  const ownedLiterals = owned.filter((entry) => !GLOB.test(entry));
+  const walked = [...available];
+  const isOwned = (file) => {
+    try {
+      return matchesAny(file, owned);
+    } catch {
+      return false;
+    }
+  };
+  // The path a missing argument would be, when ownedPaths says the worker creates it.
+  const pendingPath = (operand, direct) => {
+    if (operand.includes('/')) return isOwned(operand) ? operand : undefined;
+    const named = ownedLiterals.filter((entry) => entry.endsWith(`/${operand}`)).sort();
+    const fromSuite = direct
+      .map((file) => `${dirname(file)}/${operand}`)
+      .filter((file) => isOwned(file))
+      .sort();
+    return named[0] ?? fromSuite[0];
+  };
   const scopes = [...new Set(runners.map((runner) => runner.path))].flatMap((path) => {
     const calls = runners.filter((runner) => runner.path === path);
     if (!resolvedFiles.has(path) || calls.some((call) => !call.operands.length)) return [];
     const operands = calls.flatMap((call) => call.operands);
     const direct = [...(edges.get(path) ?? [])];
     const selected = direct.filter((file) => operands.some((operand) => file === operand || file.endsWith(`/${operand}`)));
-    if (!selected.length) return [];
+    // Missing: no file the walk found bears the operand's path or bare name.
+    // Pending: a missing operand the worker will create (it is inside ownedPaths).
+    const pending = [];
+    const missing = [];
+    for (const operand of new Set(operands)) {
+      if (walked.some((file) => file === operand || file.endsWith(`/${operand}`))) continue;
+      const target = pendingPath(operand, direct);
+      if (!target) missing.push(operand);
+      else if (!pending.includes(target)) pending.push(target);
+    }
+    if (!selected.length && !pending.length) {
+      if (missing.length) missingArguments.push({ runner: path, files: missing.sort().slice(0, MAX_FINDINGS), scoped: false });
+      return [];
+    }
     for (const file of selected) selectedSuites.add(file);
     const closure = new Set(selected.flatMap((file) => [...reachable(file)]));
     const unread = [...closure].filter((file) => !resolvedFiles.has(file)).length;
     if (unread) {
       scopeUnavailable.push({ runner: path, unreadFiles: unread });
+      if (missing.length) missingArguments.push({ runner: path, files: missing.sort().slice(0, MAX_FINDINGS), scoped: false });
       return [];
     }
-    const folders = new Set(selected.map((file) => dirname(file)));
+    const folders = new Set([...selected, ...pending].map((file) => dirname(file)));
     const suites = direct.filter((file) => !selected.includes(file) && TEST_CODE.test(file) && folders.has(dirname(file)));
-    return suites.length ? [{ runner: path, selected, suites }] : [];
+    const scope = suites.length ? [{ runner: path, selected, pending: pending.sort(), suites }] : [];
+    if (missing.length) missingArguments.push({ runner: path, files: missing.sort().slice(0, MAX_FINDINGS), scoped: scope.length > 0 });
+    return scope;
   });
   // Not certain to be denied, so never refused; scoping treats them like the rest.
   let uncertain = uncertainFound;
@@ -832,9 +871,14 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
     ...(blocking.length ? { blocking } : {}),
     ...(uncertain.length ? { uncertain: uncertain.slice(0, MAX_FINDINGS), uncertainCount: uncertain.length } : {}),
     ...(scopeUnavailable.length ? { scopeUnavailable: scopeUnavailable.slice(0, MAX_FINDINGS) } : {}),
+    ...(missingArguments.length ? { missingArguments: missingArguments.slice(0, MAX_FINDINGS) } : {}),
     ...(scopes.length
       ? {
-          scoped: scopes.map((scope) => ({ runner: scope.runner, files: scope.selected.sort().slice(0, MAX_FINDINGS) })),
+          scoped: scopes.map(({ runner, selected, pending }) => ({
+            runner,
+            files: [...selected, ...pending].sort().slice(0, MAX_FINDINGS),
+            ...(pending.length ? { pending: pending.slice(0, MAX_FINDINGS) } : {}),
+          })),
           ...(advisory.length ? { advisory: advisory.slice(0, MAX_FINDINGS), advisoryCount: advisory.length } : {}),
           ...(scopedWarnings ? { scopedWarnings } : {}),
         }
@@ -847,9 +891,9 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
 /** The public static preflight of a testCommand (undefined without one). Pass
  * the job's write scope (ownedPaths + extraWritable) to get `blocking` findings:
  * writes the verifier sandbox is certain to deny. */
-export function preflightVerifier({ repoPath, testCommand, denyRead = [], writeScope }) {
+export function preflightVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedPaths }) {
   if (!testCommand) return undefined;
-  return scanVerifier({ repoPath, testCommand, denyRead, writeScope }).result;
+  return scanVerifier({ repoPath, testCommand, denyRead, writeScope, ownedPaths }).result;
 }
 
 const shellWord = (value) => (/^[\w./@+=:,%-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`);
@@ -1032,13 +1076,21 @@ function verifierUncertainLines(value, { limit = MAX_FINDINGS } = {}) {
   return total > lines.length ? [...lines, `verifier uncertain: ${total - lines.length} more (detail "full" lists them)`] : lines;
 }
 /** Why a runner's file arguments could not limit the findings. */
-const verifierScopeLines = (value) =>
-  (Array.isArray(value?.scopeUnavailable) ? value.scopeUnavailable : [])
+const verifierScopeLines = (value) => [
+  ...(Array.isArray(value?.scopeUnavailable) ? value.scopeUnavailable : [])
     .filter((gap) => typeof gap?.runner === 'string' && Number.isInteger(gap.unreadFiles))
     .map(
       (gap) =>
         `verifier scope: the suites ${gap.runner} was given reach ${gap.unreadFiles} file(s) past the scan limits, so findings could not be limited to those suites`,
-    );
+    ),
+  ...(Array.isArray(value?.missingArguments) ? value.missingArguments : [])
+    .filter((gap) => typeof gap?.runner === 'string' && Array.isArray(gap.files) && gap.files.length)
+    .map((gap) =>
+      gap.scoped
+        ? `verifier scope: ${gap.runner} was given ${gap.files.join(', ')}, which do not exist in the start snapshot and are not in ownedPaths; findings were scoped to the other arguments`
+        : `verifier scope: ${gap.runner} was given ${gap.files.join(', ')}, which do not exist in the start snapshot and are not in ownedPaths, so no suite was selected and every suite it imports was scanned; if the worker creates them, the blockers in suites it was not given will not run, so add them to ownedPaths or pass acceptVerifierBlockers: true`,
+    ),
+];
 const narrowingLine = (value) =>
   value?.suggestedTestCommand
     ? `verifier suggestion: drop ${(value.drop ?? []).join(', ')} from testCommand: \`${value.suggestedTestCommand}\` (static rewrite; review before use)`
@@ -1147,7 +1199,16 @@ export function compactVerifierPreflight(value) {
         }
       : {}),
     ...(list('scopeUnavailable').length ? { scopeUnavailable: list('scopeUnavailable').slice(0, COMPACT_FINDINGS) } : {}),
-    ...(Array.isArray(value.scoped) ? { scoped: value.scoped.map(({ runner, files }) => ({ runner, files: (files ?? []).length })) } : {}),
+    ...(list('missingArguments').length ? { missingArguments: list('missingArguments').slice(0, COMPACT_FINDINGS) } : {}),
+    ...(Array.isArray(value.scoped)
+      ? {
+          scoped: value.scoped.map(({ runner, files, pending }) => ({
+            runner,
+            files: (files ?? []).length,
+            ...(Array.isArray(pending) && pending.length ? { pending: pending.length } : {}),
+          })),
+        }
+      : {}),
     ...(value.suggestedTestCommand ? { suggestedTestCommand: value.suggestedTestCommand } : {}),
     ...(value.narrowing ? { narrowing: value.narrowing } : {}),
     ...(Array.isArray(value.drop) && value.drop.length

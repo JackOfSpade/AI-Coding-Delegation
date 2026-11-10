@@ -499,6 +499,140 @@ test('runner scoping never demotes what always runs: runner helpers, module-scop
   assert.ok(unfiltered.blocking.some((finding) => finding.path === 'scripts/tests/diag.js'));
 });
 
+test('a runner argument the worker will create inside ownedPaths is a pending selected suite', (t) => {
+  const { root } = runnerFixture(t);
+  const result = preflightVerifier({
+    repoPath: root,
+    testCommand: `${RUNNER} scripts/tests/new.js`,
+    writeScope: ['src/**'],
+    ownedPaths: ['scripts/tests/new.js'],
+  });
+  assert.equal(result.blocking, undefined);
+  assert.equal(result.missingArguments, undefined);
+  assert.deepEqual(
+    result.advisory.map((finding) => finding.path),
+    ['scripts/tests/diag.js'],
+  );
+  assert.deepEqual(result.scoped, [
+    { runner: 'scripts/test-runner.js', files: ['scripts/tests/new.js'], pending: ['scripts/tests/new.js'] },
+  ]);
+});
+
+test('a bare runner argument is pending when its suite folder plus the name is owned', (t) => {
+  const { root } = runnerFixture(t);
+  const globbed = preflightVerifier({ repoPath: root, testCommand: `${RUNNER} new.js`, writeScope: [], ownedPaths: ['scripts/tests/**'] });
+  assert.equal(globbed.blocking, undefined);
+  assert.deepEqual(globbed.scoped, [
+    { runner: 'scripts/test-runner.js', files: ['scripts/tests/new.js'], pending: ['scripts/tests/new.js'] },
+  ]);
+  // A literal ownedPath naming the file works without a glob.
+  const literal = preflightVerifier({
+    repoPath: root,
+    testCommand: `${RUNNER} new.js`,
+    writeScope: [],
+    ownedPaths: ['scripts/tests/new.js'],
+  });
+  assert.equal(literal.blocking, undefined);
+  assert.deepEqual(literal.scoped, [
+    { runner: 'scripts/test-runner.js', files: ['scripts/tests/new.js'], pending: ['scripts/tests/new.js'] },
+  ]);
+});
+
+test('a missing runner argument outside ownedPaths scopes nothing and the refusal says so', (t) => {
+  const { root } = runnerFixture(t);
+  const result = preflightVerifier({
+    repoPath: root,
+    testCommand: `${RUNNER} scripts/tests/new.js`,
+    writeScope: [],
+    ownedPaths: ['src/**'],
+  });
+  assert.equal(result.scoped, undefined);
+  assert.ok(result.blocking.some((finding) => finding.path === 'scripts/tests/diag.js'));
+  assert.deepEqual(result.missingArguments, [{ runner: 'scripts/test-runner.js', files: ['scripts/tests/new.js'], scoped: false }]);
+  const scopeLine = verifierPreflightLines(result).find((line) => line.startsWith('verifier scope:'));
+  assert.equal(
+    scopeLine,
+    'verifier scope: scripts/test-runner.js was given scripts/tests/new.js, which do not exist in the start snapshot and are not in ownedPaths, so no suite was selected and every suite it imports was scanned; if the worker creates them, the blockers in suites it was not given will not run, so add them to ownedPaths or pass acceptVerifierBlockers: true',
+  );
+  assert.ok(verifierBlockingMessage(result).includes(scopeLine));
+});
+
+test('a runner given an existing suite and a pending one keeps the helper blocking and the sibling advisory', (t) => {
+  const { root, write } = runnerFixture(t);
+  write('scripts/tests/a.js', "import './shared.js';\nexport default [];");
+  write('scripts/tests/shared.js', "import { mkdirSync } from 'node:fs';\nmkdirSync('/tmp/shared');");
+  const result = preflightVerifier({
+    repoPath: root,
+    testCommand: `${RUNNER} a.js scripts/tests/new.js`,
+    writeScope: [],
+    ownedPaths: ['scripts/tests/new.js'],
+  });
+  assert.deepEqual(
+    result.blocking.map((finding) => finding.path),
+    ['scripts/tests/shared.js'],
+  );
+  assert.deepEqual(
+    result.advisory.map((finding) => finding.path),
+    ['scripts/tests/diag.js'],
+  );
+  assert.deepEqual(result.scoped, [
+    { runner: 'scripts/test-runner.js', files: ['scripts/tests/a.js', 'scripts/tests/new.js'], pending: ['scripts/tests/new.js'] },
+  ]);
+  // A missing argument next to an existing one is reported, and the scope is kept.
+  const mixed = preflightVerifier({
+    repoPath: root,
+    testCommand: `${RUNNER} a.js scripts/tests/other.js`,
+    writeScope: [],
+    ownedPaths: [],
+  });
+  assert.deepEqual(mixed.missingArguments, [{ runner: 'scripts/test-runner.js', files: ['scripts/tests/other.js'], scoped: true }]);
+  assert.match(verifierPreflightLines(mixed).join('\n'), /findings were scoped to the other arguments/);
+});
+
+test('a pending argument never scopes a runner that another segment runs unfiltered', (t) => {
+  const { root } = runnerFixture(t);
+  const result = preflightVerifier({
+    repoPath: root,
+    testCommand: `${RUNNER} scripts/tests/new.js && ${RUNNER}`,
+    writeScope: [],
+    ownedPaths: ['scripts/tests/**'],
+  });
+  assert.equal(result.scoped, undefined);
+  assert.ok(result.blocking.some((finding) => finding.path === 'scripts/tests/diag.js'));
+});
+
+test('a compact preflight carries the pending count and the missing arguments', (t) => {
+  const { root } = runnerFixture(t);
+  const pending = compactVerifierPreflight(
+    preflightVerifier({
+      repoPath: root,
+      testCommand: `${RUNNER} scripts/tests/new.js`,
+      writeScope: ['src/**'],
+      ownedPaths: ['scripts/tests/new.js'],
+    }),
+  );
+  assert.deepEqual(pending.scoped, [{ runner: 'scripts/test-runner.js', files: 1, pending: 1 }]);
+  assert.equal(pending.missingArguments, undefined);
+  const missing = compactVerifierPreflight(
+    preflightVerifier({
+      repoPath: root,
+      testCommand: `${RUNNER} scripts/tests/new.js`,
+      writeScope: [],
+      ownedPaths: ['src/**'],
+    }),
+  );
+  assert.deepEqual(missing.missingArguments, [{ runner: 'scripts/test-runner.js', files: ['scripts/tests/new.js'], scoped: false }]);
+  assert.equal(missing.scoped, undefined);
+});
+
+test('without ownedPaths a runner given a file the worker will create still blocks', (t) => {
+  const { root } = runnerFixture(t);
+  const result = preflightVerifier({ repoPath: root, testCommand: `${RUNNER} scripts/tests/new.js`, writeScope: [] });
+  assert.equal(result.scoped, undefined);
+  assert.ok(result.blocking.some((finding) => finding.path === 'scripts/tests/diag.js'));
+  assert.deepEqual(result.missingArguments, [{ runner: 'scripts/test-runner.js', files: ['scripts/tests/new.js'], scoped: false }]);
+});
+
 test('narrowTestCommand never leaves an option without its value or a runner with none of its file arguments', (t) => {
   const { root, write } = runnerFixture(t);
   write('scripts/stubs/register.mjs', "import { mkdirSync } from 'node:fs';\nmkdirSync('/tmp/stub');");
