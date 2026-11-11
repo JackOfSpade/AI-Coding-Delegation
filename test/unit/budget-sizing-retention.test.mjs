@@ -5,6 +5,7 @@ import {
   RANGE_CHARS_PER_LINE_ESTIMATE,
   buildBudgetSizing,
   estimateReadChars,
+  mergeLineRanges,
   raiseBudgetSizing,
   reportRetentionChars,
   safeBudgetSizing,
@@ -58,4 +59,95 @@ test('readChars and retentionChars are echoed only as bounded integers, and surv
   const raised = raiseBudgetSizing({ ...sizing, recommendedTurns: 50 }, 60);
   assert.equal(raised.readChars, 112_200);
   assert.equal(raised.retentionChars, 160_200);
+});
+
+test('mergeLineRanges sorts, merges overlaps and adjacency, and drops invalid entries', () => {
+  assert.deepEqual(
+    mergeLineRanges([
+      { start: 1, end: 100 },
+      { start: 50, end: 150 },
+      { start: 400, end: 500 },
+    ]),
+    [
+      { start: 1, end: 150 },
+      { start: 400, end: 500 },
+    ],
+  );
+  // Adjacent ranges (next.start === prev.end + 1) merge; one line apart does not.
+  assert.deepEqual(
+    mergeLineRanges([
+      { start: 5, end: 10 },
+      { start: 11, end: 20 },
+    ]),
+    [{ start: 5, end: 20 }],
+  );
+  assert.deepEqual(
+    mergeLineRanges([
+      { start: 5, end: 10 },
+      { start: 12, end: 20 },
+    ]),
+    [
+      { start: 5, end: 10 },
+      { start: 12, end: 20 },
+    ],
+  );
+  // Unsorted input comes back sorted by start, and a contained range does not extend the merged one.
+  assert.deepEqual(
+    mergeLineRanges([
+      { start: 30, end: 40 },
+      { start: 10, end: 12 },
+      { start: 11, end: 11 },
+      { start: 20, end: 22 },
+    ]),
+    [
+      { start: 10, end: 12 },
+      { start: 20, end: 22 },
+      { start: 30, end: 40 },
+    ],
+  );
+  // Invalid entries are dropped, never turned into a range or an exception.
+  assert.deepEqual(mergeLineRanges([{ start: 0, end: 5 }, { start: 10, end: 9 }, { start: 1.5, end: 3 }, { start: 1, end: 2 }, null]), [
+    { start: 1, end: 2 },
+  ]);
+  assert.deepEqual(mergeLineRanges([]), []);
+  assert.deepEqual(mergeLineRanges(), []);
+  assert.deepEqual(mergeLineRanges('nope'), []);
+});
+
+test('estimateReadChars charges the merged sum of several ranges on one file, capped at its bytes', () => {
+  // (1-150) + (400-500) = 150 + 101 lines at 200 chars, not the 500-line covering window and no double count.
+  const file = {
+    path: 'big.md',
+    bytes: 480_452,
+    range: { start: 1, end: 500 },
+    ranges: [
+      { start: 1, end: 100 },
+      { start: 50, end: 150 },
+      { start: 400, end: 500 },
+    ],
+  };
+  assert.equal(estimateReadChars([file]), (150 + 101) * RANGE_CHARS_PER_LINE_ESTIMATE);
+  assert.equal(estimateReadChars([file]), 50_200);
+  // The same entry without `ranges` still pays for the covering window.
+  assert.equal(estimateReadChars([{ ...file, ranges: undefined }]), 500 * RANGE_CHARS_PER_LINE_ESTIMATE);
+  // The per-file sum is capped at the file's bytes.
+  assert.equal(
+    estimateReadChars([
+      {
+        path: 'small',
+        bytes: 1_000,
+        ranges: [
+          { start: 1, end: 100 },
+          { start: 400, end: 500 },
+        ],
+      },
+    ]),
+    1_000,
+  );
+  // An empty or invalid `ranges` list falls back to `range` and then to whole-file sizing.
+  assert.equal(
+    estimateReadChars([{ path: 'a', bytes: 10_000, range: { start: 1, end: 10 }, ranges: [] }]),
+    10 * RANGE_CHARS_PER_LINE_ESTIMATE,
+  );
+  assert.equal(estimateReadChars([{ path: 'a', bytes: 10_000, ranges: [{ start: 0, end: 5 }] }]), 10_000);
 });

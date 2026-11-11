@@ -13,15 +13,20 @@ import {
   FLASH_TURN_USD_ESTIMATE,
   LINE_BYTES_ESTIMATE,
   MAX_SIZED_BYTES,
+  RANGE_CHARS_PER_LINE_ESTIMATE,
   READ_SEGMENT,
+  REPORT_RETENTION_HEADROOM,
+  REPORT_RETENTION_MAX,
   autoTurnCeiling,
   buildBudgetSizing,
+  estimateReadChars,
   hopRaisedTurns,
   isTestPath,
   measureFiles,
   raiseBudgetSizing,
   readSegments,
   recommendTurns,
+  reportRetentionChars,
   resolveTurnBudget,
   routeTurnUsdEstimate,
   safeBudgetSizing,
@@ -223,11 +228,79 @@ test('measureFiles stats readable regular files only, honors ranges, and never e
   for (const secret of ['.env', 'link.js', 'missing.js', 'bad:9-1']) assert.ok(!serialized.includes(secret), secret);
 });
 
-test('several ranges on one file are sized as the window that covers them, and a plain mention never widens a range', async () => {
+test('several ranges on one file keep the covering window for turn sizing but a merged ranges list for read-char sizing', async () => {
   const { dir, policy } = await repo();
   await writeFile(path.join(dir, 'a.js'), asciiFile(BIG));
   const files = await measureFiles({ policy, relevantPaths: ['a.js:10-20', 'a.js:500-600'], ownedPaths: ['a.js'] });
-  assert.deepEqual(files, [{ path: 'a.js', bytes: BIG, range: { start: 10, end: 600 } }]);
+  assert.deepEqual(files, [
+    {
+      path: 'a.js',
+      bytes: BIG,
+      range: { start: 10, end: 600 },
+      ranges: [
+        { start: 10, end: 20 },
+        { start: 500, end: 600 },
+      ],
+    },
+  ]);
+  // The covering window still drives readSegments, so turn sizing is unchanged.
+  assert.equal(readSegments(BIG, files[0].range), readSegments(BIG, { start: 10, end: 600 }));
+  assert.equal(estimateReadChars(files), (11 + 101) * RANGE_CHARS_PER_LINE_ESTIMATE);
+});
+
+test('overlapping or adjacent ranges on one file merge into one interval and keep no ranges field', async () => {
+  const { dir, policy } = await repo();
+  await writeFile(path.join(dir, 'a.js'), asciiFile(BIG));
+  const overlapping = await measureFiles({ policy, relevantPaths: ['a.js:10-300', 'a.js:200-600'] });
+  assert.deepEqual(overlapping, [{ path: 'a.js', bytes: BIG, range: { start: 10, end: 600 } }]);
+  assert.equal('ranges' in overlapping[0], false);
+  const adjacent = await measureFiles({ policy, relevantPaths: ['a.js:1-600', 'a.js:601-700'] });
+  assert.deepEqual(adjacent, [{ path: 'a.js', bytes: BIG, range: { start: 1, end: 700 } }]);
+  assert.equal('ranges' in adjacent[0], false);
+});
+
+test('a plain relevantPaths entry after two far-apart ranges still yields the whole file with no range or ranges', async () => {
+  const { dir, policy } = await repo();
+  await writeFile(path.join(dir, 'a.js'), asciiFile(BIG));
+  const files = await measureFiles({ policy, relevantPaths: ['a.js:10-20', 'a.js:500-600', 'a.js'] });
+  assert.deepEqual(files, [{ path: 'a.js', bytes: BIG }]);
+  assert.deepEqual(Object.keys(files[0]).sort(), ['bytes', 'path']);
+  // Widening also drops the tracked ranges when the plain entry comes first.
+  const widenedFirst = await measureFiles({ policy, relevantPaths: ['a.js', 'a.js:10-20', 'a.js:500-600'] });
+  assert.deepEqual(widenedFirst, [{ path: 'a.js', bytes: BIG }]);
+});
+
+test('a 480,452-byte file with two small far-apart ranges is charged the summed ranges, not the whole file', async () => {
+  const { dir, policy } = await repo();
+  // About 10,000 lines: 47-byte lines plus the final partial line, exactly 480,452 bytes.
+  const content = ('a'.repeat(47) + '\n').repeat(10_000) + 'b'.repeat(452);
+  assert.equal(Buffer.byteLength(content), 480_452);
+  await writeFile(path.join(dir, 'big.md'), content);
+  const files = await measureFiles({ policy, relevantPaths: ['big.md:200-699', 'big.md:9000-9499'] });
+  assert.deepEqual(files, [
+    {
+      path: 'big.md',
+      bytes: 480_452,
+      range: { start: 200, end: 9499 },
+      ranges: [
+        { start: 200, end: 699 },
+        { start: 9000, end: 9499 },
+      ],
+    },
+  ]);
+  const readChars = estimateReadChars(files);
+  assert.equal(readChars, 1_000 * RANGE_CHARS_PER_LINE_ESTIMATE);
+  assert.equal(readChars, 200_000);
+  const retentionChars = reportRetentionChars(readChars);
+  assert.equal(retentionChars, 248_000);
+  assert.ok(readChars < retentionChars, `${readChars} < ${retentionChars}`);
+  // No retention warning condition: readChars + headroom stays under the report ceiling.
+  assert.equal(readChars + REPORT_RETENTION_HEADROOM, 248_000);
+  assert.ok(readChars + REPORT_RETENTION_HEADROOM <= REPORT_RETENTION_MAX);
+  // The old covering-window figure (same entry, no `ranges`) was the whole 480,452 bytes.
+  const coveringChars = estimateReadChars([{ path: 'big.md', bytes: 480_452, range: files[0].range }]);
+  assert.equal(coveringChars, 480_452);
+  assert.ok(coveringChars + REPORT_RETENTION_HEADROOM > REPORT_RETENTION_MAX);
 });
 
 test('a plain relevantPaths entry is a whole-file read hint and widens a range in either order; ownedPaths never does', async () => {

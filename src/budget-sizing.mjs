@@ -93,6 +93,8 @@ export const TURN_SECONDS_ESTIMATE = 45;
 /** Ceiling for a server-scaled wall-clock allowance; an explicit caller timeout may go to 1440. */
 export const AUTO_TIMEOUT_MAX_MINUTES = 120;
 export const MAX_SIZED_FILES = 64;
+/** Ranges tracked per file for read-char sizing; past this only the covering window is kept. */
+const MAX_TRACKED_RANGES = 64;
 /** Equals read_file's prefix-scan cap: a larger file is unreadable anyway, so clamp rather than count. */
 export const MAX_SIZED_BYTES = 8 * 1024 * 1024;
 export const MAX_OWNED_ENTRIES_COUNTED = 16;
@@ -134,17 +136,49 @@ export function readSegments(bytes, range, { extendOnly = false } = {}) {
 }
 
 /**
+ * The 1-based inclusive line ranges sorted by start, with overlapping or
+ * adjacent ranges (next.start <= prev.end + 1) merged into one. Entries that
+ * are not safe integers, start below 1, or end before start are dropped. Pure:
+ * the input is never mutated.
+ */
+export function mergeLineRanges(ranges) {
+  if (!Array.isArray(ranges)) return [];
+  const valid = [];
+  for (const range of ranges) {
+    if (!Number.isSafeInteger(range?.start) || !Number.isSafeInteger(range?.end)) continue;
+    if (range.start < 1 || range.end < range.start) continue;
+    valid.push({ start: range.start, end: range.end });
+  }
+  valid.sort((a, b) => a.start - b.start || a.end - b.end);
+  const merged = [];
+  for (const range of valid) {
+    const last = merged[merged.length - 1];
+    if (last && range.start <= last.end + 1) last.end = Math.max(last.end, range.end);
+    else merged.push(range);
+  }
+  return merged;
+}
+
+/**
  * Characters of read_file output a worker needs to hold the declared read set:
  * a whole file is its bytes (capped like the sizing itself) plus a ~33 character
  * marker per page, a ranged entry is estimated per line, and a staged report
- * input is its manifest bytes (it arrives as a whole file). Arithmetic on stat
- * results only.
+ * input is its manifest bytes (it arrives as a whole file). A file carrying
+ * several disjoint `ranges` is charged for the merged sum of those ranges, not
+ * for the covering window that `range` tracks for turn sizing; the sum is
+ * capped at the file's bytes. Arithmetic on stat results only.
  */
 export function estimateReadChars(files = []) {
   const marker = 33;
   let total = 0;
   for (const file of files) {
     if (!Number.isSafeInteger(file?.bytes) || file.bytes < 0) continue;
+    const merged = mergeLineRanges(file.ranges);
+    if (merged.length) {
+      const rangeChars = merged.reduce((sum, range) => sum + (range.end - range.start + 1) * RANGE_CHARS_PER_LINE_ESTIMATE, 0);
+      total += Math.min(file.bytes, rangeChars);
+      continue;
+    }
     const range = file.range;
     if (range && Number.isSafeInteger(range.start) && Number.isSafeInteger(range.end) && range.end >= range.start)
       total += Math.min(file.bytes, (range.end - range.start + 1) * RANGE_CHARS_PER_LINE_ESTIMATE);
@@ -170,36 +204,60 @@ export const reportRetentionChars = (readChars) =>
  * PathPolicy authority as the worker's own tools (deny rules, secret names,
  * symlink escape); anything unreadable, missing, not a regular file, or a glob
  * is skipped silently and never echoed.
+ *
+ * Several ranges on one file also keep a sorted, merged `ranges` list when they
+ * form more than one disjoint interval, so read-char sizing can charge them
+ * separately instead of the whole covering window; a file whose ranges merge
+ * into a single interval carries no `ranges` at all. `range` itself stays the
+ * one window covering every declared range for that file (turn sizing and the
+ * worker's read offset use it), and a plain relevantPaths entry still widens
+ * the file to whole and drops all ranges, in either order.
  */
 export async function measureFiles({ policy, relevantPaths = [], ownedPaths = [], inputManifest = [] } = {}) {
   const candidates = new Map();
+  // Bounded per-file range tracking: past the bound only the covering window is
+  // kept, so a pathological package cannot grow the sizing work without limit.
+  const trackRange = (state, range) => {
+    if (!range || state.whole) return;
+    if (state.rangesTruncated || state.ranges.length >= MAX_TRACKED_RANGES) {
+      state.rangesTruncated = true;
+      state.ranges = [];
+      return;
+    }
+    state.ranges.push(range);
+  };
   const add = (entry, ranged) => {
     if (candidates.size >= MAX_SIZED_FILES * 2) return;
     const split = splitRelevantPath(entry);
     if (split.invalid || typeof split.path !== 'string' || GLOB_CHARACTERS.test(split.path)) return;
     const previous = candidates.get(split.path);
     if (!previous) {
-      candidates.set(split.path, { range: split.range, whole: ranged && !split.range, ownedOnly: !ranged });
+      const state = { range: split.range, whole: ranged && !split.range, ownedOnly: !ranged, ranges: [], rangesTruncated: false };
+      trackRange(state, split.range);
+      candidates.set(split.path, state);
       return;
     }
     // A range narrows the read, but a plain relevantPaths entry is an explicit
-    // whole-file read hint and widens it for good, in either order. A plain
-    // mention in ownedPaths only says the file is writable and never widens
-    // it. Several ranges are sized as the one window that covers them all,
-    // which can only over-count.
-    if (ranged && !split.range) candidates.set(split.path, { range: undefined, whole: true });
-    else if (ranged && !previous.whole)
-      candidates.set(split.path, {
-        range: previous.range
-          ? { start: Math.min(previous.range.start, split.range.start), end: Math.max(previous.range.end, split.range.end) }
-          : split.range,
-        whole: false,
-      });
+    // whole-file read hint and widens it for good, in either order; it also
+    // drops every tracked range. A plain mention in ownedPaths only says the
+    // file is writable and never widens it. Several ranges keep the one window
+    // that covers them all for turn sizing (it can only over-count there);
+    // read-char sizing uses the merged `ranges` instead.
+    if (ranged && !split.range) {
+      candidates.set(split.path, { range: undefined, whole: true });
+      return;
+    }
+    if (previous.whole) return;
+    if (!ranged || !split.range) return;
+    previous.range = previous.range
+      ? { start: Math.min(previous.range.start, split.range.start), end: Math.max(previous.range.end, split.range.end) }
+      : split.range;
+    trackRange(previous, split.range);
   };
   for (const entry of relevantPaths) add(entry, true);
   for (const entry of ownedPaths) add(entry, false);
   const files = [];
-  for (const [file, { range, ownedOnly }] of candidates) {
+  for (const [file, { range, ownedOnly, ranges, rangesTruncated }] of candidates) {
     if (files.length >= MAX_SIZED_FILES) break;
     try {
       const canonical = policy.assertReadable(file);
@@ -208,10 +266,12 @@ export async function measureFiles({ policy, relevantPaths = [], ownedPaths = []
       // An owned test file the brief never lists as a read is one the worker
       // extends: it reads the head and tail, not the whole file.
       const extendOnly = ownedOnly && !range && isTestPath(file);
+      const merged = rangesTruncated ? [] : mergeLineRanges(ranges);
       files.push({
         path: file,
         bytes: Math.min(details.size, MAX_SIZED_BYTES),
         ...(range ? { range } : {}),
+        ...(merged.length > 1 ? { ranges: merged } : {}),
         ...(extendOnly ? { extendOnly } : {}),
       });
     } catch {
