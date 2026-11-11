@@ -295,6 +295,10 @@ async function json(path, fallback = null) {
   }
 }
 
+/** True when `error` is a permission denial on the filesystem root's own node. */
+export function isDeniedRootStat(path, error) {
+  return resolve(path, '..') === resolve(path) && (error?.code === 'EPERM' || error?.code === 'EACCES');
+}
 export class JobStore {
   // Jobs whose progress log already carries its single truncation marker (the lock/serial queue makes check-and-add race free).
   #truncationMarked = new Set();
@@ -950,7 +954,11 @@ export class JobStore {
       let details;
       try {
         details = await lstat(current);
-      } catch {
+      } catch (error) {
+        // The filesystem root is the trust anchor, not a repository-controlled
+        // link. A sandbox that withholds stat of `/` (the worker run_command
+        // profile) must not turn every store init into a misleading failure.
+        if (isDeniedRootStat(current, error)) return;
         throw new Error('job storage ancestry is invalid');
       }
       if (!this.#safeAncestor(details)) throw new Error('job storage ancestry is insecure');

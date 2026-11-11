@@ -5,6 +5,7 @@ import { continuationBlocker, promptCacheSummary } from './continuation.mjs';
 import { verifierPreflightLines } from './verifier-preflight.mjs';
 import { redactText, stripTerminalControls } from './redact.mjs';
 import { TURN_SOURCES } from './budget-sizing.mjs';
+import { repairSkippedLine } from './repair-scope.mjs';
 import {
   APPLY_ELIGIBLE_STATUSES,
   continuableFailure,
@@ -55,7 +56,9 @@ function nextActionLines(job, { reportMode, violations, files, continuationReaso
     job.status !== 'DONE_UNVERIFIED' &&
     job.status !== 'VERIFY_ENV_FAILED' &&
     roundAvailable &&
-    !budgetSpent
+    !budgetSpent &&
+    // No worker round can fix a failure outside the job's writable scope.
+    !repairSkippedLine(job.repairSkipped)
   )
     nextActions.push('repair');
   if (
@@ -108,10 +111,26 @@ function nextActionLines(job, { reportMode, violations, files, continuationReaso
     !job.verify.result.timedOut &&
     !job.verify.result.cancelled &&
     !isVerifierEnvironmentKind(environmentFailure?.kind);
-  if (verifiedNoFinish) nextActions.unshift('offload_apply with applyThenVerify (recommended after diff review)');
+  // A cap stop whose retained diff the server verifier passed: the work is
+  // likely complete, so a reviewed apply with applyThenVerify is the way on.
+  const budgetVerified =
+    !reportMode &&
+    job.status === 'BUDGET' &&
+    mutationSettled &&
+    appliable &&
+    files.length > 0 &&
+    typeof job.testCommand === 'string' &&
+    job.testCommand.trim() &&
+    job.verify?.command === job.testCommand &&
+    job.verify.verdict === 'PASS' &&
+    job.verify.result?.code === 0 &&
+    !job.verify.result.timedOut &&
+    !job.verify.result.cancelled &&
+    !isVerifierEnvironmentKind(environmentFailure?.kind);
+  if (verifiedNoFinish || budgetVerified) nextActions.unshift('offload_apply with applyThenVerify (recommended after diff review)');
   else if (!reportMode && !violations.length && mutationSettled && appliable && files.length)
     nextActions.push('apply (after your own check)');
-  return { nextActions, verifiedNoFinish };
+  return { nextActions, verifiedNoFinish, budgetVerified };
 }
 
 /** Advice for a verifier-environment failure, which is not a repair-able code failure. */
@@ -340,7 +359,7 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
         : job.workspaceCleanupError
           ? `workspace cleanup: RETRYABLE ERROR — ${scalar(job.workspaceCleanupError)}`
           : '';
-  const { nextActions, verifiedNoFinish } = nextActionLines(job, {
+  const { nextActions, verifiedNoFinish, budgetVerified } = nextActionLines(job, {
     reportMode,
     violations,
     files,
@@ -353,6 +372,8 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     line1,
     verifiedNoFinish &&
       'retained diff: configured verifier PASSED (exit 0); worker omitted finish. Review the diff; apply recommended with offload_apply + applyThenVerify. Completion of every requested edit still needs review.',
+    budgetVerified &&
+      'retained diff: configured verifier PASSED (exit 0) on the diff the worker left at its budget cap (no finish call). Review the diff; apply recommended with offload_apply + applyThenVerify. Completion of every requested edit still needs review.',
     meta,
     spendLine,
     cacheLine,
@@ -387,6 +408,8 @@ export function compactReport(job, { detail = 'full', stall, spend } = {}) {
     durationWarnings,
     environment,
     verifierEnvironment,
+    repairSkippedLine(job.repairSkipped),
+    autoExtensionLine(job.budgetSizing),
     appliedUnverified,
     applyVerify,
     limitation,
@@ -730,6 +753,18 @@ function budgetSizingLine(value) {
   if (!warnings.length || !Number.isSafeInteger(value.maxTurns)) return '';
   const recommended = Number.isSafeInteger(value.recommendedTurns) ? `; recommended ${value.recommendedTurns}` : '';
   return `turn budget: ${value.maxTurns} (${scalar(value.turnsSource)}${recommended}) - ${warnings.map((w) => scalar(w).slice(0, 400)).join(' ')}`;
+}
+/** The one automatic turn extension the server granted on a Flash-route cap, when it did. */
+function autoExtensionLine(value) {
+  const ext = value && typeof value === 'object' && !Array.isArray(value) ? value.autoExtended : undefined;
+  if (!ext || typeof ext !== 'object') return '';
+  const { extraTurns, fromMaxTurns, toMaxTurns, spentUsd, maxUsd } = ext;
+  if (![extraTurns, fromMaxTurns, toMaxTurns].every((n) => Number.isSafeInteger(n) && n > 0)) return '';
+  const spend =
+    Number.isFinite(spentUsd) && Number.isFinite(maxUsd) && spentUsd >= 0 && maxUsd > 0
+      ? ` with only $${money(spentUsd)} of $${money(maxUsd)} spent`
+      : '';
+  return `turn cap auto-extended: +${extraTurns} turns (${fromMaxTurns} -> ${toMaxTurns}) once, near the cap${spend}; the worker was told to wrap up and call finish. maxUsd was not raised.`;
 }
 /** Report jobs only: the declared read set against what the worker retains, when sizing flagged it. */
 function reportReadSetLine(value) {

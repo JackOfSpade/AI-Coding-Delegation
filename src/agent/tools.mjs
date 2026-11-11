@@ -212,7 +212,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   ),
   schema(
     'run_command',
-    'Run a focused build, test, or diagnostic command through the configured sandbox runner; prefer read_file, list_dir, glob, or grep for routine file inspection.',
+    'Run a focused build, test, or diagnostic command through the configured sandbox runner. Keep it narrow and quick (one test file or --test-name-pattern); the server runs the verifier itself after finish, so do not run the whole suite. Prefer read_file, list_dir, glob, or grep for routine file inspection.',
     {
       command: { type: 'string', minLength: 1, maxLength: 8192 },
       timeoutSec: { type: 'integer', minimum: 1, maximum: MAX_COMMAND_TIMEOUT_SEC },

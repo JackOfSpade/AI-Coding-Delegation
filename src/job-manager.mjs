@@ -36,6 +36,7 @@ import { isolatedDependencyReadPaths, sameWorktreePath } from './worktree.mjs';
 import { classifyVerifierEnvironment, isVerifierEnvironmentKind } from './verify-env.mjs';
 import { continuationBlocker, promptCacheSummary } from './continuation.mjs';
 import { budgetWarning, safeBudgetOutlook } from './budget-outlook.mjs';
+import { repairOutsideScope, safeRepairSkipped } from './repair-scope.mjs';
 import { outputCapView, safeOutputCap } from './output-cap.mjs';
 import { MAX_PATH_LENGTH, revertPathsProblem, safeRevertPath, safeRevertPaths } from './revert-paths.mjs';
 import { scratchFiles } from './scratch-audit.mjs';
@@ -77,6 +78,7 @@ import {
   routeTurnMultiplier,
   routeTurnUsdEstimate,
   hopRaisedTurns,
+  autoExtendedTurns,
   safeBudgetSizing,
   splitRelevantPath,
 } from './budget-sizing.mjs';
@@ -160,6 +162,7 @@ const ROUND_SCOPED_VERIFIER_STATE = Object.freeze({
   malformedToolFinish: undefined,
   verifiedWithoutFinish: undefined,
   verifyEnvironment: undefined,
+  repairSkipped: undefined,
   applyVerify: undefined,
   reviewPacketEvidence: undefined,
   reviewPacketCheck: undefined,
@@ -2306,6 +2309,10 @@ export class JobManager {
           let budgetState = job.budget;
           let budgetSizingState = job.budgetSizing;
           let providerTransitionsState = Array.isArray(job.providerTransitions) ? job.providerTransitions : [];
+          // The round's live spend (the durable cost lags one event) and
+          // whether its one automatic turn extension has been decided.
+          let liveCostUsd = job.costUsd || 0;
+          let autoExtensionDecided = false;
           const workerJob =
             job.assertionRepair?.round === (job.rounds || 0) ? { ...job, ownedPaths: job.assertionRepair.paths, extraWritable: [] } : job;
           // limits.timeoutMinutes bounds the worker round from its claim, as the
@@ -2407,7 +2414,7 @@ export class JobManager {
                 Number.isFinite((job.costUsd || 0) + event.costUsd) &&
                 (job.costUsd || 0) + event.costUsd <= MAX_RESULT_COST
               )
-                progress.costUsd = (job.costUsd || 0) + event.costUsd;
+                progress.costUsd = liveCostUsd = (job.costUsd || 0) + event.costUsd;
               // Only the documented pending-request event shape may clear a
               // previous diagnostic. A bare null is not accepted as state,
               // and null itself is never persisted.
@@ -2445,6 +2452,38 @@ export class JobManager {
               // (a poller's proof of life); only a phase change or per-call tool
               // timings rewrite the round's record. The event's phase fields are
               // validated inside the clock, never trusted from the worker.
+              // One bounded extension of an automatically sized Flash cap, taken
+              // when the round is a turn from the cap with most of maxUsd unspent
+              // and in-scope edits to protect. Decided once per round whatever
+              // the outcome, so the in-scope check runs at most once.
+              let autoExtended;
+              if (
+                !autoExtensionDecided &&
+                event?.action === 'provider_request_pending' &&
+                Number.isSafeInteger(event.turn) &&
+                budgetState?.maxTurns != null &&
+                (job.turns || 0) + event.turn >= budgetState.maxTurns - 1 &&
+                workspace &&
+                job.mode !== 'report' &&
+                job.assertionRepair?.round !== (job.rounds || 0)
+              ) {
+                autoExtensionDecided = true;
+                const route = executionRoutes(job.executionProfile)[providerStageState];
+                const turnUsdEstimate = routeTurnUsdEstimate(route);
+                const extension = autoExtendedTurns(budgetSizingState, {
+                  currentMaxTurns: budgetState.maxTurns,
+                  costUsd: liveCostUsd,
+                  maxUsd: budgetState.maxUsd,
+                  turnUsdEstimate,
+                });
+                if (extension && (await this.#roundHasScopedChanges(job, workspace))) {
+                  budgetState = { ...budgetState, maxTurns: extension.maxTurns };
+                  budgetSizingState = extension.budgetSizing;
+                  progress.budget = budgetState;
+                  progress.budgetSizing = budgetSizingState;
+                  autoExtended = extension;
+                }
+              }
               const at = this.#nowMs();
               const transition = clock.observe(event, at);
               progress.activity = clock.activity;
@@ -2465,6 +2504,7 @@ export class JobManager {
               });
               // The worker's credit-fallback callback raises its live turn
               // allowance by exactly what was made durable above.
+              if (autoExtended) return { extraTurns: autoExtended.extraTurns, wrapUp: true };
               return hopExtraTurns > 0 ? { extraTurns: hopExtraTurns } : undefined;
             },
             // Report transcripts can contain bodies returned from untrusted
@@ -2752,6 +2792,42 @@ export class JobManager {
                 } catch (error) {
                   await this.store.update(id, {
                     ...(recoverRetained ? { status: 'FINALIZING', finalStatus: 'VERIFY_FAILED', error: undefined } : {}),
+                    verify: {
+                      command: job.testCommand,
+                      verdict: 'UNVERIFIED',
+                      result: { stderr: `Verifier could not run: ${String(error.message || error).slice(0, 1000)}` },
+                    },
+                  });
+                }
+                await this.store.update(id, stamp('finalize'));
+                job = this.validatePersisted(await this.store.get(id));
+                if (controller.signal.aborted || (await this.store.cancelRequested?.(id)))
+                  job = await this.store.update(id, { finalStatus: 'CANCELLED' });
+                workspaceAfter = await workspace.snapshot({ pin: false });
+                audited = await this.#classifyIsolatedWorkspace(job, workspace, workspaceAfter);
+              }
+              // A round that stopped on a cap never reached the verifier. Its
+              // retained in-scope diff may well be complete, so run the
+              // configured verifier on it for the primary: the job stays BUDGET
+              // and is never integrated automatically, but a passing result
+              // makes a reviewed apply the obvious next step.
+              if (
+                job.finalStatus === 'BUDGET' &&
+                job.testCommand &&
+                !job.verify &&
+                job.sandboxMode !== 'policy-only' &&
+                !controller.signal.aborted &&
+                !leaseLost &&
+                !audited.violations.length &&
+                audited.revertPaths.length
+              ) {
+                job = await this.store.update(id, { workerAfter: workspaceAfter });
+                await this.#pinTrees(job, { before: job.before, workerAfter: workspaceAfter });
+                await this.store.update(id, stamp('verify'));
+                try {
+                  await this._verify(job, { budgetStop: true });
+                } catch (error) {
+                  await this.store.update(id, {
                     verify: {
                       command: job.testCommand,
                       verdict: 'UNVERIFIED',
@@ -3353,7 +3429,26 @@ export class JobManager {
       await this.store.event(id, { type: 'verify-phase', ...event });
     } catch {}
   }
-  async _verify(job, { diagnosticOnly = false, recoverRetained = false, promoteOnPass = false } = {}) {
+  /** Whether the live worktree already holds an in-scope (owned) change this round; false when that cannot be told. */
+  async #roundHasScopedChanges(job, workspace) {
+    try {
+      const { files } = workspace.changes(await workspace.snapshot({ pin: false }));
+      return (files || []).some(
+        (file) => typeof file?.path === 'string' && !file.path.includes('\\') && matchesAny(file.path, job.ownedPaths || []),
+      );
+    } catch {
+      return false;
+    }
+  }
+  /** Repo-relative paths the worker changed so far; undefined when they cannot be known exactly. */
+  #changedPaths(job) {
+    try {
+      if (job.workspacePath && validGitObjectId(job.before) && validGitObjectId(job.workerAfter))
+        return diffTreeFiles(job.repoPath, job.before, job.workerAfter).map((file) => file.path);
+    } catch {}
+    return undefined;
+  }
+  async _verify(job, { diagnosticOnly = false, recoverRetained = false, promoteOnPass = false, budgetStop = false } = {}) {
     // Progress callbacks can durably advance a safety lifecycle while the
     // worker is running.  The object supplied by the caller predates those
     // callbacks, so verification must use the authenticated current record
@@ -3516,10 +3611,14 @@ export class JobManager {
     // A baseline that could not prove "no new failures" is a failure that no
     // repair round can address; ending here spends no further worker budget.
     const baselineInconclusive = verify.baseline?.status === 'inconclusive';
-    const canRepair =
+    // A failure only the primary can fix (the paths are outside the job's
+    // scope) ends the job here: a repair round would spend budget to fail the
+    // same way. Computed only when a repair would otherwise be queued.
+    const repairable =
       !diagnosticOnly &&
       !recoverRetained &&
       !promoteOnPass &&
+      !budgetStop &&
       !continuationBlocker(job) &&
       verify.verdict !== 'PASS' &&
       !environment &&
@@ -3529,6 +3628,20 @@ export class JobManager {
       !baselineInconclusive &&
       sandboxed &&
       (job.rounds || 0) < (job.maxRepairRounds ?? 2);
+    let repairSkipped;
+    if (repairable) {
+      try {
+        repairSkipped = repairOutsideScope({
+          verify,
+          scope: writeScope(job),
+          changed: this.#changedPaths(job),
+          roots: [job.workspacePath, job.repoPath].filter(Boolean),
+        });
+      } catch {
+        repairSkipped = undefined;
+      }
+    }
+    const canRepair = repairable && !repairSkipped;
     const status = sandboxRequirementFailed
       ? 'VERIFY_FAILED'
       : verify.verdict === 'PASS'
@@ -3543,8 +3656,11 @@ export class JobManager {
     const diagnosticFailure = diagnosticOnly || (promoteOnPass && !promoted);
     return this.store.update(job.id, {
       status: 'FINALIZING',
-      finalStatus: diagnosticFailure ? 'FAILED' : status,
+      // A cap stop keeps its BUDGET status: the verifier result is evidence for
+      // the primary (and for continue/apply), never a verdict that ends the job.
+      finalStatus: budgetStop ? 'BUDGET' : diagnosticFailure ? 'FAILED' : status,
       verify,
+      ...(repairSkipped ? { repairSkipped: safeRepairSkipped(repairSkipped) } : {}),
       ...(recoverRetained ? { error: undefined } : {}),
       ...(promoted
         ? promoteOnPass === 'malformed-tool-json'
@@ -3567,7 +3683,7 @@ export class JobManager {
       ...(environmentObservation
         ? { verifyEnvironmentHistory: [...(job.verifyEnvironmentHistory || []), environmentObservation].slice(-16) }
         : {}),
-      ...(!diagnosticFailure && finishRecoveryUnresolved && verify.verdict !== 'PASS'
+      ...(!diagnosticFailure && !budgetStop && finishRecoveryUnresolved && verify.verdict !== 'PASS'
         ? {
             error: cappedFinishRecoveryUnresolved
               ? 'automatic repair suppressed: unresolved capped implementation recovery; start a fresh job'
@@ -3619,6 +3735,7 @@ export class JobManager {
         : {}),
       ...(job.mode !== 'report' ? publicVerifierInterpreter(job) : {}),
       ...(safeVerifyEnvironment(job.verifyEnvironment) ? { verifyEnvironment: safeVerifyEnvironment(job.verifyEnvironment) } : {}),
+      ...(safeRepairSkipped(job.repairSkipped) ? { repairSkipped: safeRepairSkipped(job.repairSkipped) } : {}),
       ...(job.appliedUnverified ? { appliedUnverified: true } : {}),
       ...(publicApplyVerify(job.applyVerify) ? { applyThenVerify: publicApplyVerify(job.applyVerify) } : {}),
       // Cleanup status is operationally significant once a job reaches a

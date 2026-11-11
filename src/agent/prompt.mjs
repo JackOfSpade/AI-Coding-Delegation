@@ -150,8 +150,8 @@ export async function buildSystemPrompt({
     `Network access is ${allowNetwork ? 'permitted for this job only when necessary' : 'not permitted for this job'}. Never commit, push, switch branches, reset, stash, clean, or access secrets.`,
     allowCommand
       ? serverVerifierConfigured
-        ? 'Read files before editing them. Keep changes focused. A focused server verifier is already configured and runs after finish; do not spend turns rediscovering or rerunning it. Use run_command only for an essential diagnostic. When the in-scope implementation is ready, make a separate final response containing only finish.'
-        : 'Read files before editing them. Keep changes focused. Run relevant tests when possible.'
+        ? 'Read files before editing them. Keep changes focused. A focused server verifier is already configured and runs after finish; do not spend turns rediscovering or rerunning it. Use run_command only for narrow, quick checks: one test file or a --test-name-pattern, never the whole suite or the full testCommand, because the server runs the testCommand itself after finish and a long command can stall until its timeout. When the in-scope implementation is ready, make a separate final response containing only finish.'
+        : 'Read files before editing them. Keep changes focused. Run relevant tests when possible, one narrow file or test at a time; do not run a long full suite.'
       : 'Read files before editing them. Keep changes focused. Shell commands are unavailable for this job; report tests that you could not run.',
     `read_file's limit is a byte count of at most ${DEFAULT_READ_CAP} per call (omit it for that default); a call returns at most about ${DEFAULT_OUTPUT_CAP} characters, so page through a large file by continuing at the exact offset N printed after [truncated; next offset N].`,
     WORKER_TEST_QUALITY_RULE,

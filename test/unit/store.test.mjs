@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import * as nodeFs from 'node:fs';
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -1122,3 +1123,54 @@ test('a quarantine tombstone this process left behind does not block later write
     cleanup(gitDir);
   }
 });
+
+test('a denied stat of the filesystem root is tolerated, any other ancestry failure is not', async () => {
+  const { isDeniedRootStat } = await import('../../src/store.mjs');
+  assert.equal(isDeniedRootStat('/', { code: 'EPERM' }), true);
+  assert.equal(isDeniedRootStat('/', { code: 'EACCES' }), true);
+  assert.equal(isDeniedRootStat('/', { code: 'ENOENT' }), false);
+  assert.equal(isDeniedRootStat('/tmp', { code: 'EPERM' }), false);
+  const gitDir = tempDir();
+  try {
+    rmSync(gitDir, { recursive: true });
+    await assert.rejects(() => new JobStore({ gitDir }).init(), /ENOENT|job storage ancestry is invalid/);
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
+test(
+  'JobStore.init succeeds under the worker sandbox profile, which withholds stat of the filesystem root',
+  { skip: process.platform !== 'darwin' && 'macOS sandbox-exec only' },
+  async () => {
+    const { macosProfile, sandboxAvailable, sandboxToolEnv } = await import('../../src/sandbox.mjs');
+    const dir = nodeFs.realpathSync(tempDir());
+    try {
+      mkdirSync(join(dir, 'gitdir'));
+      mkdirSync(join(dir, 'work'));
+      const profile = macosProfile({
+        repoPath: join(dir, 'work'),
+        tempPath: dir,
+        allowTempSockets: true,
+        readablePaths: [nodeFs.realpathSync(fileURLToPath(new URL('../..', import.meta.url)))],
+      });
+      if (!sandboxAvailable('darwin', profile)) return;
+      const storeUrl = new URL('../../src/store.mjs', import.meta.url).href;
+      const script = `import { lstatSync } from 'node:fs'; let denied = false; try { lstatSync('/'); } catch { denied = true; }
+        const { JobStore } = await import(${JSON.stringify(storeUrl)});
+        await new JobStore({ gitDir: ${JSON.stringify(join(dir, 'gitdir'))} }).init();
+        console.log('rootDenied=' + denied);`;
+      writeFileSync(join(dir, 'probe.mjs'), script);
+      const result = spawnSync('/usr/bin/sandbox-exec', ['-p', profile, process.execPath, join(dir, 'probe.mjs')], {
+        cwd: join(dir, 'work'),
+        encoding: 'utf8',
+        env: { PATH: process.env.PATH, HOME: dir, TMPDIR: dir, OPENSSL_CONF: '/dev/null', ...sandboxToolEnv() },
+        timeout: 30_000,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stdout, /rootDenied=true/);
+    } finally {
+      cleanup(dir);
+    }
+  },
+);

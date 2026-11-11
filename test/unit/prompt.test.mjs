@@ -329,3 +329,13 @@ test('every worker prompt and the finish tool forbid adding finish to a parallel
     );
   }
 });
+
+test('worker brief and run_command description steer away from running the whole testCommand', async () => {
+  const configured = await buildSystemPrompt({ ownedPaths: ['src/**'], serverVerifierConfigured: true });
+  assert.match(configured, /server runs the testCommand itself after finish/);
+  assert.match(configured, /never the whole suite or the full testCommand/);
+  const unconfigured = await buildSystemPrompt({ ownedPaths: ['src/**'], serverVerifierConfigured: false });
+  assert.match(unconfigured, /one narrow file or test at a time; do not run a long full suite/);
+  const run = availableToolDefinitions({ allowCommand: true }).find((tool) => tool.function.name === 'run_command');
+  assert.match(run.function.description, /server runs the verifier itself after finish, so do not run the whole suite/);
+});

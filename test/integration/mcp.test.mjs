@@ -91,6 +91,9 @@ test('MCP lists exact tools, initializes, pings and dispatches', async () => {
     malformedToolRecovery: true,
     cancelledRepairApply: true,
     verifiedWithoutFinish: true,
+    repairScopeSkip: true,
+    budgetStopVerify: true,
+    flashTurnExtension: true,
   });
   assert.ok(
     values.some((value) => value.id === null && value.result?.tools),

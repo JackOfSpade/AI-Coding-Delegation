@@ -416,6 +416,46 @@ export function hopRaisedTurns(sizing, { currentMaxTurns, turnMultiplier, maxUsd
   return budgetSizing ? { maxTurns, extraTurns: maxTurns - currentMaxTurns, budgetSizing } : undefined;
 }
 
+/** Share of maxUsd that may be spent for the server to still treat the budget as mostly unspent. */
+export const AUTO_EXTEND_MAX_SPENT_FRACTION = 0.5;
+/** The one automatic extension is at most this share of the current turn cap. */
+export const AUTO_EXTEND_CAP_FRACTION = 0.5;
+/**
+ * One bounded automatic turn extension for an automatically sized cap that is
+ * about to stop a job with most of its USD budget unspent. Only a route with a
+ * per-turn USD estimate (DeepSeek Flash) qualifies, never a caller-fixed cap,
+ * never past maxUsd, and never above the automatic ceilings. Undefined when any
+ * condition fails. The caller grants it at most once per round.
+ */
+export function autoExtendedTurns(sizing, { currentMaxTurns, costUsd, maxUsd, turnUsdEstimate } = {}) {
+  const stored = safeBudgetSizing(sizing);
+  if (!stored || stored.turnPolicy !== 'auto' || !Number.isSafeInteger(currentMaxTurns)) return undefined;
+  if ((stored.initialTurnsSource ?? stored.turnsSource) === 'caller') return undefined;
+  if (!(Number.isFinite(turnUsdEstimate) && turnUsdEstimate > 0) || !(Number.isFinite(maxUsd) && maxUsd > 0)) return undefined;
+  if (!Number.isFinite(costUsd) || costUsd < 0 || costUsd >= maxUsd * AUTO_EXTEND_MAX_SPENT_FRACTION) return undefined;
+  const room = autoTurnCeiling({ maxUsd, turnUsdEstimate }) - currentMaxTurns;
+  const affordable = Math.floor((maxUsd - costUsd) / turnUsdEstimate);
+  const extraTurns = Math.min(Math.floor(currentMaxTurns * AUTO_EXTEND_CAP_FRACTION), affordable, room, MAX_SAFE_TURNS - currentMaxTurns);
+  if (!(extraTurns >= 1)) return undefined;
+  const maxTurns = currentMaxTurns + extraTurns;
+  const budgetSizing = safeBudgetSizing({
+    ...stored,
+    maxTurns,
+    turnsSource: 'raised',
+    autoExtended: {
+      extraTurns,
+      fromMaxTurns: currentMaxTurns,
+      toMaxTurns: maxTurns,
+      spentUsd: Math.round(costUsd * 1e6) / 1e6,
+      maxUsd,
+    },
+    warnings: [
+      `turn cap auto-extended once by ${extraTurns} (${currentMaxTurns} -> ${maxTurns}) near the cap with $${costUsd.toFixed(2)} of $${maxUsd.toFixed(2)} spent; the worker was told to wrap up and call finish. maxUsd stays the ceiling.`,
+    ],
+  });
+  return budgetSizing ? { maxTurns, extraTurns, budgetSizing } : undefined;
+}
+
 /** The persisted/echoed record for one job: arithmetic and sanitized file names only. */
 export function buildBudgetSizing({ resolved, recommendation, files = [], readChars, retentionChars }) {
   return safeBudgetSizing({
@@ -480,6 +520,21 @@ const cleanString = (value, max) =>
     ? value
     : undefined;
 
+function safeAutoExtended(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const extraTurns = boundedInteger(value.extraTurns, MAX_SAFE_TURNS),
+    fromMaxTurns = boundedInteger(value.fromMaxTurns, MAX_SAFE_TURNS),
+    toMaxTurns = boundedInteger(value.toMaxTurns, MAX_SAFE_TURNS);
+  if (!extraTurns || !fromMaxTurns || !toMaxTurns) return undefined;
+  const usd = (n) => (Number.isFinite(n) && n >= 0 && n <= 10_000 ? n : undefined);
+  return {
+    extraTurns,
+    fromMaxTurns,
+    toMaxTurns,
+    ...(usd(value.spentUsd) !== undefined ? { spentUsd: value.spentUsd } : {}),
+    ...(usd(value.maxUsd) !== undefined ? { maxUsd: value.maxUsd } : {}),
+  };
+}
 /**
  * Allowlist and bound every field of a stored or about-to-be-stored sizing
  * record. It is attached to public job views, so anything unexpected is
@@ -520,6 +575,7 @@ export function safeBudgetSizing(value) {
     turnsSource: value.turnsSource,
     ...(initialTurnsSource ? { initialTurnsSource } : {}),
     turnPolicy: value.turnPolicy,
+    ...(safeAutoExtended(value.autoExtended) ? { autoExtended: safeAutoExtended(value.autoExtended) } : {}),
     ...optional('timeoutMinutes', 1440),
     ...optional('recommendedTurns', MAX_SAFE_RECOMMENDATION),
     ...(boundedInteger(value.turnMultiplier, MAX_TURN_MULTIPLIER) > 1 ? { turnMultiplier: value.turnMultiplier } : {}),

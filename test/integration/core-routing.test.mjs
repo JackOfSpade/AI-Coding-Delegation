@@ -1294,6 +1294,9 @@ test('a no-id server listing does not bind its incidental cwd as a repository', 
     malformedToolRecovery: true,
     cancelledRepairApply: true,
     verifiedWithoutFinish: true,
+    repairScopeSkip: true,
+    budgetStopVerify: true,
+    flashTurnExtension: true,
   });
   assert.match(result.health.server.buildHash, /^sha256:[0-9a-f]{64}$/);
   assert.match(result.health.server.skillHash, /^sha256:[0-9a-f]{64}$/);
@@ -3167,7 +3170,10 @@ async function routedCore(path, { line = 'sonnet', behave, models = OPENAI_MODEL
       assertOpenAIResponsesWire(body);
     }
     // The durable stage is read back from the sealed record at spend time.
-    while (!holder.id) await new Promise((resolve) => setTimeout(resolve, 5));
+    for (const deadline = Date.now() + 30_000; !holder.id;) {
+      assert.ok(Date.now() < deadline, 'the job id was never recorded');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
     const stored = await holder.core.manager.store.get(holder.id);
     calls.push({ host, body, stage: stored.providerStage, creditFallback: stored.creditFallback });
     return behave(host, calls.filter((call) => call.host === host).length, body);

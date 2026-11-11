@@ -349,7 +349,9 @@ function assertSafeGitAncestry(path, platform) {
     let details;
     try {
       details = lstatSync(current);
-    } catch {
+    } catch (error) {
+      // The filesystem root is the trust anchor; a sandbox may deny stat of `/`.
+      if (dirname(current) === current && (error?.code === 'EPERM' || error?.code === 'EACCES')) return;
       throw new LeaseError('lease storage ancestry is invalid', 'E_LEASE_STORAGE');
     }
     if (

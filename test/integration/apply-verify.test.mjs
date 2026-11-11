@@ -181,8 +181,10 @@ test('a BUDGET write job with a focused verifier can use applyThenVerify instead
     options: { workerStatus: () => 'BUDGET' },
     run: async (h) => {
       const before = await readReport(h);
-      assert.match(before, /configured verifier: not run because the worker reached its cap before finish/);
-      assert.match(before, /use applyThenVerify with the same focused check/);
+      // A cap stop still runs the configured verifier on the retained diff; its result is evidence, not a verdict.
+      assert.match(before, /verify: `npm test` FAIL/);
+      assert.doesNotMatch(before, /configured verifier: not run/);
+      assert.match(before, /use offload_apply[\s\S]*applyThenVerify/);
 
       const result = await h.manager.apply(h.id, via());
       assert.equal(result.applied, true);

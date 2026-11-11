@@ -108,6 +108,25 @@ export const REPAIR_FIXTURE_NOTE =
 /** The task text of a repair round: the defects, then the standing fixture note. */
 export const repairBrief = (defects) =>
   `Repair these concrete defects:\n${(defects?.length ? defects : ['Continue the job and re-check the acceptance criteria.']).map((x) => `- ${x}`).join('\n')}\n\n${REPAIR_FIXTURE_NOTE}`;
+/** The fixed notice a worker gets when the server extends its turn cap once: finish, do not start new work. */
+export const autoExtensionNotice = (extraTurns, serverVerifier) =>
+  `Server notice: your turn allowance was extended by ${extraTurns} turns because most of the USD budget is unspent. This is the only extension. Wrap up now: finish any edit in progress, make sure your in-scope changes are complete, and call finish${serverVerifier ? ' (the server runs the configured verifier after you finish)' : ''}. Do not start new work.`;
+/**
+ * Wrap a worker's progress callback so a one-time turn extension the manager
+ * made durable is applied to the live loop and announced to the worker. The
+ * notice is queued after the event's own request was built, so the worker reads
+ * it on its next turn.
+ */
+export const withAutoExtension = (progress, getLoop, context, serverVerifier) => async (event) => {
+  const raised = await progress(event);
+  const loop = getLoop();
+  if (loop && raised?.wrapUp === true && Number.isSafeInteger(raised.extraTurns) && raised.extraTurns > 0 && raised.extraTurns <= 1000) {
+    loop.extendTurns(raised.extraTurns);
+    context.add({ role: 'user', content: autoExtensionNotice(raised.extraTurns, serverVerifier) });
+    await context.flush();
+  }
+  return raised;
+};
 const parentHandoff = (job) => job?.status === 'QUEUED' && job.handoffState === 'PARENT_QUEUED';
 const handoffIdentity = (job) => ({
   status: job?.status,
@@ -593,7 +612,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
           maxUsd: remainingUsd,
           now: nowMs,
           signal: api.signal,
-          progress: api.progress,
+          progress: withAutoExtension(api.progress, () => loop, context, serverVerifierConfigured),
           persistCappedFinishRecovery: api.progress,
           persistBudgetFinishRecovery: api.progress,
           cappedFinishRecovery: job.cappedFinishRecovery,
