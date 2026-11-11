@@ -387,6 +387,25 @@ function codeMask(text, python) {
   }
   return (index) => !skip[index];
 }
+
+/** The codeMask test above plus module scope: a call outside any function or
+ * callback runs whenever the file is imported, whatever a runner selects. */
+function sourceScopes(text, python) {
+  const inCode = codeMask(text, python);
+  const depth = new Int32Array(text.length + 1);
+  for (let i = 0, level = 0; i < text.length; i++) {
+    depth[i] = level;
+    if (!inCode(i)) continue;
+    if ('([{'.includes(text[i])) level++;
+    else if (')]}'.includes(text[i])) level = Math.max(0, level - 1);
+  }
+  const atModuleScope = (index) =>
+    python ? !/[ \t]/.test(text[text.lastIndexOf('\n', index - 1) + 1] ?? '') && depth[index] === 0 : depth[index] === 0;
+  return { inCode, atModuleScope };
+}
+// A listener call: only where it is code does it open a socket.
+const LISTENER_CALL =
+  /\b(?:createServer|createSecureServer)\s*\(|\b(?:app|server|srv|httpServer|httpsServer|fastify)\.listen\s*\(|\bHTTPServer\s*\(|\bsocket\.bind\s*\(/;
 const UNCERTAIN_WRITE = 'write-target-unresolved';
 const globLiteral = (path) => !/[*?[\]{}]/.test(path);
 
@@ -472,18 +491,11 @@ function writeFindings(text, file, { repoPath, writeScope }) {
     }
     return findings;
   }
-  const inCode = codeMask(text, file.endsWith('.py'));
   // A write at module scope runs whenever the file is imported, whatever a
   // runner then selects; one inside a function or callback runs only if called.
-  const depth = new Int32Array(text.length + 1);
-  for (let i = 0, level = 0; i < text.length; i++) {
-    depth[i] = level;
-    if (!inCode(i)) continue;
-    if ('([{'.includes(text[i])) level++;
-    else if (')]}'.includes(text[i])) level = Math.max(0, level - 1);
-  }
-  atModuleScope = (index) =>
-    file.endsWith('.py') ? !/[ \t]/.test(text[text.lastIndexOf('\n', index - 1) + 1] ?? '') && depth[index] === 0 : depth[index] === 0;
+  const source = sourceScopes(text, file.endsWith('.py'));
+  const { inCode } = source;
+  atModuleScope = source.atModuleScope;
   const context = (index) => ({ file, text, at: index, inCode });
   const calls = (pattern) => [...text.matchAll(pattern)].filter((match) => inCode(match.index));
   if (file.endsWith('.py')) {
@@ -515,11 +527,27 @@ function writeFindings(text, file, { repoPath, writeScope }) {
   return findings;
 }
 
+/**
+ * The first listener call that is code, not a mention in a fixture's string
+ * literal, comment or regex. One per file, naming its line; module scope is
+ * preferred and recorded non-enumerably, like a write finding.
+ */
+function listenerFindings(text, file) {
+  const { inCode, atModuleScope } = sourceScopes(text, file.endsWith('.py'));
+  const calls = [...text.matchAll(new RegExp(LISTENER_CALL, 'g'))].filter((match) => inCode(match.index));
+  const match = calls.find((call) => atModuleScope(call.index)) ?? calls[0];
+  if (!match) return undefined;
+  const finding = { code: 'loopback-listen', path: file, line: lineOf(text, match.index) };
+  // Not serialized: only runner scoping reads it.
+  if (atModuleScope(match.index)) Object.defineProperty(finding, 'moduleScope', { value: true });
+  return finding;
+}
+
 /** Never executes repository code or widens verifier permissions. Follows
  * literal command paths, package scripts and local imports; dynamic imports,
  * runner config and external packages require a real primary check. Returns
  * the public result plus the import graph and command words narrowing needs. */
-function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedPaths }) {
+function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedPaths, loopbackDenied = false }) {
   const policy = new PathPolicy({ repoPath, ownedPaths: [], denyRead });
   const candidates = [];
   let entries = 0,
@@ -596,12 +624,7 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedP
       warn('native-import', path);
     // A test that opens a TCP listener: the verifier sandbox denies bind unless
     // verifier.allowLoopback is on, and under Node the EPERM can abort the run.
-    if (
-      /\b(?:createServer|createSecureServer)\s*\(|\b(?:app|server|srv|httpServer|httpsServer|fastify)\.listen\s*\(|\bHTTPServer\s*\(|\bsocket\.bind\s*\(/.test(
-        text,
-      )
-    )
-      warn('loopback-listen', path);
+    if (LISTENER_CALL.test(text)) warn('loopback-listen', path);
     if (/(?:^|[\s'"`=])\/(?:private\/)?(?:tmp(?:\/|\b)|var\/folders(?:\/|\b))/m.test(text)) warn('system-temp', path);
     if (/\bchild_process\b|\b(?:execFile(?:Sync)?|spawn(?:Sync)?)\s*\(|\bsubprocess\b|\bos\.(?:system|popen)\s*\(/.test(text))
       warn('child-process', path);
@@ -728,6 +751,8 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedP
   command(testCommand);
   const resolvedFiles = new Set();
   const cache = new Map();
+  // The listener call in code each read file has, if any (a raw-text mention is only a warning).
+  const listeners = new Map();
   let commandBytes = 0;
   for (let index = 0; urgent.length || index < queue.length;) {
     if (resolvedFiles.size >= MAX_FILES || bytes >= MAX_BYTES) {
@@ -746,6 +771,8 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedP
     // Only test code is weighed; data and fixture files a named directory holds are not.
     if (!resolvedFiles.has(path) && named.has(path) && TEST_CODE.test(path)) commandBytes += Buffer.byteLength(text);
     if (!resolvedFiles.has(path) && TEST_CODE.test(path)) block(writeFindings(text, path, { repoPath: policy.repoPath, writeScope }));
+    // Every file, helpers included: a listener they import runs too.
+    if (!listeners.has(path)) listeners.set(path, listenerFindings(text, path));
     resolvedFiles.add(path);
     inspect(text, path);
     references(text, path, argv);
@@ -838,6 +865,34 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedP
     if (missing.length) missingArguments.push({ runner: path, files: missing.sort().slice(0, MAX_FINDINGS), scoped: scope.length > 0 });
     return scope;
   });
+  // A warning names the suites the command runs that reach it, like blocking findings do.
+  function warningTestFiles(path) {
+    if (path === 'testCommand') return [];
+    const bySuite = [...selectedSuites].filter((suite) => reachable(suite).has(path)).sort();
+    const testFiles = bySuite.length ? bySuite : testFilesFor(path);
+    return testFiles.length && !(testFiles.length === 1 && testFiles[0] === path) ? testFiles.slice(0, 8) : [];
+  }
+  // A listener the sandbox would deny bind on is a blocker once a suite the
+  // command names runs it. Done before the runner scoping below, so a listener
+  // only an unselected runner suite runs is demoted like any other finding
+  // outside the suites that runner was given as arguments.
+  if (loopbackDenied) {
+    const promoted = warnings.filter(
+      (warning) =>
+        warning.code === 'loopback-listen' &&
+        warning.path !== 'testCommand' &&
+        listeners.get(warning.path) &&
+        (warningTestFiles(warning.path).length > 0 || (named.has(warning.path) && TEST_CODE.test(warning.path))),
+    );
+    for (const warning of promoted) {
+      const finding = listeners.get(warning.path);
+      const testFiles = warningTestFiles(warning.path);
+      if (testFiles.length) finding.testFiles = testFiles;
+      // The finding itself, so a non-enumerable moduleScope survives: runner scoping reads it.
+      blocking.push(finding);
+    }
+    if (promoted.length) warnings.splice(0, warnings.length, ...warnings.filter((warning) => !promoted.includes(warning)));
+  }
   // Not certain to be denied, so never refused; scoping treats them like the rest.
   let uncertain = uncertainFound;
   let advisory = [];
@@ -861,6 +916,11 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedP
     const before = warnings.length;
     warnings.splice(0, warnings.length, ...warnings.filter((warning) => warning.path === 'testCommand' || !unselected(warning.path)));
     scopedWarnings = before - warnings.length;
+  }
+  // Every warning names the test files the command runs that reach it.
+  for (const warning of warnings) {
+    const testFiles = warningTestFiles(warning.path);
+    if (testFiles.length) warning.testFiles = testFiles;
   }
   blocking.splice(MAX_FINDINGS);
   for (const finding of [...blocking, ...uncertain]) {
@@ -898,10 +958,12 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedP
 
 /** The public static preflight of a testCommand (undefined without one). Pass
  * the job's write scope (ownedPaths + extraWritable) to get `blocking` findings:
- * writes the verifier sandbox is certain to deny. */
-export function preflightVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedPaths }) {
+ * writes the verifier sandbox is certain to deny. `loopbackDenied` (the sandbox
+ * denies bind, because verifier.allowLoopback is off) adds a listener a named
+ * suite reaches to `blocking` as well. */
+export function preflightVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedPaths, loopbackDenied = false }) {
   if (!testCommand) return undefined;
-  return scanVerifier({ repoPath, testCommand, denyRead, writeScope, ownedPaths }).result;
+  return scanVerifier({ repoPath, testCommand, denyRead, writeScope, ownedPaths, loopbackDenied }).result;
 }
 
 const shellWord = (value) => (/^[\w./@+=:,%-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`);
@@ -1044,17 +1106,21 @@ const BLOCKING_ADVICE = {
   'system-temp-write': 'the verifier can write only its per-run TMPDIR; create it under os.tmpdir() / tempfile without dir=',
   'temp-outside-scope':
     'the verifier can write only ownedPaths, extraWritable and its per-run TMPDIR; create it under os.tmpdir(), or declare it in extraWritable (never integrated)',
+  'loopback-listen':
+    'the verifier sandbox denies bind unless verifier.allowLoopback is enabled, so the run is certain to end VERIFY_ENV_FAILED (loopback-denied); drop the suite from testCommand and run it in the primary, enable verifier.allowLoopback, or pass acceptVerifierBlockers: true',
 };
 /** One line per blocking finding: file:line, the resolved target and the fix. */
 function verifierBlockingLines(value, { limit = MAX_FINDINGS } = {}) {
   if (!Array.isArray(value?.blocking)) return [];
   const shown = value.blocking.filter((finding) => BLOCKING_ADVICE[finding?.code] && typeof finding.path === 'string');
-  const lines = shown
-    .slice(0, limit)
-    .map(
-      (finding) =>
-        `verifier blocker: ${finding.path}${Number.isInteger(finding.line) ? `:${finding.line}` : ''}: ${finding.call || 'write'} ${finding.target} — ${BLOCKING_ADVICE[finding.code]}${finding.extraWritable ? ` (extraWritable: "${finding.extraWritable}")` : ''}${finding.testFiles?.length ? `; run by ${finding.testFiles.join(', ')}` : ''}`,
-    );
+  const lines = shown.slice(0, limit).map((finding) => {
+    const place = `${finding.path}${Number.isInteger(finding.line) ? `:${finding.line}` : ''}`;
+    const runBy = finding.testFiles?.length ? `; run by ${finding.testFiles.join(', ')}` : '';
+    // A listener finding has no write target, only the line that opens it.
+    if (finding.code === 'loopback-listen')
+      return `verifier blocker: ${place}: opens a TCP listener (createServer / server.listen)${runBy} — ${BLOCKING_ADVICE[finding.code]}`;
+    return `verifier blocker: ${place}: ${finding.call || 'write'} ${finding.target} — ${BLOCKING_ADVICE[finding.code]}${finding.extraWritable ? ` (extraWritable: "${finding.extraWritable}")` : ''}${runBy}`;
+  });
   return shown.length > lines.length
     ? [...lines, `verifier blocker: ${shown.length - lines.length} more (detail "full" lists them)`]
     : lines;
@@ -1067,7 +1133,7 @@ function verifierAdvisoryLines(value, { limit = MAX_FINDINGS } = {}) {
   if (!files.length) return [];
   const runner = value.advisory[0].runner;
   return [
-    `verifier advisory: ${total} denied-write finding(s) in ${files.length === 1 ? files[0] : `${files.length} suites (${files.slice(0, limit).join(', ')}${files.length > limit ? ', …' : ''})`}, which ${runner || 'the runner'} imports but was not given as an argument; not refused (they fail the run only if the runner ignores its file arguments)`,
+    `verifier advisory: ${total} denied finding(s) in ${files.length === 1 ? files[0] : `${files.length} suites (${files.slice(0, limit).join(', ')}${files.length > limit ? ', …' : ''})`}, which ${runner || 'the runner'} imports but was not given as an argument; not refused (they fail the run only if the runner ignores its file arguments)`,
   ];
 }
 /** Writes whose target the scan could not place: reported, never refused. */
@@ -1152,7 +1218,7 @@ export function verifierPreflightLines(value, { lean = false } = {}) {
     ...value.warnings
       .filter((w) => advice[w?.code] && typeof w.path === 'string')
       .slice(0, limit)
-      .map((w) => `verifier warning: ${w.path}: ${advice[w.code]}`),
+      .map((w) => `verifier warning: ${w.path}: ${advice[w.code]}${w.testFiles?.length ? `; reached by ${w.testFiles.join(', ')}` : ''}`),
     lean && value.warnings.length > limit && `verifier warning: ${value.warnings.length - limit} more (detail "full" lists them)`,
   ].filter(Boolean);
 }
@@ -1179,7 +1245,12 @@ export function compactVerifierPreflight(value) {
     ...list('blocking').map((finding) => ({ severity: 'blocking', ...findingView(finding) })),
     ...list('advisory').map((finding) => ({ severity: 'advisory', ...findingView(finding) })),
     ...list('uncertain').map((finding) => ({ severity: 'uncertain', ...findingView(finding) })),
-    ...list('warnings').map(({ code, path }) => ({ severity: 'warning', code, path })),
+    ...list('warnings').map(({ code, path, testFiles }) => ({
+      severity: 'warning',
+      code,
+      path,
+      ...(Array.isArray(testFiles) && testFiles.length ? { testFiles: testFiles.slice(0, 8) } : {}),
+    })),
   ];
   return {
     ...(value.status ? { status: value.status } : {}),

@@ -1418,6 +1418,80 @@ test('a blocking verifier finding refuses the start before any job or spend, unl
   }
 });
 
+test('a loopback listener a named suite reaches refuses the start unless the verifier may bind or the caller accepts it', async () => {
+  const h = await harness({
+    worker: async (job) => {
+      writeSrc(job, 'a.js', A_BYTES);
+      return { status: 'DONE', turns: 1 };
+    },
+  });
+  try {
+    write(
+      join(h.repo, 'test/helpers/server.mjs'),
+      "import { createServer } from 'node:http';\nexport const server = createServer(() => {}).listen(0, '127.0.0.1');\n",
+    );
+    write(join(h.repo, 'test/env.test.mjs'), "import { server } from './helpers/server.mjs';\nserver.close();\n");
+    write(join(h.repo, 'test/pure.test.mjs'), 'export {};\n');
+    const testCommand = 'node --test test/env.test.mjs test/pure.test.mjs';
+    const before = (await h.store.list({ limit: 100 })).length;
+    await assert.rejects(
+      () => h.manager.start({ repoPath: h.repo, task: 'w', ownedPaths: ['src/**'], testCommand }, { launch: false }),
+      (error) => {
+        assert.match(error.message, /verifier preflight refused the start/);
+        assert.match(error.message, /verifier blocker: test\/helpers\/server\.mjs:2: opens a TCP listener .*run by test\/env\.test\.mjs/);
+        assert.match(error.message, /verifier\.allowLoopback/);
+        assert.match(error.message, /drop test\/env\.test\.mjs from testCommand: `node --test test\/pure\.test\.mjs`/);
+        return true;
+      },
+    );
+    assert.equal((await h.store.list({ limit: 100 })).length, before, 'no job record exists');
+    assert.equal(h.counters.runs, 0);
+    const accepted = await h.manager.start(
+      { repoPath: h.repo, task: 'w', ownedPaths: ['src/**'], testCommand, acceptVerifierBlockers: true },
+      { launch: false },
+    );
+    assert.equal(accepted.verifierPreflight.blockersAccepted, true);
+    assert.equal(accepted.verifierPreflight.status, 'blocking');
+    assert.match(
+      (await h.manager.job(accepted.jobId)).report,
+      /verifier blocker: test\/helpers\/server\.mjs:2: opens a TCP listener .*run by test\/env\.test\.mjs/,
+    );
+    await h.manager.cancel(accepted.jobId);
+    // With verifier.allowLoopback set, the sandbox may bind: the listener is only a warning.
+    const allowed = await h.manager.start(
+      { repoPath: h.repo, task: 'w', ownedPaths: ['src/**'], testCommand, verifierLoopback: true },
+      { launch: false },
+    );
+    assert.equal(allowed.verifierPreflight.status, 'warning');
+    assert.equal(allowed.verifierPreflight.counts.blocking, 0);
+    assert.deepEqual(allowed.verifierPreflight.findings, [
+      { severity: 'warning', code: 'loopback-listen', path: 'test/helpers/server.mjs', testFiles: ['test/env.test.mjs'] },
+    ]);
+    assert.match(
+      (await h.manager.job(allowed.jobId)).report,
+      /verifier warning: test\/helpers\/server\.mjs: .*reached by test\/env\.test\.mjs/,
+    );
+    await h.manager.cancel(allowed.jobId);
+    // A warning that is not a certain failure is never refused, but it still narrows the start echo.
+    write(
+      join(h.repo, 'test/helpers/child.mjs'),
+      "import { execFile } from 'node:child_process';\nexport const ps = () => execFile('ps', ['-p', '1']);\n",
+    );
+    write(join(h.repo, 'test/child.test.mjs'), "import { ps } from './helpers/child.mjs';\nps();\n");
+    const warned = await h.manager.start(
+      { repoPath: h.repo, task: 'w', ownedPaths: ['src/**'], testCommand: 'node --test test/child.test.mjs test/pure.test.mjs' },
+      { launch: false },
+    );
+    assert.equal(warned.verifierPreflight.status, 'warning');
+    assert.equal(warned.verifierPreflight.counts.blocking, 0);
+    assert.deepEqual(warned.verifierPreflight.drop, ['test/child.test.mjs']);
+    assert.equal(warned.verifierPreflight.suggestedTestCommand, 'node --test test/pure.test.mjs');
+    await h.manager.cancel(warned.jobId);
+  } finally {
+    cleanup(h.repo);
+  }
+});
+
 test('a job with more than 128 changed files, dot paths among them, can be applied and reverted', async () => {
   const names = [...Array.from({ length: 139 }, (_, index) => `src/many/f${index}.js`), '.github/dependabot.yml'];
   const h = await harness({

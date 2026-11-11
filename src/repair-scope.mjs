@@ -16,6 +16,16 @@ export const PLUGIN_VERSION_MARKER = 'run npm run plugin:version';
 export const PLUGIN_VERSION_COMMAND = 'npm run plugin:version';
 export const PLUGIN_MANIFESTS = Object.freeze(['plugins/offload/plugin.json', 'plugins/offload/.codex-plugin/plugin.json']);
 
+export const SKILL_FILES = Object.freeze([
+  'plugins/offload/skills/offload_economy/SKILL.md',
+  'plugins/offload/skills/offload_premium/SKILL.md',
+]);
+const SKILL_SYNC_MARKER = 'edit both SKILL.md bodies together';
+// Only failures the skill text alone can fix. "the skill gates on X, which the server does not
+// report" and "the skill pins the revision" can come from a server-side change the worker can undo.
+const SKILL_NAME_MARKERS = [/the skill never mentions capability ([\w.-]+)/g, /the skill never mentions (?!capability\b)([\w.-]+)/g];
+const SKILL_PLAIN_MARKERS = [SKILL_SYNC_MARKER];
+
 const MAX_OUTPUT = 128 * 1024;
 const MAX_TEST_FILE_BYTES = 512 * 1024;
 const MAX_PATHS = 8;
@@ -149,6 +159,44 @@ function failingTestFiles(text, referenced) {
   return [...files];
 }
 
+/** The failure blocks of node:test ("failing tests:") or TAP ("not ok") output; undefined when neither is recognizable. */
+function failureBlocks(text) {
+  const at = text.indexOf('failing tests:');
+  if (at >= 0)
+    return text
+      .slice(at)
+      .split(/^test at /m)
+      .slice(1);
+  if (/^not ok /m.test(text)) return text.split(/^not ok /m).slice(1);
+  return undefined;
+}
+
+/**
+ * A verifier that fails only on the skill-text checks: each failing test
+ * carries one of their assertion messages. Returns `{ names, version }` or
+ * undefined when anything is unclear.
+ */
+function skillTextFailures(text) {
+  const blocks = failureBlocks(text);
+  if (!blocks?.length) return undefined;
+  const reported = text.match(/^\s*(?:ℹ|#)\s*fail\s+(\d+)\s*$/m);
+  if (reported && Number(reported[1]) !== blocks.length) return undefined;
+  const names = [];
+  let skill = 0;
+  let version = false;
+  for (const block of blocks) {
+    const found = SKILL_NAME_MARKERS.flatMap((marker) => [...block.matchAll(marker)].map((match) => match[1]));
+    const marked = found.length > 0 || SKILL_PLAIN_MARKERS.some((marker) => block.includes(marker));
+    if (marked) {
+      skill += 1;
+      names.push(...found);
+    } else if (block.includes(PLUGIN_VERSION_MARKER)) version = true;
+    else return undefined;
+  }
+  if (!skill) return undefined;
+  return { names: [...new Set(names)].slice(0, MAX_PATHS), version };
+}
+
 /**
  * Decide whether a failed verifier run is fixable only outside the job's
  * writable scope. Returns `{ reason, paths, command? }` or undefined.
@@ -171,6 +219,18 @@ export function repairOutsideScope({ verify, scope, changed, roots = [] } = {}) 
   const absoluteRoots = [
     ...new Set(roots.filter((root) => typeof root === 'string' && root).flatMap((root) => [root, safeRealpath(root)])),
   ];
+  // Skill text is only fixable in the SKILL.md files; a test the job owns must not be edited to pass.
+  const skillText = skillTextFailures(text);
+  if (skillText && !SKILL_FILES.some((path) => inside(scope, path))) {
+    const manifestsOutside = PLUGIN_MANIFESTS.every((path) => !inside(scope, path));
+    if (!skillText.version || manifestsOutside)
+      return {
+        reason: 'skill-text',
+        paths: [...SKILL_FILES],
+        missing: skillText.names,
+        ...(skillText.version ? { command: PLUGIN_VERSION_COMMAND } : {}),
+      };
+  }
   const referenced = referencedPaths(text, absoluteRoots);
   if (!referenced) return undefined;
   // The worker can still change any in-scope file the failure points at.
@@ -208,19 +268,29 @@ export function repairSkippedLine(skipped) {
     return `automatic repair skipped: the verifier fails only on the plugin content version, which the worker cannot change (${list || 'plugin manifests'} are outside its scope). The primary must fix it: run \`${PLUGIN_VERSION_COMMAND}\` in the primary after applying, then re-run the check.`;
   if (skipped.reason === 'tests-outside-scope')
     return `automatic repair skipped: every failing test file (${list}) is outside the job's writable scope and none of the job's changes is a test or is named by those tests, so no worker round can fix it. The primary must fix or triage it, then apply after its own check.`;
+  if (skipped.reason === 'skill-text') {
+    const missing = (Array.isArray(skipped.missing) ? skipped.missing : []).filter((name) => typeof name === 'string').slice(0, MAX_PATHS);
+    const files = SKILL_FILES.join(' and ');
+    const what = missing.length ? ` (${missing.join(', ')})` : '';
+    return `automatic repair skipped: the verifier fails only on skill-text checks${what}, which only ${files} can fix, and they are outside the job's writable scope. The primary must edit both SKILL.md bodies identically, run \`${PLUGIN_VERSION_COMMAND}\`, then apply after its own check.`;
+  }
   return '';
 }
 
-const SKIP_REASONS = new Set(['plugin-content-version', 'tests-outside-scope']);
+const SKIP_REASONS = new Set(['plugin-content-version', 'tests-outside-scope', 'skill-text']);
 /** The persisted/public shape: a closed reason, bounded repo-relative paths and the fixed command. */
 export function safeRepairSkipped(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !SKIP_REASONS.has(value.reason)) return undefined;
   const paths = (Array.isArray(value.paths) ? value.paths : [])
     .filter((path) => typeof path === 'string' && path.length > 0 && path.length <= 1024 && !/[\0-\x1f\x7f]/.test(path))
     .slice(0, MAX_PATHS);
+  const missing = (Array.isArray(value.missing) ? value.missing : [])
+    .filter((name) => typeof name === 'string' && /^[\w.-]{1,128}$/.test(name))
+    .slice(0, MAX_PATHS);
   return {
     reason: value.reason,
     paths,
-    ...(value.reason === 'plugin-content-version' ? { command: PLUGIN_VERSION_COMMAND } : {}),
+    ...(value.reason === 'skill-text' ? { missing } : {}),
+    ...(value.reason === 'plugin-content-version' || value.reason === 'skill-text' ? { command: PLUGIN_VERSION_COMMAND } : {}),
   };
 }

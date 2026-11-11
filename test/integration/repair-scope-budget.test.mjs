@@ -87,6 +87,53 @@ test('a verifier failure only the primary can fix ends VERIFY_FAILED without an 
   }
 });
 
+test('a skill-text-only verifier failure ends VERIFY_FAILED without a repair round and names both skill files', async () => {
+  const repo = makeRepo();
+  try {
+    let rounds = 0;
+    const m = await isolatedManager(repo, {
+      worker: {
+        run: async (job) => {
+          rounds += 1;
+          write(join(job.workspacePath, 'src', 'worker.txt'), `round ${rounds}\n`);
+          return { status: 'DONE' };
+        },
+      },
+      verify: async (_command, options) => {
+        const url = pathToFileURL(join(options.cwd, 'test/integration/mcp.test.mjs')).href;
+        return {
+          verdict: 'FAIL',
+          result: {
+            code: 1,
+            sandbox: 'macos',
+            stdout: `✖ failing tests:\n\ntest at ${url}:1578:1\n✖ the skill names exactly the capabilities (33.7ms)\n  AssertionError [ERR_ASSERTION]: the skill never mentions capability loopbackPreflightBlocking\n      at TestContext.<anonymous> (${url}:1610:12)\n\nℹ fail 1\n`,
+          },
+        };
+      },
+    });
+    const started = await m.start({
+      task: 'x',
+      ownedPaths: ['src/**', 'test/integration/mcp.test.mjs'],
+      repoPath: repo,
+      testCommand: 'verify',
+      maxRepairRounds: 1,
+    });
+    const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
+    assert.equal(done.status, 'VERIFY_FAILED');
+    assert.equal(rounds, 1, 'no repair round');
+    const stored = await m.store.get(started.jobId);
+    assert.equal(stored.repairSkipped.reason, 'skill-text');
+    assert.deepEqual(stored.repairSkipped.missing, ['loopbackPreflightBlocking']);
+    for (const detail of ['compact', 'full']) {
+      const report = (await m.job(started.jobId, { detail })).report;
+      assert.match(report, /automatic repair skipped: the verifier fails only on skill-text checks \(loopbackPreflightBlocking\)/);
+      assert.match(report, /plugins\/offload\/skills\/offload_economy\/SKILL\.md and plugins\/offload\/skills\/offload_premium\/SKILL\.md/);
+    }
+  } finally {
+    cleanup(repo);
+  }
+});
+
 const flashJob = async ({ profile = FLASH, budget = {}, policy = 'auto', changes = true, cost = 0.07, result } = {}) => {
   const repo = makeRepo();
   const events = [];

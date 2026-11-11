@@ -125,3 +125,74 @@ test('a skipped-repair VERIFY_FAILED report names the reason in both details, wi
   const ordinary = compactReport({ ...job, repairSkipped: undefined });
   assert.match(ordinary, /next: [^\n]*\brepair\b/, 'without the skip a repair is still offered');
 });
+
+const skillFailure = (root, message, { file = 'test/integration/mcp.test.mjs', count = 1 } = {}) => {
+  const url = pathToFileURL(join(root, file)).href;
+  return `✖ failing tests:\n\ntest at ${url}:1578:1\n✖ the skill names exactly the capabilities (33.7ms)\n  AssertionError [ERR_ASSERTION]: ${message}\n      at TestContext.<anonymous> (${url}:1610:12)\n      at async Test.run (node:internal/test_runner/test:1389:7)\n\nℹ fail ${count}\n`;
+};
+const SKILLS = ['plugins/offload/skills/offload_economy/SKILL.md', 'plugins/offload/skills/offload_premium/SKILL.md'];
+
+test('a verifier that fails only on skill-text checks is skipped even when the job owns the test file', () => {
+  const root = '/work/tree';
+  const verify = failed(skillFailure(root, 'the skill never mentions capability loopbackPreflightBlocking'));
+  const skipped = repairOutsideScope({ verify, scope: ['src/**', 'test/integration/mcp.test.mjs'], changed: ['src/a.mjs'], roots: [root] });
+  assert.deepEqual(skipped, { reason: 'skill-text', paths: SKILLS, missing: ['loopbackPreflightBlocking'] });
+  const tool = failed(skillFailure(root, 'the skill never mentions offload_wait'));
+  assert.deepEqual(repairOutsideScope({ verify: tool, scope: ['src/**'], changed: [], roots: [root] }).missing, ['offload_wait']);
+  // A server-side change the worker can undo (a dropped capability, a new schema revision) keeps the repair.
+  const owned = ['src/**', 'test/integration/mcp.test.mjs'];
+  for (const message of ['the skill gates on fooCap, which the server does not report', 'the skill pins the revision the server reports'])
+    assert.equal(
+      repairOutsideScope({ verify: failed(skillFailure(root, message)), scope: owned, changed: [], roots: [root] }),
+      undefined,
+      message,
+    );
+});
+
+test('skill-text failures keep the repair when the worker can write a skill or another test fails', () => {
+  const root = '/work/tree';
+  const verify = failed(skillFailure(root, 'the skill never mentions capability loopbackPreflightBlocking'));
+  assert.equal(repairOutsideScope({ verify, scope: ['src/**', 'plugins/offload/skills/**'], changed: [], roots: [root] }), undefined);
+  assert.equal(repairOutsideScope({ verify, scope: ['src/**', SKILLS[0]], changed: [], roots: [root] }), undefined, 'one writable skill');
+  const mixed = failed(
+    `${skillFailure(root, 'the skill never mentions capability x', { count: 2 })}\ntest at ${pathToFileURL(join(root, 'test/unit/a.test.mjs')).href}:1:1\n✖ other (1ms)\n  AssertionError [ERR_ASSERTION]: boom\n`,
+  );
+  assert.equal(repairOutsideScope({ verify: mixed, scope: ['src/**'], changed: [], roots: [root] })?.reason, undefined);
+  const count = failed(skillFailure(root, 'the skill never mentions capability x', { count: 2 }));
+  assert.equal(
+    repairOutsideScope({ verify: count, scope: ['src/**'], changed: [], roots: [root] })?.reason,
+    undefined,
+    'fail count disagrees',
+  );
+});
+
+test('the skill-sync body check and a mixed plugin version failure are skill-text too', () => {
+  const root = '/work/tree';
+  const sync = failed(
+    skillFailure(root, 'edit both SKILL.md bodies together; only frontmatter may differ', { file: 'test/unit/skill-sync.test.mjs' }),
+  );
+  assert.equal(repairOutsideScope({ verify: sync, scope: ['src/**'], changed: [], roots: [root] }).reason, 'skill-text');
+  const both = failed(
+    `${skillFailure(root, 'the skill never mentions capability x', { count: 2 }).replace('\nℹ fail 2\n', '')}\n${tapFailure(root, 'test/unit/skill-sync.test.mjs', VERSION)}\nℹ fail 2\n`,
+  );
+  const skipped = repairOutsideScope({ verify: both, scope: ['src/**'], changed: [], roots: [root] });
+  assert.equal(skipped.reason, 'skill-text');
+  assert.equal(skipped.command, 'npm run plugin:version');
+  assert.equal(
+    repairOutsideScope({ verify: both, scope: ['src/**', 'plugins/offload/plugin.json'], changed: [], roots: [root] }),
+    undefined,
+  );
+});
+
+test('the skill-text line names both skill files and the missing capability; the record drops malformed names', () => {
+  const line = repairSkippedLine({ reason: 'skill-text', paths: SKILLS, missing: ['loopbackPreflightBlocking'] });
+  assert.match(line, /^automatic repair skipped: the verifier fails only on skill-text checks \(loopbackPreflightBlocking\)/);
+  for (const file of SKILLS) assert.ok(line.includes(file), file);
+  assert.match(line, /npm run plugin:version/);
+  assert.deepEqual(safeRepairSkipped({ reason: 'skill-text', paths: SKILLS, missing: ['ok_name', 'bad name\n', 7] }), {
+    reason: 'skill-text',
+    paths: SKILLS,
+    missing: ['ok_name'],
+    command: 'npm run plugin:version',
+  });
+});

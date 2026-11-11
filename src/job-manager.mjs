@@ -1882,6 +1882,9 @@ export class JobManager {
       denyRead: input.denyRead,
       writeScope: [...input.ownedPaths, ...(input.extraWritable || [])],
       ownedPaths: input.ownedPaths,
+      // Unless verifier.allowLoopback is set, the sandbox denies bind, so a
+      // listener a named suite reaches is a certain VERIFY_ENV_FAILED.
+      loopbackDenied: input.verifierLoopback !== true,
     });
     // One lazily memoized scan of the store serves every consumer within this call.
     let storedJobs;
@@ -1902,16 +1905,25 @@ export class JobManager {
         );
         if (verifierPreflight.status !== 'blocking') verifierPreflight.status = 'warning';
       }
-      const drop = [
-        ...new Set([
-          ...(verifierPreflight?.blocking ?? []).flatMap((finding) => (finding.path === 'testCommand' ? [] : [finding.path])),
-          ...(verifierPreflight?.previousFailures ?? []).flatMap((failure) => failure.inCommand ?? failure.files),
-        ]),
-      ];
+      const blockingFiles = (verifierPreflight?.blocking ?? []).flatMap((finding) =>
+        finding.path === 'testCommand' ? [] : [finding.path],
+      );
+      const failureFiles = (verifierPreflight?.previousFailures ?? []).flatMap((failure) => failure.inCommand ?? failure.files);
+      // With nothing blocking and no earlier failure, a warning on a file the
+      // command reaches still names a suite worth dropping (a listener the
+      // sandbox denies, say): the suites that reach it, else its own path.
+      const warningFiles =
+        blockingFiles.length || failureFiles.length
+          ? []
+          : (verifierPreflight?.warnings ?? []).flatMap((warning) =>
+              warning.path === 'testCommand' ? [] : warning.testFiles?.length ? warning.testFiles : [warning.path],
+            );
+      const drop = [...new Set([...blockingFiles, ...failureFiles, ...warningFiles])];
       const narrowed = drop.length
         ? narrowTestCommand({ repoPath, testCommand: input.testCommand, denyRead: input.denyRead, files: drop })
         : undefined;
-      if (narrowed) {
+      // A warning on a file the command does not reach narrows nothing.
+      if (narrowed && (blockingFiles.length || failureFiles.length || narrowed.drop.length)) {
         verifierPreflight.drop = narrowed.drop.length ? narrowed.drop : drop.slice(0, 24);
         if (narrowed.command) verifierPreflight.suggestedTestCommand = narrowed.command;
         else verifierPreflight.narrowing = narrowed.reason;

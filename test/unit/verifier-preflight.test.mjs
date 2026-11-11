@@ -32,8 +32,8 @@ test('verifier preflight follows package scripts, quoted globs and local imports
   assert.equal(result.scannedFiles, 2);
   assert.deepEqual(result.warnings, [
     { code: 'system-temp', path: 'test/probe.test.mjs' },
-    { code: 'child-process', path: 'src/identity.mjs' },
-    { code: 'process-inspection', path: 'src/identity.mjs' },
+    { code: 'child-process', path: 'src/identity.mjs', testFiles: ['test/probe.test.mjs'] },
+    { code: 'process-inspection', path: 'src/identity.mjs', testFiles: ['test/probe.test.mjs'] },
   ]);
   assert.match(verifierPreflightLines(result).join('\n'), /TMPDIR.*\n.*spawn EPERM.*\n.*identity inspection/);
 });
@@ -157,7 +157,7 @@ test('native import warnings follow local Python imports and inline commands wit
   write('tests/helper.py', 'import os, torch\nraise RuntimeError("must never execute")\n');
   write('unrelated.py', 'import tensorflow\n');
   const result = preflightVerifier({ repoPath: root, testCommand: 'python tests/test_native.py' });
-  assert.deepEqual(result.warnings, [{ code: 'native-import', path: 'tests/helper.py' }]);
+  assert.deepEqual(result.warnings, [{ code: 'native-import', path: 'tests/helper.py', testFiles: ['tests/test_native.py'] }]);
   assert.match(verifierPreflightLines(result).join('\n'), /accepted interpreter.*verifierImports before spending/);
   const inline = preflightVerifier({ repoPath: root, testCommand: 'python -c "import torch"' });
   assert.ok(inline.warnings.some((warning) => warning.code === 'native-import'));
@@ -374,7 +374,7 @@ test('a runner given test-file arguments scopes blocking findings to those suite
   );
   assert.match(
     verifierPreflightLines(result).join('\n'),
-    /verifier advisory: 1 denied-write finding\(s\) in scripts\/tests\/diag\.js, which scripts\/test-runner\.js imports but was not given/,
+    /verifier advisory: 1 denied finding\(s\) in scripts\/tests\/diag\.js, which scripts\/test-runner\.js imports but was not given/,
   );
   // Selecting the suite, or giving the runner nothing to filter by, still blocks.
   assert.equal(preflightVerifier({ repoPath: root, testCommand: `${RUNNER} diag.js`, writeScope: [] }).blocking.length, 1);
@@ -866,4 +866,95 @@ test('verifier preflight warns about tests that open a TCP listener so the testC
   assert.deepEqual(result.warnings, [{ code: 'loopback-listen', path: 'test/http.test.mjs' }]);
   const lines = verifierPreflightLines(result).join('\n');
   assert.match(lines, /TCP listener.*verifier\.allowLoopback.*narrow testCommand/);
+});
+
+test('a warning names the suites that reach it, and a denied loopback becomes a blocker with a narrowed command', (t) => {
+  const { root, write } = fixture(t);
+  write(
+    'test/helpers/server.mjs',
+    "import { createServer } from 'node:http';\nexport const server = createServer(() => {}).listen(0, '127.0.0.1');",
+  );
+  write('test/env.test.mjs', "import { server } from './helpers/server.mjs';\nserver.close();");
+  write('test/pure.test.mjs', "import assert from 'node:assert';\nassert.equal(1, 1);");
+  const testCommand = 'node --test test/env.test.mjs test/pure.test.mjs';
+
+  const warning = preflightVerifier({ repoPath: root, testCommand });
+  assert.equal(warning.blocking, undefined);
+  assert.equal(warning.status, 'warning');
+  assert.deepEqual(warning.warnings, [{ code: 'loopback-listen', path: 'test/helpers/server.mjs', testFiles: ['test/env.test.mjs'] }]);
+  assert.match(
+    verifierPreflightLines(warning).join('\n'),
+    /verifier warning: test\/helpers\/server\.mjs: .*reached by test\/env\.test\.mjs/,
+  );
+  assert.deepEqual(compactVerifierPreflight(warning).findings, [
+    { severity: 'warning', code: 'loopback-listen', path: 'test/helpers/server.mjs', testFiles: ['test/env.test.mjs'] },
+  ]);
+
+  const denied = preflightVerifier({ repoPath: root, testCommand, loopbackDenied: true });
+  assert.equal(denied.status, 'blocking');
+  assert.deepEqual(denied.blocking, [
+    { code: 'loopback-listen', path: 'test/helpers/server.mjs', line: 2, testFiles: ['test/env.test.mjs'] },
+  ]);
+  assert.equal(
+    denied.warnings.some((w) => w.code === 'loopback-listen'),
+    false,
+  );
+  const message = verifierBlockingMessage(denied);
+  assert.match(message, /verifier blocker: test\/helpers\/server\.mjs:2: opens a TCP listener .*run by test\/env\.test\.mjs/);
+  assert.match(message, /verifier\.allowLoopback/);
+  assert.deepEqual(narrowTestCommand({ repoPath: root, testCommand, files: ['test/helpers/server.mjs'] }), {
+    command: 'node --test test/pure.test.mjs',
+    drop: ['test/env.test.mjs'],
+  });
+});
+
+test('a denied loopback only an unselected runner suite runs stays advisory', (t) => {
+  const { root, write } = runnerFixture(t);
+  write(
+    'scripts/tests/b.js',
+    "import { createServer } from 'node:http';\nexport default [() => { createServer(() => {}).listen(0, '127.0.0.1'); }];",
+  );
+  const result = preflightVerifier({ repoPath: root, testCommand: `${RUNNER} a.js`, loopbackDenied: true });
+  assert.equal(result.blocking, undefined);
+  assert.equal(result.status, 'warning');
+  assert.deepEqual(
+    result.advisory.map(({ code, path, runner }) => ({ code, path, runner })),
+    [
+      { code: 'system-temp-write', path: 'scripts/tests/diag.js', runner: 'scripts/test-runner.js' },
+      { code: 'loopback-listen', path: 'scripts/tests/b.js', runner: 'scripts/test-runner.js' },
+    ],
+  );
+  assert.equal(
+    result.warnings.some((w) => w.code === 'loopback-listen'),
+    false,
+  );
+  assert.match(
+    verifierPreflightLines(result).join('\n'),
+    /verifier advisory: 2 denied finding\(s\) in 2 suites \(scripts\/tests\/diag\.js, scripts\/tests\/b\.js\)/,
+  );
+});
+
+test('a module-scope listener in a runner suite the runner was not given stays blocking', (t) => {
+  const { root, write } = runnerFixture(t);
+  write(
+    'scripts/tests/b.js',
+    "import { createServer } from 'node:http';\nconst server = createServer(() => {});\nserver.listen(0, '127.0.0.1');\nexport default [];",
+  );
+  const result = preflightVerifier({ repoPath: root, testCommand: `${RUNNER} a.js`, loopbackDenied: true });
+  assert.equal(result.status, 'blocking');
+  // The runner was not given the suite, but importing it opens the listener all the same.
+  assert.deepEqual(
+    result.blocking.map(({ code, path, line }) => ({ code, path, line })),
+    [{ code: 'loopback-listen', path: 'scripts/tests/b.js', line: 2 }],
+  );
+  assert.match(verifierBlockingMessage(result), /verifier blocker: scripts\/tests\/b\.js:2: opens a TCP listener/);
+});
+
+test('a listener a file only mentions in a string literal or a comment never blocks', (t) => {
+  const { root, write } = fixture(t);
+  write('test/fixture.test.mjs', 'const src = "server.listen(0); http.createServer(() => {})";\n// app.listen(3000)\n');
+  const result = preflightVerifier({ repoPath: root, testCommand: 'node --test test/fixture.test.mjs', loopbackDenied: true });
+  assert.equal(result.blocking, undefined);
+  assert.equal(result.status, 'warning');
+  assert.deepEqual(result.warnings, [{ code: 'loopback-listen', path: 'test/fixture.test.mjs' }]);
 });
