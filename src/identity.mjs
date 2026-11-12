@@ -54,6 +54,9 @@ export const RUNTIME_CAPABILITIES = Object.freeze({
   budgetStopVerify: true,
   flashTurnExtension: true,
   loopbackPreflightBlocking: true,
+  reportPacketDrop: true,
+  reviewPacketDrift: true,
+  flashNoEditSteer: true,
 });
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));

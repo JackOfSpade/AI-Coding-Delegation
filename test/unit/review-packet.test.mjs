@@ -17,6 +17,10 @@ async function workspace() {
     path.join(dir, 'src/a.js'),
     ['export const one = 1;', 'export function add(a, b) {', '  return a + b;', '}', 'export const two = 2;'].join('\n'),
   );
+  await writeFile(
+    path.join(dir, 'src/long.js'),
+    Array.from({ length: 30 }, (_, index) => `const line${index + 1} = ${index + 1};`).join('\n'),
+  );
   await writeFile(path.join(dir, 'secret.txt'), 'token = hunter2');
   const resolveReadable = (file) => {
     if (file.startsWith('secret')) throw new Error('denied');
@@ -63,11 +67,14 @@ test('a complete packet passes and reports counts', async () => {
   assert.deepEqual(check.spotCheck, [0]);
 });
 
-test('a quote outside the cited range fails with the line where it appears', async () => {
+test('a quote more than 8 lines from its citation fails with the line where it appears', async () => {
   const ws = await workspace();
-  const check = await checkReviewPacket(packet({ claims: [claim({ startLine: 1, endLine: 2 })] }), options(ws));
+  const check = await checkReviewPacket(
+    packet({ claims: [claim({ path: 'src/long.js', startLine: 1, endLine: 2, quote: 'const line20 = 20;' })] }),
+    options(ws),
+  );
   assert.equal(check.status, 'failed');
-  assert.match(check.defects[0], /not within src\/a\.js:1-2; its first line appears at line 3/);
+  assert.match(check.defects[0], /not within src\/long\.js:1-2; its first line appears at line 20/);
   assert.equal(check.verifiedClaims, 0);
 });
 
@@ -223,4 +230,40 @@ test('a missing packet fails with a message the worker can act on', async () => 
 test('the exported schema forbids unknown fields and requires the core lists', () => {
   assert.equal(REVIEW_PACKET_SCHEMA.additionalProperties, false);
   assert.deepEqual(REVIEW_PACKET_SCHEMA.required, ['requirements', 'claims', 'uncertain']);
+});
+
+test('a quote within 8 lines of its citation is verified as drift, not a defect', async () => {
+  const ws = await workspace();
+  const check = await checkReviewPacket(packet({ claims: [claim({ startLine: 1, endLine: 2, quote: 'return a + b;\n}' })] }), options(ws));
+  assert.equal(check.status, 'passed');
+  assert.deepEqual(check.defects, []);
+  assert.deepEqual([check.claims, check.verifiedClaims, check.driftedClaims], [1, 1, 1]);
+  assert.deepEqual(check.warnings, ['claims[0] quote found at src/a.js:3-4, 2 line(s) from the cited 1-2']);
+});
+
+test('an exact citation reports no drift and no warnings', async () => {
+  const ws = await workspace();
+  const check = await checkReviewPacket(packet(), options(ws));
+  assert.equal(check.status, 'passed');
+  assert.deepEqual([check.driftedClaims, check.warnings], [0, []]);
+});
+
+test('a quote 9 lines from its citation keeps a defect and no drift credit', async () => {
+  const ws = await workspace();
+  const check = await checkReviewPacket(
+    packet({ claims: [claim({ path: 'src/long.js', startLine: 10, endLine: 11, quote: 'const line20 = 20;' })] }),
+    options(ws),
+  );
+  assert.equal(check.status, 'failed');
+  assert.deepEqual([check.verifiedClaims, check.driftedClaims, check.warnings], [0, 0, []]);
+  assert.match(check.defects[0], /not within src\/long\.js:10-11; its first line appears at line 20/);
+});
+
+test('checks that stop before the claims still carry driftedClaims and warnings', async () => {
+  const ws = await workspace();
+  for (const bad of [undefined, 'text', packet({ claims: [] })]) {
+    const check = await checkReviewPacket(bad, options(ws));
+    assert.equal(check.status, 'failed');
+    assert.deepEqual([check.driftedClaims, check.warnings], [0, []]);
+  }
 });

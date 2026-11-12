@@ -448,6 +448,21 @@ export function hopRaisedTurns(sizing, { currentMaxTurns, turnMultiplier, maxUsd
 export const AUTO_EXTEND_MAX_SPENT_FRACTION = 0.5;
 /** The one automatic extension is at most this share of the current turn cap. */
 export const AUTO_EXTEND_CAP_FRACTION = 0.5;
+/** The least cumulative turn at which a Flash write worker with no edits is steered. */
+export const NO_EDIT_STEER_MIN_TURN = 20;
+/** The share of the turn cap after which that steer fires. */
+export const NO_EDIT_STEER_CAP_FRACTION = 0.4;
+/**
+ * The cumulative turn at which a write job on the DeepSeek Flash route is
+ * steered once because it has not changed a file yet: max(20, 40% of the cap).
+ * Field evidence: two Flash write jobs spent every one of 99 and 162 turns
+ * reading and finished with no in-scope edit, so the auto-extension (which
+ * needs in-scope changes) never fired. Undefined without a usable cap.
+ */
+export function noEditSteerTurn(maxTurns) {
+  if (!Number.isSafeInteger(maxTurns) || maxTurns < 1) return undefined;
+  return Math.max(NO_EDIT_STEER_MIN_TURN, Math.ceil(NO_EDIT_STEER_CAP_FRACTION * maxTurns));
+}
 /**
  * One bounded automatic turn extension for an automatically sized cap that is
  * about to stop a job with most of its USD budget unspent. Only a route with a
@@ -568,6 +583,12 @@ function safeAutoExtended(value) {
     ...(Number.isFinite(value.turnUsd) && value.turnUsd > 0 && value.turnUsd <= 1 ? { turnUsd: value.turnUsd } : {}),
   };
 }
+function safeNoEditSteer(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const atTurn = boundedInteger(value.atTurn, MAX_SAFE_TURNS);
+  const maxTurns = boundedInteger(value.maxTurns, MAX_SAFE_TURNS);
+  return atTurn && maxTurns ? { atTurn, maxTurns } : undefined;
+}
 /**
  * Allowlist and bound every field of a stored or about-to-be-stored sizing
  * record. It is attached to public job views, so anything unexpected is
@@ -609,6 +630,7 @@ export function safeBudgetSizing(value) {
     ...(initialTurnsSource ? { initialTurnsSource } : {}),
     turnPolicy: value.turnPolicy,
     ...(safeAutoExtended(value.autoExtended) ? { autoExtended: safeAutoExtended(value.autoExtended) } : {}),
+    ...(safeNoEditSteer(value.noEditSteer) ? { noEditSteer: safeNoEditSteer(value.noEditSteer) } : {}),
     ...optional('timeoutMinutes', 1440),
     ...optional('recommendedTurns', MAX_SAFE_RECOMMENDATION),
     ...(boundedInteger(value.turnMultiplier, MAX_TURN_MULTIPLIER) > 1 ? { turnMultiplier: value.turnMultiplier } : {}),

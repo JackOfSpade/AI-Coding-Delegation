@@ -5,12 +5,13 @@ import {
   AUTO_TURNS_HEADROOM_MAX,
   AUTO_TURNS_MAX,
   FLASH_TURN_USD_ESTIMATE,
+  noEditSteerTurn,
   OBSERVED_TURN_MIN_TURNS,
   OBSERVED_TURN_USD_FLOOR,
   observedTurnUsd,
   safeBudgetSizing,
 } from '../../src/budget-sizing.mjs';
-import { autoExtensionNotice, withAutoExtension } from '../../src/core.mjs';
+import { autoExtensionNotice, noEditSteerNotice, withAutoExtension } from '../../src/core.mjs';
 
 const sizing = (extra = {}) => ({ maxTurns: 135, turnsSource: 'scaled', initialTurnsSource: 'scaled', turnPolicy: 'auto', ...extra });
 const room = { currentMaxTurns: 135, costUsd: 0.07, maxUsd: 3, turnUsdEstimate: FLASH_TURN_USD_ESTIMATE };
@@ -113,4 +114,87 @@ test('the worker-side wrapper applies a durable extension to the loop and queues
   answer = { extraTurns: 5000, wrapUp: true };
   await progress({});
   assert.deepEqual(calls, []);
+});
+
+test('the no-edit steer turn is max(20, 40% of the cap)', () => {
+  // The field caps: 99/99 and 162/162 turns with nothing edited.
+  assert.equal(noEditSteerTurn(50), 20);
+  assert.equal(noEditSteerTurn(200), 80);
+  assert.equal(noEditSteerTurn(162), 65);
+  assert.equal(noEditSteerTurn(20), 20, 'the floor applies to a tiny cap');
+  assert.equal(noEditSteerTurn(51), 21, 'just past the floor the fraction decides');
+  for (const bad of [0, -80, 2.5, undefined, null, '80', Number.POSITIVE_INFINITY]) assert.equal(noEditSteerTurn(bad), undefined);
+});
+
+test('the wrapper queues exactly one no-edit steer notice and ignores a malformed one', async () => {
+  const calls = [];
+  const context = { add: (message) => calls.push(['add', message]), flush: async () => calls.push(['flush']) };
+  let answer;
+  const progress = withAutoExtension(
+    async () => answer,
+    () => ({ extendTurns: () => calls.push(['extend']) }),
+    context,
+    false,
+  );
+  for (const bad of [
+    { steer: 'no-edits' },
+    { steer: 'no-edits', turnsUsed: 0, maxTurns: 50 },
+    { steer: 'no-edits', turnsUsed: 20, maxTurns: 0 },
+    { steer: 'no-edits', turnsUsed: 20.5, maxTurns: 50 },
+    { steer: 'no-edits', turnsUsed: '20', maxTurns: 50 },
+  ]) {
+    answer = bad;
+    await progress({ action: 'provider_request_pending', turn: 20 });
+  }
+  assert.deepEqual(calls, [], 'a malformed steer queues nothing');
+  answer = { steer: 'no-edits', turnsUsed: 20, maxTurns: 50 };
+  assert.deepEqual(await progress({ action: 'provider_request_pending', turn: 20 }), answer);
+  assert.deepEqual(calls, [['add', { role: 'user', content: noEditSteerNotice(20, 50) }], ['flush']]);
+  // A repeated steer return from a custom manager is not queued twice.
+  await progress({ action: 'provider_request_pending', turn: 21 });
+  assert.deepEqual(calls, [['add', { role: 'user', content: noEditSteerNotice(20, 50) }], ['flush']]);
+  assert.match(noEditSteerNotice(20, 50), /used 20 of 50 turns and have not changed any file in your owned paths/);
+  assert.match(noEditSteerNotice(20, 50), /stop reading and exploring now[\s\S]*call finish/);
+});
+
+test('a no-edit steer and an extension on the same return are both applied', async () => {
+  const calls = [];
+  const loop = { extendTurns: (n) => calls.push(['extend', n]) };
+  const context = { add: (message) => calls.push(['add', message]), flush: async () => calls.push(['flush']) };
+  const progress = withAutoExtension(
+    async () => ({ extraTurns: 67, wrapUp: true, steer: 'no-edits', turnsUsed: 20, maxTurns: 50 }),
+    () => loop,
+    context,
+    false,
+  );
+  await progress({ action: 'provider_request_pending', turn: 20 });
+  assert.deepEqual(calls, [
+    ['extend', 67],
+    ['add', { role: 'user', content: autoExtensionNotice(67, false) }],
+    ['flush'],
+    ['add', { role: 'user', content: noEditSteerNotice(20, 50) }],
+    ['flush'],
+  ]);
+});
+
+test('safeBudgetSizing keeps a valid no-edit steer record and drops an invalid one', () => {
+  assert.deepEqual(safeBudgetSizing(sizing({ noEditSteer: { atTurn: 65, maxTurns: 162 } })).noEditSteer, { atTurn: 65, maxTurns: 162 });
+  for (const bad of [
+    undefined,
+    null,
+    [],
+    'x',
+    { atTurn: 0, maxTurns: 162 },
+    { atTurn: 65 },
+    { maxTurns: 162 },
+    { atTurn: 65.5, maxTurns: 162 },
+    { atTurn: 65, maxTurns: -1 },
+    { atTurn: '65', maxTurns: 162 },
+  ])
+    assert.equal(safeBudgetSizing(sizing({ noEditSteer: bad })).noEditSteer, undefined, JSON.stringify(bad));
+  // Extra keys on a valid record are dropped rather than carried through.
+  assert.deepEqual(safeBudgetSizing(sizing({ noEditSteer: { atTurn: 65, maxTurns: 162, at: 'x' } })).noEditSteer, {
+    atTurn: 65,
+    maxTurns: 162,
+  });
 });

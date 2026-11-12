@@ -80,6 +80,7 @@ import {
   routeTurnUsdEstimate,
   hopRaisedTurns,
   autoExtendedTurns,
+  noEditSteerTurn,
   safeBudgetSizing,
   splitRelevantPath,
 } from './budget-sizing.mjs';
@@ -400,12 +401,14 @@ function boundedReviewPacketCheck(check) {
     status: check.status,
     claims: count(check.claims),
     verifiedClaims: count(check.verifiedClaims),
+    driftedClaims: count(check.driftedClaims),
     missingCriteria: ints(check.missingCriteria, 100),
     unlistedFiles: strings(check.unlistedFiles, 50),
     spotCheck: ints(check.spotCheck, REVIEW_PACKET_LIMITS.spotCheck),
     notDone: ints(check.notDone, 100),
     uncertain: count(check.uncertain),
     defects: strings(check.defects, REVIEW_PACKET_LIMITS.defects),
+    warnings: strings(check.warnings, 10),
   };
 }
 // `job.reviewPacket` is the request flag; the worker's packet is stored as
@@ -2325,9 +2328,11 @@ export class JobManager {
           let budgetSizingState = job.budgetSizing;
           let providerTransitionsState = Array.isArray(job.providerTransitions) ? job.providerTransitions : [];
           // The round's live spend (the durable cost lags one event) and
-          // whether its one automatic turn extension has been decided.
+          // whether its one automatic turn extension and its one "no edits
+          // yet" steer have been decided.
           let liveCostUsd = job.costUsd || 0;
           let autoExtensionDecided = false;
+          let noEditSteerDecided = false;
           const workerJob =
             job.assertionRepair?.round === (job.rounds || 0) ? { ...job, ownedPaths: job.assertionRepair.paths, extraWritable: [] } : job;
           // limits.timeoutMinutes bounds the worker round from its claim, as the
@@ -2501,6 +2506,40 @@ export class JobManager {
                   autoExtended = extension;
                 }
               }
+              // One "no edits yet" steer for a write round on the DeepSeek
+              // Flash route (the same route predicate the turn scaling and the
+              // extension use). Field evidence: two Flash write jobs spent all
+              // of 99 and 162 turns reading and never edited anything, so the
+              // extension above (which needs in-scope changes) never fired.
+              // Decided once per round whatever the outcome, so the in-scope
+              // check runs at most once for it.
+              let noEditSteer;
+              const steerTurn = noEditSteerTurn(budgetState?.maxTurns);
+              if (
+                !noEditSteerDecided &&
+                event?.action === 'provider_request_pending' &&
+                Number.isSafeInteger(event.turn) &&
+                job.mode !== 'report' &&
+                job.assertionRepair?.round !== (job.rounds || 0) &&
+                workspace &&
+                steerTurn !== undefined &&
+                (job.turns || 0) + event.turn >= steerTurn &&
+                (job.turns || 0) + event.turn < budgetState.maxTurns - 1
+              ) {
+                noEditSteerDecided = true;
+                const route = executionRoutes(job.executionProfile)[providerStageState];
+                if (routeTurnMultiplier(route) > 1 && !(await this.#roundHasScopedChanges(job, workspace))) {
+                  const steered = safeBudgetSizing({
+                    ...(budgetSizingState || {}),
+                    noEditSteer: { atTurn: (job.turns || 0) + event.turn, maxTurns: budgetState.maxTurns },
+                  });
+                  if (steered) {
+                    budgetSizingState = steered;
+                    progress.budgetSizing = budgetSizingState;
+                    noEditSteer = steered.noEditSteer;
+                  }
+                }
+              }
               const at = this.#nowMs();
               const transition = clock.observe(event, at);
               progress.activity = clock.activity;
@@ -2520,9 +2559,18 @@ export class JobManager {
                 ...(clearsProviderFinishReason ? { providerFinishReason: null } : {}),
               });
               // The worker's credit-fallback callback raises its live turn
-              // allowance by exactly what was made durable above.
-              if (autoExtended) return { extraTurns: autoExtended.extraTurns, wrapUp: true };
-              return hopExtraTurns > 0 ? { extraTurns: hopExtraTurns } : undefined;
+              // allowance by exactly what was made durable above, and the
+              // extension and the no-edit steer are never lost when both land
+              // on the same event.
+              if (autoExtended || hopExtraTurns > 0 || noEditSteer) {
+                const extraTurns = autoExtended ? autoExtended.extraTurns : hopExtraTurns;
+                return {
+                  ...(extraTurns > 0 ? { extraTurns } : {}),
+                  ...(autoExtended ? { wrapUp: true } : {}),
+                  ...(noEditSteer ? { steer: 'no-edits', turnsUsed: noEditSteer.atTurn, maxTurns: noEditSteer.maxTurns } : {}),
+                };
+              }
+              return undefined;
             },
             // Report transcripts can contain bodies returned from untrusted
             // external inputs. Custom/injected workers receive harmless no-op

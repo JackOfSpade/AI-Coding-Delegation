@@ -32,6 +32,9 @@ export const REVIEW_PACKET_LIMITS = Object.freeze({
   changedFiles: 100,
   why: 200,
   maxLineSpan: 40,
+  // Field evidence: a correct quote can sit a few lines above its citation.
+  maxLineDrift: 8,
+  warnings: 10,
   minQuoteChars: 12,
   maxFileBytes: 8 * 1024 * 1024,
   defects: 24,
@@ -158,6 +161,24 @@ export function reviewPacketProblems(packet) {
 const squash = (value) => value.replace(/\s+/g, ' ').trim();
 const posix = (value) => value.replace(/\\/g, '/').replace(/^\.\//, '');
 
+/**
+ * Where a quote actually lives when its citation drifted: the same span shifted
+ * by at most L.maxLineDrift lines either way (clamped to the file), preferring
+ * the smallest shift.
+ */
+function driftWindow(lines, quote, startLine, endLine) {
+  const span = endLine - startLine + 1;
+  for (let distance = 1; distance <= L.maxLineDrift; distance++) {
+    for (const shift of [-distance, distance]) {
+      const start = startLine + shift;
+      const end = start + span - 1;
+      if (start < 1 || end > lines.length) continue;
+      if (squash(lines.slice(start - 1, end).join('\n')).includes(quote)) return { start, end, distance };
+    }
+  }
+  return undefined;
+}
+
 /** Deterministic claim indices for the primary to read for meaning. */
 function spotCheckIndices(seed, count) {
   if (!count) return [];
@@ -179,6 +200,8 @@ function spotCheckIndices(seed, count) {
  */
 export async function checkReviewPacket(packet, { mode, acceptanceCriteria = [], changedFiles = [], resolveReadable, seed = '' } = {}) {
   const defects = [];
+  const warnings = [];
+  let driftedClaims = 0;
   const add = (message) => {
     if (defects.length < L.defects) defects.push(message);
   };
@@ -242,6 +265,18 @@ export async function checkReviewPacket(packet, { mode, acceptanceCriteria = [],
       verifiedClaims++;
       continue;
     }
+    // A citation a few lines off is drift, not a defect: credit the quote and
+    // tell the reviewer where it really sits.
+    const drift = driftWindow(lines, quote, claim.startLine, claim.endLine);
+    if (drift) {
+      verifiedClaims++;
+      driftedClaims++;
+      if (warnings.length < L.warnings)
+        warnings.push(
+          `claims[${index}] quote found at ${path}:${drift.start}-${drift.end}, ${drift.distance} line(s) from the cited ${claim.startLine}-${claim.endLine}`,
+        );
+      continue;
+    }
     // Help the worker fix a citation: report where the quote really starts, if anywhere.
     const whole = lines.map((line) => squash(line));
     const first = squash(claim.quote.split(/\r?\n/).find((line) => line.trim()) ?? '');
@@ -271,11 +306,19 @@ export async function checkReviewPacket(packet, { mode, acceptanceCriteria = [],
     spotCheck: spotCheckIndices(seed, packet.claims.length),
     notDone: packet.requirements.filter((entry) => entry.status !== 'done').map((entry) => entry.criterion),
     uncertain: packet.uncertain.length,
+    driftedClaims,
+    warnings,
   });
 }
 
-function summarize({ defects, ...rest }) {
-  return { status: defects.length ? 'failed' : 'passed', ...rest, defects };
+function summarize({ defects, driftedClaims = 0, warnings = [], ...rest }) {
+  return {
+    status: defects.length ? 'failed' : 'passed',
+    ...rest,
+    driftedClaims,
+    warnings: warnings.slice(0, L.warnings),
+    defects,
+  };
 }
 
 /** One correction message the worker can act on. */

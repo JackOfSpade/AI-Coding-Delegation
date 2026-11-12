@@ -493,7 +493,8 @@ function reviewPacketLine(job) {
   }
   const spot = Array.isArray(check.spotCheck) ? check.spotCheck.filter(Number.isSafeInteger).map((index) => index + 1) : [];
   const notDone = Array.isArray(check.notDone) ? check.notDone.length : 0;
-  return `Review packet: passed - ${scalar(check.verifiedClaims ?? 0)}/${scalar(check.claims ?? 0)} quotes verified, ${scalar(check.uncertain ?? 0)} uncertain${notDone ? `, ${notDone} not fully done` : ''}${spot.length ? `, spot-check claims ${spot.join(',')}` : ''}`;
+  const drifted = Number.isSafeInteger(check.driftedClaims) && check.driftedClaims > 0 ? check.driftedClaims : 0;
+  return `Review packet: passed - ${scalar(check.verifiedClaims ?? 0)}/${scalar(check.claims ?? 0)} quotes verified, ${scalar(check.uncertain ?? 0)} uncertain${notDone ? `, ${notDone} not fully done` : ''}${spot.length ? `, spot-check claims ${spot.join(',')}` : ''}${drifted ? `, ${drifted} quote(s) cited off by up to 8 lines` : ''}`;
 }
 /** Keep old expectations prominent even beside PASS; additions stay in the diff. */
 function testAssertionLines(audit, lean) {

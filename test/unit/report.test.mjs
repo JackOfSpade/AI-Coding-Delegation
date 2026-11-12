@@ -1898,3 +1898,26 @@ test('a loopback-denied environment failure points at the primary and forbids re
     /repair/,
   );
 });
+
+test('a passed review packet with drifted quotes says how many were cited off', () => {
+  const check = {
+    status: 'passed',
+    claims: 2,
+    verifiedClaims: 2,
+    uncertain: 0,
+    driftedClaims: 1,
+    warnings: ['claims[0] quote found at src/a.js:3-4, 2 line(s) from the cited 1-2'],
+    defects: [],
+    spotCheck: [],
+    notDone: [],
+  };
+  const job = { id: 'oj-drift', status: 'DONE_VERIFIED', reviewPacket: true, reviewPacketCheck: check };
+  const report = compactReport(job, { detail: 'compact' });
+  assert.match(report, /^Review packet: passed - 2\/2 quotes verified, 0 uncertain, 1 quote\(s\) cited off by up to 8 lines$/m);
+  const clean = compactReport(
+    { ...job, id: 'oj-drift-clean', reviewPacketCheck: { ...check, driftedClaims: 0, warnings: [] } },
+    { detail: 'compact' },
+  );
+  assert.match(clean, /^Review packet: passed - 2\/2 quotes verified, 0 uncertain$/m);
+  assert.doesNotMatch(clean, /cited off by up to 8 lines/);
+});

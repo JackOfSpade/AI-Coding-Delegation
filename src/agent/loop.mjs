@@ -1518,8 +1518,68 @@ export class AgentLoop {
             delete parsed[finishIndex].reviewPacket;
         }
         const finishNotAlone = finishIndex !== -1 && calls.length !== 1;
-        const finishProblems = finishIndex === -1 ? [] : finishArgumentProblems(parsed[finishIndex]);
-        const finishInvalid = finishProblems.length > 0;
+        let finishProblems = finishIndex === -1 ? [] : finishArgumentProblems(parsed[finishIndex]);
+        let finishInvalid = finishProblems.length > 0;
+        // A structurally malformed review packet is not a finish-argument error:
+        // in a report job it earns the packet's own bounded corrections and,
+        // when none remain, is dropped so the drafted report is still accepted.
+        const malformedPacket =
+          this.reportMode &&
+          finishIndex !== -1 &&
+          !finishNotAlone &&
+          finishInvalid &&
+          parsed[finishIndex] !== null &&
+          typeof parsed[finishIndex] === 'object' &&
+          Object.hasOwn(parsed[finishIndex], 'reviewPacket') &&
+          finishArgumentProblems(Object.fromEntries(Object.entries(parsed[finishIndex]).filter(([key]) => key !== 'reviewPacket')))
+            .length === 0;
+        let malformedPacketDropped = false;
+        if (malformedPacket) {
+          const packetCorrectionAvailable =
+            reviewPacketCorrections < MAX_REVIEW_PACKET_CORRECTIONS &&
+            turn < this.maxTurns &&
+            !budgetFinishRecovery &&
+            !reportFinalizationUsed;
+          if (packetCorrectionAvailable) {
+            reviewPacketCorrections++;
+            await this.context.addBatch([
+              assistant,
+              {
+                role: 'tool',
+                tool_call_id: calls[finishIndex].id,
+                name: 'finish',
+                content: `TOOL_ERROR: review packet check failed; nothing was accepted, but the finish arguments and the report itself were fine. Fix these and call finish again with a corrected reviewPacket:\n${finishProblems
+                  .map((problem) => `- ${problem}`)
+                  .join('\n')}`,
+              },
+            ]);
+            await this.context.flush();
+            await settleCappedImplementationRecovery();
+            await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'review_packet_check' });
+            continue;
+          }
+          // No correction left (or the forced finalization / budget recovery
+          // turn): the report is what the job paid for. Drop the packet and let
+          // the finish be accepted normally, with the failure still visible.
+          const dropped = finishProblems.join('; ');
+          reviewPacketCheck = {
+            status: 'failed',
+            claims: 0,
+            verifiedClaims: 0,
+            missingCriteria: [],
+            unlistedFiles: [],
+            spotCheck: [],
+            notDone: [],
+            uncertain: 0,
+            defects: [
+              `reviewPacket was malformed and dropped; the report was kept: ${dropped.length > 500 ? `${dropped.slice(0, 497)}...` : dropped}`,
+            ],
+          };
+          delete parsed[finishIndex].reviewPacket;
+          finishProblems = [];
+          finishInvalid = false;
+          malformedPacketDropped = true;
+        }
         if (finishNotAlone || finishInvalid) {
           // A bounded, execute-nothing correction, like the unadvertised-tool
           // one above. The response was already metered, nothing in it runs, the
@@ -1621,7 +1681,7 @@ export class AgentLoop {
             continue;
           }
         }
-        if (finishIndex !== -1 && this.checkReviewPacket) {
+        if (finishIndex !== -1 && this.checkReviewPacket && !malformedPacketDropped) {
           try {
             reviewPacketCheck = await this.checkReviewPacket(parsed[finishIndex]);
           } catch {

@@ -112,20 +112,47 @@ export const repairBrief = (defects) =>
 export const autoExtensionNotice = (extraTurns, serverVerifier) =>
   `Server notice: your turn allowance was extended by ${extraTurns} turns because most of the USD budget is unspent. This is the only extension. Wrap up now: finish any edit in progress, make sure your in-scope changes are complete, and call finish${serverVerifier ? ' (the server runs the configured verifier after you finish)' : ''}. Do not start new work.`;
 /**
- * Wrap a worker's progress callback so a one-time turn extension the manager
- * made durable is applied to the live loop and announced to the worker. The
- * notice is queued after the event's own request was built, so the worker reads
- * it on its next turn.
+ * The fixed notice a write worker gets once when it has used a large share of
+ * its turns without changing a file: stop reading, make the smallest correct
+ * edit, then finish. Field evidence: two Flash write jobs spent all of their
+ * turns reading and never edited anything.
  */
-export const withAutoExtension = (progress, getLoop, context, serverVerifier) => async (event) => {
-  const raised = await progress(event);
-  const loop = getLoop();
-  if (loop && raised?.wrapUp === true && Number.isSafeInteger(raised.extraTurns) && raised.extraTurns > 0 && raised.extraTurns <= 1000) {
-    loop.extendTurns(raised.extraTurns);
-    context.add({ role: 'user', content: autoExtensionNotice(raised.extraTurns, serverVerifier) });
-    await context.flush();
-  }
-  return raised;
+export const noEditSteerNotice = (turnsUsed, maxTurns) =>
+  `Server notice: you have used ${turnsUsed} of ${maxTurns} turns and have not changed any file in your owned paths. The brief already names what to change: stop reading and exploring now. Make your first edit within the next few turns (write the smallest correct change first, then extend it), then call finish. If something blocks you, call finish now and describe the blocker in concerns.`;
+/**
+ * Wrap a worker's progress callback so a one-time turn extension the manager
+ * made durable is applied to the live loop and announced to the worker, and so
+ * the manager's one-time "no edits yet" steer reaches the worker's context. Both
+ * notices are queued after the event's own request was built, so the worker
+ * reads them on its next turn; each is applied at most once per wrapper.
+ */
+export const withAutoExtension = (progress, getLoop, context, serverVerifier) => {
+  let steered = false;
+  return async (event) => {
+    const raised = await progress(event);
+    const loop = getLoop();
+    if (loop && raised?.wrapUp === true && Number.isSafeInteger(raised.extraTurns) && raised.extraTurns > 0 && raised.extraTurns <= 1000) {
+      loop.extendTurns(raised.extraTurns);
+      context.add({ role: 'user', content: autoExtensionNotice(raised.extraTurns, serverVerifier) });
+      await context.flush();
+    }
+    // Independent of the extension: the manager records the steer once per
+    // round, and this guard keeps a repeated or malformed return from queuing
+    // a second notice.
+    if (
+      !steered &&
+      raised?.steer === 'no-edits' &&
+      Number.isSafeInteger(raised.turnsUsed) &&
+      raised.turnsUsed > 0 &&
+      Number.isSafeInteger(raised.maxTurns) &&
+      raised.maxTurns > 0
+    ) {
+      steered = true;
+      context.add({ role: 'user', content: noEditSteerNotice(raised.turnsUsed, raised.maxTurns) });
+      await context.flush();
+    }
+    return raised;
+  };
 };
 const parentHandoff = (job) => job?.status === 'QUEUED' && job.handoffState === 'PARENT_QUEUED';
 const handoffIdentity = (job) => ({

@@ -5820,3 +5820,116 @@ test('finish-protocol still fails a report round with no draft, and a write roun
   assert.equal(write.reportSalvage, undefined);
   assert.equal(write.finishProblems, undefined);
 });
+
+// oj-20261108-a8c290d5 follow-up: a malformed reviewPacket is the packet's
+// problem, not a finish-argument problem, in a report job. It earns the
+// packet's own bounded corrections and is then dropped, so the report the job
+// paid for is still accepted.
+const passedPacketCheck = {
+  status: 'passed',
+  claims: 1,
+  verifiedClaims: 1,
+  missingCriteria: [],
+  unlistedFiles: [],
+  spotCheck: [],
+  notDone: [],
+  uncertain: 0,
+  driftedClaims: 0,
+  warnings: [],
+  defects: [],
+};
+const malformedPacketFinish = (report, id) =>
+  call('finish', JSON.stringify({ summary: 'Survey findings.', report, reviewPacket: { requirements: [] } }), id);
+
+test('a report finish whose only problem is a malformed packet gets one packet correction, then is accepted', async () => {
+  const requests = [];
+  const turns = [
+    [malformedPacketFinish('Report text.', 'f1')],
+    [call('finish', JSON.stringify({ summary: 'Survey findings.', report: 'Report text.', reviewPacket: goodPacket }), 'f2')],
+  ];
+  const { result, executed, progress } = await reportFinishProtocolRun(turns, {
+    provider: scripted(turns, requests),
+    checkReviewPacket: async () => passedPacketCheck,
+  });
+  assert.equal(result.status, 'DONE');
+  assert.equal(requests.length, 2, 'one packet correction, then accepted');
+  const correction = requests[1].at(-1).content;
+  assert.match(
+    correction,
+    /^TOOL_ERROR: review packet check failed; nothing was accepted, but the finish arguments and the report itself were fine\./,
+  );
+  assert.match(correction, /^- reviewPacket\.claims must be an array of at most 40$/m);
+  assert.equal(result.finish.report, 'Report text.');
+  assert.equal(result.finish.reviewPacketCheck.status, 'passed');
+  assert.equal(result.reportSalvage, undefined);
+  assert.equal(result.finishProblems, undefined);
+  assert.deepEqual(
+    progress.filter((action) => action.startsWith('review_packet')),
+    ['review_packet_check'],
+  );
+  assert.deepEqual(executed, ['finish'], 'only the accepted finish ran');
+});
+
+test('a report finish with a malformed packet is accepted with the packet dropped once its corrections are spent', async () => {
+  const requests = [];
+  const checked = [];
+  const turns = Array.from({ length: 3 }, (_, index) => [malformedPacketFinish('Kept report.', `f${index}`)]);
+  const { result, executed, progress } = await reportFinishProtocolRun(turns, {
+    provider: scripted(turns, requests),
+    checkReviewPacket: async () => {
+      checked.push('called');
+      return passedPacketCheck;
+    },
+  });
+  assert.equal(result.status, 'DONE');
+  assert.equal(requests.length, 3, 'two corrections, then the finish is accepted');
+  assert.equal(result.reportSalvage, undefined);
+  assert.equal(result.finishProblems, undefined);
+  assert.equal(result.finish.report, 'Kept report.');
+  assert.equal(result.finish.concerns, undefined, 'no recovered-report concern is attached');
+  assert.equal(Object.hasOwn(result.finish, 'reviewPacket'), false);
+  assert.deepEqual(checked, [], 'a dropped packet is never checked');
+  assert.equal(result.finish.reviewPacketCheck.status, 'failed');
+  assert.equal(result.finish.reviewPacketCheck.claims, 0);
+  assert.equal(result.finish.reviewPacketCheck.verifiedClaims, 0);
+  assert.deepEqual(result.finish.reviewPacketCheck.missingCriteria, []);
+  assert.deepEqual(result.finish.reviewPacketCheck.unlistedFiles, []);
+  assert.deepEqual(result.finish.reviewPacketCheck.spotCheck, []);
+  assert.deepEqual(result.finish.reviewPacketCheck.notDone, []);
+  assert.equal(result.finish.reviewPacketCheck.uncertain, 0);
+  assert.equal(result.finish.reviewPacketCheck.defects.length, 1);
+  assert.ok(
+    result.finish.reviewPacketCheck.defects[0].startsWith(
+      'reviewPacket was malformed and dropped; the report was kept: reviewPacket.claims must be an array of at most 40',
+    ),
+    result.finish.reviewPacketCheck.defects[0],
+  );
+  assert.deepEqual(
+    progress.filter((action) => action.startsWith('review_packet')),
+    ['review_packet_check', 'review_packet_check'],
+  );
+  assert.deepEqual(executed, ['finish'], 'only the accepted finish ran');
+});
+
+test('a write job keeps the finish-argument path for a malformed packet', async () => {
+  const requests = [];
+  const turns = Array.from({ length: 3 }, (_, index) => [
+    call('finish', JSON.stringify({ summary: 'done', reviewPacket: { requirements: [] } }), `f${index}`),
+  ]);
+  const result = await new AgentLoop({
+    provider: scripted(turns, requests),
+    tools: packetTools(),
+    checkReviewPacket: failingThenPassing(0),
+    maxTurns: 5,
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'FAILED');
+  assert.equal(result.failureKind, 'finish-protocol');
+  assert.equal(result.reportSalvage, undefined);
+  assert.equal(result.finishProblems, undefined);
+  assert.equal(requests.length, 3);
+  assert.match(
+    requests[1].at(-1).content,
+    /^TOOL_ERROR: finish arguments are invalid: reviewPacket\.claims must be an array of at most 40;/,
+  );
+  assert.doesNotMatch(requests[1].at(-1).content, /nothing was accepted, but the finish arguments/);
+});
