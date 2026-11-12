@@ -1116,6 +1116,57 @@ test('report jobs copy allowlisted scratch inputs read-only, return structured f
     cleanup(scratch);
   }
 });
+test('a report worker with a summary and a passing review packet but no report is kept; without a passing packet it still fails', async () => {
+  const repo = makeRepo(),
+    gitDir = await mkdtemp(`${tmpdir()}/offload-report-summary-only-`);
+  const summary = 'Two call sites reference the limit rule.';
+  const check = (status) => ({
+    status,
+    claims: 1,
+    verifiedClaims: status === 'passed' ? 1 : 0,
+    defects: status === 'passed' ? [] : ['claim 1 drifted'],
+  });
+  try {
+    const m = new JobManager({
+      store: new JobStore({ gitDir }),
+      snapshots: gitSnapshots(),
+      worker: {
+        run: async (job) => {
+          if (job.task === 'summary packet passed')
+            return { status: 'DONE', summary, finish: { summary, reviewPacketCheck: check('passed') } };
+          if (job.task === 'summary packet failed')
+            return { status: 'DONE', summary, finish: { summary, reviewPacketCheck: check('failed') } };
+          return { status: 'DONE', summary, finish: { summary, reviewPacketCheck: check('passed') } };
+        },
+      },
+      config: {
+        repoPath: repo,
+        git: { branch: async (path) => git(path, ['branch', '--show-current']), head: async (path) => git(path, ['rev-parse', 'HEAD']) },
+        isolation: { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree },
+      },
+    });
+    const run = async (task, reviewPacket) => {
+      const started = await m.start({ mode: 'report', task, repoPath: repo, ...(reviewPacket ? { reviewPacket: true } : {}) });
+      return m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
+    };
+    const kept = await run('summary packet passed', true);
+    assert.equal(kept.status, 'DONE_UNVERIFIED');
+    assert.equal((await m.store.get(kept.jobId)).reportSalvage, 'summary-only');
+    assert.ok(kept.reportResult.concerns.some((concern) => concern.startsWith('Accepted without a detailed report')));
+    assert.equal(kept.reportResult.text, summary);
+    assert.match(kept.report, /report salvaged/);
+    const failedCheck = await run('summary packet failed', true);
+    assert.equal(failedCheck.status, 'FAILED');
+    assert.match(failedCheck.report, /without a detailed report/);
+    assert.equal((await m.store.get(failedCheck.jobId)).reportSalvage, undefined);
+    const noPacket = await run('summary no packet requested', false);
+    assert.equal(noPacket.status, 'FAILED');
+    assert.match(noPacket.report, /without a detailed report/);
+    assert.equal((await m.store.get(noPacket.jobId)).reportSalvage, undefined);
+  } finally {
+    cleanup(repo);
+  }
+});
 test('report input rejection is actionable but creates no durable job or private-input artifact', async () => {
   const repo = makeRepo(),
     scratch = await mkdtemp(join(tmpdir(), 'offload-report-allowed-root-')),

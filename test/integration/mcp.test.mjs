@@ -99,6 +99,7 @@ test('MCP lists exact tools, initializes, pings and dispatches', async () => {
     reportPacketDrop: true,
     reviewPacketDrift: true,
     flashNoEditSteer: true,
+    reportSummaryAccept: true,
   });
   assert.ok(
     values.some((value) => value.id === null && value.result?.tools),

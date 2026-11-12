@@ -70,6 +70,12 @@ test('report-finish-salvaged also covers a finish the output cap cut off', () =>
   assert.match(all.find((s) => s.code === 'report-finish-salvaged').evidence, /drafted report of a finish call the output cap cut off/);
 });
 
+test('report-finish-salvaged also covers a summary-only report accepted with a passing review packet', () => {
+  const signal = only([job('a', { mode: 'report', status: 'DONE_UNVERIFIED', reportSalvage: 'summary-only' })]);
+  assert.equal(signal.code, 'report-finish-salvaged');
+  assert.match(signal.evidence, /accepted a summary with a passing review packet but no detailed report/);
+});
+
 test('report-finish-salvaged also covers a plain-text salvage after no finish call', () => {
   const all = deriveSignals([job('a', { mode: 'report', status: 'FAILED', failureKind: 'no-finish', reportSalvage: 'plain-text' })], {
     nowMs: NOW,

@@ -476,6 +476,8 @@ function reportSalvagedLine(job) {
     }; reportResult.text holds the drafted report, unreviewed`;
   if (job.reportSalvage === 'plain-text')
     return 'report salvaged: the worker ended in plain text without calling finish; reportResult.text holds its last message, unreviewed';
+  if (job.reportSalvage === 'summary-only')
+    return 'report salvaged: the finish had a summary and a passing review packet but no detailed report; reportResult.text holds the summary, unreviewed';
   if (job.reportSalvage === 'truncated-finish')
     return 'report salvaged: the finish call was cut off by the output cap; reportResult.text holds the drafted report up to the cut, unreviewed and possibly incomplete';
   return '';

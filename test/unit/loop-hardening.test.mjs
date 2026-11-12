@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { AgentLoop } from '../../src/agent/loop.mjs';
+import { AgentLoop, MISSING_REPORT_CORRECTION } from '../../src/agent/loop.mjs';
 import { AgentContext } from '../../src/agent/context.mjs';
 import { LocalTools, availableToolDefinitions } from '../../src/agent/tools.mjs';
 import { buildSystemPrompt } from '../../src/agent/prompt.mjs';
@@ -5932,4 +5932,70 @@ test('a write job keeps the finish-argument path for a malformed packet', async 
     /^TOOL_ERROR: finish arguments are invalid: reviewPacket\.claims must be an array of at most 40;/,
   );
   assert.doesNotMatch(requests[1].at(-1).content, /nothing was accepted, but the finish arguments/);
+});
+
+const summaryOnlyFinish = (id) => call('finish', JSON.stringify({ summary: 'Survey findings.' }), id);
+
+test('a report finish with a summary but no report is asked for the report once and then accepted with it', async () => {
+  const requests = [];
+  const turns = () => [
+    [call('read_file', '{"path":"a.js"}', 'r1')],
+    [summaryOnlyFinish('f1')],
+    [draftFinish('Full detailed report.', 'f2')],
+  ];
+  const { result, executed, progress } = await reportFinishProtocolRun(turns(), { provider: scripted(turns(), requests) });
+  assert.equal(result.status, 'DONE');
+  assert.equal(result.finish.report, 'Full detailed report.');
+  assert.equal(requests.length, 3);
+  const last = requests[2].at(-1);
+  assert.equal(last.role, 'tool');
+  assert.equal(last.tool_call_id, 'f1');
+  assert.equal(last.content, MISSING_REPORT_CORRECTION);
+  assert.deepEqual(executed, ['read_file', 'finish'], 'the report-less finish never ran');
+  assert.deepEqual(
+    progress.filter((action) => action === 'report_detail_request'),
+    ['report_detail_request'],
+  );
+});
+
+test('the missing-report ask is made only once; a second report-less finish is accepted', async () => {
+  const requests = [];
+  const turns = () => [[summaryOnlyFinish('f1')], [summaryOnlyFinish('f2')]];
+  const { result, progress } = await reportFinishProtocolRun(turns(), { provider: scripted(turns(), requests) });
+  assert.equal(result.status, 'DONE');
+  assert.equal(result.finish.report, undefined);
+  assert.equal(requests.length, 2);
+  assert.equal(
+    requests.flat().filter((message) => message.content === MISSING_REPORT_CORRECTION).length,
+    1,
+    'only one correction is ever sent',
+  );
+  assert.equal(progress.filter((action) => action === 'report_detail_request').length, 1);
+});
+
+test('a report finish on the last turn is not asked for a report', async () => {
+  const requests = [];
+  const { result, progress } = await reportFinishProtocolRun([[summaryOnlyFinish('f1')]], {
+    maxTurns: 1,
+    provider: scripted([[summaryOnlyFinish('f1')]], requests),
+  });
+  assert.equal(result.status, 'DONE');
+  assert.equal(requests.length, 1);
+  assert.deepEqual(
+    progress.filter((action) => action === 'report_detail_request'),
+    [],
+  );
+});
+
+test('a write-mode finish without a report is not asked for one', async () => {
+  const requests = [];
+  const invoked = [];
+  const result = await new AgentLoop({
+    provider: scripted([[summaryOnlyFinish('f1')]], requests),
+    maxTurns: 80,
+    tools: finishTools(invoked),
+  }).run({ task: 'x' });
+  assert.equal(result.status, 'DONE');
+  assert.equal(requests.length, 1);
+  assert.deepEqual(invoked, ['finish']);
 });

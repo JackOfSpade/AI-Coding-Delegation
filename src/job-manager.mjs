@@ -353,6 +353,8 @@ const VERIFIED_WITHOUT_FINISH_CONCERNS = Object.freeze({
     'The worker ended without calling finish; the server verifier passed, so the job finished. No summary, testsRun or review packet was reported: review the diff against the acceptance criteria.',
 });
 const REPORT_SALVAGE_KINDS = new Set(['finish-arguments', 'plain-text', 'truncated-finish']);
+const SUMMARY_ONLY_REPORT_CONCERN =
+  'Accepted without a detailed report: the worker finished with a summary and a passing review packet but no report text; reportResult.text holds the summary. Review it against the review packet claims.';
 const safeReportSalvage = (value) => (REPORT_SALVAGE_KINDS.has(value) ? value : undefined);
 // Fixed finish-protocol problem texts from the loop: at most 6 short, redacted lines.
 const safeFinishProblems = (value) => {
@@ -2589,7 +2591,18 @@ export class JobManager {
           const requestedStatus = malformedResult ? 'FAILED' : (result.status ?? 'DONE');
           const invalidStatus = !allowedWorkerStatuses.has(requestedStatus);
           const reportText = safeReportText(result?.report ?? result?.finish?.report);
-          const missingReport = job.mode === 'report' && requestedStatus === 'DONE' && !reportText;
+          const reportSummary = safeReportString(result?.summary ?? result?.finish?.summary, 1500);
+          // A report finish with no detailed text but a non-empty summary whose
+          // review packet passed is usable evidence, not a failed round: keep
+          // it, unverified and with a concern, instead of FAILED.
+          const summaryAccepted =
+            job.mode === 'report' &&
+            requestedStatus === 'DONE' &&
+            !reportText &&
+            !!reportSummary &&
+            job.reviewPacket === true &&
+            boundedReviewPacketCheck(result?.finish?.reviewPacketCheck)?.status === 'passed';
+          const missingReport = job.mode === 'report' && requestedStatus === 'DONE' && !reportText && !summaryAccepted;
           // A report job's forced finalization finish was invalid but its drafted report was recovered.
           const salvaged =
             job.mode === 'report' &&
@@ -2696,10 +2709,15 @@ export class JobManager {
                   reviewPacketCheck: boundedReviewPacketCheck(result?.finish?.reviewPacketCheck),
                 }
               : {}),
-            concerns:
-              (job.mode === 'report'
-                ? safeReportList(result?.concerns ?? result?.finish?.concerns)
-                : boundedStrings(result?.concerns ?? result?.finish?.concerns)) ?? job.concerns,
+            concerns: (() => {
+              const concerns =
+                (job.mode === 'report'
+                  ? safeReportList(result?.concerns ?? result?.finish?.concerns)
+                  : boundedStrings(result?.concerns ?? result?.finish?.concerns)) ?? job.concerns;
+              return summaryAccepted && workerStatus === 'WORKER_DONE'
+                ? [...(concerns ?? []).slice(0, 99), SUMMARY_ONLY_REPORT_CONCERN]
+                : concerns;
+            })(),
             testsRun:
               (job.mode === 'report'
                 ? safeReportList(result?.testsRun ?? result?.finish?.testsRun)
@@ -2731,6 +2749,7 @@ export class JobManager {
               ? { finishProblems: safeFinishProblems(result.finishProblems) }
               : {}),
             ...(salvaged && workerStatus === 'WORKER_DONE' ? { reportSalvage: 'finish-arguments' } : {}),
+            ...(summaryAccepted && workerStatus === 'WORKER_DONE' ? { reportSalvage: 'summary-only' } : {}),
             ...(plainTextSalvaged && workerStatus === 'FAILED' && failureKind === 'no-finish' ? { reportSalvage: 'plain-text' } : {}),
             ...(truncatedFinishSalvaged && workerStatus === 'FAILED' && failureKind === 'output-cap'
               ? { reportSalvage: 'truncated-finish' }

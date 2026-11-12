@@ -195,6 +195,9 @@ const NO_FINISH_REMINDER =
 // asks it to put that text in finish rather than losing the round.
 const reportNoFinishReminder = (reviewPacketRequired) =>
   `No tool was called, and prose does not complete a report job. If the text you just wrote is your complete answer, call finish now as the only tool call: put that text in report (verbatim or tightened), a 1-2 sentence summary of at most 1500 characters in summary${reviewPacketRequired ? ', and the reviewPacket the brief requires' : ''}; otherwise make the remaining read-only tool calls first.`;
+// Fixed text: nothing provider-controlled appears in it.
+export const MISSING_REPORT_CORRECTION =
+  'TOOL_ERROR: finish had no report; nothing was accepted. A report job must return its detailed findings in finish.report. Call finish alone again with the same summary, a report holding the full detailed answer, and the same reviewPacket if you sent one; do not repeat any reads.';
 const MAX_SALVAGED_REPORT_CHARS = 256000;
 const MISSING_TOOL_RECOVERY_REMINDER =
   'Do not reply with prose only. Invoke one or more allowed non-finish tools to continue, or call finish as the sole tool call if complete.';
@@ -641,6 +644,8 @@ export class AgentLoop {
     let rejectedReportFinish;
     let reviewPacketCorrections = 0;
     let reviewPacketCheck;
+    // A report finish with a summary but no detailed report gets one ask for it.
+    let missingReportAskUsed = false;
     let noFinishRecoveryUsed = false;
     // Finite non-report budgets only: what each completed request cost and
     // what the next one had to reserve, for the outlook on the reservation.
@@ -1705,6 +1710,28 @@ export class AgentLoop {
             await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'review_packet_check' });
             continue;
           }
+        }
+        // The manager treats a report finish without detailed text as missing
+        // its deliverable. Ask for it once, in-loop, while a turn is left,
+        // rather than letting a round that did the reading end FAILED.
+        if (
+          this.reportMode &&
+          finishIndex !== -1 &&
+          !missingReportAskUsed &&
+          !(typeof parsed[finishIndex]?.report === 'string' && parsed[finishIndex].report.trim().length > 0) &&
+          turn < this.maxTurns &&
+          !budgetFinishRecovery &&
+          !reportFinalizationUsed
+        ) {
+          missingReportAskUsed = true;
+          await this.context.addBatch([
+            assistant,
+            { role: 'tool', tool_call_id: calls[finishIndex].id, name: 'finish', content: MISSING_REPORT_CORRECTION },
+          ]);
+          await this.context.flush();
+          await settleCappedImplementationRecovery();
+          await this.progress?.({ turn, usage: totalUsage, costUsd: this.meter.usd, action: 'report_detail_request' });
+          continue;
         }
         this.context.add(assistant);
         await this.context.flush();
