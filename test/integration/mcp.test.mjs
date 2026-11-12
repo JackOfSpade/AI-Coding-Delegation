@@ -60,6 +60,7 @@ test('MCP lists exact tools, initializes, pings and dispatches', async () => {
     baselineVerifier: true,
     applyThenVerify: true,
     applyThenVerifyScratch: true,
+    applyThenVerifyTolerate: true,
     verifierPreflight: true,
     verifierPreflightBlocking: true,
     promptCaching: true,
@@ -208,10 +209,25 @@ test('MCP enforces advertised input schemas and maps only public operation optio
   call(40, 'offload_job', { jobId: 'j', include: 'diff', detail: 'compact' });
   call(41, 'offload_wait', { jobId: 'j', detail: 'verbose' });
   call(42, 'offload_wait', { jobId: 'j', timeoutSec: 600 });
+  call(43, 'offload_apply', {
+    jobId: 'j',
+    apply: true,
+    verifiedBy: 'ran npm test in the primary: all green',
+    applyThenVerifyTolerate: ['hard-coded /tmp one'],
+  });
+  call(44, 'offload_apply', {
+    jobId: 'j',
+    repoPath: '/repo',
+    apply: true,
+    verifiedBy: 'ran npm test in the primary: all green',
+    applyThenVerify: 'node --test test/unit/a.test.mjs',
+    applyThenVerifyTolerate: ['hard-coded /tmp one'],
+  });
   await new Promise((resolve) => setTimeout(resolve, 20));
   const responses = wire.trim().split('\n').map(JSON.parse);
-  for (const id of [1, 2, 3, 4, 5, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 25, 27, 28, 31, 32, 33, 34, 37, 38, 41, 42])
+  for (const id of [1, 2, 3, 4, 5, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 25, 27, 28, 31, 32, 33, 34, 37, 38, 41, 42, 43])
     assert.equal(responses.find((value) => value.id === id).result.isError, true);
+  assert.match(JSON.stringify(responses.find((value) => value.id === 43)), /applyThenVerifyTolerate requires applyThenVerify/);
   assert.equal(calls.revert.length, 2, 'invalid apply values must never reach a potentially applying reverter');
   assert.equal(calls.repair.length, 1, 'hidden launch:false must never reach core.repair');
   assert.deepEqual(calls.start[0].ownedPaths, ['src/**']);
@@ -233,10 +249,22 @@ test('MCP enforces advertised input schemas and maps only public operation optio
     ['j', { repoPath: '/repo', extraTurns: 30, extraUsd: 0.5, note: 'finish the tests' }],
     ['j', { repoPath: undefined }],
   ]);
-  assert.deepEqual(calls.apply, [
+  assert.deepEqual(calls.apply.slice(0, 2), [
     ['j', { repoPath: undefined, apply: false }],
     ['j', { repoPath: '/repo', apply: true, verifiedBy: 'ran npm test in the primary: all green' }],
   ]);
+  const toleratedCall = calls.apply[2][1];
+  assert.deepEqual(Object.keys(toleratedCall).sort(), [
+    'apply',
+    'applyThenVerify',
+    'applyThenVerifyTolerate',
+    'repoPath',
+    'signal',
+    'verifiedBy',
+  ]);
+  assert.equal(toleratedCall.applyThenVerify, 'node --test test/unit/a.test.mjs');
+  assert.deepEqual(toleratedCall.applyThenVerifyTolerate, ['hard-coded /tmp one']);
+  assert.ok(toleratedCall.signal instanceof AbortSignal);
   assert.equal(calls.wait[1][1].detail, 'full');
   assert.equal(calls.wait.length, 2, 'an invalid detail or oversized timeout must never reach core.wait');
   assert.match(JSON.stringify(responses.find((value) => value.id === 42)), /timeoutSec exceeds its maximum of 55/);
@@ -371,6 +399,12 @@ test('MCP exposes applyThenVerify, forwards it with the request signal only when
   });
   call(4, { jobId: 'j', apply: true, verifiedBy: 'ran npm test in the primary', applyThenVerify: 'npm test' });
   call(5, { jobId: 'j', apply: true, verifiedBy: 'ran npm test in the primary' });
+  call(16, {
+    jobId: 'j',
+    apply: true,
+    applyThenVerify: 'npm test',
+    applyThenVerifyTolerate: ['hard-coded /tmp one', 'reads /tmp fixture'],
+  });
   for (const [id, extra] of [
     [6, { applyThenVerify: '' }],
     [7, { applyThenVerify: 'x'.repeat(8193) }],
@@ -382,6 +416,11 @@ test('MCP exposes applyThenVerify, forwards it with the request signal only when
     [13, { applyThenVerifyTimeoutSec: 30 }],
     [14, { unsafePolicyOnlyVerifier: true }],
     [15, { applyThenVerify: 42 }],
+    [17, { applyThenVerifyTolerate: ['hard-coded /tmp one'] }],
+    [18, { applyThenVerify: 'npm test', applyThenVerifyTolerate: [] }],
+    [19, { applyThenVerify: 'npm test', applyThenVerifyTolerate: [''] }],
+    [20, { applyThenVerify: 'npm test', applyThenVerifyTolerate: ['x'.repeat(501)] }],
+    [21, { applyThenVerify: 'npm test', applyThenVerifyTolerate: Array.from({ length: 51 }, (_, index) => `t${index}`) }],
   ])
     call(id, { jobId: 'j', apply: true, ...extra });
   await new Promise((resolve) => setTimeout(resolve, 30));
@@ -394,12 +433,17 @@ test('MCP exposes applyThenVerify, forwards it with the request signal only when
   assert.equal(properties.applyThenVerifyTimeoutSec.type, 'integer');
   assert.equal(properties.applyThenVerifyTimeoutSec.minimum, 5);
   assert.equal(properties.applyThenVerifyTimeoutSec.maximum, 900);
+  assert.equal(properties.applyThenVerifyTolerate.type, 'array');
+  assert.equal(properties.applyThenVerifyTolerate.minItems, 1);
+  assert.equal(properties.applyThenVerifyTolerate.maxItems, 50);
+  assert.deepEqual(properties.applyThenVerifyTolerate.items, { type: 'string', minLength: 1, maxLength: 500 });
+  assert.match(properties.applyThenVerifyTolerate.description, /environment-only/);
   assert.equal(properties.unsafePolicyOnlyVerifier.type, 'boolean');
   assert.deepEqual(tool.inputSchema.required, ['jobId']);
   assert.equal(tool.inputSchema.additionalProperties, false);
   assert.match(tool.description, /applyThenVerify/);
   assert.match(tool.description, /`applied` field/);
-  assert.equal(applied.length, 4, 'every misuse is rejected before core.apply');
+  assert.equal(applied.length, 5, 'every misuse is rejected before core.apply');
   assert.deepEqual(Object.keys(applied[0][1]).sort(), ['apply', 'applyThenVerify', 'repoPath', 'signal']);
   assert.equal(applied[0][1].applyThenVerify, 'npm test');
   assert.ok(applied[0][1].signal instanceof AbortSignal, 'the request signal reaches the command so a cancel reverts');
@@ -420,8 +464,12 @@ test('MCP exposes applyThenVerify, forwards it with the request signal only when
     ['j', { repoPath: undefined, apply: true, verifiedBy: 'ran npm test in the primary' }],
     'a plain apply keeps its exact option shape',
   );
+  assert.deepEqual(Object.keys(applied[4][1]).sort(), ['apply', 'applyThenVerify', 'applyThenVerifyTolerate', 'repoPath', 'signal']);
+  assert.deepEqual(applied[4][1].applyThenVerifyTolerate, ['hard-coded /tmp one', 'reads /tmp fixture']);
   for (let id = 6; id <= 15; id += 1) assert.equal(values.find((value) => value.id === id).result.isError, true, `call ${id}`);
+  for (let id = 17; id <= 21; id += 1) assert.equal(values.find((value) => value.id === id).result.isError, true, `call ${id}`);
   for (const id of [13, 14]) assert.match(JSON.stringify(values.find((value) => value.id === id)), /require applyThenVerify/);
+  assert.match(JSON.stringify(values.find((value) => value.id === 17)), /applyThenVerifyTolerate requires applyThenVerify/);
   await server.close();
 });
 test('MCP exposes the bounded log window on offload_job, forwards it only when supplied, and names FAILED continuation', async () => {

@@ -297,6 +297,14 @@ const TOOLS = [
         maximum: 900,
         description: "applyThenVerify command timeout; default 300. The host's tool timeout may be shorter (see applyThenVerify).",
       },
+      applyThenVerifyTolerate: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 50,
+        items: { type: 'string', minLength: 1, maxLength: 500 },
+        description:
+          'Exact test names you have identified as environment-only failures (for example a test that hard-codes /tmp, which the sandbox denies by design). Requires applyThenVerify. A failing run still counts as passing only when its output parses completely (node:test/TAP/jest/vitest/pytest/go/cargo), every failing test is named here, no failure is unnamed, and at least one test passed; the server records the real non-zero exit code and the tolerated names, and the job stays DONE_UNVERIFIED. Otherwise the run reverts as usual and the result says why tolerance was not applied. Never name a test the worker changed or whose failure could be a regression. Use only when health reports applyThenVerifyTolerate.',
+      },
       unsafePolicyOnlyVerifier: {
         type: 'boolean',
         description:
@@ -731,6 +739,8 @@ export function createMcpServer(
         throw new Error('applyThenVerifyTimeoutSec and unsafePolicyOnlyVerifier require applyThenVerify');
       if (args.applyThenVerify === undefined && args.applyThenVerifyIn !== undefined)
         throw new Error('applyThenVerifyIn requires applyThenVerify');
+      if (args.applyThenVerify === undefined && args.applyThenVerifyTolerate !== undefined)
+        throw new Error('applyThenVerifyTolerate requires applyThenVerify');
     }
     return args;
   };
@@ -813,6 +823,7 @@ export function createMcpServer(
                 applyThenVerify: args.applyThenVerify,
                 ...(args.applyThenVerifyTimeoutSec !== undefined ? { applyThenVerifyTimeoutSec: args.applyThenVerifyTimeoutSec } : {}),
                 ...(args.applyThenVerifyIn !== undefined ? { applyThenVerifyIn: args.applyThenVerifyIn } : {}),
+                ...(args.applyThenVerifyTolerate !== undefined ? { applyThenVerifyTolerate: args.applyThenVerifyTolerate } : {}),
                 ...(args.unsafePolicyOnlyVerifier !== undefined ? { unsafePolicyOnlyVerifier: args.unsafePolicyOnlyVerifier } : {}),
                 signal,
               }

@@ -425,6 +425,39 @@ test('only the Flash route has a per-turn USD estimate, and maxUsd lifts the aut
   assert.equal(autoTurnCeiling({ maxUsd: Number.NaN, turnUsdEstimate: 0.01 }), AUTO_TURNS_MAX);
 });
 
+test('a start whose cap maxUsd holds below the Flash recommendation says it will likely stop BUDGET and how to avoid it', () => {
+  // Field job: 85 base turns x3 = 255 recommended, maxUsd $2 covers 200 at $0.01.
+  const sized = resolveTurnBudget({
+    configured: 80,
+    recommended: 85,
+    turnMultiplier: 3,
+    turnUsdEstimate: FLASH_TURN_USD_ESTIMATE,
+    maxUsd: 2,
+  });
+  assert.equal(sized.maxTurns, 200);
+  const warning = sized.warnings.find((text) => /exceeds the automatic ceiling/.test(text));
+  assert.match(warning, /^recommended 255 turns exceeds the automatic ceiling 200; the job is likely to stop BUDGET on its turn cap/);
+  assert.match(
+    warning,
+    /budget\.maxUsd 2 covers about 200 turns at the conservative ~\$0\.01 per turn on this route; maxUsd 2\.55 or more would allow all 255\./,
+  );
+  assert.match(warning, /Split the package, add :START-END line ranges to relevantPaths, raise budget\.maxUsd, or continue/);
+  // Past the hard headroom ceiling no USD helps, so none is suggested.
+  const huge = resolveTurnBudget({
+    configured: 80,
+    recommended: 300,
+    turnMultiplier: 3,
+    turnUsdEstimate: FLASH_TURN_USD_ESTIMATE,
+    maxUsd: 2,
+  });
+  assert.match(huge.warnings.join(' '), /likely to stop BUDGET/);
+  assert.doesNotMatch(huge.warnings.join(' '), /would allow all|raise budget\.maxUsd/);
+  // A route without a per-turn estimate gets the plain advice.
+  const plain = resolveTurnBudget({ configured: 80, recommended: 900 });
+  assert.match(plain.warnings[0], /likely to stop BUDGET/);
+  assert.doesNotMatch(plain.warnings[0], /maxUsd .* would allow/);
+});
+
 test('a Flash recommendation past 200 gets its turns when maxUsd has headroom (field job: 285 recommended, $0.24 of $4 spent)', () => {
   const flash = { configured: 80, recommended: 95, turnMultiplier: 3, turnUsdEstimate: FLASH_TURN_USD_ESTIMATE };
   const roomy = resolveTurnBudget({ ...flash, maxUsd: 4 });

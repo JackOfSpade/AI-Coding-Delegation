@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyVerifyTail, classifyApplyVerifyRun, normalizeApplyVerify, publicApplyVerify } from '../../src/apply-verify.mjs';
+import {
+  applyVerifyTail,
+  classifyApplyVerifyRun,
+  normalizeApplyVerify,
+  publicApplyVerify,
+  tolerateFailures,
+} from '../../src/apply-verify.mjs';
 
 const ok = (extra = {}) => ({ verdict: 'PASS', result: { code: 0, sandbox: 'macos', durationMs: 1234.4, ...extra } });
 
@@ -179,4 +185,135 @@ test('publicApplyVerify is a bounded whitelist that never carries the output tai
   assert.equal(view.phase, 'verifying');
   assert.equal(publicApplyVerify(undefined), undefined);
   assert.equal(publicApplyVerify([]), undefined);
+});
+
+// A flat `node --test` spec run (no nested suites, so every named failure is a
+// real test) whose failing tests hard-code a path the sandbox denies.
+const tolerateSpec = (failures, passed) => `✔ target test (0.312900ms)
+${failures.map((name) => `✖ ${name} (0.212900ms)`).join('\n')}
+ℹ tests ${failures.length + passed}
+ℹ suites 0
+ℹ pass ${passed}
+ℹ fail ${failures.length}
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 12.4011
+
+✖ failing tests:
+
+${failures
+  .map(
+    (name) => `test at a.test.mjs:2:1
+✖ ${name} (0.212900ms)
+  AssertionError: /tmp is not writable in the sandbox`,
+  )
+  .join('\n\n')}
+`;
+const failingStdout = (text) => ({ code: 1, stdout: text, stderr: '' });
+
+test('normalizeApplyVerify requires applyThenVerify for applyThenVerifyTolerate and deduplicates it', () => {
+  assert.throws(
+    () => normalizeApplyVerify({ applyThenVerifyTolerate: ['one'] }),
+    /^Error: applyThenVerifyTolerate requires applyThenVerify$/,
+  );
+  assert.equal(normalizeApplyVerify({ applyThenVerify: 'x' }).tolerate, undefined);
+  assert.equal(Object.hasOwn(normalizeApplyVerify({ applyThenVerify: 'x' }), 'tolerate'), false);
+  assert.deepEqual(normalizeApplyVerify({ applyThenVerify: 'x', applyThenVerifyTolerate: ['  one  ', 'two', 'one'] }), {
+    command: 'x',
+    timeoutSec: 300,
+    policyOnly: false,
+    location: 'primary',
+    tolerate: ['one', 'two'],
+  });
+});
+
+test('normalizeApplyVerify rejects malformed applyThenVerifyTolerate lists with its exact message', () => {
+  const shape = /applyThenVerifyTolerate must be an array of 1 to 50 exact test names/;
+  for (const bad of [[], 'one', null, 5, new Array(51).fill('x')])
+    assert.throws(() => normalizeApplyVerify({ applyThenVerify: 'x', applyThenVerifyTolerate: bad }), shape);
+  const name = /applyThenVerifyTolerate names must be non-empty strings of at most 500 characters without NUL or carriage returns/;
+  for (const bad of [[5], [''], ['   '], ['a\0b'], ['a\rb'], ['x'.repeat(501)]])
+    assert.throws(() => normalizeApplyVerify({ applyThenVerify: 'x', applyThenVerifyTolerate: bad }), name, JSON.stringify(bad));
+  assert.equal(normalizeApplyVerify({ applyThenVerify: 'x', applyThenVerifyTolerate: ['x'.repeat(500)] }).tolerate.length, 1);
+});
+
+test('tolerateFailures accepts a parsed failing run whose failing tests were all named', () => {
+  const stdout = tolerateSpec(['hard-coded /tmp ignores TMPDIR', 'reads /tmp/fixture'], 1);
+  assert.deepEqual(tolerateFailures(failingStdout(stdout), ['hard-coded /tmp ignores TMPDIR', 'reads /tmp/fixture']), {
+    pass: true,
+    tolerated: ['hard-coded /tmp ignores TMPDIR', 'reads /tmp/fixture'],
+    unused: [],
+  });
+  // Names compare after whitespace collapse and trim.
+  assert.deepEqual(tolerateFailures(failingStdout(stdout), ['  reads   /tmp/fixture ', 'hard-coded /tmp ignores TMPDIR']), {
+    pass: true,
+    tolerated: ['reads   /tmp/fixture', 'hard-coded /tmp ignores TMPDIR'],
+    unused: [],
+  });
+});
+
+test('tolerateFailures rejects an unnamed failing test and reports it', () => {
+  const stdout = tolerateSpec(['known /tmp failure', 'real regression'], 1);
+  assert.deepEqual(tolerateFailures(failingStdout(stdout), ['known /tmp failure']), {
+    pass: false,
+    reason: 'untolerated-failures',
+    untolerated: ['real regression'],
+  });
+});
+
+test('tolerateFailures rejects a run with no passing test, unparseable output, or no exit code', () => {
+  const nothingPassed = tolerateSpec(['known /tmp failure'], 0);
+  assert.deepEqual(tolerateFailures(failingStdout(nothingPassed), ['known /tmp failure']), {
+    pass: false,
+    reason: 'nothing-passed',
+  });
+  assert.deepEqual(tolerateFailures(failingStdout('Error: boom\n'), ['known /tmp failure']), {
+    pass: false,
+    reason: 'unparseable-output',
+  });
+  assert.deepEqual(tolerateFailures(failingStdout(''), ['known /tmp failure']), {
+    pass: false,
+    reason: 'unparseable-output',
+  });
+  // A timeout (code null) or cancelled run is never a tolerated pass.
+  assert.deepEqual(tolerateFailures({ code: null, stdout: nothingPassed, stderr: '' }, ['known /tmp failure']), {
+    pass: false,
+    reason: 'not-a-failing-run',
+  });
+});
+
+test('tolerateFailures reports tolerated names that did not fail this run', () => {
+  const stdout = tolerateSpec(['known /tmp failure'], 1);
+  assert.deepEqual(tolerateFailures(failingStdout(stdout), ['known /tmp failure', 'fixed /tmp failure']), {
+    pass: true,
+    tolerated: ['known /tmp failure'],
+    unused: ['fixed /tmp failure'],
+  });
+});
+
+test('publicApplyVerify exposes the tolerance fields and keeps them bounded', () => {
+  assert.deepEqual(
+    publicApplyVerify({
+      command: 'node check.js',
+      outcome: 'PASSED',
+      exitCode: 1,
+      tolerate: ['one', 'two'],
+      tolerated: ['one'],
+      toleratedUnused: ['two'],
+      toleranceRejected: 'untolerated-failures',
+      toleranceUntolerated: ['three'],
+      outputTail: 'secret output',
+    }),
+    {
+      command: 'node check.js',
+      outcome: 'PASSED',
+      exitCode: 1,
+      tolerate: ['one', 'two'],
+      tolerated: ['one'],
+      toleratedUnused: ['two'],
+      toleranceRejected: 'untolerated-failures',
+      toleranceUntolerated: ['three'],
+    },
+  );
 });

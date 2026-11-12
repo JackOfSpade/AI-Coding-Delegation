@@ -63,6 +63,7 @@ import {
   classifyApplyVerifyRun,
   normalizeApplyVerify,
   publicApplyVerify,
+  tolerateFailures,
 } from './apply-verify.mjs';
 import { PathPolicy } from './policy.mjs';
 import {
@@ -1905,8 +1906,10 @@ export class JobManager {
         );
         if (verifierPreflight.status !== 'blocking') verifierPreflight.status = 'warning';
       }
+      // A blocker in a suite the job owns must keep running (dropping it drops
+      // the job's own test); the preflight offers a per-test exclusion instead.
       const blockingFiles = (verifierPreflight?.blocking ?? []).flatMap((finding) =>
-        finding.path === 'testCommand' ? [] : [finding.path],
+        finding.path === 'testCommand' || finding.mustRun ? [] : [finding.path],
       );
       const failureFiles = (verifierPreflight?.previousFailures ?? []).flatMap((failure) => failure.inCommand ?? failure.files);
       // With nothing blocking and no earlier failure, a warning on a file the
@@ -2487,6 +2490,8 @@ export class JobManager {
                   costUsd: liveCostUsd,
                   maxUsd: budgetState.maxUsd,
                   turnUsdEstimate,
+                  // Cumulative, like liveCostUsd: the observed average sizes the extension.
+                  turnsUsed: (job.turns || 0) + event.turn,
                 });
                 if (extension && (await this.#roundHasScopedChanges(job, workspace))) {
                   budgetState = { ...budgetState, maxTurns: extension.maxTurns };
@@ -4415,10 +4420,25 @@ export class JobManager {
    */
   async apply(
     id,
-    { apply = false, verifiedBy, applyThenVerify, applyThenVerifyTimeoutSec, applyThenVerifyIn, unsafePolicyOnlyVerifier, signal } = {},
+    {
+      apply = false,
+      verifiedBy,
+      applyThenVerify,
+      applyThenVerifyTimeoutSec,
+      applyThenVerifyIn,
+      applyThenVerifyTolerate,
+      unsafePolicyOnlyVerifier,
+      signal,
+    } = {},
   ) {
     if (typeof apply !== 'boolean') throw new Error('apply must be boolean');
-    const plan = normalizeApplyVerify({ applyThenVerify, applyThenVerifyTimeoutSec, applyThenVerifyIn, unsafePolicyOnlyVerifier });
+    const plan = normalizeApplyVerify({
+      applyThenVerify,
+      applyThenVerifyTimeoutSec,
+      applyThenVerifyIn,
+      applyThenVerifyTolerate,
+      unsafePolicyOnlyVerifier,
+    });
     const evidence = typeof verifiedBy === 'string' ? verifiedBy.trim() : '';
     // A command is an alternative to the primary's own evidence, so `verifiedBy`
     // is optional beside it; a malformed one is still refused rather than ignored.
@@ -4671,6 +4691,7 @@ export class JobManager {
             timeoutSec: plan.timeoutSec,
             sandbox: plan.policyOnly ? 'policy-only-authorized' : 'required',
             ...(plan.location === 'scratch' ? { location: 'scratch' } : {}),
+            ...(plan.tolerate ? { tolerate: plan.tolerate } : {}),
             startedAt: this.now().toISOString(),
             previousStatus: job.status,
             attempts: (Number.isInteger(job.applyVerify?.attempts) ? job.applyVerify.attempts : 0) + 1,
@@ -4841,15 +4862,31 @@ export class JobManager {
         requireSandbox,
         aborted: controller.signal.aborted,
       });
+      const tolerance =
+        classified.outcome === 'FAILED' && plan.tolerate?.length
+          ? tolerateFailures(run?.result, plan.tolerate, { roots: [job.repoPath] })
+          : undefined;
+      const toleratedPass = tolerance?.pass === true;
       const finishedAt = this.now().toISOString();
       const { phase: _phase, ...base } = record;
       const result = {
         ...base,
-        outcome: classified.outcome,
+        outcome: toleratedPass ? 'PASSED' : classified.outcome,
         ...(classified.exitCode !== undefined ? { exitCode: classified.exitCode } : {}),
         durationMs: classified.durationMs ?? Date.now() - startedMs,
         ...(classified.sandbox ? { ranUnder: classified.sandbox } : {}),
         ...(classified.error ? { error: classified.error } : {}),
+        // A tolerated run keeps its real (non-zero) exit code and names the
+        // failures the caller accepted; a rejected tolerance keeps the failure
+        // and says why it was not applied.
+        ...(toleratedPass
+          ? { tolerated: tolerance.tolerated, ...(tolerance.unused.length ? { toleratedUnused: tolerance.unused } : {}) }
+          : tolerance
+            ? {
+                toleranceRejected: tolerance.reason,
+                ...(tolerance.untolerated?.length ? { toleranceUntolerated: tolerance.untolerated } : {}),
+              }
+            : {}),
         outputTail: this.#storedText(applyVerifyTail(run?.result)),
         finishedAt,
       };
@@ -4883,7 +4920,7 @@ export class JobManager {
       } catch {
         drift = { reason: 'the primary state could not be re-read', changed: [] };
       }
-      if (!drift && classified.outcome === 'PASSED') {
+      if (!drift && result.outcome === 'PASSED') {
         const passed = { ...result, ...(others.length ? { primaryChangedDuringVerify: others } : {}) };
         const failure = job.status === 'FAILED' ? this.#failureOrigin(job) : undefined;
         const done = await this.store.update(id, {
@@ -4895,7 +4932,12 @@ export class JobManager {
             at: finishedAt,
             previousStatus: job.status,
             verifiedBy: evidence,
-            applyThenVerify: { command: passed.command, outcome: 'PASSED', exitCode: passed.exitCode },
+            applyThenVerify: {
+              command: passed.command,
+              outcome: 'PASSED',
+              exitCode: passed.exitCode,
+              ...(toleratedPass ? { tolerated: passed.tolerated } : {}),
+            },
             ...(failure ? { failure } : {}),
           },
           error: undefined,
@@ -4907,6 +4949,7 @@ export class JobManager {
           previousStatus: job.status,
           files: paths.length,
           applyThenVerify: 'PASSED',
+          ...(toleratedPass ? { tolerated: passed.tolerated.length } : {}),
         });
         return {
           dryRun: false,

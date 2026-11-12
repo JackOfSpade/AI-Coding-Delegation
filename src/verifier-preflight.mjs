@@ -401,7 +401,7 @@ function sourceScopes(text, python) {
   }
   const atModuleScope = (index) =>
     python ? !/[ \t]/.test(text[text.lastIndexOf('\n', index - 1) + 1] ?? '') && depth[index] === 0 : depth[index] === 0;
-  return { inCode, atModuleScope };
+  return { inCode, atModuleScope, depth };
 }
 // A listener call: only where it is code does it open a socket.
 const LISTENER_CALL =
@@ -528,19 +528,179 @@ function writeFindings(text, file, { repoPath, writeScope }) {
 }
 
 /**
- * The first listener call that is code, not a mention in a fixture's string
- * literal, comment or regex. One per file, naming its line; module scope is
- * preferred and recorded non-enumerably, like a write finding.
+ * Every listener call that is code, not a mention in a fixture's string
+ * literal, comment or regex, with the line it opens on and whether it runs at
+ * module scope. Which one may block depends on the import graph, so
+ * scanVerifier decides reachability once it has scanned the closure.
  */
-function listenerFindings(text, file) {
+function listenerCandidates(text, file) {
   const { inCode, atModuleScope } = sourceScopes(text, file.endsWith('.py'));
-  const calls = [...text.matchAll(new RegExp(LISTENER_CALL, 'g'))].filter((match) => inCode(match.index));
-  const match = calls.find((call) => atModuleScope(call.index)) ?? calls[0];
-  if (!match) return undefined;
-  const finding = { code: 'loopback-listen', path: file, line: lineOf(text, match.index) };
-  // Not serialized: only runner scoping reads it.
-  if (atModuleScope(match.index)) Object.defineProperty(finding, 'moduleScope', { value: true });
-  return finding;
+  return [...text.matchAll(new RegExp(LISTENER_CALL, 'g'))]
+    .filter((match) => inCode(match.index))
+    .map((match) => ({ index: match.index, line: lineOf(text, match.index), moduleScope: atModuleScope(match.index) }));
+}
+
+// Words that look like a call but only open a block or an expression.
+const NOT_A_CALL = new Set([
+  'if',
+  'for',
+  'while',
+  'switch',
+  'catch',
+  'function',
+  'return',
+  'typeof',
+  'new',
+  'await',
+  'do',
+  'else',
+  'try',
+  'with',
+  'yield',
+  'delete',
+  'void',
+  'instanceof',
+  'case',
+  'throw',
+  'super',
+  'import',
+  'export',
+]);
+const CALL_SITE = /([A-Za-z_$][\w$]*)\s*\(/g;
+// A bare name handed to a call: `app.on('ready', startServer)` runs it too.
+const CALL_ARGUMENT = /[,(]\s*([A-Za-z_$][\w$]*)\s*[,)]/g;
+const FUNCTION_HEADER = /(?:^|[^\w$.])(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(/g;
+const ASSIGNED_FUNCTION =
+  /(?:^|[^\w$.])(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?(?:function\b|\([^()]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)/g;
+const PROPERTY_FUNCTION = /(?:^|[,{;\n])\s*([A-Za-z_$][\w$]*)\s*:\s*(?:async\s+)?(?:function\b|\([^()]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)/g;
+const METHOD_FUNCTION = /^[ \t]*(?:(?:static|async|get|set)\s+)*([A-Za-z_$][\w$]*)\s*\([^()]*\)\s*\{/gm;
+const PY_DEF = /(?:^|\n)([ \t]*)(?:async\s+)?def\s+([A-Za-z_$][\w$]*)\s*\(/g;
+
+/** The brace a function header opens, or -1 when the arrow has an expression body. */
+function functionBodyStart(text, inCode, from) {
+  let parens = 0;
+  for (let index = from; index < Math.min(text.length, from + 400); index++) {
+    if (!inCode(index)) continue;
+    const char = text[index];
+    if (char === '(') parens++;
+    else if (char === ')') parens = Math.max(0, parens - 1);
+    else if (char === '{' && !parens) return index;
+    else if (char === ';' && !parens) return -1;
+  }
+  return -1;
+}
+/** Where an expression-bodied arrow ends: the next `;`, `,`, newline or closing bracket. */
+function expressionEnd(text, inCode, from) {
+  let parens = 0;
+  for (let index = from; index < text.length; index++) {
+    if (!inCode(index)) continue;
+    const char = text[index];
+    if ('([{'.includes(char)) parens++;
+    else if (')]}'.includes(char)) {
+      if (!parens) return index;
+      parens--;
+    } else if (!parens && (char === ';' || char === ',' || char === '\n')) return index;
+  }
+  return text.length;
+}
+/** A Python block: the first following line that is not more indented than its `def`. */
+function pythonBlockEnd(text, from, indent) {
+  for (let index = from; index < text.length;) {
+    const lineEnd = text.indexOf('\n', index);
+    const line = text.slice(index, lineEnd < 0 ? text.length : lineEnd);
+    if (line.trim() && !line.trimStart().startsWith('#') && (line.match(/^[ \t]*/) ?? [''])[0].length <= indent) return index;
+    if (lineEnd < 0) break;
+    index = lineEnd + 1;
+  }
+  return text.length;
+}
+/** Function boundaries of one file, by brace depth or indentation: enough to
+ * name the functions a call sits inside. Light lexing, not a parser. */
+function functionScopes(text, python, inCode, depth) {
+  const scopes = [];
+  const add = (name, nameIndex, start, end) => {
+    if (name && NOT_A_CALL.has(name)) return;
+    if (end > start) scopes.push({ name, nameIndex, start, end });
+  };
+  if (python) {
+    for (const match of text.matchAll(PY_DEF)) {
+      const name = match[2];
+      const nameIndex = match.index + match[0].lastIndexOf(name);
+      if (!inCode(nameIndex)) continue;
+      const lineEnd = text.indexOf('\n', match.index);
+      add(name, nameIndex, nameIndex, pythonBlockEnd(text, lineEnd < 0 ? text.length : lineEnd + 1, match[1].length));
+    }
+    return scopes;
+  }
+  for (const pattern of [FUNCTION_HEADER, ASSIGNED_FUNCTION, PROPERTY_FUNCTION, METHOD_FUNCTION]) {
+    for (const match of text.matchAll(pattern)) {
+      const name = match[1];
+      const nameIndex = match.index + match[0].indexOf(name);
+      if (!inCode(nameIndex)) continue;
+      // A method header's match already ends on its body brace; start the body search on it.
+      const from = match.index + match[0].length - (pattern === METHOD_FUNCTION ? 1 : 0);
+      const brace = functionBodyStart(text, inCode, from);
+      if (brace < 0) {
+        add(name, nameIndex, nameIndex, expressionEnd(text, inCode, from));
+        continue;
+      }
+      let end = text.length;
+      for (let index = brace + 1; index < text.length; index++)
+        if (text[index] === '}' && inCode(index) && depth[index] === depth[brace] + 1) {
+          end = index;
+          break;
+        }
+      add(name, nameIndex, brace, end);
+    }
+  }
+  return scopes;
+}
+/** Whether an index sits inside a call's parentheses rather than an export list. */
+function insideCall(text, inCode, index) {
+  let depth = 0;
+  for (let at = index - 1; at >= 0; at--) {
+    if (!inCode(at)) continue;
+    const char = text[at];
+    if (char === ')') depth++;
+    else if (char === '(') {
+      if (!depth) return true;
+      depth--;
+    } else if (!depth && (char === ';' || char === '{' || char === '}')) return false;
+  }
+  return false;
+}
+/** The calls, definitions and function chains of one file: the raw material for
+ * deciding whether a function that opens a listener ever runs. */
+function callAnalysis(text, file) {
+  const python = file.endsWith('.py');
+  const { inCode, depth } = sourceScopes(text, python);
+  const scopes = functionScopes(text, python, inCode, depth);
+  const definitions = new Map();
+  for (const scope of scopes) {
+    if (!scope.name) continue;
+    if (!definitions.has(scope.name)) definitions.set(scope.name, []);
+    definitions.get(scope.name).push(scope.nameIndex);
+  }
+  const inside = (index) => scopes.some((scope) => scope.start <= index && index <= scope.end);
+  const chainAt = (index) =>
+    scopes
+      .filter((scope) => scope.start <= index && index <= scope.end && scope.name)
+      .sort((a, b) => b.start - a.start)
+      .map((scope) => scope.name);
+  const calls = [];
+  const add = (name, index) => {
+    if (NOT_A_CALL.has(name) || (definitions.get(name) ?? []).includes(index)) return;
+    calls.push({ name, index, module: !inside(index), chain: chainAt(index) });
+  };
+  for (const match of text.matchAll(CALL_SITE)) if (inCode(match.index)) add(match[1], match.index);
+  // A name handed to a call at module scope runs when the module loads.
+  for (const match of text.matchAll(CALL_ARGUMENT)) {
+    if (!inCode(match.index)) continue;
+    const at = match.index + match[0].indexOf(match[1]);
+    if (inside(at) || !insideCall(text, inCode, at)) continue;
+    add(match[1], at);
+  }
+  return { calls, chainAt, names: new Set(definitions.keys()) };
 }
 
 /** Never executes repository code or widens verifier permissions. Follows
@@ -771,8 +931,8 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedP
     // Only test code is weighed; data and fixture files a named directory holds are not.
     if (!resolvedFiles.has(path) && named.has(path) && TEST_CODE.test(path)) commandBytes += Buffer.byteLength(text);
     if (!resolvedFiles.has(path) && TEST_CODE.test(path)) block(writeFindings(text, path, { repoPath: policy.repoPath, writeScope }));
-    // Every file, helpers included: a listener they import runs too.
-    if (!listeners.has(path)) listeners.set(path, listenerFindings(text, path));
+    // Every file, helpers included: a listener they import may run too.
+    if (!listeners.has(path)) listeners.set(path, listenerCandidates(text, path));
     resolvedFiles.add(path);
     inspect(text, path);
     references(text, path, argv);
@@ -872,20 +1032,93 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedP
     const testFiles = bySuite.length ? bySuite : testFilesFor(path);
     return testFiles.length && !(testFiles.length === 1 && testFiles[0] === path) ? testFiles.slice(0, 8) : [];
   }
+  // A listener is refused only when a suite the command runs reaches code that
+  // calls the function which opens it: one inside a named function nothing
+  // calls (an imported module's `startServer`) never binds, so it stays a
+  // warning. Module scope always runs, and a listener written in the suite
+  // itself runs with its test callbacks.
+  const analyses = new Map();
+  const analyze = (path) => {
+    if (!analyses.has(path)) {
+      const text = cache.get(path);
+      analyses.set(path, typeof text === 'string' ? callAnalysis(text, path) : undefined);
+    }
+    return analyses.get(path);
+  };
+  const isSuiteFile = (path) => named.has(path) || selectedSuites.has(path);
+  const listenerDecision = (path) => {
+    const candidates = listeners.get(path);
+    if (!Array.isArray(candidates) || !candidates.length) return undefined;
+    const moduleScoped = candidates.find((candidate) => candidate.moduleScope);
+    if (moduleScoped) return { candidate: moduleScoped, reachable: true };
+    const analysis = analyze(path);
+    if (isSuiteFile(path) || !analysis) return { candidate: candidates[0], reachable: true };
+    // Names called anywhere in the closure of a suite that reaches this file,
+    // plus the fixpoint of calls from that file's own module scope.
+    const called = new Set();
+    for (const root of [...named, ...selectedSuites])
+      if (root !== path && TEST_CODE.test(root) && reachable(root).has(path))
+        for (const file of reachable(root)) {
+          if (file === path) continue;
+          for (const call of analyze(file)?.calls ?? []) called.add(call.name);
+        }
+    const reached = new Set([...called].filter((name) => analysis.names.has(name)));
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const call of analysis.calls) {
+        if (reached.has(call.name) || !analysis.names.has(call.name)) continue;
+        if (call.module || call.chain.some((name) => reached.has(name))) {
+          reached.add(call.name);
+          changed = true;
+        }
+      }
+    }
+    const runs = (candidate) => {
+      const chain = analysis.chainAt(candidate.index);
+      // An anonymous callback's caller is not visible here: err toward running.
+      return !chain.length || chain.some((name) => reached.has(name));
+    };
+    const chosen = candidates.find(runs);
+    return { candidate: chosen ?? candidates[0], reachable: Boolean(chosen) };
+  };
+  const decisions = new Map();
+  const listenerDecisionFor = (path) => {
+    if (!decisions.has(path)) decisions.set(path, listenerDecision(path));
+    return decisions.get(path);
+  };
+  const listenerFinding = (path) => {
+    const decision = listenerDecisionFor(path);
+    if (!decision?.reachable) return undefined;
+    const finding = { code: 'loopback-listen', path, line: decision.candidate.line };
+    // Not serialized: only runner scoping reads it.
+    if (decision.candidate.moduleScope) Object.defineProperty(finding, 'moduleScope', { value: true });
+    return finding;
+  };
+  // A listener no suite calls stays a warning, flagged so a report can say why.
+  for (const warning of warnings) {
+    if (warning.code !== 'loopback-listen' || warning.path === 'testCommand') continue;
+    const decision = listenerDecisionFor(warning.path);
+    if (decision && !decision.reachable) warning.unreached = true;
+  }
   // A listener the sandbox would deny bind on is a blocker once a suite the
-  // command names runs it. Done before the runner scoping below, so a listener
-  // only an unselected runner suite runs is demoted like any other finding
-  // outside the suites that runner was given as arguments.
+  // command names runs the code that opens it. Done before the runner scoping
+  // below, so a listener only an unselected runner suite runs is demoted like
+  // any other finding outside the suites that runner was given as arguments.
   if (loopbackDenied) {
+    const promotedFindings = new Map();
+    const blockingListener = (path) => {
+      if (!promotedFindings.has(path)) promotedFindings.set(path, listenerFinding(path));
+      return promotedFindings.get(path);
+    };
     const promoted = warnings.filter(
       (warning) =>
         warning.code === 'loopback-listen' &&
         warning.path !== 'testCommand' &&
-        listeners.get(warning.path) &&
+        blockingListener(warning.path) &&
         (warningTestFiles(warning.path).length > 0 || (named.has(warning.path) && TEST_CODE.test(warning.path))),
     );
     for (const warning of promoted) {
-      const finding = listeners.get(warning.path);
+      const finding = blockingListener(warning.path);
       const testFiles = warningTestFiles(warning.path);
       if (testFiles.length) finding.testFiles = testFiles;
       // The finding itself, so a non-enumerable moduleScope survives: runner scoping reads it.
@@ -929,6 +1162,21 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedP
     const testFiles = bySuite.length ? bySuite : finding.path === 'testCommand' ? [] : testFilesFor(finding.path);
     if (testFiles.length && !(testFiles.length === 1 && testFiles[0] === finding.path)) finding.testFiles = testFiles.slice(0, 8);
   }
+  // A blocker in a file the job owns is a file testCommand must run: "drop it
+  // from testCommand" would drop the job's own test, so name the test it fails
+  // in and, when the runner can, the command that skips only that test.
+  let mustRunBlockers = 0;
+  for (const finding of blocking) {
+    if (finding.path === 'testCommand') continue;
+    if (![finding.path, ...(finding.testFiles ?? [])].some((file) => isOwned(file))) continue;
+    finding.mustRun = true;
+    mustRunBlockers++;
+    const text = cache.get(finding.path);
+    const testName = typeof text === 'string' ? enclosingTestName(text, finding.path, finding.line) : undefined;
+    if (testName) finding.testName = testName;
+  }
+  const namedBlocker = blocking.find((finding) => finding.mustRun && typeof finding.testName === 'string');
+  const testNameExclusion = namedBlocker ? testNameExclusionFor(testCommand, namedBlocker.testName) : undefined;
   const result = {
     status: blocking.length ? 'blocking' : warnings.length || advisory.length || uncertain.length ? 'warning' : 'unknown',
     scannedFiles: resolvedFiles.size,
@@ -940,6 +1188,8 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedP
     ...(uncertain.length ? { uncertain: uncertain.slice(0, MAX_FINDINGS), uncertainCount: uncertain.length } : {}),
     ...(scopeUnavailable.length ? { scopeUnavailable: scopeUnavailable.slice(0, MAX_FINDINGS) } : {}),
     ...(missingArguments.length ? { missingArguments: missingArguments.slice(0, MAX_FINDINGS) } : {}),
+    ...(mustRunBlockers ? { mustRunBlockers } : {}),
+    ...(testNameExclusion ? { testNameExclusion } : {}),
     ...(scopes.length
       ? {
           scoped: scopes.map(({ runner, selected, pending }) => ({
@@ -983,6 +1233,68 @@ const exclusion = {
   vitest: (file) => `--exclude ${shellWord(file)}`,
   jest: (file) => `--testPathIgnorePatterns ${shellWord(escapeRegExp(file))}`,
 };
+
+const TEST_CALL = /\b(?:test|it)\s*\(\s*(['"`])((?:\\.|(?!\1)[^\\])*)\1/g;
+const PY_TEST_DEF = /(?:^|\n)([ \t]*)(?:async\s+)?def\s+(test\w*)\s*\(/g;
+
+/** The innermost test case whose body spans a line: the name a per-test filter skips. */
+function enclosingTestName(text, file, line) {
+  const python = file.endsWith('.py');
+  const { inCode } = sourceScopes(text, python);
+  let best;
+  const body = (start, end, name) => {
+    if (line < lineOf(text, start) || line > lineOf(text, end)) return;
+    if (!best || end - start < best.end - best.start) best = { name, start, end };
+  };
+  if (python) {
+    for (const match of text.matchAll(PY_TEST_DEF)) {
+      if (!inCode(match.index)) continue;
+      const lineEnd = text.indexOf('\n', match.index);
+      body(match.index, pythonBlockEnd(text, lineEnd < 0 ? text.length : lineEnd + 1, match[1].length), match[2]);
+    }
+    return best?.name;
+  }
+  for (const match of text.matchAll(TEST_CALL)) {
+    if (!inCode(match.index)) continue;
+    const open = text.indexOf('(', match.index);
+    let depth = 0;
+    let end = text.length;
+    for (let at = open; at < text.length; at++) {
+      if (!inCode(at)) continue;
+      if (text[at] === '(') depth++;
+      else if (text[at] === ')' && !--depth) {
+        end = at;
+        break;
+      }
+    }
+    body(match.index, end, match[2]);
+  }
+  return best?.name;
+}
+
+/** A command that skips only the named test, or why this runner has no such filter. */
+function testNameExclusionFor(text, testName) {
+  const pattern = escapeRegExp(testName);
+  const { segments, spans } = commandSegments(text);
+  for (const [index, words] of segments.entries()) {
+    const runner = segmentRunner(words);
+    if (!runner) continue;
+    const end = spans[index].at(-1)?.[1] ?? text.length;
+    if (runner === 'node-test') {
+      const insert = spans[index][words.indexOf('--test')]?.[1];
+      if (insert === undefined) continue;
+      const skip = `--test-skip-pattern=${shellWord(pattern)}`;
+      return { testName, command: `${text.slice(0, insert)} ${skip}${text.slice(insert)}` };
+    }
+    if (runner === 'pytest') return { testName, command: `${text.slice(0, end)} -k ${shellWord(`not ${testName}`)}${text.slice(end)}` };
+    if (runner === 'jest' || runner === 'vitest') {
+      const skip = shellWord(`^(?!.*${pattern}).*$`);
+      const flag = runner === 'jest' ? `--testNamePattern=${skip}` : `-t ${skip}`;
+      return { testName, command: `${text.slice(0, end)} ${flag}${text.slice(end)}` };
+    }
+  }
+  return { testName, reason: 'runner has no test-name filter' };
+}
 
 /** Rewrite one command text so it no longer runs `drop` (named test files). */
 function narrowCommandText(text, words0, drop) {
@@ -1109,6 +1421,15 @@ const BLOCKING_ADVICE = {
   'loopback-listen':
     'the verifier sandbox denies bind unless verifier.allowLoopback is enabled, so the run is certain to end VERIFY_ENV_FAILED (loopback-denied); drop the suite from testCommand and run it in the primary, enable verifier.allowLoopback, or pass acceptVerifierBlockers: true',
 };
+/** Why a blocker inside the job's own suite cannot be dropped from testCommand,
+ * and the command that skips only the test it fails in. */
+function mustRunAdvice(value, finding) {
+  const head = "this suite is in ownedPaths and must run, so dropping it from testCommand would drop the job's own test";
+  const skip = value?.testNameExclusion;
+  if (!finding.testName || !skip || skip.testName !== finding.testName) return head;
+  if (skip.command) return `${head}; skip only the failing test "${finding.testName}": \`${skip.command}\``;
+  return `${head}; no per-test filter for this runner: start with verifierMode "baseline-diff" (the start snapshot shares the failure, so it is tolerated), or plan to apply with offload_apply + applyThenVerifyTolerate [${JSON.stringify(finding.testName)}] / verifiedBy; acceptVerifierBlockers alone only pays for a run that will end VERIFY_ENV_FAILED`;
+}
 /** One line per blocking finding: file:line, the resolved target and the fix. */
 function verifierBlockingLines(value, { limit = MAX_FINDINGS } = {}) {
   if (!Array.isArray(value?.blocking)) return [];
@@ -1116,10 +1437,12 @@ function verifierBlockingLines(value, { limit = MAX_FINDINGS } = {}) {
   const lines = shown.slice(0, limit).map((finding) => {
     const place = `${finding.path}${Number.isInteger(finding.line) ? `:${finding.line}` : ''}`;
     const runBy = finding.testFiles?.length ? `; run by ${finding.testFiles.join(', ')}` : '';
+    // A file testCommand must run cannot be dropped, so say so before the fix.
+    const advice = finding.mustRun ? `${mustRunAdvice(value, finding)} | ${BLOCKING_ADVICE[finding.code]}` : BLOCKING_ADVICE[finding.code];
     // A listener finding has no write target, only the line that opens it.
     if (finding.code === 'loopback-listen')
-      return `verifier blocker: ${place}: opens a TCP listener (createServer / server.listen)${runBy} — ${BLOCKING_ADVICE[finding.code]}`;
-    return `verifier blocker: ${place}: ${finding.call || 'write'} ${finding.target} — ${BLOCKING_ADVICE[finding.code]}${finding.extraWritable ? ` (extraWritable: "${finding.extraWritable}")` : ''}${runBy}`;
+      return `verifier blocker: ${place}: opens a TCP listener (createServer / server.listen)${runBy} — ${advice}`;
+    return `verifier blocker: ${place}: ${finding.call || 'write'} ${finding.target} — ${advice}${finding.extraWritable ? ` (extraWritable: "${finding.extraWritable}")` : ''}${runBy}`;
   });
   return shown.length > lines.length
     ? [...lines, `verifier blocker: ${shown.length - lines.length} more (detail "full" lists them)`]
@@ -1179,8 +1502,21 @@ export function verifierBlockingMessage(value) {
       'verifier preflight refused the start: the testCommand runs writes the verifier sandbox is certain to deny, so the job would end VERIFY_ENV_FAILED after spending its budget.',
       ...verifierBlockingLines(value, { limit: COMPACT_FINDINGS }),
       ...verifierScopeLines(value),
+      ...(Number.isInteger(value?.mustRunBlockers) && value.mustRunBlockers
+        ? [
+            `verifier preflight: ${value.mustRunBlockers} blocker(s) are in files the job owns (ownedPaths), so testCommand must keep running them${
+              value.testNameExclusion?.command
+                ? `; skip only the failing test: \`${value.testNameExclusion.command}\``
+                : value.testNameExclusion
+                  ? '; no per-test filter for this runner: start with verifierMode "baseline-diff", or apply with applyThenVerifyTolerate / verifiedBy'
+                  : ''
+            }`,
+          ]
+        : []),
       narrowingLine(value),
-      'Fix the tests, declare the listed extraWritable glob, drop the files from testCommand (and check them in the primary), or pass acceptVerifierBlockers: true to start anyway.',
+      value?.mustRunBlockers
+        ? 'Fix the tests, or skip only the listed test name: the suites in ownedPaths must keep running, so dropping them from testCommand is not an option, and acceptVerifierBlockers alone only pays for a run that will end VERIFY_ENV_FAILED.'
+        : 'Fix the tests, declare the listed extraWritable glob, drop the files from testCommand (and check them in the primary), or pass acceptVerifierBlockers: true to start anyway.',
     ]
       .filter(Boolean)
       // MCP error text drops control characters, so newlines would run lines together.
@@ -1215,15 +1551,32 @@ export function verifierPreflightLines(value, { lean = false } = {}) {
         : `verifier session warning: ${failure.jobId} (${failure.kind}): ${(failure.inCommand ?? failure.files).join(', ') || 'offending files unknown'}; exclude these files from testCommand and check them in the primary before spending again`,
     ),
     narrowingLine(value),
+    ...(Number.isInteger(value.mustRunBlockers) && value.mustRunBlockers
+      ? [
+          `verifier preflight: ${value.mustRunBlockers} blocker(s) are in files the job owns (ownedPaths), so testCommand must keep running them${
+            value.testNameExclusion?.testName ? `; the failing test is "${value.testNameExclusion.testName}"` : ''
+          }`,
+        ]
+      : []),
+    ...(value.testNameExclusion?.testName
+      ? [
+          value.testNameExclusion.command
+            ? `verifier exclusion: skip only "${value.testNameExclusion.testName}": \`${value.testNameExclusion.command}\` (static rewrite; review before use)`
+            : `verifier exclusion: no per-test filter for this runner to skip "${value.testNameExclusion.testName}"; start with verifierMode "baseline-diff" or plan to apply with applyThenVerifyTolerate [${JSON.stringify(value.testNameExclusion.testName)}] / verifiedBy`,
+        ]
+      : []),
     ...value.warnings
       .filter((w) => advice[w?.code] && typeof w.path === 'string')
       .slice(0, limit)
-      .map((w) => `verifier warning: ${w.path}: ${advice[w.code]}${w.testFiles?.length ? `; reached by ${w.testFiles.join(', ')}` : ''}`),
+      .map(
+        (w) =>
+          `verifier warning: ${w.path}: ${advice[w.code]}${w.unreached ? ' (not refused: no suite calls the function that opens it)' : ''}${w.testFiles?.length ? `; reached by ${w.testFiles.join(', ')}` : ''}`,
+      ),
     lean && value.warnings.length > limit && `verifier warning: ${value.warnings.length - limit} more (detail "full" lists them)`,
   ].filter(Boolean);
 }
 
-const findingView = ({ code, path, line, call, target, extraWritable, runner }) => ({
+const findingView = ({ code, path, line, call, target, extraWritable, runner, mustRun, testName }) => ({
   code,
   path,
   ...(Number.isInteger(line) ? { line } : {}),
@@ -1231,6 +1584,8 @@ const findingView = ({ code, path, line, call, target, extraWritable, runner }) 
   ...(target ? { target } : {}),
   ...(extraWritable ? { extraWritable } : {}),
   ...(runner ? { runner } : {}),
+  ...(mustRun ? { mustRun: true } : {}),
+  ...(testName ? { testName } : {}),
 });
 /**
  * The preflight as start, cancel, wait and job responses carry it by default:
@@ -1245,10 +1600,11 @@ export function compactVerifierPreflight(value) {
     ...list('blocking').map((finding) => ({ severity: 'blocking', ...findingView(finding) })),
     ...list('advisory').map((finding) => ({ severity: 'advisory', ...findingView(finding) })),
     ...list('uncertain').map((finding) => ({ severity: 'uncertain', ...findingView(finding) })),
-    ...list('warnings').map(({ code, path, testFiles }) => ({
+    ...list('warnings').map(({ code, path, testFiles, unreached }) => ({
       severity: 'warning',
       code,
       path,
+      ...(unreached ? { unreached: true } : {}),
       ...(Array.isArray(testFiles) && testFiles.length ? { testFiles: testFiles.slice(0, 8) } : {}),
     })),
   ];
@@ -1296,6 +1652,8 @@ export function compactVerifierPreflight(value) {
       ? { drop: value.drop.slice(0, COMPACT_FINDINGS), dropCount: value.drop.length }
       : {}),
     ...(value.blockersAccepted ? { blockersAccepted: true } : {}),
+    ...(Number.isInteger(value.mustRunBlockers) && value.mustRunBlockers ? { mustRunBlockers: value.mustRunBlockers } : {}),
+    ...(value.testNameExclusion && typeof value.testNameExclusion === 'object' ? { testNameExclusion: value.testNameExclusion } : {}),
     ...(findings.length > COMPACT_FINDINGS || list('resolvedFiles').length
       ? { more: 'detail "full" (offload_job or offload_wait) lists every file and finding' }
       : {}),

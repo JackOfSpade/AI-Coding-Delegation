@@ -1410,3 +1410,95 @@ test(
     }
   },
 );
+
+/**
+ * A realistic `node --test` spec run: the target test passes and each failure
+ * hard-codes /tmp, which the sandbox denies by design. Flat on purpose, so every
+ * named failure is a real test and the summary's failure count matches them.
+ */
+const tolerateStdout = (extraFailures = []) => {
+  const failures = ['hard-coded /tmp ignores TMPDIR', 'reads /tmp fixture', ...extraFailures];
+  return `✔ target test (0.312900ms)
+${failures.map((name) => `✖ ${name} (0.212900ms)`).join('\n')}
+ℹ tests ${failures.length + 1}
+ℹ suites 0
+ℹ pass 1
+ℹ fail ${failures.length}
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 14.2011
+
+✖ failing tests:
+
+${failures
+  .map(
+    (name) => `test at check.test.mjs:2:1
+✖ ${name} (0.212900ms)
+  AssertionError: /tmp is not writable in the sandbox`,
+  )
+  .join('\n\n')}
+`;
+};
+const tolerateCheck = (extraFailures = []) => ({
+  command: CHECK,
+  verdict: 'FAIL',
+  result: { code: 1, stdout: tolerateStdout(extraFailures), stderr: '', sandbox: 'macos', durationMs: 900 },
+});
+const TOLERATED = ['hard-coded /tmp ignores TMPDIR', 'reads /tmp fixture'];
+
+test('a failing applyThenVerify whose only failures are named environment-only ones applies and keeps the real exit code', async () => {
+  await run({
+    options: { check: () => tolerateCheck() },
+    run: async (h) => {
+      const result = await h.manager.apply(h.id, via(CHECK, { applyThenVerifyTolerate: TOLERATED }));
+      // The real JobManager result shape (never a hand-built fake).
+      assert.equal(result.applied, true);
+      assert.equal(result.status, 'DONE_UNVERIFIED');
+      assert.equal(result.applyThenVerify.outcome, 'PASSED');
+      assert.equal(result.applyThenVerify.exitCode, 1, 'the real non-zero exit code is recorded, not 0');
+      assert.deepEqual(result.applyThenVerify.tolerated, TOLERATED);
+      assert.deepEqual(result.applyThenVerify.tolerate, TOLERATED);
+      assert.equal(result.applyThenVerify.toleratedUnused, undefined);
+      assert.equal(result.applyThenVerify.toleranceRejected, undefined);
+      assert.equal(existsSync(join(h.repo, 'src', 'a.js')), true, 'the diff stays applied');
+      const job = await h.store.get(h.id);
+      assert.equal(job.status, 'DONE_UNVERIFIED');
+      assert.equal(job.applied, true);
+      assert.deepEqual(job.applyVerify.tolerate, TOLERATED);
+      assert.deepEqual(job.applyVerify.tolerated, TOLERATED);
+      assert.equal(job.applyVerify.exitCode, 1);
+      assert.equal(job.applyVerify.outcome, 'PASSED');
+      assert.deepEqual(job.appliedUnverified.applyThenVerify.tolerated, TOLERATED);
+      const report = await readReport(h);
+      assert.match(
+        report,
+        /applyThenVerify PASSED with 2 known environment-only failures tolerated \(exit 1\): hard-coded \/tmp ignores TMPDIR, reads \/tmp fixture/,
+      );
+      assert.doesNotMatch(report, /applyThenVerify PASSED \(exit 0/);
+      assert.match(report, /DONE_UNVERIFIED/);
+    },
+  });
+});
+
+test('one untolerated failure reverts the diff and records why tolerance was not applied', async () => {
+  await run({
+    options: { check: () => tolerateCheck(['real regression']) },
+    run: async (h) => {
+      const result = await h.manager.apply(h.id, via(CHECK, { applyThenVerifyTolerate: TOLERATED }));
+      assert.equal(result.applied, false);
+      assert.equal(result.reverted, true);
+      assert.equal(result.applyThenVerify.outcome, 'FAILED');
+      assert.equal(result.applyThenVerify.exitCode, 1);
+      assert.equal(result.applyThenVerify.toleranceRejected, 'untolerated-failures');
+      assert.deepEqual(result.applyThenVerify.toleranceUntolerated, ['real regression']);
+      assert.equal(existsSync(join(h.repo, 'src', 'a.js')), false, 'the diff is reverted');
+      const job = await h.store.get(h.id);
+      assert.equal(job.status, 'VERIFY_ENV_FAILED');
+      assert.equal(job.applyVerify.outcome, 'FAILED');
+      assert.equal(job.applyVerify.reverted, true);
+      assert.equal(job.applyVerify.toleranceRejected, 'untolerated-failures');
+      assert.match(await readReport(h), /Tolerance not applied: untolerated-failures \(failing tests you did not name: real regression\)/);
+    },
+  });
+});

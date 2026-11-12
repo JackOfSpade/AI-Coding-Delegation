@@ -77,6 +77,24 @@ export function autoTurnCeiling({ maxUsd, turnUsdEstimate } = {}) {
   if (!(Number.isFinite(maxUsd) && maxUsd > 0) || !(Number.isFinite(turnUsdEstimate) && turnUsdEstimate > 0)) return AUTO_TURNS_MAX;
   return Math.min(AUTO_TURNS_HEADROOM_MAX, Math.max(AUTO_TURNS_MAX, Math.floor(maxUsd / turnUsdEstimate)));
 }
+/** Observed spend is trusted for sizing only after this many turns. */
+export const OBSERVED_TURN_MIN_TURNS = 20;
+/** Safety margin over the observed average USD per turn. */
+export const OBSERVED_TURN_USD_MARGIN = 2;
+/** The least USD per turn an observed average may imply. */
+export const OBSERVED_TURN_USD_FLOOR = 0.001;
+/**
+ * The USD per turn to size an extension by: the route's conservative estimate,
+ * or, once at least OBSERVED_TURN_MIN_TURNS turns have run, twice the job's
+ * observed average (never below OBSERVED_TURN_USD_FLOOR, never above the
+ * estimate). Field data: a $2 Flash job spent $0.20 over 200 turns, so the
+ * static $0.01 estimate alone left it no room past its 200-turn cap.
+ */
+export function observedTurnUsd({ costUsd, turns, turnUsdEstimate } = {}) {
+  if (!(Number.isFinite(turnUsdEstimate) && turnUsdEstimate > 0)) return undefined;
+  if (!Number.isSafeInteger(turns) || turns < OBSERVED_TURN_MIN_TURNS || !(Number.isFinite(costUsd) && costUsd > 0)) return turnUsdEstimate;
+  return Math.min(turnUsdEstimate, Math.max(OBSERVED_TURN_USD_FLOOR, (OBSERVED_TURN_USD_MARGIN * costUsd) / turns));
+}
 /** The turn multiplier for one execution route (1 unless it is the DeepSeek Flash route). */
 export function routeTurnMultiplier(route) {
   if (!route || typeof route !== 'object' || route.type !== 'openai-chat' || typeof route.baseUrl !== 'string') return 1;
@@ -338,9 +356,19 @@ export function resolveTurnBudget({
   const turnsSource = maxTurns !== base ? (given ? 'raised' : 'scaled') : given ? 'caller' : 'default';
   const warnings = [];
   if (maxTurns < recommended) {
+    // When maxUsd, not the hard ceiling, holds the cap down, say which USD would
+    // cover the recommendation; the job is otherwise likely to stop on turns.
+    const usdLimited =
+      Number.isFinite(turnUsdEstimate) &&
+      turnUsdEstimate > 0 &&
+      ceiling < AUTO_TURNS_HEADROOM_MAX &&
+      recommended <= AUTO_TURNS_HEADROOM_MAX;
+    const usdAdvice = usdLimited
+      ? ` budget.maxUsd ${maxUsd ?? 'unset'} covers about ${ceiling} turns at the conservative ~$${turnUsdEstimate} per turn on this route; maxUsd ${Math.ceil(Math.round(recommended * turnUsdEstimate * 1e6) / 1e4) / 100} or more would allow all ${recommended}.`
+      : '';
     warnings.push(
       mode === 'auto'
-        ? `recommended ${recommended} turns exceeds the automatic ceiling ${ceiling}; split the package, add :START-END line ranges to relevantPaths, or continue with extraTurns after a BUDGET stop.`
+        ? `recommended ${recommended} turns exceeds the automatic ceiling ${ceiling}; the job is likely to stop BUDGET on its turn cap before it finishes.${usdAdvice} Split the package, add :START-END line ranges to relevantPaths${usdLimited ? ', raise budget.maxUsd' : ''}, or continue with extraTurns after a BUDGET stop.`
         : `maxTurns ${maxTurns} is below the recommended ${recommended} (reading the sized files needs about ${readTurns} turns at ${READ_SEGMENT}-character read_file segments). The cap is honored. ${given ? 'Omit maxTurns or pass' : 'Pass'} budget.turnPolicy:"auto" to let the server scale it, and use budget.maxUsd as the ceiling.`,
     );
   }
@@ -427,14 +455,17 @@ export const AUTO_EXTEND_CAP_FRACTION = 0.5;
  * never past maxUsd, and never above the automatic ceilings. Undefined when any
  * condition fails. The caller grants it at most once per round.
  */
-export function autoExtendedTurns(sizing, { currentMaxTurns, costUsd, maxUsd, turnUsdEstimate } = {}) {
+export function autoExtendedTurns(sizing, { currentMaxTurns, costUsd, maxUsd, turnUsdEstimate, turnsUsed } = {}) {
   const stored = safeBudgetSizing(sizing);
   if (!stored || stored.turnPolicy !== 'auto' || !Number.isSafeInteger(currentMaxTurns)) return undefined;
   if ((stored.initialTurnsSource ?? stored.turnsSource) === 'caller') return undefined;
   if (!(Number.isFinite(turnUsdEstimate) && turnUsdEstimate > 0) || !(Number.isFinite(maxUsd) && maxUsd > 0)) return undefined;
   if (!Number.isFinite(costUsd) || costUsd < 0 || costUsd >= maxUsd * AUTO_EXTEND_MAX_SPENT_FRACTION) return undefined;
-  const room = autoTurnCeiling({ maxUsd, turnUsdEstimate }) - currentMaxTurns;
-  const affordable = Math.floor((maxUsd - costUsd) / turnUsdEstimate);
+  // Sized by what this job's turns have actually cost once enough have run, so
+  // a cheap round is not stranded by a static estimate that equals its cap.
+  const turnUsd = observedTurnUsd({ costUsd, turns: turnsUsed, turnUsdEstimate });
+  const room = autoTurnCeiling({ maxUsd, turnUsdEstimate: turnUsd }) - currentMaxTurns;
+  const affordable = Math.floor((maxUsd - costUsd) / turnUsd);
   const extraTurns = Math.min(Math.floor(currentMaxTurns * AUTO_EXTEND_CAP_FRACTION), affordable, room, MAX_SAFE_TURNS - currentMaxTurns);
   if (!(extraTurns >= 1)) return undefined;
   const maxTurns = currentMaxTurns + extraTurns;
@@ -448,9 +479,10 @@ export function autoExtendedTurns(sizing, { currentMaxTurns, costUsd, maxUsd, tu
       toMaxTurns: maxTurns,
       spentUsd: Math.round(costUsd * 1e6) / 1e6,
       maxUsd,
+      ...(turnUsd < turnUsdEstimate ? { turnUsd: Math.round(turnUsd * 1e6) / 1e6 } : {}),
     },
     warnings: [
-      `turn cap auto-extended once by ${extraTurns} (${currentMaxTurns} -> ${maxTurns}) near the cap with $${costUsd.toFixed(2)} of $${maxUsd.toFixed(2)} spent; the worker was told to wrap up and call finish. maxUsd stays the ceiling.`,
+      `turn cap auto-extended once by ${extraTurns} (${currentMaxTurns} -> ${maxTurns}) near the cap with $${costUsd.toFixed(2)} of $${maxUsd.toFixed(2)} spent${turnUsd < turnUsdEstimate ? ` (sized at ~$${turnUsd.toFixed(4)} per turn, twice the observed average)` : ''}; the worker was told to wrap up and call finish. maxUsd stays the ceiling.`,
     ],
   });
   return budgetSizing ? { maxTurns, extraTurns, budgetSizing } : undefined;
@@ -533,6 +565,7 @@ function safeAutoExtended(value) {
     toMaxTurns,
     ...(usd(value.spentUsd) !== undefined ? { spentUsd: value.spentUsd } : {}),
     ...(usd(value.maxUsd) !== undefined ? { maxUsd: value.maxUsd } : {}),
+    ...(Number.isFinite(value.turnUsd) && value.turnUsd > 0 && value.turnUsd <= 1 ? { turnUsd: value.turnUsd } : {}),
   };
 }
 /**

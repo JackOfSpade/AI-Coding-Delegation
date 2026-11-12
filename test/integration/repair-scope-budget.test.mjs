@@ -134,7 +134,7 @@ test('a skill-text-only verifier failure ends VERIFY_FAILED without a repair rou
   }
 });
 
-const flashJob = async ({ profile = FLASH, budget = {}, policy = 'auto', changes = true, cost = 0.07, result } = {}) => {
+const flashJob = async ({ profile = FLASH, budget = {}, policy = 'auto', changes = true, cost = 0.07, result, configured = 80 } = {}) => {
   const repo = makeRepo();
   const events = [];
   const verifies = [];
@@ -165,7 +165,7 @@ const flashJob = async ({ profile = FLASH, budget = {}, policy = 'auto', changes
       testCommand: 'verify',
       budget: { maxTurns: 80, maxUsd: 3, timeoutMinutes: 30, ...budget },
     },
-    { turnBudget: { configured: 80, policy, requested: policy === 'fixed' ? (budget.maxTurns ?? 80) : undefined } },
+    { turnBudget: { configured, policy, requested: policy === 'fixed' ? (budget.maxTurns ?? 80) : undefined } },
   );
   const startCap = (await m.store.get(started.jobId)).budget.maxTurns;
   const done = await m.wait(started.jobId, { timeoutSec: TERMINAL_WAIT_SEC });
@@ -189,6 +189,23 @@ test('an automatically sized Flash cap gets one bounded extension when most of m
     assert.equal(run.done.status, 'DONE_VERIFIED');
     const report = (await run.m.job(run.id, { detail: 'compact' })).report;
     assert.match(report, new RegExp(`turn cap auto-extended: \\+${extra} turns \\(${cap} -> ${cap + extra}\\)`));
+  } finally {
+    cleanup(run.repo);
+  }
+});
+
+test('a $2 Flash job at its 200-turn cap with $0.20 spent is extended by its observed per-turn cost', async () => {
+  // Field job oj-20261112-bbc8...: 200/200 turns, $0.20 of $2.00; the static
+  // $0.01 estimate gave a ceiling of exactly 200, so nothing was granted.
+  const run = await flashJob({ configured: 200, cost: 0.2, budget: { maxUsd: 2 } });
+  try {
+    assert.equal(run.startCap, 200);
+    assert.deepEqual(run.events, [{ extraTurns: 100, wrapUp: true }, undefined]);
+    assert.equal(run.stored.budget.maxTurns, 300);
+    assert.equal(run.stored.budget.maxUsd, 2, 'maxUsd is never raised');
+    const ext = run.done.budgetSizing.autoExtended;
+    assert.deepEqual([ext.extraTurns, ext.fromMaxTurns, ext.toMaxTurns], [100, 200, 300]);
+    assert.ok(ext.turnUsd > 0 && ext.turnUsd < FLASH_TURN_USD_ESTIMATE, `observed basis: ${ext.turnUsd}`);
   } finally {
     cleanup(run.repo);
   }

@@ -1,4 +1,5 @@
 import { redactText, stripTerminalControls } from './redact.mjs';
+import { createFailureCollector } from './verify-baseline.mjs';
 
 /**
  * Pure helpers for `offload_apply`'s `applyThenVerify`: the primary names a
@@ -15,6 +16,9 @@ export const MAX_APPLY_VERIFY_COMMAND = 8_192;
 export const APPLY_VERIFY_RECORD_COMMAND = 500;
 const MAX_APPLY_VERIFY_TAIL_CHARS = 8_000;
 const MAX_APPLY_VERIFY_TAIL_LINES = 40;
+export const MAX_APPLY_VERIFY_TOLERATE = 50;
+const MAX_APPLY_VERIFY_TOLERATE_NAME = 500;
+const MAX_TOLERANCE_REJECTED = 200;
 // Keep tail extraction bounded even for a custom runner's unusually large output.
 const TAIL_SCAN_CHARS = 64 * 1024;
 export const APPLY_VERIFY_PHASES = new Set(['applying', 'verifying', 'reverting']);
@@ -26,13 +30,21 @@ const APPLY_VERIFY_LOCATIONS = new Set(['primary', 'scratch']);
 /**
  * Validate the apply-time options together. Returns `null` when no command was
  * requested (after proving the dependent options are absent too), otherwise
- * `{ command, timeoutSec, policyOnly, location }`.
+ * `{ command, timeoutSec, policyOnly, location }`, plus `tolerate` when the
+ * caller named known environment-only failures to accept.
  */
-export function normalizeApplyVerify({ applyThenVerify, applyThenVerifyTimeoutSec, applyThenVerifyIn, unsafePolicyOnlyVerifier } = {}) {
+export function normalizeApplyVerify({
+  applyThenVerify,
+  applyThenVerifyTimeoutSec,
+  applyThenVerifyIn,
+  applyThenVerifyTolerate,
+  unsafePolicyOnlyVerifier,
+} = {}) {
   if (applyThenVerify === undefined) {
     if (applyThenVerifyTimeoutSec !== undefined || unsafePolicyOnlyVerifier !== undefined)
       throw new Error('applyThenVerifyTimeoutSec and unsafePolicyOnlyVerifier require applyThenVerify');
     if (applyThenVerifyIn !== undefined) throw new Error('applyThenVerifyIn requires applyThenVerify');
+    if (applyThenVerifyTolerate !== undefined) throw new Error('applyThenVerifyTolerate requires applyThenVerify');
     return null;
   }
   if (
@@ -58,11 +70,80 @@ export function normalizeApplyVerify({ applyThenVerify, applyThenVerifyTimeoutSe
   // Policy-only means no OS sandbox at all: a writable scratch copy would add nothing to that consent.
   if (applyThenVerifyIn === 'scratch' && unsafePolicyOnlyVerifier === true)
     throw new Error('applyThenVerifyIn "scratch" runs only under the macOS sandbox; it cannot be combined with unsafePolicyOnlyVerifier');
+  const tolerate = normalizeTolerateList(applyThenVerifyTolerate);
   return {
     command: applyThenVerify.trim(),
     timeoutSec: applyThenVerifyTimeoutSec ?? APPLY_VERIFY_DEFAULT_TIMEOUT_SEC,
     policyOnly: unsafePolicyOnlyVerifier === true,
     location: applyThenVerifyIn ?? 'primary',
+    ...(tolerate ? { tolerate } : {}),
+  };
+}
+
+/**
+ * Validate the caller's known environment-only failures: 1-50 exact test
+ * names, each a non-empty string without NUL or carriage returns, trimmed and
+ * deduplicated. Returns `undefined` when nothing was requested.
+ */
+function normalizeTolerateList(value) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_APPLY_VERIFY_TOLERATE)
+    throw new Error(`applyThenVerifyTolerate must be an array of 1 to ${MAX_APPLY_VERIFY_TOLERATE} exact test names`);
+  const out = [];
+  const seen = new Set();
+  for (const name of value) {
+    if (typeof name !== 'string' || !name.trim() || name.length > MAX_APPLY_VERIFY_TOLERATE_NAME || /[\0\r]/.test(name))
+      throw new Error(
+        `applyThenVerifyTolerate names must be non-empty strings of at most ${MAX_APPLY_VERIFY_TOLERATE_NAME} characters without NUL or carriage returns`,
+      );
+    const trimmed = name.trim();
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out.length ? out : undefined;
+}
+
+const collapseFailureName = (name) => String(name).replace(/\s+/g, ' ').trim();
+
+/**
+ * Decide whether a FAILED applyThenVerify run may still count as a pass because
+ * the caller named its failures as known environment-only ones (a test that
+ * hard-codes /tmp the sandbox denies, say). The run is accepted only when its
+ * output parses completely into named failures, every failing name was named by
+ * the caller, no failure is unnamed, and at least one test passed. Anything
+ * else keeps the failure and reports why the tolerance was not applied.
+ */
+export function tolerateFailures(result, tolerate, { roots = [] } = {}) {
+  const requested = Array.isArray(tolerate)
+    ? tolerate.filter((name) => typeof name === 'string' && name.trim()).map((name) => name.trim())
+    : [];
+  if (!requested.length) return { pass: false, reason: 'no-tolerance-list' };
+  if (!Number.isInteger(result?.code) || result.code === 0) return { pass: false, reason: 'not-a-failing-run' };
+  const collector = createFailureCollector({ roots });
+  for (const [stream, chunk] of [
+    ['stdout', result?.stdout],
+    ['stderr', result?.stderr],
+  ])
+    if (typeof chunk === 'string' && chunk) collector.push(chunk, stream);
+  const parsed = collector.finish();
+  if (parsed.truncated) return { pass: false, reason: 'truncated' };
+  if (parsed.format === 'none' || !parsed.distinct) return { pass: false, reason: 'unparseable-output' };
+  if (!parsed.complete) return { pass: false, reason: 'incomplete-output' };
+  if (parsed.stoppedEarly) return { pass: false, reason: 'stopped-early' };
+  const failing = [...parsed.failures.keys()];
+  const failingKeys = new Set(failing.map(collapseFailureName));
+  const toleratedKeys = new Set(requested.map(collapseFailureName));
+  const untolerated = failing.filter((name) => !toleratedKeys.has(collapseFailureName(name))).slice(0, 10);
+  if (untolerated.length) return { pass: false, reason: 'untolerated-failures', untolerated };
+  // The summary must account for every failure the parser named: an unnamed
+  // failure (a crash, a hook error) cannot be matched against the list.
+  if (parsed.summaryFailed !== null && parsed.summaryFailed !== parsed.total) return { pass: false, reason: 'unnamed-failures' };
+  if (!(parsed.summaryPassed > 0)) return { pass: false, reason: 'nothing-passed' };
+  return {
+    pass: true,
+    tolerated: requested.filter((name) => failingKeys.has(collapseFailureName(name))),
+    unused: requested.filter((name) => !failingKeys.has(collapseFailureName(name))),
   };
 }
 
@@ -144,9 +225,10 @@ export function publicApplyVerify(record) {
   for (const key of ['reverted', 'revertVerified', 'primaryRestoredExactly']) if (typeof record[key] === 'boolean') out[key] = record[key];
   for (const key of ['autoRevertError', 'error']) if (typeof record[key] === 'string') out[key] = text(record[key], 500);
   if (Number.isInteger(record.attempts)) out.attempts = record.attempts;
-  for (const key of ['changed', 'primaryChangedDuringVerify']) {
+  for (const key of ['changed', 'primaryChangedDuringVerify', 'tolerate', 'tolerated', 'toleratedUnused', 'toleranceUntolerated']) {
     const list = names(record[key]);
     if (list?.length) out[key] = list;
   }
+  if (typeof record.toleranceRejected === 'string') out.toleranceRejected = text(record.toleranceRejected, MAX_TOLERANCE_REJECTED);
   return out;
 }

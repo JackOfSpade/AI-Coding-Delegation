@@ -1633,6 +1633,7 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
               applyThenVerify: opts.applyThenVerify,
               ...(opts.applyThenVerifyTimeoutSec !== undefined ? { applyThenVerifyTimeoutSec: opts.applyThenVerifyTimeoutSec } : {}),
               ...(opts.applyThenVerifyIn !== undefined ? { applyThenVerifyIn: opts.applyThenVerifyIn } : {}),
+              ...(opts.applyThenVerifyTolerate !== undefined ? { applyThenVerifyTolerate: opts.applyThenVerifyTolerate } : {}),
               ...(opts.unsafePolicyOnlyVerifier !== undefined ? { unsafePolicyOnlyVerifier: opts.unsafePolicyOnlyVerifier } : {}),
               ...(opts.signal ? { signal: opts.signal } : {}),
             }

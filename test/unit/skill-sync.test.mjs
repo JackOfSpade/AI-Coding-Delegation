@@ -26,6 +26,15 @@ test('the premium and economy skills are identical apart from frontmatter name a
   assert.deepEqual(rest(premium.metadata), rest(economy.metadata));
 });
 
+test('the skill bodies contain no $<digit>, which Claude Code substitutes with the command arguments', async () => {
+  // `$0.01` reached a session as "Improve.01": `$0` is the first argument word.
+  for (const file of ['offload_economy', 'offload_premium'].map((name) => join(skills, name, 'SKILL.md'))) {
+    const text = await readFile(file, 'utf8');
+    const placeholders = [...text.matchAll(/\$\d/g)].map((match) => text.slice(Math.max(0, match.index - 30), match.index + 10));
+    assert.deepEqual(placeholders, [], file);
+  }
+});
+
 test('the plugin manifests carry the current content version', async () => {
   const { stale } = await syncPluginVersion({ check: true });
   assert.deepEqual(stale, [], 'run npm run plugin:version after changing plugins/offload');

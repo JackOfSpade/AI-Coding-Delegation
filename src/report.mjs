@@ -619,6 +619,12 @@ function applyVerifyLines(record, lean) {
   if (['applying', 'verifying', 'reverting'].includes(record.phase))
     return `applyThenVerify RUNNING (${scalar(record.phase)}) since ${scalar(record.startedAt || 'unknown')}: ${command} — the diff is applied and will be reverted automatically if this fails`;
   if (record.outcome === 'PASSED') {
+    const tolerated = Array.isArray(record.tolerated) ? record.tolerated.filter((name) => typeof name === 'string') : [];
+    if (tolerated.length) {
+      const exit = Number.isInteger(record.exitCode) && record.exitCode !== 0 ? `exit ${scalar(record.exitCode)}` : 'exit unknown';
+      const unused = Array.isArray(record.toleratedUnused) ? record.toleratedUnused.length : 0;
+      return `applyThenVerify PASSED with ${tolerated.length} known environment-only failure${tolerated.length === 1 ? '' : 's'} tolerated (${exit}): ${tolerated.slice(0, 10).map(scalar).join(', ')}${unused ? ` (not failing this run: ${record.toleratedUnused.slice(0, 10).map(scalar).join(', ')})` : ''} — the diff was applied and the job is DONE_UNVERIFIED: the primary named these failing tests as environment-only, the server only recorded the run.${unsandboxed}${tail(lean ? 10 : 40)}`;
+    }
     const others = Array.isArray(record.primaryChangedDuringVerify) && record.primaryChangedDuringVerify.length;
     return `applyThenVerify PASSED (${[`exit ${scalar(record.exitCode ?? 0)}`, seconds, ran].filter(Boolean).join(', ')}): ${command} — the primary's own check, run by the server after applying; the job is DONE_UNVERIFIED, not server-verified.${unsandboxed}${others ? ` Other primary files changed meanwhile: ${record.primaryChangedDuringVerify.slice(0, 20).map(scalar).join(', ')}.` : ''}${tail(lean ? 10 : 40)}`;
   }
@@ -649,7 +655,17 @@ function applyVerifyLines(record, lean) {
     /\b(?:EPERM|EACCES)\b|operation not permitted|permission denied/i.test(record.outputTail)
       ? ' The command was denied a write; if the suite writes into the repo tree (fixtures, mkdtemp under the project), retry with applyThenVerifyIn: "scratch".'
       : '';
-  return `applyThenVerify ${outcome}${exit || seconds ? ` (${[exit, seconds, ran].filter(Boolean).join(', ')})` : ''}: ${command} — the diff was REVERTED; the primary's job-owned paths are verified identical to before${record.primaryRestoredExactly === false ? ' (other primary files changed during verification and were left alone)' : ''}. Fix the cause and call offload_apply again${gitFixtureHint}${scratchHint}${tail(lean ? 20 : 40)}`;
+  // A rejected tolerance must say why the caller's known-failure list did not
+  // make the run a pass; the names it did not cover show what is left.
+  const tolerance =
+    typeof record.toleranceRejected === 'string'
+      ? ` Tolerance not applied: ${scalar(record.toleranceRejected).slice(0, 120)}${
+          Array.isArray(record.toleranceUntolerated) && record.toleranceUntolerated.length
+            ? ` (failing tests you did not name: ${record.toleranceUntolerated.slice(0, 10).map(scalar).join(', ')})`
+            : ''
+        }.`
+      : '';
+  return `applyThenVerify ${outcome}${exit || seconds ? ` (${[exit, seconds, ran].filter(Boolean).join(', ')})` : ''}: ${command} — the diff was REVERTED; the primary's job-owned paths are verified identical to before${record.primaryRestoredExactly === false ? ' (other primary files changed during verification and were left alone)' : ''}. Fix the cause and call offload_apply again${tolerance}${gitFixtureHint}${scratchHint}${tail(lean ? 20 : 40)}`;
 }
 const BASELINE_HINTS = {
   'unparseable-output': 'Use a runner with node:test/TAP/jest/pytest/go/cargo output so failing tests can be named.',

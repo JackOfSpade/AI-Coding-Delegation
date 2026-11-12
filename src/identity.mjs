@@ -18,6 +18,7 @@ export const RUNTIME_CAPABILITIES = Object.freeze({
   baselineVerifier: true,
   applyThenVerify: true,
   applyThenVerifyScratch: true,
+  applyThenVerifyTolerate: true,
   verifierPreflight: true,
   verifierPreflightBlocking: true,
   promptCaching: true,

@@ -958,3 +958,196 @@ test('a listener a file only mentions in a string literal or a comment never blo
   assert.equal(result.status, 'warning');
   assert.deepEqual(result.warnings, [{ code: 'loopback-listen', path: 'test/fixture.test.mjs' }]);
 });
+
+test('a listener inside a function no suite calls is never refused', (t) => {
+  const { root, write } = fixture(t);
+  write('test/app.test.mjs', "import { startServer } from '../src/server.mjs';\ntest('adds', () => {});");
+  write(
+    'src/server.mjs',
+    "import { createServer } from 'node:http';\nexport function startServer() {\n  const server = createServer(() => {});\n  return server.listen(0, '127.0.0.1');\n}\n",
+  );
+  const result = preflightVerifier({
+    repoPath: root,
+    testCommand: 'node --test test/app.test.mjs',
+    writeScope: [],
+    loopbackDenied: true,
+  });
+  assert.notEqual(result.status, 'blocking');
+  assert.equal(result.blocking, undefined);
+  assert.deepEqual(result.warnings, [
+    { code: 'loopback-listen', path: 'src/server.mjs', testFiles: ['test/app.test.mjs'], unreached: true },
+  ]);
+  const lines = verifierPreflightLines(result).join('\n');
+  assert.match(lines, /not refused: no suite calls the function that opens it/);
+  assert.equal(lines.includes('verifier blocker'), false);
+});
+
+test('a listener inside a class method is refused only when a suite calls that method', (t) => {
+  const { root, write } = fixture(t);
+  write(
+    'electron/ipc/sync.js',
+    "const http = require('http');\nclass Sync {\n  constructor() { this.port = 0; }\n  startServer() {\n    const server = http.createServer(() => {});\n    server.listen(0);\n    return server;\n  }\n  status() { return 'ok'; }\n}\nmodule.exports = { Sync };\n",
+  );
+  write('test/status.test.js', "const { Sync } = require('../electron/ipc/sync.js');\ntest('status', () => { new Sync().status(); });\n");
+  write(
+    'test/serve.test.js',
+    "const { Sync } = require('../electron/ipc/sync.js');\ntest('serve', () => { new Sync().startServer(); });\n",
+  );
+  const scan = (file) => preflightVerifier({ repoPath: root, testCommand: `node --test ${file}`, writeScope: [], loopbackDenied: true });
+  const unreached = scan('test/status.test.js');
+  assert.equal(unreached.blocking, undefined);
+  assert.deepEqual(
+    unreached.warnings.filter((warning) => warning.code === 'loopback-listen'),
+    [{ code: 'loopback-listen', path: 'electron/ipc/sync.js', testFiles: ['test/status.test.js'], unreached: true }],
+  );
+  const reached = scan('test/serve.test.js');
+  assert.equal(reached.status, 'blocking');
+  assert.deepEqual(reached.blocking, [
+    { code: 'loopback-listen', path: 'electron/ipc/sync.js', line: 5, testFiles: ['test/serve.test.js'] },
+  ]);
+});
+
+test('a listener inside a helper function a suite calls blocks, directly or one call away', (t) => {
+  const { root, write } = fixture(t);
+  write(
+    'src/server.mjs',
+    "import { createServer } from 'node:http';\nexport function startServer() {\n  createServer(() => {}).listen(0, '127.0.0.1');\n}\nexport function boot() {\n  startServer();\n}\n",
+  );
+  write('test/direct.test.mjs', "import { startServer } from '../src/server.mjs';\nstartServer();");
+  write('test/indirect.test.mjs', "import { boot } from '../src/server.mjs';\nboot();");
+  for (const [command, suite] of [
+    ['node --test test/direct.test.mjs', 'test/direct.test.mjs'],
+    ['node --test test/indirect.test.mjs', 'test/indirect.test.mjs'],
+  ]) {
+    const result = preflightVerifier({ repoPath: root, testCommand: command, writeScope: [], loopbackDenied: true });
+    assert.equal(result.status, 'blocking', command);
+    assert.deepEqual(
+      result.blocking.map((finding) => [finding.path, finding.testFiles]),
+      [['src/server.mjs', [suite]]],
+      command,
+    );
+  }
+});
+
+test('a helper listener passed as a module-scope callback, and a module-scope listener, still block', (t) => {
+  const { root, write } = fixture(t);
+  write(
+    'src/callback.mjs',
+    "import { createServer } from 'node:http';\nexport function startServer() {\n  createServer(() => {}).listen(0, '127.0.0.1');\n}\n",
+  );
+  write(
+    'src/module.mjs',
+    "import { createServer } from 'node:http';\nexport const server = createServer(() => {}).listen(0, '127.0.0.1');",
+  );
+  write('test/callback.test.mjs', "import { startServer } from '../src/callback.mjs';\nprocess.on('ready', startServer);");
+  write('test/module.test.mjs', "import '../src/module.mjs';");
+  const callback = preflightVerifier({
+    repoPath: root,
+    testCommand: 'node --test test/callback.test.mjs',
+    writeScope: [],
+    loopbackDenied: true,
+  });
+  assert.equal(callback.status, 'blocking');
+  assert.deepEqual(
+    callback.blocking.map((finding) => [finding.path, finding.testFiles]),
+    [['src/callback.mjs', ['test/callback.test.mjs']]],
+  );
+  const atModuleScope = preflightVerifier({
+    repoPath: root,
+    testCommand: 'node --test test/module.test.mjs',
+    writeScope: [],
+    loopbackDenied: true,
+  });
+  assert.equal(atModuleScope.status, 'blocking');
+  assert.deepEqual(
+    atModuleScope.blocking.map((finding) => [finding.path, finding.testFiles]),
+    [['src/module.mjs', ['test/module.test.mjs']]],
+  );
+});
+
+test('a listener function a helper only mentions in an export list is not refused', (t) => {
+  const { root, write } = fixture(t);
+  write(
+    'src/exports.mjs',
+    "import { createServer } from 'node:http';\nexport function start() {\n  createServer(() => {}).listen(0, '127.0.0.1');\n}\nmodule.exports = { start };\n",
+  );
+  write('test/exports.test.mjs', "import * as mod from '../src/exports.mjs';\nexport { start } from '../src/exports.mjs';\n");
+  const result = preflightVerifier({
+    repoPath: root,
+    testCommand: 'node --test test/exports.test.mjs',
+    writeScope: [],
+    loopbackDenied: true,
+  });
+  assert.equal(result.status, 'warning');
+  assert.equal(result.blocking, undefined);
+  assert.deepEqual(result.warnings, [
+    { code: 'loopback-listen', path: 'src/exports.mjs', testFiles: ['test/exports.test.mjs'], unreached: true },
+  ]);
+});
+
+const tempSuite = "import { mkdtempSync } from 'node:fs';\ntest('writes temp', () => {\n  mkdtempSync('/tmp/x-');\n});\n";
+
+test('a blocker in a suite ownedPaths covers must run, and names the test a command can skip', (t) => {
+  const { root, write } = fixture(t);
+  write('test/temp.test.mjs', tempSuite);
+  const result = preflightVerifier({
+    repoPath: root,
+    testCommand: 'node --test test/temp.test.mjs',
+    writeScope: [],
+    ownedPaths: ['test/**'],
+  });
+  assert.equal(result.status, 'blocking');
+  assert.equal(result.mustRunBlockers, 1);
+  const [finding] = result.blocking;
+  assert.equal(finding.path, 'test/temp.test.mjs');
+  assert.equal(finding.line, 3);
+  assert.equal(finding.mustRun, true);
+  assert.equal(finding.testName, 'writes temp');
+  assert.deepEqual(result.testNameExclusion, {
+    testName: 'writes temp',
+    command: "node --test --test-skip-pattern='writes temp' test/temp.test.mjs",
+  });
+  const message = verifierBlockingMessage(result);
+  assert.ok(message.includes(result.testNameExclusion.command));
+  assert.match(message, /this suite is in ownedPaths and must run, so dropping it from testCommand would drop the job's own test/);
+  assert.ok(message.length <= 3_000);
+  assert.match(verifierPreflightLines(result).join('\n'), /skip only "writes temp"/);
+  const compact = compactVerifierPreflight(result);
+  assert.equal(compact.mustRunBlockers, 1);
+  assert.deepEqual(compact.testNameExclusion, result.testNameExclusion);
+  assert.equal(compact.findings[0].mustRun, true);
+  assert.equal(compact.findings[0].testName, 'writes temp');
+});
+
+test('a mustRun blocker in a custom script names no flag and points at baseline-diff or applyThenVerifyTolerate', (t) => {
+  const { root, write } = fixture(t);
+  write('test/temp.test.mjs', tempSuite);
+  const result = preflightVerifier({
+    repoPath: root,
+    testCommand: 'node test/temp.test.mjs',
+    writeScope: [],
+    ownedPaths: ['test/**'],
+  });
+  assert.equal(result.blocking[0].mustRun, true);
+  assert.equal(result.mustRunBlockers, 1);
+  assert.deepEqual(result.testNameExclusion, { testName: 'writes temp', reason: 'runner has no test-name filter' });
+  const message = verifierBlockingMessage(result);
+  assert.match(message, /no per-test filter for this runner/);
+  assert.match(message, /verifierMode "baseline-diff"/);
+  assert.match(message, /applyThenVerifyTolerate \["writes temp"\]/);
+  assert.equal(message.includes('--test-skip-pattern'), false);
+});
+
+test('a blocker outside ownedPaths keeps the drop-the-file advice and carries no mustRun', (t) => {
+  const { root, write } = fixture(t);
+  write('test/temp.test.mjs', tempSuite);
+  const result = preflightVerifier({ repoPath: root, testCommand: 'node --test test/temp.test.mjs', writeScope: [] });
+  assert.equal(result.status, 'blocking');
+  assert.equal('mustRun' in result.blocking[0], false);
+  assert.equal('testName' in result.blocking[0], false);
+  assert.equal(result.mustRunBlockers, undefined);
+  assert.equal(result.testNameExclusion, undefined);
+  const message = verifierBlockingMessage(result);
+  assert.match(message, /drop the files from testCommand/);
+  assert.equal(message.includes('must run, so dropping'), false);
+});
