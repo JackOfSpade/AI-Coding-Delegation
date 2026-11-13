@@ -19,6 +19,9 @@ const ENVIRONMENT_KINDS = new Set([
   // Set by the baseline-diff verifier, never by the classifier below: the same
   // failures in both runs were the sandbox refusing the suite's fixtures.
   'sandbox-dominated',
+  // Set by the standard-mode verify step, never by the classifier: every failing
+  // test is one the job did not change and fails the same on the start snapshot.
+  'preexisting-unchanged',
 ]);
 const GIT_POINTER_DETAIL =
   'the verifier sandbox denied stat of the worktree .git pointer (pytest probes it during collection); add --ignore=.git to the pytest command, or update Offload (current servers allow this stat)';

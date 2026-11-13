@@ -151,3 +151,11 @@ test('estimateReadChars charges the merged sum of several ranges on one file, ca
   );
   assert.equal(estimateReadChars([{ path: 'a', bytes: 10_000, ranges: [{ start: 0, end: 5 }] }]), 10_000);
 });
+
+test('report output size warning triggers on large reads with an unbounded brief only', async () => {
+  const { LARGE_REPORT_READ_CHARS, briefBoundsReportSize, reportOutputWarning } = await import('../../src/output-cap.mjs');
+  assert.equal(LARGE_REPORT_READ_CHARS, 100_000);
+  assert.equal(briefBoundsReportSize('Judge each answer in detail.'), false);
+  assert.equal(briefBoundsReportSize('Judge each answer, under 5,000 characters.'), true);
+  assert.match(reportOutputWarning(130_000), /^report output: .*compact report/);
+});

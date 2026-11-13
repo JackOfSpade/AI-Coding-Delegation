@@ -350,10 +350,10 @@ test('report output-cap advice never tells the primary to continue or write in p
   const cap = { turn: 79, tool: 'finish', chars: 21_811, steer: 'continue', recovered: true };
   const failed = outputCapAdvice(cap, 'FAILED', 'report');
   assert.match(failed, /inside the report finish call of about 21 KB/);
-  assert.match(failed, /asked once for a shorter finish/);
+  assert.match(failed, /asked once to call finish with a compact report/);
   assert.match(failed, /reportResult\.text/);
   assert.doesNotMatch(failed, /write_file|Continue or rebrief/);
-  assert.match(outputCapAdvice({ ...cap, recovered: false }, 'RUNNING', 'report'), /No turn was left for a shorter finish/);
+  assert.match(outputCapAdvice({ ...cap, recovered: false }, 'RUNNING', 'report'), /No turn was left to ask for a compact finish/);
   assert.match(outputCapAdvice(cap, 'FAILED'), /write_file/, 'write jobs keep their advice');
 });
 

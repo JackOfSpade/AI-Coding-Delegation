@@ -9,6 +9,28 @@
 import { INCREMENTAL_WRITE_BYTES, INCREMENTAL_WRITE_LINES } from './agent/tools.mjs';
 import { MAX_TOOL_ARGUMENT_CHARS } from './transcript-limits.mjs';
 
+// Per-response output cap the worker loop applies on every route (keep equal to
+// MAX_REQUEST_OUTPUT_TOKENS in agent/loop.mjs; a unit test enforces it). On
+// thinking routes reasoning shares it.
+export const REQUEST_OUTPUT_TOKEN_CAP = 16_384;
+// A report this size fits one capped response with room for reasoning.
+export const REPORT_TARGET_CHARS = 12_000;
+// Declared reads at or above this size, with no output bound in the brief,
+// make an unbounded detailed report likely to hit the cap.
+export const LARGE_REPORT_READ_CHARS = 100_000;
+const BOUND_PATTERNS = [
+  /(?:\b(?:under|below|within|less than|fewer than|at most|no more than|up to|max(?:imum)?(?: of)?|limit(?:ed)? to|capped at)|<=?)\s*~?\d[\d,_.]*\s*k?\s*(?:chars?|characters?|words?|lines?|sentences?|bullets?|tokens?)\b/i,
+  /\bone[- ](?:short )?(?:line|sentence|bullet|paragraph)\s+(?:per|for each|each)\b/i,
+  /\b\d[\d,_.]*\s*(?:chars?|characters?|words?|lines?)\s+(?:max|maximum|or (?:less|fewer))\b/i,
+];
+
+/** True when a report brief already states an output size bound. */
+export const briefBoundsReportSize = (task) => typeof task === 'string' && BOUND_PATTERNS.some((re) => re.test(task));
+
+/** Start-time warning for a large-read report whose brief sets no size bound. */
+export const reportOutputWarning = (readChars) =>
+  `report output: each response is capped at about ${REQUEST_OUTPUT_TOKEN_CAP} output tokens (shared with reasoning on thinking routes such as DeepSeek Flash); with ~${readChars} chars of inputs and no size bound in the brief, ask for a compact report (for example under 5,000 characters, one line per item, written in one finish call)`;
+
 // A dropped write whose arguments were already at least this long when the
 // cap struck is treated as a whole-file-in-one-call attempt.
 export const LARGE_TRUNCATED_WRITE_CHARS = INCREMENTAL_WRITE_BYTES;
@@ -78,7 +100,9 @@ export function outputCapAdvice(cap, status = 'RUNNING', mode) {
   // recovery is the one shorter finish its finalization requests.
   if (mode === 'report') {
     const cut = `Turn ${safe.turn} hit the provider output cap${safe.tool ? ` inside ${safe.tool === 'finish' ? 'the report' : 'a'} ${safe.tool} call of about ${kb(safe.chars ?? 0)}, which was not run` : ' before any tool call ran'}.`;
-    const told = safe.recovered ? ' The worker was asked once for a shorter finish.' : ' No turn was left for a shorter finish.';
+    const told = safe.recovered
+      ? ' The worker was asked once to call finish with a compact report.'
+      : ' No turn was left to ask for a compact finish.';
     if (status === 'FAILED')
       return `${cut}${told} Any drafted report up to the cut is in reportResult.text (report salvaged line); otherwise start a fresh, narrower report job.`;
     return `${cut}${told}`;

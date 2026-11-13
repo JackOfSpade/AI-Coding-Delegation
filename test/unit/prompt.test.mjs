@@ -339,3 +339,18 @@ test('worker brief and run_command description steer away from running the whole
   const run = availableToolDefinitions({ allowCommand: true }).find((tool) => tool.function.name === 'run_command');
   assert.match(run.function.description, /server runs the verifier itself after finish, so do not run the whole suite/);
 });
+
+test('report prompt states the per-response cap and a compact target, not a 256000 goal', async () => {
+  const { REPORT_TARGET_CHARS, REQUEST_OUTPUT_TOKEN_CAP } = await import('../../src/output-cap.mjs');
+  const report = await buildSystemPrompt({ mode: 'report' });
+  assert.equal(REPORT_TARGET_CHARS, 12_000);
+  assert.ok(report.includes(`about ${REQUEST_OUTPUT_TOKEN_CAP} output tokens`));
+  assert.match(report, /directly in the finish call; do not draft it first/);
+  assert.match(report, /at most about 12000 characters/);
+  assert.match(report, /one short line per item, most important first/);
+  assert.match(report, /hard maximum 256000 characters/);
+  assert.doesNotMatch(report, /up to 256000/);
+  assert.ok(report.includes('Send finish ALONE'), 'finish-alone rule kept');
+  const write = await buildSystemPrompt({ ownedPaths: ['src/**'] });
+  assert.doesNotMatch(write, /output tokens, and a longer response/);
+});

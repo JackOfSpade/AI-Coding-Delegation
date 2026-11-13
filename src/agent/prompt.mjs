@@ -2,8 +2,10 @@ import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { PAGE_PAYLOAD, splitRelevantPath } from '../budget-sizing.mjs';
 import { readRegularFile } from '../regular-file.mjs';
+import { REPORT_TARGET_CHARS, REQUEST_OUTPUT_TOKEN_CAP } from '../output-cap.mjs';
 import { DEFAULT_OUTPUT_CAP, DEFAULT_READ_CAP, INCREMENTAL_WRITE_BYTES, INCREMENTAL_WRITE_LINES } from './tools.mjs';
 
+export const WORKER_REPORT_SIZE_RULE = `Each response, reasoning included, is limited to about ${REQUEST_OUTPUT_TOKEN_CAP} output tokens, and a longer response is cut off and lost. Write the report directly in the finish call; do not draft it first in prose or in long reasoning. Keep it compact, at most about ${REPORT_TARGET_CHARS} characters; when judging or listing many items, give one short line per item, most important first.`;
 const MAX_CONVENTIONS_BYTES = 128 * 1024;
 const MAX_RELEVANT_PATHS = 50;
 // An entry as the prompt lists it: a ":START-END" suffix, with or without the
@@ -165,7 +167,7 @@ export async function buildSystemPrompt({
       : '',
     reviewPacket === true ? reviewPacketRule(reportMode, acceptanceCriteria.length) : '',
     reportMode
-      ? `You must call finish with a concise summary and your detailed findings in its report field (up to 256000 characters), plus concerns and testsRun. ${FINISH_ALONE_RULE}`
+      ? `You must call finish with a concise summary and your findings in its report field (hard maximum 256000 characters), plus concerns and testsRun. ${WORKER_REPORT_SIZE_RULE} ${FINISH_ALONE_RULE}`
       : `You must call finish with a concise summary, concerns, and testsRun when the task is complete. Check every owned path against the task. If the server flags untouched paths, complete the missing work or confirm each in finish.untouchedPaths with {path, reason} explaining why it needs no edit. ${FINISH_ALONE_RULE}`,
   ];
   const local = conventions ?? (await repoConventions(repoPath));

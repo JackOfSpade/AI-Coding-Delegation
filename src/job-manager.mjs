@@ -10,6 +10,7 @@ import { parseKeyRef } from './secrets.mjs';
 import { isDeepSeekEndpoint, isOpenAIEndpoint, isSupportedProviderType, modelPolicyViolation } from './model-policy.mjs';
 import { isMalformedToolJsonFailure, safeProviderFailureReason } from './provider/openai-chat.mjs';
 import { diffTreeFiles, diffTrees, git as snapshotGit } from './git-snapshot.mjs';
+import { changedLinesFromDiff, changedTestNames, failingTestChanged } from './changed-tests.mjs';
 import { copyReportInputs, prepareReportInputsForCleanup, reportInputRoots, validateReportInputFiles } from './report-inputs.mjs';
 import { redactText, redactTokenShapes, redactedSummary, stripTerminalControls } from './redact.mjs';
 import { jobLogWindow, resolveLogWindow } from './diagnostics.mjs';
@@ -37,7 +38,7 @@ import { classifyVerifierEnvironment, isVerifierEnvironmentKind } from './verify
 import { continuationBlocker, promptCacheSummary } from './continuation.mjs';
 import { budgetWarning, safeBudgetOutlook } from './budget-outlook.mjs';
 import { repairOutsideScope, safeRepairSkipped } from './repair-scope.mjs';
-import { outputCapView, safeOutputCap } from './output-cap.mjs';
+import { LARGE_REPORT_READ_CHARS, briefBoundsReportSize, outputCapView, reportOutputWarning, safeOutputCap } from './output-cap.mjs';
 import { MAX_PATH_LENGTH, revertPathsProblem, safeRevertPath, safeRevertPaths } from './revert-paths.mjs';
 import { scratchFiles } from './scratch-audit.mjs';
 import { compactVerifierPreflight, narrowTestCommand, preflightVerifier, verifierBlockingMessage } from './verifier-preflight.mjs';
@@ -113,7 +114,8 @@ const MIN_VERIFIER_TIMEOUT_SEC = 5,
   // Each of the two baseline-diff runs gets this unless the caller says otherwise;
   // a full suite routinely outlasts the one-minute default of a standard verifier.
   BASELINE_VERIFIER_TIMEOUT_SEC = 300,
-  MAX_BASELINE_CACHE = 32;
+  MAX_BASELINE_CACHE = 32,
+  MAX_CHANGED_TEST_FILES = 200;
 const final = (status) => terminalStatuses.has(status);
 // Lifecycle Git probes never need a provider credential. Reuse the snapshot
 // helper so every branch/head/index query receives the same scrubbed
@@ -352,7 +354,7 @@ const VERIFIED_WITHOUT_FINISH_CONCERNS = Object.freeze({
   'no-finish':
     'The worker ended without calling finish; the server verifier passed, so the job finished. No summary, testsRun or review packet was reported: review the diff against the acceptance criteria.',
 });
-const REPORT_SALVAGE_KINDS = new Set(['finish-arguments', 'plain-text', 'truncated-finish']);
+const REPORT_SALVAGE_KINDS = new Set(['finish-arguments', 'plain-text', 'truncated-finish', 'truncated-text', 'truncated-reasoning']);
 const SUMMARY_ONLY_REPORT_CONCERN =
   'Accepted without a detailed report: the worker finished with a summary and a passing review packet but no report text; reportResult.text holds the summary. Review it against the review packet claims.';
 const safeReportSalvage = (value) => (REPORT_SALVAGE_KINDS.has(value) ? value : undefined);
@@ -2130,6 +2132,8 @@ export class JobManager {
         resolved.warnings.push(
           `declared reads (~${readChars} chars) exceed what a report worker can keep in context (${REPORT_RETENTION_MAX} chars); split the report package or narrow :START-END ranges`,
         );
+      if (readChars >= LARGE_REPORT_READ_CHARS && !briefBoundsReportSize(input.task))
+        resolved.warnings.push(reportOutputWarning(readChars));
     }
     return { resolved, budgetSizing: buildBudgetSizing({ resolved, recommendation, files, readChars, retentionChars }) };
   }
@@ -2620,7 +2624,7 @@ export class JobManager {
             job.mode === 'report' &&
             requestedStatus === 'FAILED' &&
             !!reportText &&
-            safeReportSalvage(result?.reportSalvage) === 'truncated-finish';
+            ['truncated-finish', 'truncated-text', 'truncated-reasoning'].includes(safeReportSalvage(result?.reportSalvage));
           let workerStatus = leaseLost
             ? 'FAILED'
             : controller.signal.aborted
@@ -2752,7 +2756,7 @@ export class JobManager {
             ...(summaryAccepted && workerStatus === 'WORKER_DONE' ? { reportSalvage: 'summary-only' } : {}),
             ...(plainTextSalvaged && workerStatus === 'FAILED' && failureKind === 'no-finish' ? { reportSalvage: 'plain-text' } : {}),
             ...(truncatedFinishSalvaged && workerStatus === 'FAILED' && failureKind === 'output-cap'
-              ? { reportSalvage: 'truncated-finish' }
+              ? { reportSalvage: safeReportSalvage(result.reportSalvage) }
               : {}),
             ...(leaseLost
               ? { error: `lease lost: ${leaseLost}` }
@@ -3532,6 +3536,46 @@ export class JobManager {
     } catch {}
     return undefined;
   }
+  /**
+   * Names of the tests the worker's change touched, read from the real
+   * before -> workerAfter trees. Undefined when they cannot be known exactly
+   * (no trees, unreadable test-like files, too many files): a caller must then
+   * assume a failing test may be one of them.
+   */
+  #changedTestNames(job) {
+    try {
+      if (!job.workspacePath || !validGitObjectId(job.before) || !validGitObjectId(job.workerAfter)) return undefined;
+      const entries = diffTreeFiles(job.repoPath, job.before, job.workerAfter);
+      if (entries.length > MAX_CHANGED_TEST_FILES) return undefined;
+      const files = [];
+      for (const entry of entries) {
+        if (entry.status === 'D' || !safeRevertPath(entry.path)) continue;
+        // Only files whose tests this reads need their text and hunks.
+        if (!/\.(?:[cm]?[jt]s|[jt]sx|py)$/i.test(entry.path)) {
+          files.push({ path: entry.path, text: '', changedLines: new Set([1]) });
+          continue;
+        }
+        const spec = `:(top,literal)${entry.path}`;
+        const diff = git(job.repoPath, [
+          'diff',
+          '--no-ext-diff',
+          '--no-textconv',
+          '--no-renames',
+          '-U0',
+          job.before,
+          job.workerAfter,
+          '--',
+          spec,
+        ]);
+        const text = snapshotGit(job.repoPath, ['show', `${job.workerAfter}:${entry.path}`]);
+        files.push({ path: entry.path, text, changedLines: changedLinesFromDiff(diff) });
+      }
+      const { names, unsupported } = changedTestNames({ files });
+      return unsupported.length ? undefined : names;
+    } catch {
+      return undefined;
+    }
+  }
   async _verify(job, { diagnosticOnly = false, recoverRetained = false, promoteOnPass = false, budgetStop = false } = {}) {
     // Progress callbacks can durably advance a safety lifecycle while the
     // worker is running.  The object supplied by the caller predates those
@@ -3673,6 +3717,73 @@ export class JobManager {
       } catch {
         // A parse failure proves nothing: leave the run to the ordinary paths.
         environment = null;
+      }
+    }
+    // Failures in tests the job never touched that fail identically on the
+    // untouched start snapshot are not the worker's to fix, however many other
+    // tests pass: a repair round would only spend budget. The snapshot run is
+    // made only when a repair would otherwise be queued and every failing test
+    // is provably unchanged by the job; any doubt leaves the ordinary path.
+    // The verdict stays FAIL: this is an environment verdict, never a pass.
+    if (
+      !environment &&
+      !baselineMode &&
+      verify.verdict !== 'PASS' &&
+      sandboxed &&
+      !sandboxRequirementFailed &&
+      !diagnosticOnly &&
+      !recoverRetained &&
+      !promoteOnPass &&
+      !budgetStop &&
+      !finishRecoveryUnresolved &&
+      !continuationBlocker(job) &&
+      this.isolated &&
+      job.workspacePath &&
+      (job.rounds || 0) < (job.maxRepairRounds ?? 2)
+    ) {
+      try {
+        const collector = createFailureCollector({
+          roots: this.#collectorRoots(executionPath),
+          stopsEarly: commandStopsEarly(job.testCommand),
+        });
+        const resultRun = this.#parsedRun(verify, collector);
+        const parsed = resultRun.parsed;
+        const usable =
+          resultRun.sandboxed &&
+          !resultRun.timedOut &&
+          !resultRun.cancelled &&
+          !resultRun.truncated &&
+          !resultRun.signal &&
+          typeof resultRun.code === 'number' &&
+          resultRun.code !== 0 &&
+          parsed.distinct > 0 &&
+          parsed.complete === true &&
+          parsed.truncated !== true &&
+          parsed.stoppedEarly !== true &&
+          (parsed.summaryFailed == null || parsed.summaryFailed <= parsed.total);
+        const changedTests = usable ? this.#changedTestNames(job) : undefined;
+        const failing = usable ? [...parsed.failures.keys()] : [];
+        if (changedTests && !failing.some((name) => failingTestChanged(name, changedTests))) {
+          const snapshotRun = await this.#baselineRun(job, { timeoutSec: job.verifierTimeoutSec });
+          const decision = compareFailureRuns({ baseline: snapshotRun.run, result: resultRun });
+          if (decision.status === 'compared' && decision.pass && !decision.regression && !decision.newFailures?.length) {
+            const baseline = describeBaseline(decision, {
+              baseline: snapshotRun.run,
+              result: resultRun,
+              baselineMs: snapshotRun.durationMs,
+              resultMs: verify.result?.durationMs,
+              cached: snapshotRun.cached,
+            });
+            verify = { ...verify, baseline };
+            const shown = failing.slice(0, 3).map((name) => (name.length > 60 ? `${name.slice(0, 59)}…` : name));
+            environment = {
+              kind: 'preexisting-unchanged',
+              detail: `${failing.length} failing test(s), none changed by this job, fail identically on the untouched start snapshot (${shown.join('; ')}${failing.length > shown.length ? '; …' : ''}); a repair round cannot fix them: check them in the primary checkout`,
+            };
+          }
+        }
+      } catch {
+        // Any doubt leaves the run to the ordinary repair path.
       }
     }
     // The same environmental noise in the untouched snapshot is not what made

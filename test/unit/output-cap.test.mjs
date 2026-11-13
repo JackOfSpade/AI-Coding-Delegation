@@ -225,3 +225,34 @@ test('outputCapLine renders one prefixed line for a job and nothing for a job wi
   assert.equal(outputCapLine({ outputCap: { turn: 2, steer: 'write-in-parts' } }), '');
   assert.equal(outputCapLine({ outputCap: 'nope' }), '');
 });
+
+test('briefBoundsReportSize detects an output size bound in the brief', async () => {
+  const { briefBoundsReportSize } = await import('../../src/output-cap.mjs');
+  for (const ok of [
+    'Judge each answer, under 5,000 characters total.',
+    'at most 8000 chars please',
+    'No more than 300 words.',
+    'one line per answer',
+    'Write one short sentence for each item',
+    'Keep it <= 40 lines',
+    '500 words max',
+  ])
+    assert.equal(briefBoundsReportSize(ok), true, ok);
+  for (const bad of ['Give a detailed judgment of every answer.', 'Review 6 answers and list 5 issues', '', undefined, 42])
+    assert.equal(briefBoundsReportSize(bad), false, String(bad));
+});
+
+test('REQUEST_OUTPUT_TOKEN_CAP matches the loop constant and the warning names it', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const { REQUEST_OUTPUT_TOKEN_CAP, reportOutputWarning } = await import('../../src/output-cap.mjs');
+  const src = await readFile(new URL('../../src/agent/loop.mjs', import.meta.url), 'utf8');
+  const literal = /const MAX_REQUEST_OUTPUT_TOKENS = ([\d_]+);/.exec(src)[1];
+  assert.equal(Number(literal.replaceAll('_', '')), REQUEST_OUTPUT_TOKEN_CAP);
+  assert.match(reportOutputWarning(130_000), /about 16384 output tokens .*~130000 chars of inputs and no size bound/);
+});
+
+test('report output-cap advice wording fits both the generic and finish recovery', () => {
+  const cap = { turn: 3, steer: 'continue', recovered: true };
+  assert.match(outputCapAdvice(cap, 'RUNNING', 'report'), /asked once to call finish with a compact report/);
+  assert.match(outputCapAdvice({ ...cap, recovered: false }, 'RUNNING', 'report'), /No turn was left to ask for a compact finish/);
+});

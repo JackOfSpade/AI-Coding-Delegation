@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -990,8 +990,10 @@ test(
       assert.equal(portable.sandbox, 'macos');
       const temp = /^TMPDIR=(.+)$/m.exec(portable.stdout)[1];
       assert.ok(
-        temp.startsWith(await realpath(tmpdir())) && temp.includes('offload-sandbox-'),
-        `a disposable directory under the host temp (${temp})`,
+        // TMPDIR keeps the host's own spelling of its temp root (on macOS the
+        // lexical /var/folders/..., not its /private/var realpath).
+        temp.startsWith(tmpdir()) && temp.includes('offload-sandbox-'),
+        `a disposable directory under the host temp, in the host's spelling (${temp})`,
       );
       assert.equal(hardcoded.code, 1);
       assert.match(hardcoded.stderr, /EPERM: operation not permitted, mkdtemp '\/tmp\/w-XXXXXX'/);

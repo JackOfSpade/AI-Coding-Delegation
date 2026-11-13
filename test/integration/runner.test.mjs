@@ -664,7 +664,14 @@ test(
     assert.match(result.stdout, /parent-readonly/);
     assert.doesNotMatch(result.stdout, /parent-write-unexpected/);
     assert.equal(existsSync(join(parent, 'parent-write-must-fail')), false);
-    assert.match(result.stdout, /tmp:\/private\/var\//, 'TMPDIR is the physical sandbox directory');
+    // TMPDIR keeps the host's own spelling (/var/folders/... rather than its
+    // /private/var/folders/... realpath), so os.tmpdir()-built paths diverge
+    // from realpath in the sandbox exactly as they do on the host.
+    const reportedTmp = result.stdout
+      .split('\n')
+      .find((line) => line.startsWith('tmp:'))
+      ?.slice('tmp:'.length);
+    assert.ok(reportedTmp?.startsWith(tmpdir()), `TMPDIR keeps the host spelling ${tmpdir()}: ${result.stdout}`);
     assert.ok(result.stdout.includes(`cwd:${physicalParent}`), result.stdout);
   },
 );
@@ -941,7 +948,7 @@ test('simulated Darwin temp profiles map Windows I/O to one unique POSIX write r
   }
 });
 
-test('the macOS verifier grants exactly one physical per-run temp directory through TMPDIR, TMP, TEMP and HOME', async () => {
+test('the macOS verifier exposes the host spelling of exactly one physical per-run temp directory through TMPDIR, TMP, TEMP and HOME', async () => {
   const child = fakeChild();
   let environment;
   let profile;
@@ -966,19 +973,32 @@ test('the macOS verifier grants exactly one physical per-run temp directory thro
     },
   });
   const temp = environment.TMPDIR;
-  assert.equal(environment.TMP, temp);
-  assert.equal(environment.TEMP, temp);
-  assert.equal(environment.HOME, temp);
-  assert.match(basename(temp), /^offload-sandbox-/);
-  assert.equal(temp, await realpath(dirname(temp)).then((parent) => join(parent, basename(temp))), 'the grant is the physical spelling');
+  const home = environment.HOME;
+  assert.equal(environment.TMP, temp, 'TMP is the same per-run directory');
+  assert.equal(environment.TEMP, temp, 'TEMP is the same per-run directory');
+  assert.match(basename(home), /^offload-sandbox-/);
+  assert.equal(home, await realpath(dirname(home)).then((parent) => join(parent, basename(home))), 'HOME is the physical spelling');
+  assert.equal(temp, join(tmpdir(), basename(home)), 'TMPDIR is the host spelling of the same directory');
   assert.equal(existedWhileRunning, true);
-  assert.equal(existsSync(temp), false, 'the per-run directory is removed when the command ends');
+  assert.equal(existsSync(home), false, 'the per-run directory is removed when the command ends');
   // The write set is exactly that directory: no /tmp, /private/tmp or /var/folders grant, ever.
   const writes = profileWriteRoots(profile);
   assert.deepEqual(writes, [profileTemp]);
-  if (process.platform !== 'win32') assert.equal(profileTemp, temp, 'native macOS grants its actual physical temp path');
+  if (process.platform !== 'win32') assert.equal(profileTemp, home, 'native macOS grants its actual physical temp path');
   for (const broad of ['/tmp', '/private/tmp', '/var/folders', '/private/var/folders', await realpath(tmpdir())])
     assert.equal(writes.includes(broad), false, `${broad} is never granted`);
+  // Where the host's own tmpdir() is a symlink (macOS /var -> /private/var) the
+  // two spellings differ: TMPDIR carries the host spelling, HOME stays the
+  // physical grant, and the profile adds metadata-only literals for the alias
+  // ancestors so Seatbelt resolves TMPDIR onto that grant.
+  const hostTemp = tmpdir();
+  if (process.platform !== 'win32' && hostTemp !== (await realpath(hostTemp))) {
+    assert.notEqual(temp, home, 'TMPDIR keeps the host spelling while HOME stays physical');
+    for (let parent = dirname(temp), next = dirname(parent); parent !== next; parent = next, next = dirname(parent))
+      assert.ok(profile.split('\n').includes(`(allow file-read-metadata (literal "${parent}"))`), `${parent} is granted as metadata only`);
+  } else {
+    assert.equal(temp, home, 'without a host temp symlink both spellings coincide');
+  }
   // Caller-chosen values never survive the scrub.
   assert.notEqual(environment.TMPDIR, '/caller/tmp');
   assert.equal(environment.GIT_CONFIG_GLOBAL, undefined);
@@ -1073,6 +1093,8 @@ test(
           'mktemp -d "$TMPDIR/x.XXXXXX" >/dev/null && echo own=ok || echo own=denied',
           `mktemp -d /tmp/${token}.XXXXXX >/dev/null 2>&1 && echo system=writable || echo system=denied`,
           'echo "darwin=$(getconf DARWIN_USER_TEMP_DIR)"',
+          'echo "darwin-physical=$(cd "$(getconf DARWIN_USER_TEMP_DIR)" && pwd -P)"',
+          'echo "tmpdir-physical=$(cd "$TMPDIR" && pwd -P)"',
           'echo "stripped=$(env -i /usr/bin/mktemp -d 2>&1 | head -1)"',
           `echo "node=$(node -p 'require("os").tmpdir()' 2>&1 | head -1)"`,
         ].join('\n'),
@@ -1087,7 +1109,9 @@ test(
       );
       assert.equal(lines.own, 'ok', 'a directory can be made under TMPDIR');
       assert.equal(lines.system, 'denied', 'a hard-coded /tmp stays denied');
-      assert.equal(lines.darwin, lines.tmpdir, 'getconf honors the per-run directory');
+      // TMPDIR keeps the host's lexical spelling, so getconf may report either
+      // spelling of the same directory; compare the physical paths instead.
+      assert.equal(lines['darwin-physical'], lines['tmpdir-physical'], 'getconf honors the per-run directory');
       assert.match(lines.stripped, /Operation not permitted/, 'a child that drops TMPDIR falls back to the denied /tmp');
       if (HOMEBREW_NODE) assert.equal(lines.node, lines.tmpdir, 'Node os.tmpdir() honors it too');
       assert.deepEqual(
@@ -1096,6 +1120,48 @@ test(
         'nothing was created in /tmp',
       );
       assert.equal(existsSync(lines.tmpdir), false, 'the per-run directory is gone');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'macOS verifier reproduces the host temp spelling so mkdtemp, mktemp and git work under $TMPDIR',
+  { skip: !sandboxAvailable() && MACOS_SANDBOX_SKIP_REASON },
+  async () => {
+    if (!existsSync(`${COMMAND_LINE_TOOLS}/usr/bin/git`)) return;
+    const cwd = await mkdtemp(join(tmpdir(), 'offload-temp-alias-'));
+    const hostTemp = tmpdir();
+    try {
+      const program = [
+        "const fs = require('node:fs');",
+        "const os = require('node:os');",
+        "const path = require('node:path');",
+        "const d = fs.mkdtempSync(path.join(os.tmpdir(), 'alias-'));",
+        'console.log(JSON.stringify({ tmp: os.tmpdir(), d, real: fs.realpathSync(d) }));',
+      ].join(' ');
+      const result = await runCommand(
+        [
+          ...(HOMEBREW_NODE ? [`node -e ${shellQuote(program)}`] : []),
+          'mktemp -d "$TMPDIR/m.XXXXXX" >/dev/null && echo mktemp=ok || echo mktemp=denied',
+          'git init -q "$TMPDIR/g" && echo git=ok || echo git=denied',
+        ].join('\n'),
+        { cwd, requireSandbox: true, timeoutSec: 30 },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /^mktemp=ok$/m, result.stdout);
+      assert.match(result.stdout, /^git=ok$/m, result.stdout);
+      if (!HOMEBREW_NODE) return;
+      const report = JSON.parse(result.stdout.split('\n').find((line) => line.startsWith('{')) ?? 'null');
+      // The host's own tmpdir() may be a symlink (/var -> /private/var). The
+      // verifier must reproduce that divergence instead of pre-resolving TMPDIR.
+      assert.ok(report.tmp.startsWith(hostTemp), `os.tmpdir() keeps the host spelling ${hostTemp}: ${report.tmp}`);
+      assert.equal(
+        report.d === report.real,
+        hostTemp === (await realpath(hostTemp)),
+        'a mkdtemp path under TMPDIR diverges from its realpath exactly as it does on the host',
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

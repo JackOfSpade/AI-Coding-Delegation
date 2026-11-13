@@ -6,7 +6,7 @@ import path from 'node:path';
 import { OpenAIChatProvider } from '../../src/provider/openai-chat.mjs';
 import { createMockOpenAIServer } from '../mock-openai-server.mjs';
 import { LOOPBACK_SKIP_MARKER } from '../run-suite.mjs';
-import { LocalTools } from '../../src/agent/tools.mjs';
+import { LocalTools, availableToolDefinitions } from '../../src/agent/tools.mjs';
 import { AgentLoop } from '../../src/agent/loop.mjs';
 
 const tool = (index, id, name, args) => ({
@@ -218,4 +218,104 @@ test('mock server releases a header-stall timer without starting another stall a
     await server.close();
     for (const timer of timers) clear(timer);
   }
+});
+
+// ---- report-mode capped, tool-less turns ----------------------------------------
+const cappedPrice = {
+  models: {
+    m: {
+      usd_per_1m: {
+        input_cache_hit: { off_peak: 0, peak: 0 },
+        input_cache_miss: { off_peak: 1, peak: 1 },
+        output: { off_peak: 1, peak: 1 },
+      },
+    },
+  },
+};
+const REPORT_CAPPED_MESSAGE_PATTERN = /hit the output cap before any tool call ran.*Call finish now as the sole tool call/s;
+async function cappedRound({ reportMode = true, turns, maxTurns = 4 }) {
+  const requests = [];
+  let index = 0;
+  const result = await new AgentLoop({
+    provider: {
+      async *chat(options) {
+        requests.push(structuredClone(options.messages));
+        yield* turns[Math.min(index++, turns.length - 1)]();
+      },
+    },
+    tools: { execute: async () => ({ finish: { summary: 's', concerns: [], testsRun: [] } }) },
+    model: 'm',
+    pricing: cappedPrice,
+    maxUsd: 1,
+    maxTurns,
+    reportMode,
+    ...(reportMode ? { toolDefinitions: availableToolDefinitions({ readOnly: true }) } : {}),
+  }).run({ task: 'Survey' });
+  return { result, requests };
+}
+const cappedTurn = (fields) =>
+  async function* () {
+    yield { ...fields, providerFinishReason: 'length', usage: { inputTokens: 0, outputTokens: 16_384 } };
+  };
+
+test('a tool-less capped report turn gets the report-specific continuation', async () => {
+  const { result, requests } = await cappedRound({ turns: [cappedTurn({ text: 'x' }), cappedTurn({ text: 'x' })] });
+  assert.equal(result.status, 'FAILED');
+  assert.match(requests[1].at(-1).content, REPORT_CAPPED_MESSAGE_PATTERN);
+  assert.doesNotMatch(requests[1].at(-1).content, /^Continue using an allowed tool call/);
+});
+
+test('non-report mode keeps the generic capped continuation and salvages nothing', async () => {
+  const { result, requests } = await cappedRound({ reportMode: false, turns: [cappedTurn({ text: 'a' }), cappedTurn({ text: 'b' })] });
+  assert.equal(requests[1].at(-1).content, 'Continue using an allowed tool call. When complete, call finish as the sole tool call.');
+  assert.equal(result.status, 'FAILED');
+  assert.equal(result.reportSalvage, undefined);
+  assert.equal(result.report, undefined);
+});
+
+test('two capped tool-less report turns keep the longest visible text as truncated-text', async () => {
+  const { result } = await cappedRound({
+    turns: [cappedTurn({ text: 'Finding 1: long enough draft' }), cappedTurn({ text: 'Finding 1', reasoning: 'thinking hard' })],
+  });
+  assert.equal(result.status, 'FAILED');
+  assert.equal(result.failureKind, 'output-cap');
+  assert.equal(result.reportSalvage, 'truncated-text');
+  assert.equal(result.report, 'Finding 1: long enough draft');
+});
+
+test('capped report turns with only plain reasoning keep it labeled as truncated-reasoning', async () => {
+  const { result } = await cappedRound({
+    turns: [cappedTurn({ reasoning: 'short thoughts' }), cappedTurn({ reasoning: 'longer reasoning about the files' })],
+  });
+  assert.equal(result.failureKind, 'output-cap');
+  assert.equal(result.reportSalvage, 'truncated-reasoning');
+  assert.match(result.report, /^\[Not a finished report/);
+  assert.match(result.report, /longer reasoning about the files$/);
+});
+
+test('encrypted OpenAI reasoning is never salvaged as a draft', async () => {
+  const { result } = await cappedRound({
+    turns: [
+      cappedTurn({
+        openaiReasoning: [{ type: 'reasoning', encrypted_content: 'abc', summary: [{ type: 'summary_text', text: 'hidden summary' }] }],
+      }),
+      cappedTurn({}),
+    ],
+  });
+  assert.equal(result.reportSalvage, undefined);
+  assert.equal(result.report, undefined);
+});
+
+test('a cut-off finish report beats visible text and reasoning', async () => {
+  const { result } = await cappedRound({
+    turns: [
+      cappedTurn({
+        text: 'a very long visible prose draft that is longer',
+        reasoning: 'a very long reasoning that is much much longer than all',
+      }),
+      cappedTurn({ truncatedToolCall: { name: 'finish', chars: 30_000, partial: '{"summary":"s","report":"cut finish' } }),
+    ],
+  });
+  assert.equal(result.reportSalvage, 'truncated-finish');
+  assert.equal(result.report, 'cut finish');
 });

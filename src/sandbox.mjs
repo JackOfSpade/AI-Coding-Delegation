@@ -307,6 +307,7 @@ export function macosProfile({
   denyRead = [],
   denyWrite = DEFAULT_DENY_WRITE,
   tempPath,
+  tempAliasPath,
   cachePaths = [],
   interpreterPaths = [],
   interpreterMetadataPaths = [],
@@ -335,10 +336,25 @@ export function macosProfile({
     !Array.isArray(interpreterMetadataPaths)
   )
     throw new TypeError('sandbox writable/readable/cache/interpreter paths must be arrays');
-  for (const value of [repoPath, gitDir, tempPath, ...writablePaths, ...readablePaths, ...cachePaths, ...interpreterPaths].filter(
-    (value) => value !== undefined,
-  ))
+  for (const value of [
+    repoPath,
+    gitDir,
+    tempPath,
+    tempAliasPath,
+    ...writablePaths,
+    ...readablePaths,
+    ...cachePaths,
+    ...interpreterPaths,
+  ].filter((value) => value !== undefined))
     seatbeltPath(value);
+  // tempAliasPath is the host's lexical spelling of an already granted temp
+  // directory (on macOS, `/var/folders/...` for `/private/var/folders/...`).
+  // It is a second spelling of that one directory, never a second capability,
+  // so it is meaningless without the physical tempPath that is granted.
+  if (tempAliasPath !== undefined) {
+    if (!tempPath) throw new TypeError('tempAliasPath requires tempPath');
+    if (!isAbsolute(tempAliasPath)) throw new TypeError('sandbox tempAliasPath must be absolute');
+  }
   const root = resolve(repoPath);
   const resolvedGit = isAbsolute(gitDir) ? resolve(gitDir) : resolve(root, gitDir);
   // Command callers include the worker shell and verifier. Neither can opt
@@ -391,6 +407,15 @@ export function macosProfile({
     dirname(MACOS_SHELL_SELECTOR),
   ].filter(Boolean))
     for (const parent of sandboxTraversalAncestors(path, dirname)) traversalMetadata.add(parent);
+  // The host's lexical temp spelling (typically `/var/folders/...` for the
+  // granted `/private/var/folders/...`) is what a command sees in TMPDIR, so
+  // os.tmpdir()/mkdtemp results inside the sandbox match the host exactly.
+  // Seatbelt resolves that spelling through the `/var` symlink to the physical
+  // directory the profile already grants; it only needs to stat the symlink
+  // path's own nodes. Exact metadata literals only: never a read or write
+  // subpath grant for the alias, which would widen access beyond the granted
+  // temp directory.
+  if (tempAliasPath) for (const parent of sandboxTraversalAncestors(tempAliasPath, dirname)) traversalMetadata.add(parent);
   // Stat of the root directory node itself: metadata of that one node, never
   // its contents, and less than the `file-read-data (literal "/")` listing every
   // profile already grants. CPython's realpath(3) stats each component from
@@ -676,6 +701,14 @@ export async function runCommand(command, options = {}) {
   // Grant the freshly created private directory by that spelling so a lexical
   // `/var` temporary path cannot lose its `/private/var` ancestry at launch.
   const sandboxTempPath = sandbox === 'macos' ? await realpath(dir) : dir;
+  // The host's own spelling of that same directory (`/var/folders/...` for the
+  // granted `/private/var/folders/...`). TMPDIR carries it so a test that
+  // builds a path from os.tmpdir() and compares it with realpath diverges
+  // exactly as it does on the host; the profile grants the physical directory
+  // plus metadata of this spelling's ancestors, which is all Seatbelt needs to
+  // resolve the alias onto that grant. A non-POSIX lexical path (a native
+  // Windows temp path in a Darwin fixture) is never a profile path.
+  const tempAlias = sandbox === 'macos' && posix.isAbsolute(dir) && dir !== sandboxTempPath ? dir : undefined;
   const scriptName = platform === 'win32' ? 'offload-command.cmd' : 'offload-command.sh';
   const scriptPath = join(dir, scriptName);
   const stdout = capture(Math.floor(cap / 2)),
@@ -694,12 +727,14 @@ export async function runCommand(command, options = {}) {
       // these variables, is denied by design and is deliberately not widened
       // here. A directory shared across a job's commands is rejected on purpose:
       // it would carry worker-written state into the verifier.
-      // Seatbelt evaluates the physical path. Using the lexical `/var` alias
-      // here causes Node's os.tmpdir()/mkdtemp to target a path the profile
-      // has not granted on macOS. Keep policy-only behavior unchanged.
+      // TMPDIR/TMP/TEMP carry the alias when the host's lexical spelling
+      // differs from the physical grant, so os.tmpdir() and a mkdtemp under it
+      // diverge from realpath exactly as they do on the host; HOME stays the
+      // physical directory the profile writes. Keep policy-only behavior
+      // unchanged.
       ...scrubEnv(options.env, {
         home: sandbox === 'macos' ? sandboxTempPath : dir,
-        temp: sandbox === 'macos' ? sandboxTempPath : dir,
+        temp: sandbox === 'macos' ? (tempAlias ?? sandboxTempPath) : dir,
         platform,
       }),
       OFFLOAD_COMMAND_CWD: sandbox === 'macos' ? sandboxCwd : cwd,
@@ -723,6 +758,9 @@ export async function runCommand(command, options = {}) {
             // interpreter. A separately requested temporary directory remains
             // an explicit cache capability rather than replacing that root.
             tempPath: sandboxTempPath,
+            // Metadata-only: the host's lexical spelling of that same granted
+            // directory, so TMPDIR below resolves inside Seatbelt.
+            tempAliasPath: tempAlias,
             cachePaths: [...sandboxCachePaths, ...(options.tempPath ? [sandboxPath(options.tempPath)] : [])],
             interpreterPaths: sandboxInterpreterPaths,
             allowTempSockets: true,

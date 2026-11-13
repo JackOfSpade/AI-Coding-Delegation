@@ -495,6 +495,53 @@ test('Core starts a report job without injecting write or verifier fields', asyn
     await rm(path, { recursive: true, force: true });
   }
 });
+test('a large-read report start with no output size bound in its brief warns about the per-response output cap', async () => {
+  const path = await repo('offload-core-report-output-');
+  await mkdir(join(path, 'docs'));
+  await writeFile(join(path, 'docs', 'a.md'), ('x'.repeat(99) + '\n').repeat(2_000));
+  await writeFile(join(path, 'docs', 'small.md'), 'short\n');
+  execFileSync('git', ['-C', path, 'add', 'docs']);
+  execFileSync('git', ['-C', path, 'commit', '-qm', 'docs']);
+  const isolation = { create: createIsolatedWorktree, open: openIsolatedWorktree, cleanup: cleanupIsolatedWorktree };
+  const core = createCore({
+    config: { loaded, resolveKey: () => 'credential', isolation },
+    isolation,
+    worker: { run: async () => ({ status: 'DONE', report: 'analysis complete' }) },
+  });
+  const outputWarning = (started) => started.budgetSizing.warnings.filter((w) => /^report output: /.test(w));
+  try {
+    const unbounded = await core.start({
+      mode: 'report',
+      task: 'judge every answer in detail',
+      relevantPaths: ['docs/a.md'],
+      repoPath: path,
+    });
+    assert.equal(outputWarning(unbounded).length, 1, JSON.stringify(unbounded.budgetSizing.warnings));
+    assert.match(
+      outputWarning(unbounded)[0],
+      /capped at about 16384 output tokens .*with ~\d+ chars of inputs and no size bound in the brief/,
+    );
+    const bounded = await core.start({
+      mode: 'report',
+      task: 'judge every answer; keep it under 5,000 characters, one line per answer',
+      relevantPaths: ['docs/a.md'],
+      repoPath: path,
+    });
+    assert.deepEqual(outputWarning(bounded), []);
+    const small = await core.start({
+      mode: 'report',
+      task: 'judge every answer in detail',
+      relevantPaths: ['docs/small.md'],
+      repoPath: path,
+    });
+    assert.deepEqual(outputWarning(small), []);
+    for (const id of [unbounded.jobId, bounded.jobId, small.jobId]) await core.wait(id, { repoPath: path, timeoutSec: TERMINAL_WAIT_SEC });
+  } finally {
+    await core.shutdown();
+    await rm(path, { recursive: true, force: true });
+  }
+});
+
 test('a report job echoes its read size and retention, and warns when the declared reads cannot be retained', async () => {
   const path = await repo('offload-core-report-retention-');
   await mkdir(join(path, 'docs'));
@@ -1303,6 +1350,10 @@ test('a no-id server listing does not bind its incidental cwd as a repository', 
     reviewPacketDrift: true,
     flashNoEditSteer: true,
     reportSummaryAccept: true,
+    preflightTestFilters: true,
+    preexistingUnchanged: true,
+    reportOutputSteer: true,
+    reportCappedDraftSalvage: true,
   });
   assert.match(result.health.server.buildHash, /^sha256:[0-9a-f]{64}$/);
   assert.match(result.health.server.skillHash, /^sha256:[0-9a-f]{64}$/);

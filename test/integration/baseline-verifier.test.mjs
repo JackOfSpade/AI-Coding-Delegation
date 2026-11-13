@@ -1224,7 +1224,9 @@ test('standard mode: ordinary assertion failures are still repaired', async () =
   let verifyCalls = 0;
   const h = await harness({
     repo: withSuite(),
-    verify: () => {
+    verify: (call) => {
+      // The untouched snapshot passes: the failure is the change's, so it is repaired.
+      if (!call.isResult) return spec([], 0);
       verifyCalls += 1;
       return verifyCalls === 1 ? assertionFailure() : spec([], 0);
     },
@@ -1233,6 +1235,7 @@ test('standard mode: ordinary assertion failures are still repaired', async () =
     const started = await start(h, { testCommand: SUITE, verifierMode: 'standard' });
     const done = await h.m.wait(started.jobId, { timeoutSec: TIMEOUT_SEC });
     assert.equal(verifyCalls, 2);
+    assert.equal(snapshotCalls(h).length, 1, 'the unchanged failing test cost one snapshot run, which did not excuse it');
     assert.equal(h.workers.length, 2, 'one repair round');
     assert.equal(done.status, 'DONE_VERIFIED');
     const job = await h.m.store.get(started.jobId);
@@ -1240,6 +1243,115 @@ test('standard mode: ordinary assertion failures are still repaired', async () =
     assert.match(h.workers[1].defects[0], /^Verifier failed:/);
     assert.match(h.workers[1].defects[0], /AssertionError/);
     assert.doesNotMatch(done.report, /sandbox-dominated|verifier environment/);
+  } finally {
+    h.finish();
+  }
+});
+
+// A standard-mode suite whose passes outnumber its failures and whose failures
+// print no sandbox denial: only the job's own diff and the untouched snapshot
+// can show that a repair round cannot help.
+const TEST_FILE = `import { describe, it } from 'node:test';
+describe('suite', () => {
+  it('old A', () => {
+    check('a');
+  });
+  it('old B', () => {
+    check('b');
+  });
+});
+`;
+const withTestFile = () => {
+  const repo = makeRepo();
+  write(join(repo, 'src', 't.test.mjs'), TEST_FILE);
+  git(repo, ['add', '.']);
+  git(repo, ['commit', '-m', 'tests']);
+  return repo;
+};
+const OLD = ['suite > old A', 'suite > old B'];
+const snapshotCalls = (h) => h.calls.filter((call) => !call.isResult);
+const editOldA = (job) => {
+  write(join(job.workspacePath, 'src', 't.test.mjs'), TEST_FILE.replace("check('a');", "check('a2');"));
+  return { status: 'DONE' };
+};
+
+test('standard mode: failures in tests the job did not change that fail identically on the snapshot end VERIFY_ENV_FAILED with no repair round', async () => {
+  const h = await harness({ repo: withTestFile(), verify: () => spec(OLD) });
+  try {
+    const started = await start(h, { verifierMode: 'standard', maxRepairRounds: 1 });
+    const done = await h.m.wait(started.jobId, { timeoutSec: TIMEOUT_SEC });
+    assert.equal(done.status, 'VERIFY_ENV_FAILED');
+    const job = await h.m.store.get(started.jobId);
+    assert.equal(job.verify.verdict, 'FAIL', 'never flipped to a pass');
+    assert.equal(job.verifyEnvironment.kind, 'preexisting-unchanged');
+    assert.equal(
+      job.verifyEnvironment.detail,
+      '2 failing test(s), none changed by this job, fail identically on the untouched start snapshot (suite > old A; suite > old B); a repair round cannot fix them: check them in the primary checkout',
+    );
+    assert.equal(job.verify.baseline.status, 'compared');
+    assert.equal(job.verify.baseline.newFailureCount, 0);
+    assert.equal(job.verify.baseline.preexisting, 2);
+    assert.equal(job.verify.baseline.baseline.failures, 2);
+    assert.equal(job.rounds || 0, 0);
+    assert.equal(h.workers.length, 1, 'no repair round is spent');
+    assert.equal(snapshotCalls(h).length, 1, 'one run of the untouched snapshot');
+    assert.equal(h.calls.length, 2);
+    assert.equal(done.verifyEnvironment.kind, 'preexisting-unchanged');
+    assert.match(done.report, /verifier environment: 2 failing test\(s\), none changed by this job/);
+    assert.match(
+      done.report.split('\n').find((line) => line.startsWith('next:')),
+      /· apply \(after your own check\)/,
+    );
+  } finally {
+    h.finish();
+  }
+});
+
+test('standard mode: a failing test whose body the job edited takes the ordinary repair path with no snapshot run', async () => {
+  const h = await harness({ repo: withTestFile(), verify: () => spec(OLD), worker: editOldA });
+  try {
+    const started = await start(h, { verifierMode: 'standard', maxRepairRounds: 1 });
+    const done = await h.m.wait(started.jobId, { timeoutSec: TIMEOUT_SEC });
+    assert.equal(done.status, 'VERIFY_FAILED');
+    const job = await h.m.store.get(started.jobId);
+    assert.equal(job.verifyEnvironment, undefined);
+    assert.equal(job.verify.baseline, undefined);
+    assert.equal(job.rounds, 1);
+    assert.equal(h.workers.length, 2, 'the repair round ran');
+    assert.equal(snapshotCalls(h).length, 0, 'the snapshot was never run');
+  } finally {
+    h.finish();
+  }
+});
+
+test('standard mode: a new failure absent on the snapshot takes the ordinary repair path', async () => {
+  const h = await harness({ repo: withTestFile(), verify: (call) => spec(call.isResult ? [...OLD, 'suite > new C'] : OLD) });
+  try {
+    const started = await start(h, { verifierMode: 'standard', maxRepairRounds: 1 });
+    const done = await h.m.wait(started.jobId, { timeoutSec: TIMEOUT_SEC });
+    assert.equal(done.status, 'VERIFY_FAILED');
+    const job = await h.m.store.get(started.jobId);
+    assert.equal(job.verifyEnvironment, undefined);
+    assert.equal(job.verify.baseline, undefined, 'the unfavourable comparison is not recorded');
+    assert.equal(job.rounds, 1);
+    assert.equal(h.workers.length, 2);
+    assert.equal(snapshotCalls(h).length, 1, 'the snapshot run is cached across rounds');
+  } finally {
+    h.finish();
+  }
+});
+
+test('standard mode: unparseable output keeps the ordinary repair path with no snapshot run', async () => {
+  const h = await harness({ repo: withTestFile(), verify: () => unparseable() });
+  try {
+    const started = await start(h, { verifierMode: 'standard', maxRepairRounds: 1 });
+    const done = await h.m.wait(started.jobId, { timeoutSec: TIMEOUT_SEC });
+    assert.equal(done.status, 'VERIFY_FAILED');
+    const job = await h.m.store.get(started.jobId);
+    assert.equal(job.verifyEnvironment, undefined);
+    assert.equal(job.rounds, 1);
+    assert.equal(h.workers.length, 2);
+    assert.equal(snapshotCalls(h).length, 0);
   } finally {
     h.finish();
   }

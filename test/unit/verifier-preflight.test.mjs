@@ -1151,3 +1151,146 @@ test('a blocker outside ownedPaths keeps the drop-the-file advice and carries no
   assert.match(message, /drop the files from testCommand/);
   assert.equal(message.includes('must run, so dropping'), false);
 });
+
+const ownedTemp = (t, command, source = tempSuite, file = 'test/temp.test.mjs') => {
+  const { root, write } = fixture(t);
+  write(file, source);
+  return preflightVerifier({ repoPath: root, testCommand: command, writeScope: [], ownedPaths: ['test/**'] });
+};
+const countOf = (text, needle) => text.split(needle).length - 1;
+
+test('a node --test-skip-pattern already skipping the blocked test leaves it advisory, not blocking', (t) => {
+  const result = ownedTemp(t, "node --test --test-skip-pattern='writes temp' test/temp.test.mjs");
+  assert.equal(result.blocking, undefined);
+  assert.equal(result.status, 'warning');
+  assert.equal(result.mustRunBlockers, undefined);
+  assert.equal(result.testNameExclusion, undefined);
+  assert.equal(result.advisoryCount, 1);
+  assert.deepEqual(result.advisory, [
+    {
+      code: 'system-temp-write',
+      path: 'test/temp.test.mjs',
+      line: 3,
+      call: 'mkdtempSync',
+      target: '/tmp/x-XXXXXX',
+      testName: 'writes temp',
+      skippedBy: 'test-name-filter',
+    },
+  ]);
+  const compact = compactVerifierPreflight(result);
+  assert.equal(compact.counts.blocking, 0);
+  assert.equal(compact.counts.advisory, 1);
+  assert.equal(compact.findings[0].severity, 'advisory');
+  assert.equal(compact.findings[0].skippedBy, 'test-name-filter');
+  assert.deepEqual(
+    verifierPreflightLines(result).filter((line) => line.startsWith('verifier advisory:')),
+    [
+      'verifier advisory: test/temp.test.mjs:3: the test "writes temp" is excluded by a test-name filter already in testCommand; not refused',
+    ],
+  );
+});
+
+test('a skip pattern for an unrelated test still blocks, and the suggestion adds the flag exactly once', (t) => {
+  const command = "node --test --test-skip-pattern='other test' test/temp.test.mjs";
+  const result = ownedTemp(t, command);
+  assert.equal(result.status, 'blocking');
+  assert.equal(result.blocking.length, 1);
+  assert.equal(result.advisory, undefined);
+  const suggested = result.testNameExclusion.command;
+  assert.equal(countOf(suggested, '--test-skip-pattern'), 2);
+  assert.equal(countOf(suggested, "--test-skip-pattern='writes temp'"), 1);
+  assert.equal(suggested, "node --test --test-skip-pattern='writes temp' --test-skip-pattern='other test' test/temp.test.mjs");
+  const again = ownedTemp(t, suggested);
+  assert.equal(again.blocking, undefined);
+  assert.equal(again.advisory[0].skippedBy, 'test-name-filter');
+});
+
+test('a node --test-name-pattern selecting only another test leaves the blocked one advisory', (t) => {
+  const source = `${tempSuite}test('safe', () => {});\n`;
+  const skipped = ownedTemp(t, 'node --test --test-name-pattern=safe test/temp.test.mjs', source);
+  assert.equal(skipped.blocking, undefined);
+  assert.equal(skipped.advisory[0].skippedBy, 'test-name-filter');
+  const selected = ownedTemp(t, 'node --test --test-name-pattern "writes temp" test/temp.test.mjs', source);
+  assert.equal(selected.status, 'blocking');
+  assert.equal(selected.blocking[0].testName, 'writes temp');
+});
+
+test('the pytest -k suggestion round-trips to a non-blocking advisory finding', (t) => {
+  const source = "import tempfile\n\ndef test_x():\n    tempfile.mkdtemp(dir='/tmp')\n\ndef test_y():\n    pass\n";
+  const first = ownedTemp(t, 'pytest test/temp_test.py', source, 'test/temp_test.py');
+  assert.equal(first.status, 'blocking');
+  assert.equal(first.blocking[0].testName, 'test_x');
+  assert.equal(first.testNameExclusion.command, "pytest test/temp_test.py -k 'not test_x'");
+  const second = ownedTemp(t, first.testNameExclusion.command, source, 'test/temp_test.py');
+  assert.equal(second.blocking, undefined);
+  assert.equal(second.advisory[0].skippedBy, 'test-name-filter');
+  assert.equal(second.testNameExclusion, undefined);
+});
+
+test('the pytest -k suggestion extends an existing expression without a second -k', (t) => {
+  const source = "import tempfile\n\ndef test_x():\n    tempfile.mkdtemp(dir='/tmp')\n";
+  const result = ownedTemp(t, "pytest test/temp_test.py -k 'not test_other'", source, 'test/temp_test.py');
+  assert.equal(result.status, 'blocking');
+  const suggested = result.testNameExclusion.command;
+  assert.equal(suggested, "pytest test/temp_test.py -k '(not test_other) and not test_x'");
+  assert.equal(countOf(suggested, ' -k '), 1);
+});
+
+test('the jest negative testNamePattern suggestion round-trips to a non-blocking advisory finding', (t) => {
+  const first = ownedTemp(t, 'jest test/temp.test.mjs');
+  assert.equal(first.status, 'blocking');
+  assert.equal(first.testNameExclusion.command, "jest test/temp.test.mjs --testNamePattern='^(?!.*writes temp).*$'");
+  const second = ownedTemp(t, first.testNameExclusion.command);
+  assert.equal(second.blocking, undefined);
+  assert.equal(second.advisory[0].skippedBy, 'test-name-filter');
+  assert.equal(second.testNameExclusion, undefined);
+  const vitest = ownedTemp(t, 'vitest run test/temp.test.mjs');
+  assert.equal(vitest.testNameExclusion.command, "vitest run test/temp.test.mjs -t '^(?!.*writes temp).*$'");
+  assert.equal(ownedTemp(t, vitest.testNameExclusion.command).blocking, undefined);
+});
+
+test('an unparseable skip pattern is ignored: the finding still blocks', (t) => {
+  const result = ownedTemp(t, "node --test --test-skip-pattern='(' test/temp.test.mjs");
+  assert.equal(result.status, 'blocking');
+  assert.equal(result.blocking[0].testName, 'writes temp');
+  assert.equal(result.advisory, undefined);
+  assert.equal(
+    result.testNameExclusion.command,
+    "node --test --test-skip-pattern='writes temp' --test-skip-pattern='(' test/temp.test.mjs",
+  );
+});
+
+const skipSuite = (options) =>
+  `import { mkdtempSync } from 'node:fs';\ntest('writes temp', ${options}, async () => {\n  mkdtempSync('/tmp/x-');\n});\n`;
+
+test('a test skipped when the sandbox is unavailable is advisory: nested sandbox-exec cannot run in the verifier', (t) => {
+  for (const options of [
+    '{ skip: !sandboxAvailable() && MACOS_SANDBOX_SKIP_REASON }',
+    "{ skip: !HOMEBREW_NODE ? 'no homebrew node' : !sandboxAvailable() && MACOS_SANDBOX_SKIP_REASON }",
+    '{ skip: MACOS_SANDBOX_SKIP_REASON }',
+  ]) {
+    const result = ownedTemp(t, 'node --test test/temp.test.mjs', skipSuite(options));
+    assert.equal(result.blocking, undefined, options);
+    assert.equal(result.status, 'warning', options);
+    assert.equal(result.mustRunBlockers, undefined, options);
+    assert.deepEqual(
+      result.advisory.map(({ path, line, testName, skippedBy }) => ({ path, line, testName, skippedBy })),
+      [{ path: 'test/temp.test.mjs', line: 3, testName: 'writes temp', skippedBy: 'sandbox-guard' }],
+      options,
+    );
+  }
+});
+
+test('other skip expressions do not demote: those tests run in the verifier', (t) => {
+  for (const options of [
+    "{ skip: process.platform !== 'darwin' }",
+    '{ skip: !HOMEBREW_NODE }',
+    '{ timeout: 5000 }',
+    "{ skip: 'sandbox is broken' }",
+  ]) {
+    const result = ownedTemp(t, 'node --test test/temp.test.mjs', skipSuite(options));
+    assert.equal(result.status, 'blocking', options);
+    assert.equal(result.blocking[0].testName, 'writes temp', options);
+    assert.equal(result.advisory, undefined, options);
+  }
+});

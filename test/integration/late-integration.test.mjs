@@ -1153,6 +1153,43 @@ test('a report job records only the shape of a looping call and can never be con
   }
 });
 
+for (const [kind, text, line] of [
+  ['truncated-text', 'Finding 1: drafted prose cut by the cap', /drafted text up to the cut, unreviewed and possibly incomplete/],
+  [
+    'truncated-reasoning',
+    "[Not a finished report: this is the worker's reasoning, cut off by the output cap.]\n\nreasoning",
+    /holds the worker's reasoning up to the cut, not a finished report/,
+  ],
+]) {
+  test(`a report worker capped before any finish keeps ${kind} on the FAILED output-cap job`, async () => {
+    const h = await harness({
+      worker: async () => ({
+        status: 'FAILED',
+        turn: 8,
+        costUsd: 0.05,
+        failureKind: 'output-cap',
+        error: 'The provider output cap cut off the response',
+        report: text,
+        reportSalvage: kind,
+      }),
+      verify: pass,
+    });
+    try {
+      const { jobId } = await h.manager.start({ mode: 'report', task: 'analyze', repoPath: h.repo });
+      const failed = await h.settle(jobId);
+      assert.equal(failed.status, 'FAILED');
+      assert.equal(failed.failureKind, 'output-cap');
+      assert.equal((await h.manager.store.get(jobId)).reportSalvage, kind);
+      const view = await h.manager.job(jobId);
+      assert.equal(view.reportResult.text, text);
+      assert.match(view.report, /report salvaged: the output cap cut off the worker's response before any finish call/);
+      assert.match(view.report, line);
+    } finally {
+      cleanup(h.repo);
+    }
+  });
+}
+
 test('a report worker that ended in plain text lands FAILED no-finish with its last message, unreviewed, and cannot be continued', async () => {
   const h = await harness({
     worker: async () => ({

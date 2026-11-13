@@ -81,6 +81,8 @@ const MAX_REQUEST_OUTPUT_TOKENS = 16_384;
 // full affordable reservation.
 const MAX_FINITE_REQUEST_OUTPUT_TOKENS = 4_096;
 const CAPPED_REASONING_REMINDER = 'Continue using an allowed tool call. When complete, call finish as the sole tool call.';
+const REPORT_CAPPED_REASONING_REMINDER =
+  'Your last response hit the output cap before any tool call ran, so nothing from it was kept. Stop reading and reasoning at length. Call finish now as the sole tool call and write the report directly in it, compactly (at most about 8000 characters; one short line per item when there are many; most important findings first).';
 const FORCED_FOCUS_CAPPED_REASONING_REMINDER = 'Continue using a required allowed tool call. Read needed input, or make the next mutation.';
 // A direct write is not proof that a multi-file implementation is complete.
 // A capped, tool-less response after one instead earns exactly one crash-safe
@@ -731,6 +733,18 @@ export class AgentLoop {
     // A report finish the output cap cut off, kept while its one shorter retry
     // is pending: any exit other than a finish or a stop then keeps that draft.
     let pendingTruncatedReport;
+    // The best drafted text across this report round's capped, tool-less turns:
+    // a cut-off finish report beats visible prose, which beats plain-string
+    // reasoning; within one source the longer wins.
+    let bestCappedDraft;
+    const CAPPED_DRAFT_RANK = { 'truncated-reasoning': 1, 'truncated-text': 2, 'truncated-finish': 3 };
+    const noteCappedDraft = (kind, draft) => {
+      if (typeof draft !== 'string' || !draft.trim()) return;
+      const rank = CAPPED_DRAFT_RANK[kind];
+      const best = bestCappedDraft;
+      if (!best || rank > CAPPED_DRAFT_RANK[best.kind] || (rank === CAPPED_DRAFT_RANK[best.kind] && draft.length > best.draft.length))
+        bestCappedDraft = { kind, draft };
+    };
     const withPendingDraft = (status, extra) =>
       pendingTruncatedReport === undefined ||
       status === 'DONE' ||
@@ -1294,6 +1308,13 @@ export class AgentLoop {
               ? truncatedToolCall
               : undefined;
           const capSteer = outputCapSteer(cappedCall);
+          if (this.reportMode && providerFinishReason === 'length') {
+            if (cappedCall?.name === 'finish') noteCappedDraft('truncated-finish', extractPartialStringField(cappedCall.partial, 'report'));
+            noteCappedDraft('truncated-text', text);
+            // Only plain-string reasoning (DeepSeek reasoning_content) is readable; encrypted OpenAI or Anthropic thinking is not.
+            if (reasoningWasExplicitString && openaiReasoning === undefined && anthropicContent === undefined)
+              noteCappedDraft('truncated-reasoning', reasoning);
+          }
           // `recovered` says whether this turn earns a continuation request.
           const outputCapFor = (recovered) => ({
             turn,
@@ -1383,7 +1404,11 @@ export class AgentLoop {
                 role: 'user',
                 content:
                   outputCapReminder(capSteer) ??
-                  (forcedImplementationFocus ? FORCED_FOCUS_CAPPED_REASONING_REMINDER : CAPPED_REASONING_REMINDER),
+                  (forcedImplementationFocus
+                    ? FORCED_FOCUS_CAPPED_REASONING_REMINDER
+                    : this.reportMode
+                      ? REPORT_CAPPED_REASONING_REMINDER
+                      : CAPPED_REASONING_REMINDER),
               },
             ]);
             if (forcedImplementationFocus) forcedImplementationFocusContinuationPending = true;
@@ -1477,8 +1502,11 @@ export class AgentLoop {
             this.reportMode && providerFinishReason === 'length' && cappedCall?.name === 'finish'
               ? extractPartialStringField(cappedCall.partial, 'report')
               : undefined;
+          const cappedDraft =
+            truncatedReport === undefined && this.reportMode && providerFinishReason === 'length' ? bestCappedDraft : undefined;
           const outputCapRecoveryExhausted =
             truncatedReport !== undefined ||
+            cappedDraft !== undefined ||
             (usageRecords === 1 &&
               providerFinishReason === 'length' &&
               (((cappedReasoningContinuationUsed || cappedFinishRecoveryUsed) && maxTokens !== undefined) || capSteer !== 'continue'));
@@ -1498,13 +1526,22 @@ export class AgentLoop {
             // The worker's last complete prose is kept, unreviewed, rather than lost with the spend; a cut-off or filtered stop is not.
             ...(truncatedReport !== undefined
               ? { report: clipSalvagedReport(truncatedReport), reportSalvage: 'truncated-finish' }
-              : this.reportMode &&
-                  providerFinishReason !== 'content_filter' &&
-                  providerFinishReason !== 'length' &&
-                  !outputCapRecoveryExhausted &&
-                  text.trim()
-                ? { report: clipSalvagedReport(text), reportSalvage: 'plain-text' }
-                : {}),
+              : cappedDraft !== undefined
+                ? {
+                    report: clipSalvagedReport(
+                      cappedDraft.kind === 'truncated-reasoning'
+                        ? `[Not a finished report: this is the worker's reasoning, cut off by the output cap.]\n\n${cappedDraft.draft}`
+                        : cappedDraft.draft,
+                    ),
+                    reportSalvage: cappedDraft.kind,
+                  }
+                : this.reportMode &&
+                    providerFinishReason !== 'content_filter' &&
+                    providerFinishReason !== 'length' &&
+                    !outputCapRecoveryExhausted &&
+                    text.trim()
+                  ? { report: clipSalvagedReport(text), reportSalvage: 'plain-text' }
+                  : {}),
           });
         }
         let parsed;

@@ -58,6 +58,10 @@ export const RUNTIME_CAPABILITIES = Object.freeze({
   reviewPacketDrift: true,
   flashNoEditSteer: true,
   reportSummaryAccept: true,
+  preflightTestFilters: true,
+  preexistingUnchanged: true,
+  reportOutputSteer: true,
+  reportCappedDraftSalvage: true,
 });
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));

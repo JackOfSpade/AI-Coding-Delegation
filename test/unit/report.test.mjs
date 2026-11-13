@@ -1785,6 +1785,15 @@ test('a report job shows its fixed finish problems and a salvaged report is flag
     /^report salvaged: the finish call was cut off by the output cap; reportResult\.text holds the drafted report up to the cut, unreviewed and possibly incomplete$/m,
   );
   assert.match(truncated, /next: read reportResult/);
+  const cappedBase = { id: 'r5', mode: 'report', status: 'FAILED', failureKind: 'output-cap' };
+  assert.match(
+    compactReport({ ...cappedBase, reportSalvage: 'truncated-text' }),
+    /^report salvaged: the output cap cut off the worker's response before any finish call; reportResult\.text holds its drafted text up to the cut, unreviewed and possibly incomplete$/m,
+  );
+  assert.match(
+    compactReport({ ...cappedBase, reportSalvage: 'truncated-reasoning' }),
+    /^report salvaged: the output cap cut off the worker's response before any finish call; reportResult\.text holds the worker's reasoning up to the cut, not a finished report, unreviewed and possibly incomplete$/m,
+  );
   assert.match(
     compactReport({ id: 'w1', status: 'DONE_VERIFIED', malformedToolFinish: true }),
     /^worker stop: the provider ended on malformed tool-call JSON; the server verifier passed/m,

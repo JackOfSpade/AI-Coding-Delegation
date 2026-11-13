@@ -153,9 +153,11 @@ function environmentLine(job, environmentFailure, { reportMode, primaryChecked, 
                     : ' Run the import in the primary checkout to determine whether the verifier sandbox caused the crash. An accepted interpreter declaration grants read and exec; it does not prove imports work.'
                   : environmentFailure.kind === 'loopback-denied'
                     ? ' A test bound a local TCP port, which the verifier sandbox denies unless verifier.allowLoopback is enabled in the Offload config. Run those suites in the primary checkout and give the next job a testCommand without them; do not have the worker rewrite the existing server fixtures.'
-                    : environmentFailure.kind === 'sandbox-dominated'
-                      ? " Most of the suite's child-process/Git fixtures cannot run in the verifier sandbox, so the runs are no evidence about the change: run that suite in the primary checkout, and give the next job a testCommand without those files."
-                      : ''
+                    : environmentFailure.kind === 'preexisting-unchanged'
+                      ? ' Every failing test is one this job did not change and fails identically on the untouched start snapshot, so the failures are pre-existing or environmental, not caused by the worker: confirm them in the primary checkout, and give the next job a testCommand that excludes them or use verifierMode "baseline-diff".'
+                      : environmentFailure.kind === 'sandbox-dominated'
+                        ? " Most of the suite's child-process/Git fixtures cannot run in the verifier sandbox, so the runs are no evidence about the change: run that suite in the primary checkout, and give the next job a testCommand without those files."
+                        : ''
       }${
         // An applyThenVerify run is already acting on this very advice.
         applyRunning || job.applied === true
@@ -480,6 +482,10 @@ function reportSalvagedLine(job) {
     return 'report salvaged: the finish had a summary and a passing review packet but no detailed report; reportResult.text holds the summary, unreviewed';
   if (job.reportSalvage === 'truncated-finish')
     return 'report salvaged: the finish call was cut off by the output cap; reportResult.text holds the drafted report up to the cut, unreviewed and possibly incomplete';
+  if (job.reportSalvage === 'truncated-text')
+    return "report salvaged: the output cap cut off the worker's response before any finish call; reportResult.text holds its drafted text up to the cut, unreviewed and possibly incomplete";
+  if (job.reportSalvage === 'truncated-reasoning')
+    return "report salvaged: the output cap cut off the worker's response before any finish call; reportResult.text holds the worker's reasoning up to the cut, not a finished report, unreviewed and possibly incomplete";
   return '';
 }
 const reportModeOf = (job) => job?.mode === 'report';

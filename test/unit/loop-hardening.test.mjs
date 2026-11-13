@@ -5176,7 +5176,9 @@ test('report length and content_filter stops are not recovered with the no-finis
   assert.equal(filtered.requests.length, 2);
   const capped = await reportProseRun(['read', 'length', 'length']);
   assert.ok(!capped.progress.includes('provider_report_no_finish_recover'));
-  assert.equal(capped.result.reportSalvage, undefined);
+  // The cap-cut prose is kept as truncated-text, never as a plain-text salvage.
+  assert.equal(capped.result.reportSalvage, 'truncated-text');
+  assert.equal(capped.result.report, 'My complete findings.');
   assert.ok(
     !capped.requests.some((messages) => messages.at(-1).content?.startsWith?.('No tool was called, and prose does not complete a report')),
   );

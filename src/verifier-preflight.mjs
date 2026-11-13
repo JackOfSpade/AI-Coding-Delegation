@@ -1165,16 +1165,32 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedP
   // A blocker in a file the job owns is a file testCommand must run: "drop it
   // from testCommand" would drop the job's own test, so name the test it fails
   // in and, when the runner can, the command that skips only that test.
-  let mustRunBlockers = 0;
+  // Findings that cannot fire are advisory, never refused: the test is skipped by a
+  // test-name filter already in testCommand, or by a sandbox skip guard.
+  const kept = [];
   for (const finding of blocking) {
-    if (finding.path === 'testCommand') continue;
-    if (![finding.path, ...(finding.testFiles ?? [])].some((file) => isOwned(file))) continue;
-    finding.mustRun = true;
-    mustRunBlockers++;
+    if (finding.path === 'testCommand') {
+      kept.push(finding);
+      continue;
+    }
     const text = cache.get(finding.path);
-    const testName = typeof text === 'string' ? enclosingTestName(text, finding.path, finding.line) : undefined;
-    if (testName) finding.testName = testName;
+    const testCase = typeof text === 'string' ? enclosingTestCase(text, finding.path, finding.line) : undefined;
+    const owned = [finding.path, ...(finding.testFiles ?? [])].some((file) => isOwned(file));
+    if (owned && testCase?.name) finding.testName = testCase.name;
+    // A test declared `{ skip: !sandboxAvailable() ... }` skips inside the verifier: sandbox-exec cannot nest there.
+    if (testCase?.sandboxGuarded) {
+      advisory.push({ ...finding, skippedBy: 'sandbox-guard' });
+      continue;
+    }
+    if (owned && testCase?.name && testNameFilteredOut(testCommand, testCase.name)) {
+      advisory.push({ ...finding, skippedBy: 'test-name-filter' });
+      continue;
+    }
+    if (owned) finding.mustRun = true;
+    kept.push(finding);
   }
+  blocking.splice(0, blocking.length, ...kept);
+  const mustRunBlockers = blocking.filter((finding) => finding.mustRun).length;
   const namedBlocker = blocking.find((finding) => finding.mustRun && typeof finding.testName === 'string');
   const testNameExclusion = namedBlocker ? testNameExclusionFor(testCommand, namedBlocker.testName) : undefined;
   const result = {
@@ -1190,6 +1206,7 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedP
     ...(missingArguments.length ? { missingArguments: missingArguments.slice(0, MAX_FINDINGS) } : {}),
     ...(mustRunBlockers ? { mustRunBlockers } : {}),
     ...(testNameExclusion ? { testNameExclusion } : {}),
+    ...(advisory.length ? { advisory: advisory.slice(0, MAX_FINDINGS), advisoryCount: advisory.length } : {}),
     ...(scopes.length
       ? {
           scoped: scopes.map(({ runner, selected, pending }) => ({
@@ -1197,7 +1214,6 @@ function scanVerifier({ repoPath, testCommand, denyRead = [], writeScope, ownedP
             files: [...selected, ...pending].sort().slice(0, MAX_FINDINGS),
             ...(pending.length ? { pending: pending.slice(0, MAX_FINDINGS) } : {}),
           })),
-          ...(advisory.length ? { advisory: advisory.slice(0, MAX_FINDINGS), advisoryCount: advisory.length } : {}),
           ...(scopedWarnings ? { scopedWarnings } : {}),
         }
       : {}),
@@ -1237,23 +1253,32 @@ const exclusion = {
 const TEST_CALL = /\b(?:test|it)\s*\(\s*(['"`])((?:\\.|(?!\1)[^\\])*)\1/g;
 const PY_TEST_DEF = /(?:^|\n)([ \t]*)(?:async\s+)?def\s+(test\w*)\s*\(/g;
 
-/** The innermost test case whose body spans a line: the name a per-test filter skips. */
-function enclosingTestName(text, file, line) {
+/** The innermost test case whose body spans a line: the name a per-test filter
+ * skips, and whether its options object skips it inside the verifier sandbox. */
+function enclosingTestCase(text, file, line) {
   const python = file.endsWith('.py');
   const { inCode } = sourceScopes(text, python);
   let best;
-  const body = (start, end, name) => {
+  const body = (start, end, name, sandboxGuarded = false) => {
     if (line < lineOf(text, start) || line > lineOf(text, end)) return;
-    if (!best || end - start < best.end - best.start) best = { name, start, end };
+    if (!best || end - start < best.end - best.start) best = { name, start, end, sandboxGuarded };
   };
   if (python) {
     for (const match of text.matchAll(PY_TEST_DEF)) {
       if (!inCode(match.index)) continue;
-      const lineEnd = text.indexOf('\n', match.index);
-      body(match.index, pythonBlockEnd(text, lineEnd < 0 ? text.length : lineEnd + 1, match[1].length), match[2]);
+      // The match starts at the newline before the def; the def line itself ends the header.
+      const defStart = text[match.index] === '\n' ? match.index + 1 : match.index;
+      const lineEnd = text.indexOf('\n', defStart);
+      body(defStart, pythonBlockEnd(text, lineEnd < 0 ? text.length : lineEnd + 1, match[1].length), match[2]);
     }
-    return best?.name;
+    return best && { name: best.name, sandboxGuarded: false };
   }
+  // The code-only view of text[from, to): strings and comments blanked.
+  const codeOnly = (from, to) => {
+    let out = '';
+    for (let at = from; at < to; at++) out += inCode(at) ? text[at] : ' ';
+    return out;
+  };
   for (const match of text.matchAll(TEST_CALL)) {
     if (!inCode(match.index)) continue;
     const open = text.indexOf('(', match.index);
@@ -1267,33 +1292,152 @@ function enclosingTestName(text, file, line) {
         break;
       }
     }
-    body(match.index, end, match[2]);
+    body(match.index, end, match[2], sandboxSkipGuard(text, match.index + match[0].length, end, inCode, codeOnly));
   }
-  return best?.name;
+  return best && { name: best.name, sandboxGuarded: best.sandboxGuarded };
 }
 
-/** A command that skips only the named test, or why this runner has no such filter. */
+/** Whether `test(name, { skip: <expr> }, fn)` skips on a sandbox: `from` is just
+ * after the name. Nested sandbox-exec cannot run inside the verifier sandbox, so a
+ * test that skips when the sandbox is unavailable (a `sandbox...()` call, or a
+ * SANDBOX identifier in `skip`) skips there and cannot fire its finding. Other
+ * skip expressions (a platform or binary check) still run on the verifier. */
+function sandboxSkipGuard(text, from, limit, inCode, codeOnly) {
+  let at = from;
+  const next = () => {
+    while (at < limit && /\s/.test(text[at])) at++;
+    return text[at];
+  };
+  if (next() !== ',') return false;
+  at++;
+  if (next() !== '{') return false;
+  const open = at;
+  let depth = 0;
+  let close = limit;
+  for (let i = open; i < limit; i++) {
+    if (!inCode(i)) continue;
+    if ('([{'.includes(text[i])) depth++;
+    else if (')]}'.includes(text[i]) && !--depth) {
+      close = i;
+      break;
+    }
+  }
+  const options = codeOnly(open + 1, close);
+  const key = /(?:^|[\s,{])skip\s*:/.exec(options);
+  if (!key) return false;
+  let expr = '';
+  depth = 0;
+  for (let i = key.index + key[0].length; i < options.length; i++) {
+    const c = options[i];
+    if ('([{'.includes(c)) depth++;
+    else if (')]}'.includes(c)) depth--;
+    else if (c === ',' && depth === 0) break;
+    if (depth < 0) break;
+    expr += c;
+  }
+  return /\bsandbox\w*\s*\(/i.test(expr) || /\w*SANDBOX\w*/.test(expr);
+}
+
+const compileNamePattern = (value) => {
+  try {
+    const literal = /^\/([\s\S]*)\/([a-z]*)$/.exec(value);
+    return literal ? new RegExp(literal[1], literal[2]) : new RegExp(value);
+  } catch {
+    return undefined;
+  }
+};
+// The `-k` expression forms this module emits: `not a and not b`. Anything richer is not parsed.
+const pytestSkippedNames = (expr) => {
+  const terms = expr.trim().split(/\s+and\s+/);
+  const names = terms.map((term) => /^not\s+(\S.*)$/.exec(term)?.[1]);
+  return names.every(Boolean) ? names : undefined;
+};
+// The jest/vitest pattern this module emits: a negative lookahead around the escaped name.
+const NEGATIVE_LOOKAHEAD = /^\^\(\?!\.\*([\s\S]*)\)\.\*\$$/;
+/** The occurrences of flag names (`--flag=V` or `--flag V`) in a segment's words: value and its word index. */
+function flagOccurrences(words, flags) {
+  const found = [];
+  for (const [index, word] of words.entries())
+    for (const flag of flags) {
+      if (word === flag && index + 1 < words.length) found.push({ value: words[index + 1], index: index + 1, inline: false });
+      else if (word.startsWith(`${flag}=`)) found.push({ value: word.slice(flag.length + 1), index, inline: true });
+    }
+  return found.sort((a, b) => a.index - b.index);
+}
+/** Whether one runner segment's test-name filters already keep `testName` from running. */
+function segmentExcludes(runner, words, testName) {
+  if (runner === 'node-test') {
+    const compiled = (flag) =>
+      flagOccurrences(words, [flag])
+        .map((occurrence) => compileNamePattern(occurrence.value))
+        .filter(Boolean);
+    const skips = compiled('--test-skip-pattern');
+    const selects = compiled('--test-name-pattern');
+    return skips.some((re) => re.test(testName)) || (selects.length > 0 && !selects.some((re) => re.test(testName)));
+  }
+  if (runner === 'pytest') {
+    const last = flagOccurrences(words, ['-k']).at(-1);
+    const names = last && pytestSkippedNames(last.value);
+    return Boolean(names?.some((name) => testName.toLowerCase().includes(name.toLowerCase())));
+  }
+  if (runner === 'jest' || runner === 'vitest') {
+    const last = flagOccurrences(words, runner === 'jest' ? ['--testNamePattern', '-t'] : ['-t']).at(-1);
+    if (!last || !NEGATIVE_LOOKAHEAD.test(last.value)) return false;
+    const re = compileNamePattern(last.value);
+    return Boolean(re) && !re.test(testName);
+  }
+  return false;
+}
+/** Whether every test runner in testCommand already filters `testName` out (so it never runs). */
+function testNameFilteredOut(text, testName) {
+  const runners = commandSegments(text)
+    .segments.map((words) => [segmentRunner(words), words])
+    .filter(([runner]) => runner);
+  return runners.length > 0 && runners.every(([runner, words]) => segmentExcludes(runner, words, testName));
+}
+
+/** A command that skips only the named test, or why this runner has no such filter.
+ * Undefined when testCommand already excludes it. */
 function testNameExclusionFor(text, testName) {
   const pattern = escapeRegExp(testName);
   const { segments, spans } = commandSegments(text);
+  let excluded = false;
   for (const [index, words] of segments.entries()) {
     const runner = segmentRunner(words);
     if (!runner) continue;
+    if (segmentExcludes(runner, words, testName)) {
+      excluded = true;
+      continue;
+    }
     const end = spans[index].at(-1)?.[1] ?? text.length;
+    const replaceWord = (word, replacement) => {
+      const [from, to] = spans[index][word];
+      return `${text.slice(0, from)}${replacement}${text.slice(to)}`;
+    };
     if (runner === 'node-test') {
       const insert = spans[index][words.indexOf('--test')]?.[1];
       if (insert === undefined) continue;
       const skip = `--test-skip-pattern=${shellWord(pattern)}`;
       return { testName, command: `${text.slice(0, insert)} ${skip}${text.slice(insert)}` };
     }
-    if (runner === 'pytest') return { testName, command: `${text.slice(0, end)} -k ${shellWord(`not ${testName}`)}${text.slice(end)}` };
+    if (runner === 'pytest') {
+      // A later -k replaces an earlier one, so extend an existing expression rather than add a second flag.
+      const last = flagOccurrences(words, ['-k']).at(-1);
+      if (last && !last.inline) return { testName, command: replaceWord(last.index, shellWord(`(${last.value}) and not ${testName}`)) };
+      return { testName, command: `${text.slice(0, end)} -k ${shellWord(`not ${testName}`)}${text.slice(end)}` };
+    }
     if (runner === 'jest' || runner === 'vitest') {
+      const flags = runner === 'jest' ? ['--testNamePattern', '-t'] : ['-t'];
+      const last = flagOccurrences(words, flags).at(-1);
+      const existing = last ? NEGATIVE_LOOKAHEAD.exec(last.value)?.[1] : undefined;
+      if (existing !== undefined && !last.inline)
+        return { testName, command: replaceWord(last.index, shellWord(`^(?!.*(?:${existing}|${pattern})).*$`)) };
       const skip = shellWord(`^(?!.*${pattern}).*$`);
       const flag = runner === 'jest' ? `--testNamePattern=${skip}` : `-t ${skip}`;
       return { testName, command: `${text.slice(0, end)} ${flag}${text.slice(end)}` };
     }
   }
-  return { testName, reason: 'runner has no test-name filter' };
+  return excluded ? undefined : { testName, reason: 'runner has no test-name filter' };
 }
 
 /** Rewrite one command text so it no longer runs `drop` (named test files). */
@@ -1452,12 +1596,27 @@ function verifierBlockingLines(value, { limit = MAX_FINDINGS } = {}) {
 function verifierAdvisoryLines(value, { limit = MAX_FINDINGS } = {}) {
   if (!Array.isArray(value?.advisory)) return [];
   const total = Number.isInteger(value.advisoryCount) ? value.advisoryCount : value.advisory.length;
-  const files = [...new Set(value.advisory.filter((finding) => typeof finding?.path === 'string').map((finding) => finding.path))];
-  if (!files.length) return [];
-  const runner = value.advisory[0].runner;
-  return [
-    `verifier advisory: ${total} denied finding(s) in ${files.length === 1 ? files[0] : `${files.length} suites (${files.slice(0, limit).join(', ')}${files.length > limit ? ', …' : ''})`}, which ${runner || 'the runner'} imports but was not given as an argument; not refused (they fail the run only if the runner ignores its file arguments)`,
-  ];
+  const placed = value.advisory.filter((finding) => typeof finding?.path === 'string');
+  // Findings a test-name filter or a sandbox skip guard keeps from running are not runner-scoped ones.
+  const unrun = placed.filter((finding) => finding.skippedBy);
+  const scoped = placed.filter((finding) => !finding.skippedBy);
+  const lines = [];
+  const files = [...new Set(scoped.map((finding) => finding.path))];
+  if (files.length) {
+    const runner = scoped[0].runner;
+    lines.push(
+      `verifier advisory: ${total - unrun.length} denied finding(s) in ${files.length === 1 ? files[0] : `${files.length} suites (${files.slice(0, limit).join(', ')}${files.length > limit ? ', …' : ''})`}, which ${runner || 'the runner'} imports but was not given as an argument; not refused (they fail the run only if the runner ignores its file arguments)`,
+    );
+  }
+  for (const finding of unrun.slice(0, limit)) {
+    const place = `${finding.path}${Number.isInteger(finding.line) ? `:${finding.line}` : ''}`;
+    lines.push(
+      finding.skippedBy === 'sandbox-guard'
+        ? `verifier advisory: ${place}: the test${finding.testName ? ` "${finding.testName}"` : ''} is skipped inside the verifier sandbox (sandbox-exec cannot nest); not refused`
+        : `verifier advisory: ${place}: the test${finding.testName ? ` "${finding.testName}"` : ''} is excluded by a test-name filter already in testCommand; not refused`,
+    );
+  }
+  return lines;
 }
 /** Writes whose target the scan could not place: reported, never refused. */
 function verifierUncertainLines(value, { limit = MAX_FINDINGS } = {}) {
@@ -1576,7 +1735,7 @@ export function verifierPreflightLines(value, { lean = false } = {}) {
   ].filter(Boolean);
 }
 
-const findingView = ({ code, path, line, call, target, extraWritable, runner, mustRun, testName }) => ({
+const findingView = ({ code, path, line, call, target, extraWritable, runner, mustRun, testName, skippedBy }) => ({
   code,
   path,
   ...(Number.isInteger(line) ? { line } : {}),
@@ -1586,6 +1745,7 @@ const findingView = ({ code, path, line, call, target, extraWritable, runner, mu
   ...(runner ? { runner } : {}),
   ...(mustRun ? { mustRun: true } : {}),
   ...(testName ? { testName } : {}),
+  ...(skippedBy ? { skippedBy } : {}),
 });
 /**
  * The preflight as start, cancel, wait and job responses carry it by default:
