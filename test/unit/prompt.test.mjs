@@ -288,11 +288,13 @@ test('reviewPacket numbers the acceptance criteria and adds the packet rule only
   assert.match(write, /verbatim quote/);
   assert.match(write, /uncertain:/);
   assert.match(write, /changedFiles: every file you changed/);
+  assert.match(write, /node_modules.*must never appear in changedFiles/);
   assert.doesNotMatch(write, /offload-report-inputs/);
   const report = await buildSystemPrompt({ ...base, ownedPaths: [], mode: 'report', acceptanceCriteria: [], reviewPacket: true });
   assert.match(report, /criterion 0 = the task/);
   assert.match(report, /\.offload-report-inputs\//);
   assert.doesNotMatch(report, /changedFiles: every file/);
+  assert.doesNotMatch(report, /node_modules/);
 });
 
 test('the report elision rule appears once in report mode and never in write mode', async () => {

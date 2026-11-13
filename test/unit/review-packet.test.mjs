@@ -154,6 +154,42 @@ test('write jobs must list every changed file and only changed files', async () 
   assert.match(unchanged.defects[0], /lists paths with no change: src\/c\.js/);
 });
 
+test('offload-provided paths are never changed files, and listing one warns', async () => {
+  const ws = await workspace();
+  // A link-only change: the raw changed set carries node_modules, but the
+  // packet lists only the real edit.
+  const linkOnly = await checkReviewPacket(
+    packet(),
+    options(ws, { changedFiles: ['src/a.js', 'node_modules'], providedPaths: ['node_modules'] }),
+  );
+  assert.equal(linkOnly.status, 'passed');
+  assert.deepEqual([linkOnly.defects, linkOnly.unlistedFiles, linkOnly.warnings], [[], [], []]);
+  // Listing the provided path is a warning naming it, never a defect.
+  const listedProvided = await checkReviewPacket(
+    packet({
+      changedFiles: [
+        { path: 'src/a.js', why: 'added add()' },
+        { path: 'node_modules', why: 'dependency link' },
+      ],
+    }),
+    options(ws, { changedFiles: ['src/a.js', 'node_modules'], providedPaths: ['node_modules'] }),
+  );
+  assert.equal(listedProvided.status, 'passed');
+  assert.deepEqual([listedProvided.defects, listedProvided.unlistedFiles], [[], []]);
+  assert.deepEqual(listedProvided.warnings, ['changedFiles lists node_modules, a read-only link Offload provides; never list it']);
+  // Anything under a provided path is provided too.
+  const underProvided = await checkReviewPacket(
+    packet(),
+    options(ws, { changedFiles: ['src/a.js', 'node_modules/pkg/index.js'], providedPaths: ['node_modules'] }),
+  );
+  assert.deepEqual(underProvided.unlistedFiles, []);
+  // Without providedPaths the old behavior is unchanged.
+  const raw = await checkReviewPacket(packet(), options(ws, { changedFiles: ['src/a.js', 'node_modules'] }));
+  assert.equal(raw.status, 'failed');
+  assert.deepEqual(raw.unlistedFiles, ['node_modules']);
+  assert.match(raw.defects[0], /changedFiles omits node_modules/);
+});
+
 test('report jobs skip the changed-file rule', async () => {
   const ws = await workspace();
   const { changedFiles: _omit, ...withoutFiles } = packet();

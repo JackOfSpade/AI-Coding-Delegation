@@ -192,7 +192,7 @@ function isolatedHandle({
       ensureOpen();
       try {
         const tree = snapshotWorkingTree(workspacePath, {
-          excludePaths: workspaceDependencyLink(workspacePath, primaryPath) ? ['node_modules'] : [],
+          excludePaths: offloadProvidedPaths(workspacePath, primaryPath),
         });
         // A single rolling after-tree pin is enough for the lifecycle's next
         // comparison/integration step and stays bounded during a live job.
@@ -221,7 +221,8 @@ function isolatedHandle({
       ensureOpen();
       try {
         const raw = run(workspacePath, ['ls-files', '--others', '--ignored', '--exclude-standard', '-z'], 'E_WORKTREE_IGNORED');
-        return raw.split('\0').filter((path) => path && !(path === 'node_modules' && workspaceDependencyLink(workspacePath, primaryPath)));
+        const provided = offloadProvidedPaths(workspacePath, primaryPath);
+        return raw.split('\0').filter((path) => path && !provided.includes(path));
       } catch (error) {
         if (error instanceof WorktreeIsolationError) throw error;
         throw new WorktreeIsolationError('Could not inspect ignored workspace files', 'E_WORKTREE_IGNORED');
@@ -386,6 +387,16 @@ export function linkPrimaryNodeModules(primaryPath, privateRoot) {
     return { nodeModules: 'link-failed' };
   }
   return { nodeModules: 'linked' };
+}
+
+/**
+ * Workspace-relative paths the server itself provides as a read-only link, so
+ * no comparison should ever report them as changed work. Empty unless the
+ * private `workspace/node_modules -> ../node_modules` link still points at the
+ * primary repository's own node_modules.
+ */
+export function offloadProvidedPaths(workspacePath, repoPath) {
+  return workspaceDependencyLink(workspacePath, repoPath) ? ['node_modules'] : [];
 }
 
 function workspaceDependencyLink(workspacePath, repoPath) {

@@ -47,7 +47,9 @@ const reviewPacketRule = (reportMode, criteriaCount) =>
   }, each {criterion, status done|partial|not_done, evidence}. claims: your key findings, each {claim, path, startLine, endLine, quote} with a verbatim quote and the exact 1-based line range from a file you read${
     reportMode ? ' (staged inputs under .offload-report-inputs/ are citable)' : ''
   }; the server rejects a quote that is not within the cited lines. uncertain: what you are unsure of or did not check, so the reviewer looks there (use [] only if nothing). decisions: judgment calls with alternatives and reasons.${
-    reportMode ? '' : ' changedFiles: every file you changed, each {path, why}, and no file you did not change.'
+    reportMode
+      ? ''
+      : ' changedFiles: every file you changed, each {path, why}, and no file you did not change. node_modules, the read-only dependency link Offload provides, is never a changed file and must never appear in changedFiles.'
   } A failed packet check is returned to you for correction.`;
 
 export async function repoConventions(repoPath, maxChars = 12_000) {

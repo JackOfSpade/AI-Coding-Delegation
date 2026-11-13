@@ -195,10 +195,16 @@ function spotCheckIndices(seed, count) {
  * - mode: 'write' | 'report'
  * - acceptanceCriteria: string[] (the brief's)
  * - changedFiles: string[] (write jobs: repo-relative changed paths)
+ * - providedPaths: string[] (paths Offload itself provides read-only, for
+ *   example the node_modules link: excluded from the changed set, and listing
+ *   one is a warning, not a defect)
  * - resolveReadable(path): absolute path, throwing for unreadable/denied paths
  * - seed: string for the spot-check sample (the job id)
  */
-export async function checkReviewPacket(packet, { mode, acceptanceCriteria = [], changedFiles = [], resolveReadable, seed = '' } = {}) {
+export async function checkReviewPacket(
+  packet,
+  { mode, acceptanceCriteria = [], changedFiles = [], providedPaths = [], resolveReadable, seed = '' } = {},
+) {
   const defects = [];
   const warnings = [];
   let driftedClaims = 0;
@@ -290,12 +296,20 @@ export async function checkReviewPacket(packet, { mode, acceptanceCriteria = [],
   // Write jobs: every changed file listed, and only changed files.
   const unlistedFiles = [];
   if (mode !== 'report') {
-    const listed = new Set((packet.changedFiles ?? []).map((entry) => posix(entry.path)));
-    const changed = new Set(changedFiles.map(posix));
+    // Paths Offload itself provides (the read-only node_modules link) are never
+    // the worker's work: they must not count as changed, and a packet that
+    // lists one gets a warning rather than a "no change" defect.
+    const provided = providedPaths.map(posix).filter(Boolean);
+    const isProvided = (path) => provided.some((root) => path === root || path.startsWith(`${root}/`));
+    const listedAll = (packet.changedFiles ?? []).map((entry) => posix(entry.path));
+    const listed = new Set(listedAll);
+    const changed = new Set(changedFiles.map(posix).filter((path) => !isProvided(path)));
     for (const path of changed) if (!listed.has(path)) unlistedFiles.push(path);
     if (unlistedFiles.length) add(`changedFiles omits ${unlistedFiles.slice(0, 10).join(', ')}${unlistedFiles.length > 10 ? ', ...' : ''}`);
-    const unchanged = [...listed].filter((path) => !changed.has(path));
+    const unchanged = [...listed].filter((path) => !isProvided(path) && !changed.has(path));
     if (unchanged.length) add(`changedFiles lists paths with no change: ${unchanged.slice(0, 10).join(', ')}`);
+    for (const path of new Set(listedAll.filter(isProvided)))
+      if (warnings.length < L.warnings) warnings.push(`changedFiles lists ${path}, a read-only link Offload provides; never list it`);
   }
   return summarize({
     defects,

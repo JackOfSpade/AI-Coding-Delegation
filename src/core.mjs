@@ -34,6 +34,7 @@ import {
   openIsolatedWorktree,
   cleanupIsolatedWorktree,
   isolatedDependencyReadPaths,
+  offloadProvidedPaths,
   verifierDependencyStatus,
   workingTreeStatus,
   integrateRecordedTree,
@@ -541,6 +542,11 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
         // only inside its private linked worktree.
         const executionPath = job.workspacePath || job.repoPath;
         const readablePaths = isolatedWorkspaceReadablePaths(job, executionPath);
+        // Paths Offload itself provides inside the workspace (the read-only
+        // node_modules link) are not worker work: neither the owned-path check
+        // nor the review-packet check may count them as changed files.
+        const offloadProvided = offloadProvidedPaths(executionPath, job.repoPath);
+        const isOffloadProvided = (filePath) => offloadProvided.some((root) => filePath === root || filePath.startsWith(`${root}/`));
         const policy = new PathPolicy({
           repoPath: executionPath,
           ownedPaths: job.ownedPaths,
@@ -650,7 +656,9 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
             : {
                 checkOwnedPaths: async () => {
                   const after = await resolvedSnapshots.create(executionPath);
-                  const changed = await resolvedSnapshots.files(executionPath, job.before, after);
+                  const changed = (await resolvedSnapshots.files(executionPath, job.before, after)).filter(
+                    (file) => !isOffloadProvided(file.path),
+                  );
                   return job.ownedPaths.filter((pattern) => !changed.some((file) => matchesAny(file.path, [pattern])));
                 },
               }),
@@ -660,12 +668,15 @@ export function createCore({ store, runner, worker, snapshots, leases, config = 
                   let changedFiles = [];
                   if (job.mode !== 'report') {
                     const after = await resolvedSnapshots.create(executionPath);
-                    changedFiles = (await resolvedSnapshots.files(executionPath, job.before, after)).map((file) => file.path);
+                    changedFiles = (await resolvedSnapshots.files(executionPath, job.before, after))
+                      .map((file) => file.path)
+                      .filter((file) => !isOffloadProvided(file));
                   }
                   return checkReviewPacket(args.reviewPacket, {
                     mode: job.mode,
                     acceptanceCriteria: job.acceptanceCriteria || [],
                     changedFiles,
+                    providedPaths: offloadProvided,
                     resolveReadable: (file) => policy.assertReadable(file),
                     seed: job.id,
                   });

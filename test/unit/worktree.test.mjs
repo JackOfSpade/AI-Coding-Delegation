@@ -22,6 +22,7 @@ import {
   createIsolatedWorktree,
   integrateRecordedTree,
   isolatedDependencyReadPaths,
+  offloadProvidedPaths,
   verifierDependencyStatus,
   openIsolatedWorktree,
   pinJobTrees,
@@ -29,7 +30,7 @@ import {
   sameWorktreePath,
   workingTreeStatus,
 } from '../../src/worktree.mjs';
-import { snapshotWorkingTree } from '../../src/git-snapshot.mjs';
+import { diffTreeFiles, snapshotWorkingTree } from '../../src/git-snapshot.mjs';
 import { runCommand, sandboxAvailable } from '../../src/sandbox.mjs';
 import { cleanup, git, makeRepo, tempDir, write } from './helpers.mjs';
 
@@ -726,6 +727,40 @@ test('a private worktree resolves primary dependencies through parent and local 
   } finally {
     isolated?.cleanup();
     cleanup(repo);
+  }
+});
+
+test('offload-provided paths name the dependency link and never count as changed files', () => {
+  const repo = repoWithDependency();
+  let isolated;
+  try {
+    const baseline = snapshotWorkingTree(repo);
+    isolated = createIsolatedWorktree({ repoPath: repo, baselineTree: baseline });
+    assert.equal(isolated.dependencies.nodeModules, 'linked');
+    assert.deepEqual(offloadProvidedPaths(isolated.path, repo), ['node_modules']);
+    // `node_modules/` matches directories only, so the server's symlink is
+    // untracked-not-ignored: the raw snapshot diff does list it.
+    const raw = diffTreeFiles(isolated.path, baseline, snapshotWorkingTree(isolated.path));
+    assert.deepEqual(raw, [{ path: 'node_modules', status: 'A' }]);
+    const provided = offloadProvidedPaths(isolated.path, repo);
+    assert.deepEqual(
+      raw.filter((file) => !provided.includes(file.path)),
+      [],
+    );
+  } finally {
+    isolated?.cleanup();
+    cleanup(repo);
+  }
+  const plain = makeRepo();
+  let plainIsolated;
+  try {
+    const baseline = snapshotWorkingTree(plain);
+    plainIsolated = createIsolatedWorktree({ repoPath: plain, baselineTree: baseline });
+    assert.notEqual(plainIsolated.dependencies.nodeModules, 'linked');
+    assert.deepEqual(offloadProvidedPaths(plainIsolated.path, plain), []);
+  } finally {
+    plainIsolated?.cleanup();
+    cleanup(plain);
   }
 });
 
