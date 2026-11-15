@@ -2061,7 +2061,9 @@ export class JobManager {
       await this.store.event(job.id, { type: 'started', reason: 'start', round: 0, status: job.status });
       signal?.throwIfAborted();
       if (launch) this._launch(job.id, 'start', undefined, job);
-      return this.public(job);
+      const published = this.public(job);
+      if (!published.briefRedaction) return published;
+      return { ...published, warnings: [briefRedactionWarning(published.briefRedaction)] };
     } catch (error) {
       if (job) await this.#finishOwnedTerminal(job, signal?.aborted ? 'CANCELLED' : 'FAILED', { error: String(error?.message ?? error) });
       let cleanupFailure;
@@ -3954,6 +3956,7 @@ export class JobManager {
         : {}),
       ...(safeBudgetReservation(job.budgetReservation) ? { budgetReservation: safeBudgetReservation(job.budgetReservation) } : {}),
       ...(safeBudgetSizing(job.budgetSizing) ? { budgetSizing: safeBudgetSizing(job.budgetSizing) } : {}),
+      ...(safeBriefRedaction(job.briefRedaction) ? { briefRedaction: safeBriefRedaction(job.briefRedaction) } : {}),
       ...(job.status === 'BUDGET' && safeBudgetStop(job.budgetStop) ? { budgetStop: safeBudgetStop(job.budgetStop) } : {}),
       ...(job.status === 'FAILED' ? failureView(job) : {}),
     };
@@ -6084,4 +6087,27 @@ export class JobManager {
       if (timer !== undefined) this.clearTimeout(timer);
     }
   }
+}
+
+/**
+ * The brief-redaction counts a start response may carry. Only a record whose
+ * brief really lost a value reports them, so a job whose brief needed no
+ * redaction carries neither the counts nor a warning.
+ */
+function safeBriefRedaction(value) {
+  if (!value || !Number.isSafeInteger(value.spans) || value.spans <= 0) return undefined;
+  return {
+    spans: value.spans,
+    task: Number.isSafeInteger(value.task) ? value.task : 0,
+    acceptanceCriteria: Number.isSafeInteger(value.acceptanceCriteria) ? value.acceptanceCriteria : 0,
+  };
+}
+
+/** Tell the caller that redaction changed the brief before the worker saw it. */
+function briefRedactionWarning({ spans, task, acceptanceCriteria }) {
+  return (
+    `brief redaction: ${spans} span(s) of the task brief were replaced with [REDACTED] before the worker saw them ` +
+    `(task ${task}, acceptanceCriteria ${acceptanceCriteria}); if that text was not a real credential, ` +
+    'offload_cancel this job and restart with the wording changed (for example write a placeholder such as <key>)'
+  );
 }

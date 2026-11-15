@@ -1174,3 +1174,43 @@ test(
     }
   },
 );
+
+test('a stored brief keeps the rest of a line after a sensitive header while other string fields stay line-cut', async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir });
+    const task = 'Send x-api-key: key, then the body {"id":1} and accept 201 or 204.';
+    const criteria = ['Poll every 2s; authorization: Basic dXNlcjpwYXNzd29yZA== stays on this line.'];
+    const job = await store.create({ task, acceptanceCriteria: criteria, ownedPaths: ['src/**'] });
+    assert.equal(job.task, task);
+    assert.deepEqual(job.acceptanceCriteria, ['Poll every 2s; authorization: Basic [REDACTED] stays on this line.']);
+    assert.deepEqual(job.briefRedaction, { spans: 1, task: 0, acceptanceCriteria: 1 });
+    await store.update(job.id, { error: 'Send x-api-key: key, then the body {"id":1}.' });
+    const stored = await store.get(job.id);
+    assert.equal(stored.task, task, 'a later save keeps the brief line');
+    assert.deepEqual(stored.acceptanceCriteria, ['Poll every 2s; authorization: Basic [REDACTED] stays on this line.']);
+    assert.equal(stored.error, 'Send x-api-key: [REDACTED]', 'a non-brief string still loses the rest of the line');
+    assert.deepEqual(stored.briefRedaction, { spans: 1, task: 0, acceptanceCriteria: 1 });
+    await store.update(job.id, { status: 'RUNNING' });
+    const resaved = await store.get(job.id);
+    assert.equal(resaved.task, task);
+    assert.deepEqual(resaved.acceptanceCriteria, stored.acceptanceCriteria);
+    assert.deepEqual(resaved.briefRedaction, { spans: 1, task: 0, acceptanceCriteria: 1 });
+  } finally {
+    cleanup(gitDir);
+  }
+});
+
+test('a bare token shape in a brief is counted in the stored brief redaction', async () => {
+  const gitDir = tempDir();
+  try {
+    const store = new JobStore({ gitDir });
+    const job = await store.create({ task: 'Call it with sk-abcdefghijklmnop1234 and then poll.', ownedPaths: ['src/**'] });
+    assert.equal(job.task, 'Call it with [REDACTED] and then poll.');
+    assert.deepEqual(job.briefRedaction, { spans: 1, task: 1, acceptanceCriteria: 0 });
+    await store.update(job.id, { status: 'RUNNING' });
+    assert.deepEqual((await store.get(job.id)).briefRedaction, { spans: 1, task: 1, acceptanceCriteria: 0 });
+  } finally {
+    cleanup(gitDir);
+  }
+});

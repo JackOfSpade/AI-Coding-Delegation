@@ -104,6 +104,7 @@ test('MCP lists exact tools, initializes, pings and dispatches', async () => {
     preexistingUnchanged: true,
     reportOutputSteer: true,
     reportCappedDraftSalvage: true,
+    briefRedactionWarning: true,
   });
   assert.ok(
     values.some((value) => value.id === null && value.result?.tools),

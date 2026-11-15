@@ -4,6 +4,7 @@ import {
   redact,
   redactError,
   redactText,
+  redactBriefText,
   redactTokenShapes,
   RedactionProjector,
   stripTerminalControls,
@@ -141,4 +142,83 @@ test('streaming header detection agrees with text redaction across long source p
     projector.finish(value.length);
     assert.equal(output, redactText(value));
   }
+});
+
+test('brief redaction keeps a brief line that only names a header', () => {
+  const sentence = 'Send the request with the x-api-key: key header, then the body {"id":1}, poll every 2s and accept 201.';
+  assert.deepEqual(redactBriefText(sentence), { text: sentence, spans: 0 });
+  const placeholder = 'Send the request with the x-api-key: <key> header, then the body {"id":1}, poll every 2s and accept 201.';
+  assert.deepEqual(redactBriefText(placeholder), { text: placeholder, spans: 0 });
+});
+
+test('brief redaction replaces only a secret-shaped header value and keeps the rest of the line', () => {
+  assert.deepEqual(redactBriefText('Send x-api-key: ak9f8d7s6a5q4w3e2r1t0zz, then poll status 204 twice.'), {
+    text: 'Send x-api-key: [REDACTED], then poll status 204 twice.',
+    spans: 1,
+  });
+});
+
+test('brief redaction judges the credential after an authorization scheme word', () => {
+  assert.deepEqual(redactBriefText('Use authorization: Basic dXNlcjpwYXNzd29yZA==, then retry the call.'), {
+    text: 'Use authorization: Basic [REDACTED], then retry the call.',
+    spans: 1,
+  });
+  assert.deepEqual(redactBriefText('Use authorization: Basic <token>, then retry the call.'), {
+    text: 'Use authorization: Basic <token>, then retry the call.',
+    spans: 0,
+  });
+});
+
+test('brief redaction judges every cookie pair and keeps names and attributes', () => {
+  assert.deepEqual(redactBriefText('cookie: session=sk9f8d7s6a5q4w3e2r1t0zz; theme=<dark>; secure'), {
+    text: 'cookie: session=[REDACTED]; theme=<dark>; secure',
+    spans: 1,
+  });
+});
+
+test('brief redaction leaves later lines of a multi-line brief untouched', () => {
+  assert.deepEqual(redactBriefText('Send x-api-key: ak9f8d7s6a5q4w3e2r1t0zz\nStatus codes 201 and 204.\nPoll every 2s.'), {
+    text: 'Send x-api-key: [REDACTED]\nStatus codes 201 and 204.\nPoll every 2s.',
+    spans: 1,
+  });
+});
+
+test('brief redaction replaces a known literal secret', () => {
+  assert.deepEqual(redactBriefText('the value sup3r-s3cret-value goes here', ['sup3r-s3cret-value']), {
+    text: 'the value [REDACTED] goes here',
+    spans: 1,
+  });
+});
+
+test('brief redaction is idempotent on its own output', () => {
+  const brief = [
+    'Send x-api-key: ak9f8d7s6a5q4w3e2r1t0zz then authorization: Basic dXNlcjpwYXNzd29yZA==',
+    'and cookie: a=sk9f8d7s6a5q4w3e2r1t0zz; theme=<dark>',
+  ].join('\n');
+  const once = redactBriefText(brief);
+  assert.equal(once.spans, 3);
+  assert.deepEqual(redactBriefText(once.text), { text: once.text, spans: 0 });
+});
+
+test('redactText still cuts the whole line after a sensitive header name', () => {
+  assert.equal(
+    redactText('Send the request with the x-api-key: key header, then the body.'),
+    'Send the request with the x-api-key: [REDACTED]',
+  );
+  assert.equal(redactText('cookie: theme=<dark>; secure'), 'cookie: [REDACTED]');
+});
+
+test('brief redaction treats a mixed-case letter run as a credential but keeps single-case and Capitalized words', () => {
+  assert.deepEqual(redactBriefText('Authorization: Basic dXNlcjpwYXNz then more'), {
+    text: 'Authorization: Basic [REDACTED] then more',
+    spans: 1,
+  });
+  assert.deepEqual(redactBriefText('x-api-key: AbCdEfGhIjKlMnOp tail'), { text: 'x-api-key: [REDACTED] tail', spans: 1 });
+  for (const kept of [
+    'x-api-key: Key, body',
+    'x-api-key: YOUR_API_KEY, body',
+    'x-api-key: your-api-key, body',
+    'Authorization: Basic credentials here',
+  ])
+    assert.deepEqual(redactBriefText(kept), { text: kept, spans: 0 });
 });

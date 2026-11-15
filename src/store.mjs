@@ -3,7 +3,7 @@ import { constants } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { redact as foundationRedact, redactText, redactTokenShapes, safeTokenAccountingValue } from './redact.mjs';
+import { redact as foundationRedact, redactBriefText, redactText, redactTokenShapes, safeTokenAccountingValue } from './redact.mjs';
 import { validJobId } from './job-manager.mjs';
 import { pidAlive as defaultPidAlive } from './pid.mjs';
 import { getGitDir } from './lease.mjs';
@@ -385,6 +385,22 @@ export class JobStore {
       updatedAt: this.now().toISOString(),
       status: input.status || 'QUEUED',
     });
+    // Count brief redaction on the caller's original text: the pass above has
+    // already replaced bare token shapes, which #writeJob could no longer count.
+    const briefTask = typeof input.task === 'string' ? redactBriefText(input.task, this.secrets) : undefined;
+    const briefCriteria = Array.isArray(input.acceptanceCriteria)
+      ? input.acceptanceCriteria.map((item) => (typeof item === 'string' ? redactBriefText(item, this.secrets) : { text: item, spans: 0 }))
+      : undefined;
+    if (briefTask) base.task = briefTask.text;
+    if (briefCriteria) base.acceptanceCriteria = briefCriteria.map((item) => item.text);
+    const criteriaSpans = (briefCriteria ?? []).reduce((total, item) => total + item.spans, 0);
+    if ((briefTask?.spans ?? 0) + criteriaSpans > 0)
+      base.briefRedaction = {
+        spans: (briefTask?.spans ?? 0) + criteriaSpans,
+        task: briefTask?.spans ?? 0,
+        acceptanceCriteria: criteriaSpans,
+      };
+    else delete base.briefRedaction;
     let prepared = base;
     if (this.integrityRequired(base) && typeof this.integrity.prepare === 'function') {
       try {
@@ -428,6 +444,24 @@ export class JobStore {
     const fallbackCredentialFingerprint = job.fallbackCredentialFingerprint;
     const fallbackCredentialFingerprints = job.fallbackCredentialFingerprints;
     const copy = foundationRedact(redact({ ...job, updatedAt: this.now().toISOString() }), this.secrets);
+    // A task brief is instructions the worker must still follow, not log text:
+    // only a secret-shaped value is replaced there, so a line that merely names
+    // a header keeps its prose. The brief value is computed from the incoming
+    // record, never from the whole-line copy above, and redactBriefText is
+    // idempotent because a job record is re-saved many times.
+    const briefTask = typeof job.task === 'string' ? redactBriefText(job.task, this.secrets) : undefined;
+    const briefCriteria = Array.isArray(job.acceptanceCriteria)
+      ? job.acceptanceCriteria.map((item) => (typeof item === 'string' ? redactBriefText(item, this.secrets) : { text: item, spans: 0 }))
+      : undefined;
+    if (briefTask) copy.task = briefTask.text;
+    if (briefCriteria) copy.acceptanceCriteria = briefCriteria.map((item) => item.text);
+    const criteriaSpans = (briefCriteria ?? []).reduce((total, item) => total + item.spans, 0);
+    const briefSpans = (briefTask?.spans ?? 0) + criteriaSpans;
+    if (briefSpans > 0) copy.briefRedaction = { spans: briefSpans, task: briefTask?.spans ?? 0, acceptanceCriteria: criteriaSpans };
+    // The primary's repair note is instructions to the worker too, so it gets
+    // the same brief treatment instead of losing the rest of its line.
+    if (typeof job.assertionRepair?.note === 'string')
+      copy.assertionRepair = { ...copy.assertionRepair, note: redactBriefText(job.assertionRepair.note, this.secrets).text };
     if (ownerNonce) copy.leaseOwnerNonce = ownerNonce;
     if (credentialFingerprint) copy.credentialFingerprint = credentialFingerprint;
     if (fallbackCredentialFingerprint) copy.fallbackCredentialFingerprint = fallbackCredentialFingerprint;

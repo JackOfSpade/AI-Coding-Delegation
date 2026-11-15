@@ -32,6 +32,9 @@ const ASSIGNMENT = /\b(?!key=\{)((?:(?:[A-Za-z_][A-Za-z0-9_]*_)?(?:TOKEN|SECRET|
 // recognize those as headers at the start of a line, never inside source or
 // an encoded tool argument such as `return { token: match[1], rest };`.
 const SENSITIVE_HEADER = /(?:\b(?:(?:x-)?api[-_ ]?key|authorization|(?:set-)?cookie)|^[ \t]*(?:token|secret|password))\s*:\s*[^\r\n]*/gim;
+// Bare token shapes (sk-…, rk-…, key…, bearer-…) the durable store removes
+// before the key/assignment rules of `redactText` run.
+const TOKEN_SHAPES = /\b(?:sk|rk|key|bearer)[-_][-_A-Za-z0-9]{11,}\b/gi;
 const ASSIGNMENT_SUFFIX = /(?:^|_)(?:TOKEN|SECRET|PASSWORD|API_KEY|KEY)$/i;
 const EXACT_ASSIGNMENT = /^(?:AUTHORIZATION|COOKIE)$/i;
 const HEADER_SUFFIX = /(?:(?:^|[^A-Za-z0-9_])(?:(?:x-)?api[-_ ]?key|authorization|(?:set-)?cookie)|^[ \t]*(?:token|secret|password))$/i;
@@ -359,7 +362,7 @@ export function redactTokenShapes(value) {
   // random runs inside base64 Anthropic thinking signatures. Those signatures
   // must survive byte-for-byte for replay. Known literal secrets are still
   // removed independently, regardless of their shape.
-  return String(value).replace(/\b(?:sk|rk|key|bearer)[-_][-_A-Za-z0-9]{11,}\b/gi, '[REDACTED]');
+  return String(value).replace(TOKEN_SHAPES, '[REDACTED]');
 }
 
 /** Redact known literal secrets and common credential-bearing text forms. */
@@ -435,4 +438,170 @@ export function redactError(error, secrets = []) {
     code: error?.code == null ? undefined : redactText(error.code, secrets),
     message: redactText(error?.message || 'Unknown error', secrets),
   };
+}
+
+/*
+ * A brief is prose the worker must still be able to follow, so brief redaction
+ * replaces only a value that looks like a credential and keeps the rest of the
+ * line byte for byte. `redactText` stays the whole-line rule for tool output,
+ * logs, errors, transcripts and every field that is not part of a brief.
+ */
+const BRIEF_MARKER = '[REDACTED]';
+// A value token ends at whitespace or at punctuation that closes a sentence, a
+// list entry, a quoted value or a parenthetical.
+const BRIEF_TOKEN_END = /[\s,;'"`)]/;
+const BRIEF_BEARER = /\b(Bearer)([ \t]+)([A-Za-z0-9._~+/-]+=*)/gi;
+const BRIEF_HEADER = /(?:\b(?:(?:x-)?api[-_ ]?key|authorization|(?:set-)?cookie)|^[ \t]*(?:token|secret|password))[ \t]*:[ \t]*/gim;
+
+/** A value a brief keeps: empty, the marker, a variable, a mask, or a word. */
+function briefPlaceholder(token) {
+  if (!token || token === BRIEF_MARKER) return true;
+  if (token.length > 1) {
+    const last = token[token.length - 1];
+    if (token[0] === '<' && last === '>') return true;
+    if (token[0] === '{' && last === '}') return true;
+    if (token[0] === '[' && last === ']') return true;
+    if (token[0] === '%' && last === '%') return true;
+  }
+  if (token[0] === '$') return true;
+  if (/^[.*xX]+$/.test(token)) return true;
+  // A word: letters, underscores and hyphens only, each part in one case or
+  // Capitalized. Mixed case inside a part (a digit-free base64 run) is a secret.
+  return (
+    token.length <= 40 && /^[A-Za-z_-]+$/.test(token) && token.split(/[_-]/).every((part) => /^(?:[a-z]*|[A-Z]+|[A-Z][a-z]+)$/.test(part))
+  );
+}
+
+/** The value tokens of one line, with offsets, so prose is never rewritten. */
+function briefTokens(line) {
+  const tokens = [];
+  let index = 0;
+  while (index < line.length) {
+    while (index < line.length && BRIEF_TOKEN_END.test(line[index])) index += 1;
+    const start = index;
+    while (index < line.length && !BRIEF_TOKEN_END.test(line[index])) index += 1;
+    if (index > start) tokens.push({ start, end: index, token: line.slice(start, index) });
+  }
+  return tokens;
+}
+
+const briefEdit = (token) => ({ start: token.start, end: token.end, text: BRIEF_MARKER });
+
+function briefRedactLine(line) {
+  const [first] = briefTokens(line);
+  return first && !briefPlaceholder(first.token) ? [briefEdit(first)] : [];
+}
+
+/** `Basic <credential>`: the scheme word is ordinary text, the credential judged. */
+function briefAuthorizationLine(line) {
+  const [first, second] = briefTokens(line);
+  if (!first) return [];
+  const scheme = second && /^[A-Za-z]+$/.test(first.token) && /^[ \t]+$/.test(line.slice(first.end, second.start));
+  const target = scheme ? second : first;
+  return briefPlaceholder(target.token) ? [] : [briefEdit(target)];
+}
+
+/** Every `name=value` pair on a cookie line is judged; names and attributes stay. */
+function briefCookieLine(line) {
+  const edits = [];
+  for (const token of briefTokens(line)) {
+    const equals = token.token.indexOf('=');
+    if (equals < 0 || briefPlaceholder(token.token.slice(equals + 1))) continue;
+    edits.push({ start: token.start + equals + 1, end: token.end, text: BRIEF_MARKER });
+  }
+  return edits;
+}
+
+const briefHeaderName = (match) =>
+  match
+    .replace(/[ \t]*:[ \t]*$/, '')
+    .trim()
+    .toLowerCase();
+
+/** Only the first value token after a sensitive header name is considered. */
+function briefLineEdits(name, line) {
+  if (name === 'authorization') return briefAuthorizationLine(line);
+  if (name === 'cookie' || name === 'set-cookie') return briefCookieLine(line);
+  return briefRedactLine(line);
+}
+
+/**
+ * Replace the judged token of every sensitive header line, keeping the header
+ * name, its colon and everything after that token exactly as it was.
+ */
+function briefRedactHeaders(source) {
+  const edits = [];
+  let match;
+  BRIEF_HEADER.lastIndex = 0;
+  while ((match = BRIEF_HEADER.exec(source))) {
+    const start = match.index + match[0].length;
+    const newline = source.indexOf('\n', start);
+    const line = source.slice(start, newline < 0 ? source.length : newline);
+    for (const edit of briefLineEdits(briefHeaderName(match[0]), line))
+      edits.push({ start: start + edit.start, end: start + edit.end, text: edit.text });
+    // Continue just after this header's colon, so a second header name later on
+    // the same line is judged on its own value.
+    BRIEF_HEADER.lastIndex = start;
+  }
+  edits.sort((left, right) => left.start - right.start);
+  let text = '';
+  let last = 0;
+  let spans = 0;
+  for (const edit of edits) {
+    if (edit.start < last) continue;
+    text += `${source.slice(last, edit.start)}${edit.text}`;
+    last = edit.end;
+    spans += 1;
+  }
+  return { text: `${text}${source.slice(last)}`, spans };
+}
+
+/** Run `regex` and count how many matches `replace` actually changed. */
+function briefReplace(text, regex, replace) {
+  let spans = 0;
+  const output = text.replace(regex, (...args) => {
+    const replacement = replace(...args);
+    if (replacement === args[0]) return replacement;
+    spans += 1;
+    return replacement;
+  });
+  return { text: output, spans };
+}
+
+/** The value of an assignment-shaped token, unless that value is a placeholder. */
+function briefAssignMatch(match, head) {
+  const tail = match.slice(head.length);
+  const equals = tail.indexOf('=');
+  if (equals < 0) return match;
+  const value = tail.slice(equals + 1);
+  const leading = /^[ \t]*/.exec(value)[0];
+  if (briefPlaceholder(value.slice(leading.length))) return match;
+  return `${head}${tail.slice(0, equals + 1)}${leading}${BRIEF_MARKER}`;
+}
+
+/**
+ * Redact a task brief: only secret-shaped values are replaced, so a sentence
+ * that names a header or an assignment keeps its prose. Returns
+ * `{ text, spans }`, where `spans` counts replaced values and is 0 when the
+ * text is unchanged. Applying it to its own output changes nothing.
+ */
+export function redactBriefText(value, secrets = []) {
+  let text = typeof value === 'string' ? value : String(value ?? '');
+  let spans = 0;
+  for (const secret of secrets) {
+    if (typeof secret !== 'string' || secret.length === 0) continue;
+    const found = text.split(secret).length - 1;
+    if (found === 0) continue;
+    spans += found;
+    text = text.split(secret).join(BRIEF_MARKER);
+  }
+  const shaped = briefReplace(text, TOKEN_SHAPES, () => BRIEF_MARKER);
+  const bearer = briefReplace(shaped.text, BRIEF_BEARER, (match, label, space, token) =>
+    briefPlaceholder(token) ? match : `${label}${space}${BRIEF_MARKER}`,
+  );
+  const assigned = briefReplace(bearer.text, ASSIGNMENT, (match, ...groups) =>
+    typeof groups[0] === 'string' ? briefAssignMatch(match, groups[0]) : match,
+  );
+  const headers = briefRedactHeaders(assigned.text);
+  return { text: headers.text, spans: spans + shaped.spans + bearer.spans + assigned.spans + headers.spans };
 }
