@@ -43,7 +43,7 @@
     "c8": "12.0.0",
     "eslint": "10.14.0",
     "globals": "17.14.0",
-    "prettier": "3.9.9"
+    "prettier": "3.10.1"
   },
   "overrides": {
     "glob": "14.0.4",
